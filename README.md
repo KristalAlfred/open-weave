@@ -19,11 +19,12 @@ future vendor adapters into one observed/control model.
   observed state from southbound, and will become the planner/command emitter.
 - **`weave-southbound`** — adapter/media-node-facing API for registration,
   telemetry, endpoint discovery, and future command streams.
-- **`weave-media-node`** — managed edge agent for unmanaged media endpoints:
-  phones, browser ingest, microphones, SRT/RIST/WebRTC/ST 2110 gateways, and local
-  monitor outputs.
+- **`weave-adapter-strom`** — southbound adapter for existing
+  [Strom](https://github.com/Eyevinn/strom) media runtimes.
+- **`weave-media-node`** — future managed edge agent for unmanaged media endpoints
+  that do not fit an existing runtime.
 
-Future adapter crates can be split out as needed, for example:
+Adapter crates can be split out as needed, for example:
 
 - `weave-adapter-nmos`
 - `weave-adapter-mxl-domain`
@@ -37,25 +38,37 @@ operator/system
   -> weave / weave-northbound
   -> weave-controller
   -> weave-southbound
-  -> weave-media-node or adapter implementations
-  -> existing media systems and transports
+  -> weave-adapter-strom or other adapter implementations
+  -> Strom, existing media systems, and transports
 ```
 
 The core rule is: **wide southbound ecosystem, narrow adapter contract**. A
 southbound implementation may only discover, only report health, or fully
 connect/provision resources depending on its capabilities.
 
+## Strom adapter and drift policy
+
+Strom is the first media runtime target. `weave-adapter-strom` runs beside one
+Strom instance, registers it with southbound, polls `/api/flows`, and reports
+Strom flows as observed endpoints. Future controller work will translate
+open-weave desired state into Strom flow create/update/start/stop calls.
+
+Strom UI/API edits are **drift**, like direct edits to Kubernetes managed
+objects. The source of truth is open-weave desired state; out-of-band Strom
+changes should be reconciled back or explicitly adopted into desired state.
+
 ## Quickstart
 
 ```sh
 just build
-just run-north       # 127.0.0.1:8080
-just run-south       # 127.0.0.1:8081
-just run-controller  # 127.0.0.1:8082 health endpoint
-just run-node        # registers local-media-node, then serves health on 127.0.0.1:8090
+just run-north           # 127.0.0.1:8080
+just run-south           # 127.0.0.1:8081
+just run-controller      # 127.0.0.1:8082 health endpoint
+just run-strom-adapter   # registers Strom from http://127.0.0.1:8080
+just run-node            # future first-party edge node stub
 just cli -- --help
 ```
 
 > Phase 0 scaffolding: APIs are in-memory and the controller only reports desired
-> vs observed counts. Planning, persistence, command streams, and real adapter
-> implementations come next.
+> vs observed counts. Planning, persistence, command streams, and adapter command
+> application come next.

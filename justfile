@@ -31,5 +31,8 @@ run-controller:
 run-node *ARGS:
     cargo run -p weave-media-node -- {{ARGS}}
 
+run-strom-adapter *ARGS:
+    cargo run -p weave-adapter-strom -- {{ARGS}}
+
 cli *ARGS:
     cargo run -p weave-cli -- {{ARGS}}

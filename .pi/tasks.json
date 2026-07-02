@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "tasks": [
+    {
+      "id": "t_20260702092654_473y5p",
+      "title": "Implement Strom adapter command application",
+      "description": "Translate open-weave desired definitions into Strom flow create/update/start/stop calls via weave-adapter-strom. README now documents this as future controller work; current adapter only observes /api/flows and reports endpoints.",
+      "status": "open",
+      "priority": "high",
+      "tags": [
+        "adapter",
+        "strom",
+        "controller"
+      ],
+      "source": "README.md; crates/adapter-strom/src/main.rs",
+      "createdAt": "2026-07-02T09:26:54.168Z",
+      "updatedAt": "2026-07-02T09:26:54.168Z",
+      "notes": []
+    }
+  ]
+}

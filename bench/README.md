@@ -8,7 +8,7 @@ under packet loss / latency / jitter / reorder / blackout.
 This is the "real bench first" step: the media plane + impairment + telemetry
 surface. open-weave's own Rust binaries are **not** wired in yet — flows are
 provisioned directly against strom's HTTP API (`scripts/flows.sh`, a temporary
-stand-in for the future Rust southbound).
+stand-in for future `weave-adapter-strom` command application).
 
 ## Topology
 

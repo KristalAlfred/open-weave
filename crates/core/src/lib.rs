@@ -36,6 +36,7 @@ pub struct AdapterDescriptor {
 #[serde(rename_all = "snake_case")]
 pub enum AdapterKind {
     MediaNode,
+    Strom,
     Nmos,
     MxlDomain,
     MxlK8s,
