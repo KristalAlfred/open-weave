@@ -1,14 +1,7 @@
 //! Shared domain types for open-weave.
-//!
-//! Phase 0 placeholders. These describe the desired-state vocabulary the control
-//! plane speaks: `Definition`s come in from the north, `NodeDescriptor`s track the
-//! media nodes reconciled from the south. Fields and shapes will change.
 
 use serde::{Deserialize, Serialize};
 
-/// A unit of desired state submitted by an operator or system.
-///
-/// The `spec` is an opaque placeholder until the desired-state schema is defined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Definition {
     pub id: String,
@@ -16,15 +9,107 @@ pub struct Definition {
     pub spec: serde_json::Value,
 }
 
-/// A media node known to the control plane and its last observed status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeDescriptor {
     pub id: String,
     pub endpoint: String,
     pub status: NodeStatus,
+    #[serde(default)]
+    pub capabilities: NodeCapabilities,
 }
 
-/// Last observed reconciliation status of a media node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NodeCapabilities {
+    #[serde(default)]
+    pub adapters: Vec<AdapterDescriptor>,
+    #[serde(default)]
+    pub transports: Vec<TransportDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdapterDescriptor {
+    pub name: String,
+    pub kind: AdapterKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterKind {
+    MediaNode,
+    Nmos,
+    MxlDomain,
+    MxlK8s,
+    Mcm,
+    Vendor,
+    Custom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportDescriptor {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointDescriptor {
+    pub id: String,
+    pub label: String,
+    pub node_id: Option<String>,
+    pub kind: EndpointKind,
+    #[serde(default)]
+    pub transports: Vec<TransportDescriptor>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointKind {
+    Source,
+    Destination,
+    Bidirectional,
+    Flow,
+    Gateway,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeRegistration {
+    pub node: NodeDescriptor,
+    #[serde(default)]
+    pub endpoints: Vec<EndpointDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeHeartbeat {
+    pub node_id: String,
+    pub status: NodeStatus,
+    #[serde(default)]
+    pub endpoints: Vec<EndpointDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedState {
+    #[serde(default)]
+    pub nodes: Vec<NodeDescriptor>,
+    #[serde(default)]
+    pub endpoints: Vec<EndpointDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconcileReport {
+    pub status: ReconcileStatus,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconcileStatus {
+    Idle,
+    Converging,
+    Converged,
+    Degraded,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeStatus {

@@ -1,34 +1,61 @@
 # open-weave
 
 open-weave is a software-defined media contribution orchestrator — the control-plane
-"brain" that accepts declarative *definitions* of desired state and drives a fleet of
-media nodes toward that state. Operators describe what they want on the northbound
-side; the control plane reconciles it onto media nodes over the southbound side.
+"brain" that accepts declarative desired state and reconciles it onto a wide
+southbound ecosystem of media nodes, adapters, and existing transport systems.
 
-## Crates
+It does **not** define a new media data plane. The northbound side speaks operator
+intent; the southbound side normalizes NMOS, MXL, MCM, managed edge nodes, and
+future vendor adapters into one observed/control model.
 
-- **`weave-core`** — shared domain types (definitions / desired state, node descriptors).
-- **`weave-cli`** (`weave`) — operator CLI for applying definitions and inspecting state.
-- **`weave-northbound`** — northbound API: accepts desired-state definitions from
-  operators and systems.
-- **`weave-southbound`** — southbound API: the media-node-facing side that drives nodes
-  toward desired state.
+## Crates and binaries
 
-## Why two binaries
+- **`weave-core`** — shared domain types: definitions, nodes, endpoints, adapters,
+  capabilities, observed state, reconcile reports.
+- **`weave-cli`** (`weave`) — operator CLI for applying definitions and inspecting
+  state.
+- **`weave-northbound`** — northbound API for desired-state CRUD.
+- **`weave-controller`** — reconciler loop. It reads desired state from northbound,
+  observed state from southbound, and will become the planner/command emitter.
+- **`weave-southbound`** — adapter/media-node-facing API for registration,
+  telemetry, endpoint discovery, and future command streams.
+- **`weave-media-node`** — managed edge agent for unmanaged media endpoints:
+  phones, browser ingest, microphones, SRT/RIST/WebRTC/ST 2110 gateways, and local
+  monitor outputs.
 
-Northbound and southbound run as separate binaries. The northbound surface is a
-request/response HTTP API for operators. The southbound surface is stateless HTTP
-today, but is expected to grow a persistent-connection transport (gRPC streaming or
-WebSocket) for real-time reconciliation and telemetry. Keeping it separate lets that
-transport evolve without touching the northbound binary.
+Future adapter crates can be split out as needed, for example:
+
+- `weave-adapter-nmos`
+- `weave-adapter-mxl-domain`
+- `weave-adapter-mxl-k8s`
+- `weave-adapter-mcm`
+
+## Runtime shape
+
+```text
+operator/system
+  -> weave / weave-northbound
+  -> weave-controller
+  -> weave-southbound
+  -> weave-media-node or adapter implementations
+  -> existing media systems and transports
+```
+
+The core rule is: **wide southbound ecosystem, narrow adapter contract**. A
+southbound implementation may only discover, only report health, or fully
+connect/provision resources depending on its capabilities.
 
 ## Quickstart
 
 ```sh
-just build       # cargo build
-just run-north   # start the northbound API on 127.0.0.1:8080
-just run-south   # start the southbound API on 127.0.0.1:8081
+just build
+just run-north       # 127.0.0.1:8080
+just run-south       # 127.0.0.1:8081
+just run-controller  # 127.0.0.1:8082 health endpoint
+just run-node        # registers local-media-node, then serves health on 127.0.0.1:8090
 just cli -- --help
 ```
 
-> Phase 0 scaffolding: handlers are stubs and no reconciliation logic exists yet.
+> Phase 0 scaffolding: APIs are in-memory and the controller only reports desired
+> vs observed counts. Planning, persistence, command streams, and real adapter
+> implementations come next.

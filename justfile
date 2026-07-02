@@ -1,3 +1,6 @@
+# Network-impairment media test bench (docker-compose). See bench/README.md.
+mod bench
+
 default:
     @just --list
 
@@ -21,6 +24,12 @@ run-north:
 
 run-south:
     cargo run -p weave-southbound
+
+run-controller:
+    cargo run -p weave-controller
+
+run-node *ARGS:
+    cargo run -p weave-media-node -- {{ARGS}}
 
 cli *ARGS:
     cargo run -p weave-cli -- {{ARGS}}
