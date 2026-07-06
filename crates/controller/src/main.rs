@@ -8,7 +8,7 @@ use clap::Parser;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
-use weave_core::{Definition, NodeDescriptor, ReconcileReport, ReconcileStatus};
+use weave_core::{NodeDescriptor, ReconcileReport, ReconcileStatus, StreamDefinition};
 
 #[derive(Debug, Parser)]
 #[command(name = "weave-controller", version, about = "open-weave reconciler")]
@@ -94,16 +94,16 @@ async fn reconcile_once(
     northbound_url: &str,
     southbound_url: &str,
 ) -> Result<ReconcileReport> {
-    let definitions = client
-        .get(format!("{northbound_url}/definitions"))
+    let streams = client
+        .get(format!("{northbound_url}/streams"))
         .send()
         .await
-        .context("fetching definitions")?
+        .context("fetching streams")?
         .error_for_status()
-        .context("northbound definitions request failed")?
-        .json::<Vec<Definition>>()
+        .context("northbound streams request failed")?
+        .json::<Vec<StreamDefinition>>()
         .await
-        .context("decoding definitions")?;
+        .context("decoding streams")?;
 
     let nodes = client
         .get(format!("{southbound_url}/nodes"))
@@ -116,7 +116,7 @@ async fn reconcile_once(
         .await
         .context("decoding nodes")?;
 
-    let status = if definitions.is_empty() {
+    let status = if streams.is_empty() {
         ReconcileStatus::Idle
     } else if nodes.is_empty() {
         ReconcileStatus::Degraded
@@ -127,8 +127,8 @@ async fn reconcile_once(
     Ok(ReconcileReport {
         status,
         summary: format!(
-            "{} desired definition(s), {} observed node(s)",
-            definitions.len(),
+            "{} desired stream(s), {} observed node(s)",
+            streams.len(),
             nodes.len()
         ),
     })

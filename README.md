@@ -68,7 +68,3 @@ just run-strom-adapter   # registers Strom from http://127.0.0.1:8080
 just run-node            # future first-party edge node stub
 just cli -- --help
 ```
-
-> Phase 0 scaffolding: APIs are in-memory and the controller only reports desired
-> vs observed counts. Planning, persistence, command streams, and adapter command
-> application come next.

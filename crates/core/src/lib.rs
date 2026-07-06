@@ -2,11 +2,40 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Definition {
-    pub id: String,
+/// Operator intent: one source streamed to one or more destinations over a transport.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StreamDefinition {
     pub name: String,
-    pub spec: serde_json::Value,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    pub source: StreamTransport,
+    pub destinations: Vec<StreamTransport>,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+/// Transport carrying a stream endpoint. Externally tagged by transport name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamTransport {
+    Srt(SrtEndpoint),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SrtEndpoint {
+    pub url: String,
+    pub mode: SrtMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SrtMode {
+    Listener,
+    Caller,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,4 +147,53 @@ pub enum NodeStatus {
     Ready,
     Degraded,
     Offline,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_json_uses_snake_case_transport_tag_and_defaults_enabled() {
+        let json = serde_json::json!({
+            "name": "cam1-to-studio",
+            "source": { "srt": { "url": "srt://0.0.0.0:7001", "mode": "listener", "latency": 200 } },
+            "destinations": [
+                { "srt": { "url": "srt://studio:7002", "mode": "caller" } }
+            ]
+        });
+
+        let stream: StreamDefinition = serde_json::from_value(json).expect("parse stream");
+
+        assert!(stream.enabled, "enabled defaults to true when omitted");
+        assert_eq!(
+            stream.source,
+            StreamTransport::Srt(SrtEndpoint {
+                url: "srt://0.0.0.0:7001".to_string(),
+                mode: SrtMode::Listener,
+                latency: Some(200),
+            })
+        );
+        assert_eq!(
+            stream.destinations[0],
+            StreamTransport::Srt(SrtEndpoint {
+                url: "srt://studio:7002".to_string(),
+                mode: SrtMode::Caller,
+                latency: None,
+            })
+        );
+
+        let round_trip: StreamDefinition =
+            serde_json::from_str(&serde_json::to_string(&stream).unwrap()).unwrap();
+        assert_eq!(stream, round_trip);
+        assert_eq!(
+            serde_json::to_value(&stream).unwrap()["source"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .next()
+                .unwrap(),
+            "srt"
+        );
+    }
 }

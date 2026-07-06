@@ -1,0 +1,14 @@
+name: cam1-to-studio
+enabled: true
+source:
+  srt:
+    url: srt://0.0.0.0:7001
+    mode: listener
+    latency: 200
+destinations:
+  - srt:
+      url: srt://studio:7002
+      mode: caller
+  - srt:
+      url: srt://backup:7002
+      mode: caller
