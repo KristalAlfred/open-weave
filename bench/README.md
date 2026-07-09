@@ -41,7 +41,9 @@ may still hold 9080/8082/18080/18081. Point the CLI at northbound with
 ```sh
 just up            # build + start + wait for healthy
 just status        # health, registered nodes, controller view, streams
-weave apply -f ../examples/contribution.yaml   # drive it yourself
+
+just stream-ls     # list the stream manifests (see manifests/README.md)
+just stream basic  # apply a manifest; `just stream-rm basic` removes it
 
 just netem node1 delay 200ms loss 5%   # impair node 1's network
 just netem-show node1
@@ -68,8 +70,9 @@ traffic crosses the same impaired hops as real external peers.
 - `consumer` pulls the receiver flow's output from `strom-2:7003` (SRT caller)
   and discards it (`-f null -`).
 
-They target the ports used by `examples/contribution.yaml`; apply that stream
-first (`weave apply -f ../examples/contribution.yaml`) so the flows exist.
+They target the ports used by the `basic` manifest; apply it first
+(`just stream basic`) so the flows exist. See `manifests/README.md` for the full
+manifest library and observed status per scenario.
 
 ## Notes
 

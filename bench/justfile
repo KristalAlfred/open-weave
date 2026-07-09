@@ -1,5 +1,6 @@
-compose := "docker compose -f " + source_directory() / "docker-compose.yml"
-scripts := source_directory() / "scripts"
+compose   := "docker compose -f " + source_directory() / "docker-compose.yml"
+scripts   := source_directory() / "scripts"
+manifests := source_directory() / "manifests"
 nb      := "http://localhost:29080"
 sb      := "http://localhost:29081"
 ctrl    := "http://localhost:29082"
@@ -53,6 +54,20 @@ status:
     @curl -sf {{ctrl}}/status | (jq . 2>/dev/null || cat)
     @echo "== streams (northbound) =="
     @curl -sf {{nb}}/streams | (jq . 2>/dev/null || cat)
+
+# List the available stream manifests with their one-line description.
+stream-ls:
+    @for f in {{manifests}}/*.yaml; do \
+        printf "%-14s %s\n" "$(basename "$f" .yaml)" "$(head -1 "$f" | sed 's/^# *//')"; \
+    done
+
+# Apply a manifest by name (stem == stream name), e.g. `just stream basic`.
+stream name:
+    WEAVE_NORTHBOUND_URL={{nb}} cargo run --quiet -p weave-cli -- apply -f {{manifests}}/{{name}}.yaml
+
+# Remove a stream by name, e.g. `just stream-rm basic`. Controller tears down its hops next tick.
+stream-rm name:
+    @curl -sf -X DELETE {{nb}}/streams/{{name}} && echo "deleted {{name}}" || echo "not found: {{name}}"
 
 # Start the external ffmpeg producer (SRT caller into strom-1's ingress :7001).
 # Verification endpoint only — not part of the system under test.

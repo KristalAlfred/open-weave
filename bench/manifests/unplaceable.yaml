@@ -1,0 +1,15 @@
+# Source pinned to a node that never registers: stays pending until it does
+# (Kubernetes-style unschedulable), never provisions.
+name: unplaceable
+enabled: true
+source:
+  srt:
+    url: srt://0.0.0.0:7001
+    mode: listener
+    latency: 200
+    node: strom-node-404
+destinations:
+  - srt:
+      url: srt://172.27.0.10:7002
+      mode: caller
+      latency: 1000

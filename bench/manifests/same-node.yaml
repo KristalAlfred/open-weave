@@ -1,0 +1,14 @@
+# Loopback: source and destination both placed on node-1.
+name: same-node
+enabled: true
+source:
+  srt:
+    url: srt://0.0.0.0:7001
+    mode: listener
+    latency: 200
+    node: strom-node-1
+destinations:
+  - srt:
+      url: srt://172.26.0.10:7002
+      mode: caller
+      latency: 1000

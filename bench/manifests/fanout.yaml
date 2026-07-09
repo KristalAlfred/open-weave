@@ -1,0 +1,19 @@
+# Fan-out to two destinations. LIMITATION: only the first destination is
+# realised today (controller derive_path is first-destination-only).
+name: fanout
+enabled: true
+source:
+  srt:
+    url: srt://0.0.0.0:7001
+    mode: listener
+    latency: 200
+    node: strom-node-1
+destinations:
+  - srt:
+      url: srt://172.27.0.10:7002
+      mode: caller
+      latency: 1000
+  - srt:
+      url: srt://172.26.0.10:7002
+      mode: caller
+      latency: 1000

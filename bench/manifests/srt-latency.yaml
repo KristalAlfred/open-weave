@@ -1,0 +1,15 @@
+# SRT latency variant: non-default source (120ms) and destination (2000ms)
+# latency carried through to the provisioned hops.
+name: srt-latency
+enabled: true
+source:
+  srt:
+    url: srt://0.0.0.0:7001
+    mode: listener
+    latency: 120
+    node: strom-node-1
+destinations:
+  - srt:
+      url: srt://172.27.0.10:7002
+      mode: caller
+      latency: 2000
