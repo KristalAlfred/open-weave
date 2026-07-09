@@ -26,6 +26,10 @@ down:
 flows:
     bash {{scripts}}/flows.sh
 
+# Create + start ONLY egress; leave the ingress side for the weave controller.
+flows-egress:
+    bash {{scripts}}/flows-egress.sh
+
 # Poll srt-stats from both nodes and pretty-print key fields.
 stats:
     bash {{scripts}}/stats.sh

@@ -1,0 +1,14 @@
+# Single contribution feed: SRT listener on :7001 relayed to the egress node.
+# Maps 1:1 to bench/flows/ingress.json when the controller actuates it.
+name: contribution
+enabled: true
+source:
+  srt:
+    url: srt://0.0.0.0:7001
+    mode: listener
+    latency: 200
+destinations:
+  - srt:
+      url: srt://172.31.0.10:7002
+      mode: caller
+      latency: 1000
