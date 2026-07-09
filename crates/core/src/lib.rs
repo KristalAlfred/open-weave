@@ -129,6 +129,18 @@ pub struct HopStatus {
     pub stats: Option<LinkStats>,
 }
 
+impl HopStatus {
+    /// The lifecycle + per-socket conditions consumed by [`roll_up_path`].
+    #[must_use]
+    pub fn conditions(&self) -> HopConditions {
+        HopConditions {
+            state: self.state,
+            ingress: self.ingress,
+            egress: self.egress,
+        }
+    }
+}
+
 /// Control-plane lifecycle of a hop's provisioning. Runtime link health is
 /// reported separately per socket via [`LinkCondition`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +164,73 @@ pub enum LinkCondition {
     Connected,
     /// SRT connection up and media flowing.
     Flowing,
+}
+
+/// Lifecycle plus both socket conditions of one hop — the unit rolled up per path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HopConditions {
+    pub state: HopState,
+    pub ingress: LinkCondition,
+    pub egress: LinkCondition,
+}
+
+/// End-to-end status of a path, derived from its hops' conditions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathStatus {
+    /// The path is disabled.
+    Idle,
+    /// At least one hop failed to provision.
+    Failed,
+    /// A hop is still provisioning or has not reported yet.
+    Pending,
+    /// Provisioned end to end, but no media is entering at the source.
+    AwaitingInput,
+    /// Media is entering at the source but not flowing all the way through.
+    Degraded,
+    /// Media is flowing across every hop.
+    Flowing,
+}
+
+/// Roll a path's ordered (source→destination) hop conditions into one status.
+///
+/// `None` entries mark desired hops that have not reported yet. Precedence, first
+/// match wins: disabled → `Idle`; any hop failed → `Failed`; any hop pending or
+/// missing → `Pending`; source not yet receiving media → `AwaitingInput`; media
+/// entering but not flowing end to end → `Degraded`; all flowing → `Flowing`.
+#[must_use]
+pub fn roll_up_path(enabled: bool, hops: &[Option<HopConditions>]) -> PathStatus {
+    if !enabled {
+        return PathStatus::Idle;
+    }
+    if hops
+        .iter()
+        .any(|hop| hop.is_some_and(|h| h.state == HopState::Failed))
+    {
+        return PathStatus::Failed;
+    }
+    if hops
+        .iter()
+        .any(|hop| hop.is_none_or(|h| h.state == HopState::Pending))
+    {
+        return PathStatus::Pending;
+    }
+
+    let source_flowing =
+        hops.first().and_then(|hop| hop.map(|h| h.ingress)) == Some(LinkCondition::Flowing);
+    if !source_flowing {
+        return PathStatus::AwaitingInput;
+    }
+
+    let all_flowing = hops
+        .iter()
+        .flatten()
+        .all(|h| h.ingress == LinkCondition::Flowing && h.egress == LinkCondition::Flowing);
+    if all_flowing {
+        PathStatus::Flowing
+    } else {
+        PathStatus::Degraded
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,5 +525,133 @@ mod tests {
         assert!(is_managed_hop_id("weave-contribution-sender"));
         assert!(!is_managed_hop_id("contribution"));
         assert!(!is_managed_hop_id("contribution-recv"));
+    }
+
+    fn hc(state: HopState, ingress: LinkCondition, egress: LinkCondition) -> Option<HopConditions> {
+        Some(HopConditions {
+            state,
+            ingress,
+            egress,
+        })
+    }
+
+    #[test]
+    fn rollup_disabled_is_idle() {
+        let hops = [hc(
+            HopState::Provisioned,
+            LinkCondition::Flowing,
+            LinkCondition::Flowing,
+        )];
+        assert_eq!(roll_up_path(false, &hops), PathStatus::Idle);
+    }
+
+    #[test]
+    fn rollup_failed_hop_wins_over_flowing() {
+        let hops = [
+            hc(
+                HopState::Provisioned,
+                LinkCondition::Flowing,
+                LinkCondition::Flowing,
+            ),
+            hc(
+                HopState::Failed,
+                LinkCondition::Flowing,
+                LinkCondition::Flowing,
+            ),
+        ];
+        assert_eq!(roll_up_path(true, &hops), PathStatus::Failed);
+    }
+
+    #[test]
+    fn rollup_pending_or_missing_hop_is_pending() {
+        let pending = [hc(
+            HopState::Pending,
+            LinkCondition::Idle,
+            LinkCondition::Idle,
+        )];
+        assert_eq!(roll_up_path(true, &pending), PathStatus::Pending);
+
+        let missing = [
+            hc(
+                HopState::Provisioned,
+                LinkCondition::Flowing,
+                LinkCondition::Flowing,
+            ),
+            None,
+        ];
+        assert_eq!(roll_up_path(true, &missing), PathStatus::Pending);
+    }
+
+    #[test]
+    fn rollup_source_not_receiving_is_awaiting_input() {
+        let idle = [hc(
+            HopState::Provisioned,
+            LinkCondition::Idle,
+            LinkCondition::Idle,
+        )];
+        assert_eq!(roll_up_path(true, &idle), PathStatus::AwaitingInput);
+
+        let silent = [hc(
+            HopState::Provisioned,
+            LinkCondition::Connected,
+            LinkCondition::Connected,
+        )];
+        assert_eq!(roll_up_path(true, &silent), PathStatus::AwaitingInput);
+    }
+
+    #[test]
+    fn rollup_flowing_source_with_stalled_downstream_is_degraded() {
+        let hops = [
+            hc(
+                HopState::Provisioned,
+                LinkCondition::Flowing,
+                LinkCondition::Flowing,
+            ),
+            hc(
+                HopState::Provisioned,
+                LinkCondition::Connected,
+                LinkCondition::Connected,
+            ),
+        ];
+        assert_eq!(roll_up_path(true, &hops), PathStatus::Degraded);
+    }
+
+    #[test]
+    fn rollup_all_flowing_is_flowing() {
+        let hops = [
+            hc(
+                HopState::Provisioned,
+                LinkCondition::Flowing,
+                LinkCondition::Flowing,
+            ),
+            hc(
+                HopState::Provisioned,
+                LinkCondition::Flowing,
+                LinkCondition::Flowing,
+            ),
+        ];
+        assert_eq!(roll_up_path(true, &hops), PathStatus::Flowing);
+    }
+
+    #[test]
+    fn hop_status_conditions_extracts_state_and_link_conditions() {
+        let status = HopStatus {
+            id: "weave-a".to_string(),
+            node_id: "n1".to_string(),
+            state: HopState::Provisioned,
+            ingress: LinkCondition::Flowing,
+            egress: LinkCondition::Connected,
+            resolved_ingress: None,
+            resolved_egress: None,
+            stats: None,
+        };
+        assert_eq!(
+            status.conditions(),
+            HopConditions {
+                state: HopState::Provisioned,
+                ingress: LinkCondition::Flowing,
+                egress: LinkCondition::Connected,
+            }
+        );
     }
 }
