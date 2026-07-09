@@ -2,7 +2,9 @@
 
 use std::collections::HashSet;
 
-use weave_core::{DesiredHop, HopState, ResolvedAddr, SocketRole, SocketSpec, is_managed_hop_id};
+use weave_core::{
+    DesiredHop, HopState, LinkCondition, ResolvedAddr, SocketRole, SocketSpec, is_managed_hop_id,
+};
 use weave_strom::StromFlow;
 
 #[derive(Debug, Default, PartialEq)]
@@ -56,16 +58,33 @@ pub fn diff_hops(desired: &[DesiredHop], flows: &[StromFlow]) -> HopPlan {
     }
 }
 
-/// Derive a hop's reported state from its flow and connection status.
+/// Derive a hop's control-plane lifecycle state from its flow presence.
+///
+/// Runtime link health (connection up, media flowing) is reported separately per
+/// socket via [`socket_condition`], not folded into the lifecycle state.
 #[must_use]
-pub fn hop_state(flow: Option<&StromFlow>, connected: bool, failed: bool) -> HopState {
+pub fn hop_state(flow: Option<&StromFlow>, failed: bool) -> HopState {
     if failed {
         return HopState::Failed;
     }
     match flow {
         None => HopState::Pending,
-        Some(flow) if flow.running && connected => HopState::Connected,
         Some(_) => HopState::Provisioned,
+    }
+}
+
+/// Map an observed socket to its link condition.
+///
+/// A socket with no SRT connection is `Idle` when it listens (healthy waiting)
+/// and `Connecting` when it calls (retrying — ambiguous, not degraded). A live
+/// connection is `Flowing` when media moves and `Connected` when it is silent.
+#[must_use]
+pub fn socket_condition(role: SocketRole, connected: bool, rate_mbps: f64) -> LinkCondition {
+    match (connected, role) {
+        (false, SocketRole::Listen) => LinkCondition::Idle,
+        (false, SocketRole::Connect) => LinkCondition::Connecting,
+        (true, _) if rate_mbps > 0.0 => LinkCondition::Flowing,
+        (true, _) => LinkCondition::Connected,
     }
 }
 
@@ -172,21 +191,43 @@ mod tests {
     }
 
     #[test]
-    fn hop_state_reflects_flow_and_connection() {
+    fn hop_state_reports_lifecycle_only() {
         let running = flow("weave-a", "id-a", true);
         let stopped = flow("weave-a", "id-a", false);
 
-        assert_eq!(hop_state(None, false, false), HopState::Pending);
+        assert_eq!(hop_state(None, false), HopState::Pending);
+        assert_eq!(hop_state(Some(&stopped), false), HopState::Provisioned);
+        assert_eq!(hop_state(Some(&running), false), HopState::Provisioned);
+        assert_eq!(hop_state(Some(&running), true), HopState::Failed);
+        assert_eq!(hop_state(None, true), HopState::Failed);
+    }
+
+    #[test]
+    fn socket_condition_distinguishes_listener_and_caller_when_down() {
         assert_eq!(
-            hop_state(Some(&stopped), true, false),
-            HopState::Provisioned
+            socket_condition(SocketRole::Listen, false, 0.0),
+            LinkCondition::Idle
         );
         assert_eq!(
-            hop_state(Some(&running), false, false),
-            HopState::Provisioned
+            socket_condition(SocketRole::Connect, false, 0.0),
+            LinkCondition::Connecting
         );
-        assert_eq!(hop_state(Some(&running), true, false), HopState::Connected);
-        assert_eq!(hop_state(Some(&running), true, true), HopState::Failed);
+    }
+
+    #[test]
+    fn socket_condition_flows_only_when_connected_with_rate() {
+        assert_eq!(
+            socket_condition(SocketRole::Listen, true, 0.0),
+            LinkCondition::Connected
+        );
+        assert_eq!(
+            socket_condition(SocketRole::Connect, true, 3.2),
+            LinkCondition::Flowing
+        );
+        assert_eq!(
+            socket_condition(SocketRole::Listen, true, 3.2),
+            LinkCondition::Flowing
+        );
     }
 
     #[test]

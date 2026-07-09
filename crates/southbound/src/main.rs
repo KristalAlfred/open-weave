@@ -178,8 +178,8 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
     use weave_core::{
-        HopRole, HopState, HopStatus, NodeCapabilities, NodeStatus, SocketRole, SocketSpec,
-        SrtParams, Transport,
+        HopRole, HopState, HopStatus, LinkCondition, NodeCapabilities, NodeStatus, SocketRole,
+        SocketSpec, SrtParams, Transport,
     };
 
     fn hop(id: &str, node_id: &str) -> DesiredHop {
@@ -330,7 +330,9 @@ mod tests {
             hop_status: vec![HopStatus {
                 id: "weave-a".to_string(),
                 node_id: "strom-node-1".to_string(),
-                state: HopState::Connected,
+                state: HopState::Provisioned,
+                ingress: LinkCondition::Flowing,
+                egress: LinkCondition::Connected,
                 resolved_ingress: None,
                 resolved_egress: None,
                 stats: None,
@@ -351,6 +353,7 @@ mod tests {
         assert_eq!(observed.nodes.len(), 1);
         assert_eq!(observed.hops.len(), 1);
         assert_eq!(observed.hops[0].id, "weave-a");
-        assert_eq!(observed.hops[0].state, HopState::Connected);
+        assert_eq!(observed.hops[0].state, HopState::Provisioned);
+        assert_eq!(observed.hops[0].ingress, LinkCondition::Flowing);
     }
 }

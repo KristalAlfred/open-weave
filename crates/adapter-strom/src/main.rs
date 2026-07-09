@@ -16,9 +16,9 @@ use weave_core::{
     LinkStats, NodeCapabilities, NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus,
     TransportDescriptor,
 };
-use weave_strom::{StromClient, StromFlow, flow_spec_from_hop, parse_flow_stats};
+use weave_strom::{FlowStats, StromClient, StromFlow, flow_spec_from_hop, parse_flow_stats};
 
-use provision::{diff_hops, hop_state, resolved_addr};
+use provision::{diff_hops, hop_state, resolved_addr, socket_condition};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -240,27 +240,35 @@ async fn hop_statuses(
     let mut statuses = Vec::with_capacity(desired.len());
     for hop in desired {
         let flow = flows.iter().find(|f| f.name == hop.id);
-        let (connected, stats) = match flow {
+        let stats = match flow {
             Some(flow) => match strom.srt_stats(&flow.id).await {
-                Ok(value) => {
-                    let flow_stats = parse_flow_stats(&value);
-                    (flow_stats.connected, Some(LinkStats::from(flow_stats)))
-                }
+                Ok(value) => Some(parse_flow_stats(&value)),
                 Err(error) => {
                     tracing::debug!(hop = %hop.id, %error, "srt-stats unavailable");
-                    (false, None)
+                    None
                 }
             },
-            None => (false, None),
+            None => None,
         };
+
+        let (ingress_connected, ingress_rate) = stats
+            .as_ref()
+            .and_then(FlowStats::ingress)
+            .map_or((false, 0.0), |e| (e.connected, e.rate_mbps));
+        let (egress_connected, egress_rate) = stats
+            .as_ref()
+            .and_then(FlowStats::egress)
+            .map_or((false, 0.0), |e| (e.connected, e.rate_mbps));
 
         statuses.push(HopStatus {
             id: hop.id.clone(),
             node_id: hop.node_id.clone(),
-            state: hop_state(flow, connected, failed.contains(&hop.id)),
+            state: hop_state(flow, failed.contains(&hop.id)),
+            ingress: socket_condition(hop.ingress.role, ingress_connected, ingress_rate),
+            egress: socket_condition(hop.egress.role, egress_connected, egress_rate),
             resolved_ingress: resolved_addr(&hop.ingress),
             resolved_egress: resolved_addr(&hop.egress),
-            stats,
+            stats: stats.map(LinkStats::from),
         });
     }
     statuses

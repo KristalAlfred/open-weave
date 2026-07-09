@@ -44,9 +44,13 @@ impl FlowStats {
 
 impl From<FlowStats> for weave_core::LinkStats {
     fn from(stats: FlowStats) -> Self {
+        let ingress_rate_mbps = stats.ingress().map_or(0.0, |e| e.rate_mbps);
+        let egress_rate_mbps = stats.egress().map_or(0.0, |e| e.rate_mbps);
         Self {
             connections: stats.elements.len(),
             connected: stats.connected,
+            ingress_rate_mbps,
+            egress_rate_mbps,
             packets_sent_lost: stats.packets_sent_lost,
             packets_retransmitted: stats.packets_retransmitted,
             packets_received_lost: stats.packets_received_lost,

@@ -112,11 +112,15 @@ pub struct SrtParams {
 }
 
 /// Node-reported realisation status for one desired hop.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HopStatus {
     pub id: String,
     pub node_id: String,
     pub state: HopState,
+    #[serde(default)]
+    pub ingress: LinkCondition,
+    #[serde(default)]
+    pub egress: LinkCondition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_ingress: Option<ResolvedAddr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,13 +129,29 @@ pub struct HopStatus {
     pub stats: Option<LinkStats>,
 }
 
+/// Control-plane lifecycle of a hop's provisioning. Runtime link health is
+/// reported separately per socket via [`LinkCondition`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HopState {
     Pending,
     Provisioned,
-    Connected,
     Failed,
+}
+
+/// Observed condition of one socket on a hop, independent of control-plane lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkCondition {
+    /// No SRT connection; the socket is a listener patiently waiting. Healthy.
+    #[default]
+    Idle,
+    /// No SRT connection; the socket is a caller still retrying. Ambiguous, not degraded.
+    Connecting,
+    /// SRT connection up but rate ~0 — fine on our end, nothing coming through yet.
+    Connected,
+    /// SRT connection up and media flowing.
+    Flowing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,12 +161,16 @@ pub struct ResolvedAddr {
 }
 
 /// Link-level SRT stats mirrored from Strom's `srt-stats` payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub struct LinkStats {
     #[serde(default)]
     pub connections: usize,
     #[serde(default)]
     pub connected: bool,
+    #[serde(default)]
+    pub ingress_rate_mbps: f64,
+    #[serde(default)]
+    pub egress_rate_mbps: f64,
     #[serde(default)]
     pub packets_sent_lost: i64,
     #[serde(default)]
@@ -221,7 +245,7 @@ pub enum EndpointKind {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeRegistration {
     pub node: NodeDescriptor,
     #[serde(default)]
@@ -230,7 +254,7 @@ pub struct NodeRegistration {
     pub hop_status: Vec<HopStatus>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeHeartbeat {
     pub node_id: String,
     pub status: NodeStatus,
@@ -240,7 +264,7 @@ pub struct NodeHeartbeat {
     pub hop_status: Vec<HopStatus>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObservedState {
     #[serde(default)]
     pub nodes: Vec<NodeDescriptor>,
@@ -387,7 +411,9 @@ mod tests {
         let status = HopStatus {
             id: "weave-contribution-sender".to_string(),
             node_id: "strom-node-1".to_string(),
-            state: HopState::Connected,
+            state: HopState::Provisioned,
+            ingress: LinkCondition::Flowing,
+            egress: LinkCondition::Connected,
             resolved_ingress: Some(ResolvedAddr {
                 host: "0.0.0.0".to_string(),
                 port: 7001,
@@ -396,6 +422,7 @@ mod tests {
             stats: Some(LinkStats {
                 connections: 1,
                 connected: true,
+                ingress_rate_mbps: 4.5,
                 ..LinkStats::default()
             }),
         };
