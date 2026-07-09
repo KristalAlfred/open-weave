@@ -16,6 +16,53 @@
       "createdAt": "2026-07-02T09:26:54.168Z",
       "updatedAt": "2026-07-02T09:26:54.168Z",
       "notes": []
+    },
+    {
+      "id": "t_20260709122940_pvug8q",
+      "title": "Fan-out streams only provision the first destination",
+      "description": "Controller path derivation builds a hop chain for the first destination only; any additional destinations in a StreamDefinition are silently dropped. Observed on the bench fanout manifest: node-1 gets one sender hop, node-2 one receiver hop, and no hop is placed for the second destination. Expected: every entry in destinations[] is provisioned.",
+      "status": "open",
+      "priority": "high",
+      "tags": [
+        "bug",
+        "controller",
+        "fanout"
+      ],
+      "source": "bench/manifests/fanout.yaml; controller path derivation (derive_path)",
+      "createdAt": "2026-07-09T12:29:40.006Z",
+      "updatedAt": "2026-07-09T12:29:40.006Z",
+      "notes": []
+    },
+    {
+      "id": "t_20260709122941_6v8pqk",
+      "title": "Bench producer/consumer are hardwired to the basic manifest addresses",
+      "description": "The bench producer pushes to strom-1:7001 and the consumer pulls from strom-2:7003, matching only the basic scenario. As a result reverse (source listener on node-2) and same-node (receiver output on node-1) cannot be driven to flowing by the bundled verification endpoints. Make the verification endpoints parameterizable per scenario so every manifest can be exercised end to end.",
+      "status": "open",
+      "priority": "medium",
+      "tags": [
+        "bug",
+        "bench"
+      ],
+      "source": "bench/docker-compose.yml; bench/manifests/README.md",
+      "createdAt": "2026-07-09T12:29:41.006Z",
+      "updatedAt": "2026-07-09T12:29:41.006Z",
+      "notes": []
+    },
+    {
+      "id": "t_20260709122942_ius5ss",
+      "title": "Re-applying a manifest on the same ports stays pending ~10-15s after removing the prior stream",
+      "description": "Applying a manifest immediately after stream-rm on the same SRT ports leaves the new stream pending for ~10-15s while the prior flow's socket release lags the delete. Reconciliation should free the ports and converge promptly once the prior definition is deleted rather than requiring a wait between apply cycles.",
+      "status": "open",
+      "priority": "medium",
+      "tags": [
+        "bug",
+        "controller",
+        "bench"
+      ],
+      "source": "bench/manifests/README.md; controller/adapter reconcile loop",
+      "createdAt": "2026-07-09T12:29:42.006Z",
+      "updatedAt": "2026-07-09T12:29:42.006Z",
+      "notes": []
     }
   ]
 }

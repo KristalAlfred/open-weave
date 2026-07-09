@@ -1,5 +1,4 @@
-# Fan-out to two destinations. LIMITATION: only the first destination is
-# realised today (controller derive_path is first-destination-only).
+# Fan-out: one source relayed to two destinations.
 name: fanout
 enabled: true
 source:
