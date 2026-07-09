@@ -17,7 +17,6 @@ pub struct ElementStats {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FlowStats {
     pub elements: Vec<ElementStats>,
-    pub connected: bool,
     pub packets_sent_lost: i64,
     pub packets_retransmitted: i64,
     pub packets_received_lost: i64,
@@ -48,7 +47,6 @@ impl From<FlowStats> for weave_core::LinkStats {
         let egress_rate_mbps = stats.egress().map_or(0.0, |e| e.rate_mbps);
         Self {
             connections: stats.elements.len(),
-            connected: stats.connected,
             ingress_rate_mbps,
             egress_rate_mbps,
             packets_sent_lost: stats.packets_sent_lost,
@@ -61,9 +59,6 @@ impl From<FlowStats> for weave_core::LinkStats {
 
 /// Parse per-element connection status and aggregate loss counters from a
 /// `srt-stats` payload. Every field is optional; missing shapes yield defaults.
-///
-/// The flow-level `connected` flag is derived as "at least one element and every
-/// one connected", preserving the pre-per-element semantics for existing callers.
 #[must_use]
 pub fn parse_flow_stats(value: &Value) -> FlowStats {
     let Some(connections) = value
@@ -105,7 +100,6 @@ pub fn parse_flow_stats(value: &Value) -> FlowStats {
         });
     }
 
-    stats.connected = !stats.elements.is_empty() && stats.elements.iter().all(|e| e.connected);
     stats
 }
 
@@ -140,7 +134,6 @@ mod tests {
         let stats = parse_flow_stats(&value);
 
         assert_eq!(stats.elements.len(), 2);
-        assert!(stats.connected);
         assert_eq!(stats.ingress().map(|e| e.rate_mbps), Some(4.5));
         assert_eq!(stats.egress().map(|e| e.rate_mbps), Some(4.4));
         assert!(stats.ingress().is_some_and(|e| e.connected));
@@ -151,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn any_disconnected_element_marks_flow_disconnected_but_keeps_element_detail() {
+    fn per_element_connection_detail_is_preserved_across_mixed_states() {
         let value = serde_json::json!({
             "stats": { "connections": {
                 "srtsrc_0": { "connected": true, "callers": [] },
@@ -159,7 +152,6 @@ mod tests {
             }}
         });
         let stats = parse_flow_stats(&value);
-        assert!(!stats.connected);
         assert!(stats.ingress().is_some_and(|e| e.connected));
         assert!(stats.egress().is_some_and(|e| !e.connected));
     }

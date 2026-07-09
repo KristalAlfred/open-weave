@@ -245,8 +245,6 @@ pub struct LinkStats {
     #[serde(default)]
     pub connections: usize,
     #[serde(default)]
-    pub connected: bool,
-    #[serde(default)]
     pub ingress_rate_mbps: f64,
     #[serde(default)]
     pub egress_rate_mbps: f64,
@@ -500,7 +498,6 @@ mod tests {
             resolved_egress: None,
             stats: Some(LinkStats {
                 connections: 1,
-                connected: true,
                 ingress_rate_mbps: 4.5,
                 ..LinkStats::default()
             }),
