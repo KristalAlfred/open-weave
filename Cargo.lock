@@ -1442,12 +1442,12 @@ dependencies = [
  "axum",
  "clap",
  "reqwest",
- "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "weave-core",
+ "weave-strom",
 ]
 
 [[package]]
@@ -1530,6 +1530,17 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "weave-core",
+]
+
+[[package]]
+name = "weave-strom"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
  "weave-core",
 ]
 

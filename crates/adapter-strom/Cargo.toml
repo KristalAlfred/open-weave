@@ -11,11 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 weave-core = { workspace = true }
+weave-strom = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 clap = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -1,12 +1,11 @@
 //! `weave-adapter-strom` — southbound adapter for Strom instances.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use axum::{Json, Router, routing::get};
 use clap::Parser;
 use reqwest::{Client, StatusCode};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
@@ -14,6 +13,7 @@ use weave_core::{
     AdapterDescriptor, AdapterKind, EndpointDescriptor, EndpointKind, NodeCapabilities,
     NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus, TransportDescriptor,
 };
+use weave_strom::{StromClient, StromFlow};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -38,10 +38,12 @@ struct Args {
         default_value = "http://127.0.0.1:8081"
     )]
     southbound_url: String,
-    #[arg(long, env = "WEAVE_STROM_URL", default_value = "http://127.0.0.1:8080")]
+    #[arg(
+        long,
+        env = "WEAVE_STROM_URL",
+        default_value = "http://127.0.0.1:18080"
+    )]
     strom_url: String,
-    #[arg(long, env = "WEAVE_STROM_API_KEY")]
-    strom_api_key: Option<String>,
     #[arg(
         long,
         value_delimiter = ',',
@@ -50,40 +52,6 @@ struct Args {
     transports: Vec<String>,
     #[arg(long, env = "WEAVE_STROM_POLL_INTERVAL_SECS", default_value_t = 5)]
     poll_interval_secs: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct FlowListResponse {
-    #[serde(default)]
-    flows: Vec<StromFlow>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StromFlow {
-    id: String,
-    name: String,
-    #[serde(default)]
-    running: bool,
-    #[serde(default)]
-    elements: Vec<StromElement>,
-    #[serde(default)]
-    blocks: Vec<StromBlock>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StromElement {
-    #[serde(default)]
-    element_type: String,
-    #[serde(default)]
-    properties: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StromBlock {
-    #[serde(default)]
-    block_definition_id: String,
-    #[serde(default)]
-    properties: BTreeMap<String, Value>,
 }
 
 #[tokio::main]
@@ -100,6 +68,7 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| format!("http://{}", args.listen));
     let client = Client::new();
+    let strom = StromClient::new(&args.strom_url);
     let health_server = spawn_health_server(args.listen.clone());
 
     tracing::info!(
@@ -117,7 +86,7 @@ async fn main() -> Result<()> {
             health_server.abort();
             Ok(())
         }
-        result = sync_loop(&client, &args, &public_endpoint) => {
+        result = sync_loop(&client, &strom, &args, &public_endpoint) => {
             health_server.abort();
             result
         }
@@ -138,12 +107,17 @@ fn spawn_health_server(addr: String) -> JoinHandle<Result<()>> {
     })
 }
 
-async fn sync_loop(client: &Client, args: &Args, public_endpoint: &str) -> Result<()> {
+async fn sync_loop(
+    client: &Client,
+    strom: &StromClient,
+    args: &Args,
+    public_endpoint: &str,
+) -> Result<()> {
     let mut registered = false;
     let interval = Duration::from_secs(args.poll_interval_secs);
 
     loop {
-        match sync_once(client, args, public_endpoint, registered).await {
+        match sync_once(client, strom, args, public_endpoint, registered).await {
             Ok(next_registered) => registered = next_registered,
             Err(error) => {
                 registered = false;
@@ -157,11 +131,12 @@ async fn sync_loop(client: &Client, args: &Args, public_endpoint: &str) -> Resul
 
 async fn sync_once(
     client: &Client,
+    strom: &StromClient,
     args: &Args,
     public_endpoint: &str,
     registered: bool,
 ) -> Result<bool> {
-    let (status, endpoints) = match fetch_flows(client, args).await {
+    let (status, endpoints) = match strom.list_flows().await {
         Ok(flows) => (NodeStatus::Ready, strom_endpoints(&args.node_id, &flows)),
         Err(error) => {
             tracing::warn!(%error, "Strom observation failed");
@@ -213,31 +188,6 @@ fn registration(
             },
         },
         endpoints,
-    }
-}
-
-async fn fetch_flows(client: &Client, args: &Args) -> Result<Vec<StromFlow>> {
-    let response = strom_get(client, args, "/api/flows")
-        .send()
-        .await
-        .context("fetching Strom flows")?
-        .error_for_status()
-        .context("Strom flow list request failed")?;
-
-    let flows = response
-        .json::<FlowListResponse>()
-        .await
-        .context("decoding Strom flows")?;
-
-    Ok(flows.flows)
-}
-
-fn strom_get(client: &Client, args: &Args, path: &str) -> reqwest::RequestBuilder {
-    let request = client.get(join_url(&args.strom_url, path));
-    if let Some(api_key) = &args.strom_api_key {
-        request.bearer_auth(api_key)
-    } else {
-        request
     }
 }
 

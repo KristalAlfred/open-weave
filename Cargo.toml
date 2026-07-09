@@ -8,6 +8,7 @@ members = [
     "crates/controller",
     "crates/media-node",
     "crates/adapter-strom",
+    "crates/strom",
 ]
 
 [workspace.package]
@@ -18,6 +19,7 @@ repository = "https://github.com/kristalalfred/open-weave"
 
 [workspace.dependencies]
 weave-core = { path = "crates/core" }
+weave-strom = { path = "crates/strom" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 axum = "0.8"
