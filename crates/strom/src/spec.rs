@@ -2,7 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use weave_core::{SrtEndpoint, SrtMode, StreamDefinition, StreamTransport};
+use weave_core::{
+    DesiredHop, SocketRole, SocketSpec, SrtEndpoint, SrtMode, StreamDefinition, StreamTransport,
+    Transport,
+};
 
 const PLACEHOLDER_ID: &str = "00000000-0000-0000-0000-000000000000";
 const DEFAULT_SRC_LATENCY: u32 = 200;
@@ -38,6 +41,8 @@ pub enum MappingError {
     NoDestination,
     #[error("invalid srt url: {0}")]
     InvalidUrl(String),
+    #[error("incomplete socket spec: missing {0}")]
+    IncompleteSocket(&'static str),
 }
 
 /// Map operator intent (source + first destination) to a linear srtsrc→queue→srtsink flow.
@@ -115,6 +120,44 @@ pub fn receiver_flow_from_stream(stream: &StreamDefinition) -> Result<FlowSpec, 
     ))
 }
 
+/// Map a desired hop to a linear srtsrc→queue→srtsink Strom flow.
+///
+/// Byte-compatible with `flow_spec_from_stream`/`receiver_flow_from_stream` for
+/// equivalent inputs. The flow name is the hop id, so flows are adopted by name.
+pub fn flow_spec_from_hop(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
+    let mut src_props = Map::new();
+    src_props.insert("uri".to_string(), Value::String(socket_uri(&hop.ingress)?));
+    src_props.insert(
+        "latency".to_string(),
+        Value::from(hop.ingress.params.latency.unwrap_or(DEFAULT_SRC_LATENCY)),
+    );
+
+    let mut sink_props = Map::new();
+    sink_props.insert("uri".to_string(), Value::String(socket_uri(&hop.egress)?));
+    sink_props.insert(
+        "latency".to_string(),
+        Value::from(hop.egress.params.latency.unwrap_or(DEFAULT_SINK_LATENCY)),
+    );
+    sink_props.insert("wait-for-connection".to_string(), Value::Bool(false));
+
+    Ok(linear_srt_flow(hop.id.clone(), src_props, sink_props))
+}
+
+fn socket_uri(spec: &SocketSpec) -> Result<String, MappingError> {
+    let Transport::Srt = spec.transport;
+    let port = spec.port.ok_or(MappingError::IncompleteSocket("port"))?;
+    Ok(match spec.role {
+        SocketRole::Listen => format!("srt://:{port}?mode=listener"),
+        SocketRole::Connect => {
+            let host = spec
+                .host
+                .as_deref()
+                .ok_or(MappingError::IncompleteSocket("host"))?;
+            format!("srt://{host}:{port}?mode=caller")
+        }
+    })
+}
+
 fn linear_srt_flow(
     name: String,
     src_props: Map<String, Value>,
@@ -189,6 +232,55 @@ fn split_host_port(url: &str) -> Result<(String, u16), MappingError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weave_core::{HopRole, SrtParams};
+
+    fn demo_ingress_hop(id: &str) -> DesiredHop {
+        DesiredHop {
+            id: id.to_string(),
+            node_id: "strom-node-1".to_string(),
+            role: HopRole::Sender,
+            ingress: SocketSpec {
+                transport: Transport::Srt,
+                role: SocketRole::Listen,
+                host: None,
+                port: Some(7001),
+                params: SrtParams { latency: Some(200) },
+            },
+            egress: SocketSpec {
+                transport: Transport::Srt,
+                role: SocketRole::Connect,
+                host: Some("172.31.0.10".to_string()),
+                port: Some(7002),
+                params: SrtParams {
+                    latency: Some(1000),
+                },
+            },
+        }
+    }
+
+    fn demo_recv_hop(id: &str) -> DesiredHop {
+        DesiredHop {
+            id: id.to_string(),
+            node_id: "strom-node-2".to_string(),
+            role: HopRole::Receiver,
+            ingress: SocketSpec {
+                transport: Transport::Srt,
+                role: SocketRole::Listen,
+                host: None,
+                port: Some(7002),
+                params: SrtParams {
+                    latency: Some(1000),
+                },
+            },
+            egress: SocketSpec {
+                transport: Transport::Srt,
+                role: SocketRole::Listen,
+                host: None,
+                port: Some(7003),
+                params: SrtParams { latency: Some(200) },
+            },
+        }
+    }
 
     fn demo_stream(name: &str) -> StreamDefinition {
         StreamDefinition {
@@ -210,8 +302,8 @@ mod tests {
     }
 
     #[test]
-    fn maps_demo_stream_to_known_good_ingress_payload() {
-        let spec = flow_spec_from_stream(&demo_stream("bench-ingress")).expect("map");
+    fn maps_ingress_hop_to_known_good_payload() {
+        let spec = flow_spec_from_hop(&demo_ingress_hop("bench-ingress")).expect("map");
         let produced = serde_json::to_value(&spec).expect("serialize");
 
         let golden: Value = serde_json::from_str(include_str!("testdata/ingress.json"))
@@ -221,14 +313,41 @@ mod tests {
     }
 
     #[test]
-    fn maps_demo_stream_to_known_good_receiver_payload() {
-        let spec = receiver_flow_from_stream(&demo_stream("bench")).expect("map");
+    fn maps_receiver_hop_to_known_good_payload() {
+        let spec = flow_spec_from_hop(&demo_recv_hop("bench-recv")).expect("map");
         let produced = serde_json::to_value(&spec).expect("serialize");
 
         let golden: Value = serde_json::from_str(include_str!("testdata/receiver.json"))
             .expect("parse receiver.json");
 
         assert_eq!(produced, golden);
+    }
+
+    #[test]
+    fn hop_flow_matches_stream_flow_for_equivalent_inputs() {
+        let from_hop = flow_spec_from_hop(&demo_ingress_hop("bench-ingress")).expect("hop");
+        let from_stream = flow_spec_from_stream(&demo_stream("bench-ingress")).expect("stream");
+        assert_eq!(from_hop, from_stream);
+    }
+
+    #[test]
+    fn connect_socket_without_host_is_an_error() {
+        let mut hop = demo_ingress_hop("x");
+        hop.egress.host = None;
+        assert!(matches!(
+            flow_spec_from_hop(&hop),
+            Err(MappingError::IncompleteSocket("host"))
+        ));
+    }
+
+    #[test]
+    fn socket_without_port_is_an_error() {
+        let mut hop = demo_ingress_hop("x");
+        hop.ingress.port = None;
+        assert!(matches!(
+            flow_spec_from_hop(&hop),
+            Err(MappingError::IncompleteSocket("port"))
+        ));
     }
 
     #[test]
