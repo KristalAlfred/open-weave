@@ -1527,9 +1527,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "http-body-util",
  "serde",
  "serde_json",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "weave-core",
