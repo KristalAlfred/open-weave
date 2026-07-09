@@ -28,9 +28,9 @@ wait:
         sleep 2; \
     done; echo "timeout waiting for stack" >&2; {{compose}} ps; exit 1
 
-# Tear everything down: containers, networks, volumes.
+# Tear everything down: containers, networks, volumes (incl. profiled endpoints).
 down:
-    {{compose}} down -v --remove-orphans
+    {{compose}} --profile producer --profile consumer down -v --remove-orphans
 
 ps:
     {{compose}} ps
