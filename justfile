@@ -42,34 +42,3 @@ apply FILE="examples/stream.yaml":
 
 get-streams:
     cargo run -p weave-cli -- get streams
-
-# --- full-loop demo (docker bench + northbound + controller actuation) ---
-
-# Build binaries, bring up the bench (egress-only), start northbound + controller.
-demo-up:
-    cargo build
-    bash scripts/demo.sh up
-
-# Apply the contribution intent; the controller creates+starts the Strom flow.
-demo-apply:
-    bash scripts/demo.sh apply
-
-# Resolve the weave-managed flow by name and print srt-stats for both hops.
-demo-stats:
-    bash scripts/demo.sh stats
-
-# Controller's own /status view (reconcile status + per-flow telemetry).
-demo-status:
-    bash scripts/demo.sh status
-
-# Inject packet loss on the impaired ingress<->egress hop.
-demo-loss pct:
-    bash bench/scripts/netem.sh loss {{pct}}
-
-# Clear all impairment.
-demo-heal:
-    bash bench/scripts/netem.sh clear
-
-# Stop weave processes and tear the bench down.
-demo-down:
-    bash scripts/demo.sh down
