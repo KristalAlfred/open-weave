@@ -10,6 +10,6 @@ source:
     node: strom-node-1
 destinations:
   - srt:
-      url: srt://172.31.0.10:7002
+      url: srt://172.27.0.10:7002
       mode: caller
       latency: 1000
