@@ -90,7 +90,6 @@ services:
     environment:
       WEAVE_CONTROLLER_ADDR: 0.0.0.0:8082
       WEAVE_NORTHBOUND_URL: http://172.25.0.20:9080
-      WEAVE_STROM_URL: http://172.26.0.10:8080
       WEAVE_SOUTHBOUND_URL: http://172.25.0.21:8081
       WEAVE_RECONCILE_INTERVAL_SECS: "5"
     ports:

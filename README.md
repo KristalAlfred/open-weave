@@ -15,8 +15,9 @@ future vendor adapters into one observed/control model.
 - **`weave-cli`** (`weave`) — operator CLI for applying definitions and inspecting
   state.
 - **`weave-northbound`** — northbound API for desired-state CRUD.
-- **`weave-controller`** — reconciler loop. It reads desired state from northbound,
-  observed state from southbound, and will become the planner/command emitter.
+- **`weave-controller`** — reconciler loop. It reads desired streams from
+  northbound and observed state from southbound, derives a per-stream hop path,
+  and writes desired hops to southbound per node for the adapters to realise.
 - **`weave-southbound`** — adapter/media-node-facing API for registration,
   telemetry, endpoint discovery, and future command streams.
 - **`weave-adapter-strom`** — southbound adapter for existing
@@ -50,8 +51,8 @@ connect/provision resources depending on its capabilities.
 
 Strom is the first media runtime target. `weave-adapter-strom` runs beside one
 Strom instance, registers it with southbound, polls `/api/flows`, and reports
-Strom flows as observed endpoints. Future controller work will translate
-open-weave desired state into Strom flow create/update/start/stop calls.
+Strom flows as observed endpoints. It pulls its node's desired hops from
+southbound and translates them into Strom flow create/start/delete calls.
 
 Strom UI/API edits are **drift**, like direct edits to Kubernetes managed
 objects. The source of truth is open-weave desired state; out-of-band Strom

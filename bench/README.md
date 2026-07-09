@@ -73,10 +73,16 @@ first (`weave apply -f ../examples/contribution.yaml`) so the flows exist.
 
 ## Notes
 
-- The controller places the **sender** flow on `WEAVE_STROM_URL` (strom-1) and,
-  for each enabled stream, a matching **receiver** flow (`<name>-recv`) on the
-  destination node's Strom. It maps the destination SRT host to a registered node
-  via southbound (`WEAVE_SOUTHBOUND_URL`); with no match it logs and places only
-  the sender. The receiver listens on the destination port and re-exposes the media
-  on `port + 1` for a downstream consumer.
+- The controller never talks to Strom. Per stream it derives an ordered hop chain
+  — a **sender** hop and a **receiver** hop — places each on a node (sender by
+  `source.node` or host-match on the source URL; receiver by host-match on the
+  destination), and writes the grouped desired hops to southbound per node
+  (`PUT /nodes/{id}/desired`, full replace). The per-node **adapters** pull their
+  desired hops and create/start/delete the `weave-…` Strom flows. Hops for a node
+  that has not registered yet just wait until it does.
+- Per-stream status is rolled up from adapter-reported hop conditions:
+  `awaiting_input` (no source media) → `degraded` (source flowing, not end to end)
+  → `flowing`. See the controller `/status` endpoint.
+- The receiver hop listens on the destination port and re-exposes the media on
+  `port + 1` for a downstream consumer.
 - No pre-configured flows are shipped — create them through the CLI.
