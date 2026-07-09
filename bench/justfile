@@ -54,6 +54,23 @@ status:
     @echo "== streams (northbound) =="
     @curl -sf {{nb}}/streams | (jq . 2>/dev/null || cat)
 
+# Start the external ffmpeg producer (SRT caller into strom-1's ingress :7001).
+# Verification endpoint only — not part of the system under test.
+producer-up:
+    {{compose}} --profile producer up -d producer route-producer
+
+# Stop and remove the external producer.
+producer-down:
+    {{compose}} --profile producer rm -sf producer route-producer
+
+# Start the external ffmpeg consumer (SRT caller pulling the receiver output :7003).
+consumer-up:
+    {{compose}} --profile consumer up -d consumer route-consumer
+
+# Stop and remove the external consumer.
+consumer-down:
+    {{compose}} --profile consumer rm -sf consumer route-consumer
+
 # Impair a node's network via its router, e.g. `just netem node1 delay 200ms loss 5%`.
 netem +ARGS:
     bash {{scripts}}/netem.sh {{ARGS}}

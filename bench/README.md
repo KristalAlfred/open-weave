@@ -47,8 +47,29 @@ just netem node1 delay 200ms loss 5%   # impair node 1's network
 just netem-show node1
 just netem-clear node1
 
+just producer-up   # external ffmpeg feed -> strom-1 ingress :7001 (SRT caller)
+just producer-down # stop it (drives no-source -> source -> no-source transitions)
+just consumer-up   # external ffmpeg sink <- receiver output :7003 (SRT caller)
+just consumer-down
+
 just down          # tear down (containers, networks, volumes)
 ```
+
+## External verification endpoints
+
+`producer` and `consumer` are ffmpeg containers that live **outside** the system
+and only exist to exercise it. They are off by default (compose `profiles`) and
+started explicitly by the recipes above — never as part of `just up`. Both sit on
+`net_core` and route to the node subnets through the netem routers, so their SRT
+traffic crosses the same impaired hops as real external peers.
+
+- `producer` pushes `testsrc2 + sine` as MPEG-TS over SRT (caller) into the
+  contribution feed's ingress listener on `strom-1:7001`.
+- `consumer` pulls the receiver flow's output from `strom-2:7003` (SRT caller)
+  and discards it (`-f null -`).
+
+They target the ports used by `examples/contribution.yaml`; apply that stream
+first (`weave apply -f ../examples/contribution.yaml`) so the flows exist.
 
 ## Notes
 
