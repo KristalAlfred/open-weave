@@ -316,7 +316,7 @@ services:
             -f lavfi -i sine=frequency=1000:sample_rate=48000 \
             -c:v libx264 -preset veryfast -tune zerolatency -b:v 2500k -pix_fmt yuv420p -g 60 \
             -c:a aac -b:a 128k \
-            -f mpegts "srt://172.26.0.10:7001?mode=caller&latency=200&streamid=producer" &
+            -f mpegts "srt://${PRODUCER_TARGET:-172.26.0.10:7001}?mode=caller&latency=200&streamid=producer" &
           child=$$!
           wait "$$child" || true
           [ "$$running" = 1 ] && { echo "producer ffmpeg exited; retrying in 2s" >&2; sleep 2; }
@@ -331,11 +331,13 @@ services:
     command:
       - sh
       - -c
-      - "for i in $$(seq 1 10); do ip route replace 172.26.0.0/24 via 172.25.0.11 && echo routes-installed && exit 0; echo retry $$i; sleep 1; done; echo ROUTE_FAILED >&2; exit 1"
+      - "for i in $$(seq 1 10); do ip route replace 172.26.0.0/24 via 172.25.0.11 && ip route replace 172.27.0.0/24 via 172.25.0.12 && echo routes-installed && exit 0; echo retry $$i; sleep 1; done; echo ROUTE_FAILED >&2; exit 1"
     depends_on:
       producer:
         condition: service_started
       router-1:
+        condition: service_started
+      router-2:
         condition: service_started
 
   consumer:
@@ -353,7 +355,7 @@ services:
         trap 'running=0; kill -TERM "$$child" 2>/dev/null' TERM INT
         while [ "$$running" = 1 ]; do
           ffmpeg -hide_banner -loglevel warning \
-            -i "srt://172.27.0.10:7003?mode=caller&latency=200" \
+            -i "srt://${CONSUMER_SOURCE:-172.27.0.10:7003}?mode=caller&latency=200" \
             -f null - &
           child=$$!
           wait "$$child" || true
@@ -369,11 +371,13 @@ services:
     command:
       - sh
       - -c
-      - "for i in $$(seq 1 10); do ip route replace 172.27.0.0/24 via 172.25.0.12 && echo routes-installed && exit 0; echo retry $$i; sleep 1; done; echo ROUTE_FAILED >&2; exit 1"
+      - "for i in $$(seq 1 10); do ip route replace 172.27.0.0/24 via 172.25.0.12 && ip route replace 172.26.0.0/24 via 172.25.0.11 && echo routes-installed && exit 0; echo retry $$i; sleep 1; done; echo ROUTE_FAILED >&2; exit 1"
     depends_on:
       consumer:
         condition: service_started
       router-2:
+        condition: service_started
+      router-1:
         condition: service_started
 
 volumes:

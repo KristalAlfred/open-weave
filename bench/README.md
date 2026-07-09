@@ -49,9 +49,11 @@ just netem node1 delay 200ms loss 5%   # impair node 1's network
 just netem-show node1
 just netem-clear node1
 
-just producer-up   # external ffmpeg feed -> strom-1 ingress :7001 (SRT caller)
+just producer-up                    # feed the basic source (default 172.26.0.10:7001)
+just producer-up 172.27.0.10:7001   # feed another scenario's source (host:port)
 just producer-down # stop it (drives no-source -> source -> no-source transitions)
-just consumer-up   # external ffmpeg sink <- receiver output :7003 (SRT caller)
+just consumer-up                    # pull the basic receiver output (default 172.27.0.10:7003)
+just consumer-up 172.26.0.10:7003   # pull another scenario's receiver output (host:port)
 just consumer-down
 
 just down          # tear down (containers, networks, volumes)
@@ -65,14 +67,18 @@ started explicitly by the recipes above — never as part of `just up`. Both sit
 `net_core` and route to the node subnets through the netem routers, so their SRT
 traffic crosses the same impaired hops as real external peers.
 
-- `producer` pushes `testsrc2 + sine` as MPEG-TS over SRT (caller) into the
-  contribution feed's ingress listener on `strom-1:7001`.
-- `consumer` pulls the receiver flow's output from `strom-2:7003` (SRT caller)
-  and discards it (`-f null -`).
+- `producer` pushes `testsrc2 + sine` as MPEG-TS over SRT (caller) into a source
+  ingress listener. Target defaults to the `basic` source `172.26.0.10:7001`;
+  pass `host:port` to feed another scenario's source.
+- `consumer` pulls a receiver flow's output (SRT caller) and discards it
+  (`-f null -`). Source defaults to the `basic` receiver `172.27.0.10:7003`; pass
+  `host:port` to pull another scenario's receiver output.
 
-They target the ports used by the `basic` manifest; apply it first
-(`just stream basic`) so the flows exist. See `manifests/README.md` for the full
-manifest library and observed status per scenario.
+Both sit on `net_core` and route to either node subnet through the netem routers.
+The receiver re-exposes media on the destination port + 1, so a scenario whose
+destination is `srt://<host>:<port>` has its receiver output at `<host>:<port+1>`.
+See `manifests/README.md` for the full manifest library and the address each
+scenario needs.
 
 ## Notes
 

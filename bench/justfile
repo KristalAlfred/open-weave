@@ -69,18 +69,20 @@ stream name:
 stream-rm name:
     @curl -sf -X DELETE {{nb}}/streams/{{name}} && echo "deleted {{name}}" || echo "not found: {{name}}"
 
-# Start the external ffmpeg producer (SRT caller into strom-1's ingress :7001).
+# Start the external ffmpeg producer (SRT caller into a source ingress).
+# Pass the source listener as host:port; defaults to the basic scenario.
 # Verification endpoint only — not part of the system under test.
-producer-up:
-    {{compose}} --profile producer up -d producer route-producer
+producer-up target="172.26.0.10:7001":
+    PRODUCER_TARGET={{target}} {{compose}} --profile producer up -d producer route-producer
 
 # Stop and remove the external producer.
 producer-down:
     {{compose}} --profile producer rm -sf producer route-producer
 
-# Start the external ffmpeg consumer (SRT caller pulling the receiver output :7003).
-consumer-up:
-    {{compose}} --profile consumer up -d consumer route-consumer
+# Start the external ffmpeg consumer (SRT caller pulling a receiver output).
+# Pass the receiver output as host:port; defaults to the basic scenario.
+consumer-up source="172.27.0.10:7003":
+    CONSUMER_SOURCE={{source}} {{compose}} --profile consumer up -d consumer route-consumer
 
 # Stop and remove the external consumer.
 consumer-down:
