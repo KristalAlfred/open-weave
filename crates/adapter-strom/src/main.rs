@@ -1,5 +1,7 @@
 //! `weave-adapter-strom` — southbound adapter for Strom instances.
 
+mod provision;
+
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -10,10 +12,13 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 use weave_core::{
-    AdapterDescriptor, AdapterKind, EndpointDescriptor, EndpointKind, NodeCapabilities,
-    NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus, TransportDescriptor,
+    AdapterDescriptor, AdapterKind, DesiredHop, EndpointDescriptor, EndpointKind, HopStatus,
+    LinkStats, NodeCapabilities, NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus,
+    TransportDescriptor,
 };
-use weave_strom::{StromClient, StromFlow};
+use weave_strom::{StromClient, StromFlow, flow_spec_from_hop, parse_flow_stats};
+
+use provision::{diff_hops, hop_state, resolved_addr};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -136,15 +141,34 @@ async fn sync_once(
     public_endpoint: &str,
     registered: bool,
 ) -> Result<bool> {
-    let (status, endpoints) = match strom.list_flows().await {
-        Ok(flows) => (NodeStatus::Ready, strom_endpoints(&args.node_id, &flows)),
+    let (status, flows) = match strom.list_flows().await {
+        Ok(flows) => (NodeStatus::Ready, flows),
         Err(error) => {
             tracing::warn!(%error, "Strom observation failed");
             (NodeStatus::Degraded, Vec::new())
         }
     };
+    let endpoints = strom_endpoints(&args.node_id, &flows);
 
-    let registration = registration(args, public_endpoint, status, endpoints.clone());
+    let hop_status = if status == NodeStatus::Ready {
+        match provision(client, strom, &args.southbound_url, &args.node_id, &flows).await {
+            Ok(hop_status) => hop_status,
+            Err(error) => {
+                tracing::warn!(%error, "provisioning desired hops failed");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let registration = registration(
+        args,
+        public_endpoint,
+        status,
+        endpoints.clone(),
+        hop_status.clone(),
+    );
 
     if !registered {
         register_node(client, &args.southbound_url, &registration).await?;
@@ -155,7 +179,7 @@ async fn sync_once(
         node_id: args.node_id.clone(),
         status,
         endpoints,
-        hop_status: Vec::new(),
+        hop_status,
     };
 
     if heartbeat_node(client, &args.southbound_url, &heartbeat).await? == StatusCode::NOT_FOUND {
@@ -165,11 +189,123 @@ async fn sync_once(
     Ok(true)
 }
 
+/// Pull desired hops for this node, reconcile them into Strom flows, and report
+/// each hop's realised status. Inert when no desired hops are set.
+async fn provision(
+    client: &Client,
+    strom: &StromClient,
+    southbound_url: &str,
+    node_id: &str,
+    flows: &[StromFlow],
+) -> Result<Vec<HopStatus>> {
+    let desired = fetch_desired(client, southbound_url, node_id).await?;
+    let plan = diff_hops(&desired, flows);
+
+    let mut failed = std::collections::HashSet::new();
+    for hop in &plan.create {
+        if let Err(error) = provision_hop(strom, hop).await {
+            tracing::warn!(hop = %hop.id, %error, "provisioning hop failed");
+            failed.insert(hop.id.clone());
+        }
+    }
+    for flow_id in &plan.start {
+        if let Err(error) = strom.start_flow(flow_id).await {
+            tracing::warn!(flow_id = %flow_id, %error, "starting adopted flow failed");
+        }
+    }
+    for flow_id in &plan.delete {
+        match strom.delete_flow(flow_id).await {
+            Ok(()) => tracing::info!(flow_id = %flow_id, "deleted undesired managed flow"),
+            Err(error) => tracing::warn!(flow_id = %flow_id, %error, "deleting flow failed"),
+        }
+    }
+
+    let refreshed;
+    let current: &[StromFlow] = if plan.is_empty() {
+        flows
+    } else {
+        refreshed = strom.list_flows().await.unwrap_or_default();
+        &refreshed
+    };
+
+    Ok(hop_statuses(strom, &desired, current, &failed).await)
+}
+
+async fn hop_statuses(
+    strom: &StromClient,
+    desired: &[DesiredHop],
+    flows: &[StromFlow],
+    failed: &std::collections::HashSet<String>,
+) -> Vec<HopStatus> {
+    let mut statuses = Vec::with_capacity(desired.len());
+    for hop in desired {
+        let flow = flows.iter().find(|f| f.name == hop.id);
+        let (connected, stats) = match flow {
+            Some(flow) => match strom.srt_stats(&flow.id).await {
+                Ok(value) => {
+                    let flow_stats = parse_flow_stats(&value);
+                    (flow_stats.connected, Some(LinkStats::from(flow_stats)))
+                }
+                Err(error) => {
+                    tracing::debug!(hop = %hop.id, %error, "srt-stats unavailable");
+                    (false, None)
+                }
+            },
+            None => (false, None),
+        };
+
+        statuses.push(HopStatus {
+            id: hop.id.clone(),
+            node_id: hop.node_id.clone(),
+            state: hop_state(flow, connected, failed.contains(&hop.id)),
+            resolved_ingress: resolved_addr(&hop.ingress),
+            resolved_egress: resolved_addr(&hop.egress),
+            stats,
+        });
+    }
+    statuses
+}
+
+async fn provision_hop(strom: &StromClient, hop: &DesiredHop) -> Result<()> {
+    let spec = flow_spec_from_hop(hop).with_context(|| format!("mapping hop {}", hop.id))?;
+    let id = strom
+        .create_flow(&spec)
+        .await
+        .with_context(|| format!("creating hop {}", hop.id))?;
+    strom
+        .start_flow(&id)
+        .await
+        .with_context(|| format!("starting hop {}", hop.id))?;
+    tracing::info!(hop = %hop.id, flow_id = %id, "provisioned hop");
+    Ok(())
+}
+
+async fn fetch_desired(
+    client: &Client,
+    southbound_url: &str,
+    node_id: &str,
+) -> Result<Vec<DesiredHop>> {
+    client
+        .get(join_url(
+            southbound_url,
+            &format!("/nodes/{node_id}/desired"),
+        ))
+        .send()
+        .await
+        .context("fetching desired hops")?
+        .error_for_status()
+        .context("southbound desired request failed")?
+        .json::<Vec<DesiredHop>>()
+        .await
+        .context("decoding desired hops")
+}
+
 fn registration(
     args: &Args,
     public_endpoint: &str,
     status: NodeStatus,
     endpoints: Vec<EndpointDescriptor>,
+    hop_status: Vec<HopStatus>,
 ) -> NodeRegistration {
     NodeRegistration {
         node: NodeDescriptor {
@@ -189,7 +325,7 @@ fn registration(
             },
         },
         endpoints,
-        hop_status: Vec::new(),
+        hop_status,
     }
 }
 

@@ -69,6 +69,15 @@ impl StromClient {
         Ok(())
     }
 
+    pub async fn delete_flow(&self, id: &str) -> Result<(), StromError> {
+        self.http
+            .delete(format!("{}/api/flows/{id}", self.base_url))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     pub async fn srt_stats(&self, id: &str) -> Result<Value, StromError> {
         let response = self
             .http

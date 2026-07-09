@@ -12,6 +12,19 @@ pub struct FlowStats {
     pub packets_received_retransmitted: i64,
 }
 
+impl From<FlowStats> for weave_core::LinkStats {
+    fn from(stats: FlowStats) -> Self {
+        Self {
+            connections: stats.connections,
+            connected: stats.connected,
+            packets_sent_lost: stats.packets_sent_lost,
+            packets_retransmitted: stats.packets_retransmitted,
+            packets_received_lost: stats.packets_received_lost,
+            packets_received_retransmitted: stats.packets_received_retransmitted,
+        }
+    }
+}
+
 /// A flow is `connected` only when it has at least one connection and every one reports `connected: true`.
 #[must_use]
 pub fn parse_flow_stats(value: &Value) -> FlowStats {

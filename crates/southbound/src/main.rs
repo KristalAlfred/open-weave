@@ -217,12 +217,19 @@ mod tests {
         }
     }
 
-    async fn send(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+    async fn send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
         let request = Request::builder()
             .method(method)
             .uri(uri)
             .header("content-type", "application/json")
-            .body(body.map_or(Body::empty(), |v| Body::from(serde_json::to_vec(&v).unwrap())))
+            .body(body.map_or(Body::empty(), |v| {
+                Body::from(serde_json::to_vec(&v).unwrap())
+            }))
             .unwrap();
         let response = app.clone().oneshot(request).await.unwrap();
         let status = response.status();
