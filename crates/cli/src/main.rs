@@ -153,6 +153,7 @@ destinations:
                 url: "srt://0.0.0.0:7001".to_string(),
                 mode: SrtMode::Listener,
                 latency: Some(200),
+                node: None,
             })
         );
         assert_eq!(stream.destinations.len(), 2);
@@ -162,6 +163,7 @@ destinations:
                 url: "srt://backup:7002".to_string(),
                 mode: SrtMode::Caller,
                 latency: None,
+                node: None,
             })
         );
     }

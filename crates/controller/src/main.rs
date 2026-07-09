@@ -421,11 +421,13 @@ mod tests {
                 url: "srt://0.0.0.0:7001".to_string(),
                 mode: SrtMode::Listener,
                 latency: Some(200),
+                node: None,
             }),
             destinations: vec![StreamTransport::Srt(SrtEndpoint {
                 url: "srt://172.31.0.10:7002".to_string(),
                 mode: SrtMode::Caller,
                 latency: Some(1000),
+                node: None,
             })],
         }
     }

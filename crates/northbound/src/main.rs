@@ -13,7 +13,7 @@ use axum::{
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
-use weave_core::StreamDefinition;
+use weave_core::{SrtMode, StreamDefinition, StreamTransport};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:9080";
 
@@ -73,6 +73,12 @@ async fn submit_stream(
             "stream must have at least one destination",
         );
     }
+    if listener_source_without_node(&stream) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "source node is required for listener sources",
+        );
+    }
 
     let name = stream.name.clone();
     state.streams.write().await.insert(name.clone(), stream);
@@ -89,6 +95,27 @@ fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
 }
 
+/// A listener source binds a wildcard address, so it has no host to place it by;
+/// the operator must name the node that hosts it.
+fn listener_source_without_node(stream: &StreamDefinition) -> bool {
+    let StreamTransport::Srt(source) = &stream.source;
+    let is_listener = source.mode == SrtMode::Listener || url_is_wildcard(&source.url);
+    is_listener && source.node.is_none()
+}
+
+fn url_is_wildcard(url: &str) -> bool {
+    let host = url
+        .rsplit("://")
+        .next()
+        .unwrap_or_default()
+        .split(['/', '?'])
+        .next()
+        .unwrap_or_default()
+        .rsplit_once(':')
+        .map_or("", |(host, _)| host);
+    matches!(host, "" | "0.0.0.0" | "::" | "[::]")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,7 +123,7 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
-    use weave_core::{SrtEndpoint, SrtMode, StreamTransport};
+    use weave_core::SrtEndpoint;
 
     fn sample_stream() -> StreamDefinition {
         StreamDefinition {
@@ -106,11 +133,13 @@ mod tests {
                 url: "srt://0.0.0.0:7001".to_string(),
                 mode: SrtMode::Listener,
                 latency: Some(200),
+                node: Some("strom-node-1".to_string()),
             }),
             destinations: vec![StreamTransport::Srt(SrtEndpoint {
                 url: "srt://studio:7002".to_string(),
                 mode: SrtMode::Caller,
                 latency: None,
+                node: None,
             })],
         }
     }
@@ -186,5 +215,56 @@ mod tests {
                 .unwrap()
                 .contains("destination")
         );
+    }
+
+    async fn post_stream(stream: &StreamDefinition) -> Response {
+        router(AppState::default())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/streams")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(stream).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn listener_source_without_node_is_rejected() {
+        let mut stream = sample_stream();
+        let StreamTransport::Srt(source) = &mut stream.source;
+        source.node = None;
+
+        let response = post_stream(&stream).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            body_json(response).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("source node is required")
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_source_with_node_is_accepted() {
+        let response = post_stream(&sample_stream()).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn caller_source_without_node_is_accepted() {
+        let mut stream = sample_stream();
+        stream.source = StreamTransport::Srt(SrtEndpoint {
+            url: "srt://camera:7001".to_string(),
+            mode: SrtMode::Caller,
+            latency: None,
+            node: None,
+        });
+
+        let response = post_stream(&stream).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 }

@@ -70,6 +70,7 @@ fn registration(node_id: &str, endpoint: &str, transports: &[String]) -> NodeReg
             },
         },
         endpoints: Vec::new(),
+        hop_status: Vec::new(),
     }
 }
 

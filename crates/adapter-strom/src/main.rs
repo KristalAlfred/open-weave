@@ -155,6 +155,7 @@ async fn sync_once(
         node_id: args.node_id.clone(),
         status,
         endpoints,
+        hop_status: Vec::new(),
     };
 
     if heartbeat_node(client, &args.southbound_url, &heartbeat).await? == StatusCode::NOT_FOUND {
@@ -188,6 +189,7 @@ fn registration(
             },
         },
         endpoints,
+        hop_status: Vec::new(),
     }
 }
 

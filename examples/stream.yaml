@@ -5,6 +5,7 @@ source:
     url: srt://0.0.0.0:7001
     mode: listener
     latency: 200
+    node: strom-node-1
 destinations:
   - srt:
       url: srt://studio:7002

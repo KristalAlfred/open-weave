@@ -29,6 +29,10 @@ pub struct SrtEndpoint {
     pub mode: SrtMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency: Option<u32>,
+    /// Registered node id hosting this endpoint. Required for listener sources,
+    /// which have no host to place them by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +40,121 @@ pub struct SrtEndpoint {
 pub enum SrtMode {
     Listener,
     Caller,
+}
+
+/// Prefix marking a hop id (and thus its provisioned flow) as owned by open-weave.
+/// Adapters only delete flows whose name carries this prefix.
+pub const HOP_ID_PREFIX: &str = "weave-";
+
+/// Whether a flow/hop name is owned by open-weave and safe to reconcile or delete.
+#[must_use]
+pub fn is_managed_hop_id(name: &str) -> bool {
+    name.starts_with(HOP_ID_PREFIX)
+}
+
+/// An ordered chain of hops (upstream→downstream) realising one stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Path {
+    pub stream: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub hops: Vec<DesiredHop>,
+}
+
+/// One provisioning unit placed on a single node: ingress socket → egress socket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesiredHop {
+    pub id: String,
+    pub node_id: String,
+    pub role: HopRole,
+    pub ingress: SocketSpec,
+    pub egress: SocketSpec,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HopRole {
+    Sender,
+    Bridge,
+    Receiver,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketSpec {
+    pub transport: Transport,
+    pub role: SocketRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub params: SrtParams,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SocketRole {
+    Listen,
+    Connect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Transport {
+    Srt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SrtParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency: Option<u32>,
+}
+
+/// Node-reported realisation status for one desired hop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HopStatus {
+    pub id: String,
+    pub node_id: String,
+    pub state: HopState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_ingress: Option<ResolvedAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_egress: Option<ResolvedAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<LinkStats>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HopState {
+    Pending,
+    Provisioned,
+    Connected,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedAddr {
+    pub host: String,
+    pub port: u16,
+}
+
+/// Link-level SRT stats mirrored from Strom's `srt-stats` payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct LinkStats {
+    #[serde(default)]
+    pub connections: usize,
+    #[serde(default)]
+    pub connected: bool,
+    #[serde(default)]
+    pub packets_sent_lost: i64,
+    #[serde(default)]
+    pub packets_retransmitted: i64,
+    #[serde(default)]
+    pub packets_received_lost: i64,
+    #[serde(default)]
+    pub packets_received_retransmitted: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +226,8 @@ pub struct NodeRegistration {
     pub node: NodeDescriptor,
     #[serde(default)]
     pub endpoints: Vec<EndpointDescriptor>,
+    #[serde(default)]
+    pub hop_status: Vec<HopStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +236,8 @@ pub struct NodeHeartbeat {
     pub status: NodeStatus,
     #[serde(default)]
     pub endpoints: Vec<EndpointDescriptor>,
+    #[serde(default)]
+    pub hop_status: Vec<HopStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +246,8 @@ pub struct ObservedState {
     pub nodes: Vec<NodeDescriptor>,
     #[serde(default)]
     pub endpoints: Vec<EndpointDescriptor>,
+    #[serde(default)]
+    pub hops: Vec<HopStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +297,7 @@ mod tests {
                 url: "srt://0.0.0.0:7001".to_string(),
                 mode: SrtMode::Listener,
                 latency: Some(200),
+                node: None,
             })
         );
         assert_eq!(
@@ -180,6 +306,7 @@ mod tests {
                 url: "srt://studio:7002".to_string(),
                 mode: SrtMode::Caller,
                 latency: None,
+                node: None,
             })
         );
 
@@ -195,5 +322,102 @@ mod tests {
                 .unwrap(),
             "srt"
         );
+    }
+
+    fn sample_hop() -> DesiredHop {
+        DesiredHop {
+            id: "weave-contribution-sender".to_string(),
+            node_id: "strom-node-1".to_string(),
+            role: HopRole::Sender,
+            ingress: SocketSpec {
+                transport: Transport::Srt,
+                role: SocketRole::Listen,
+                host: None,
+                port: Some(7001),
+                params: SrtParams { latency: Some(200) },
+            },
+            egress: SocketSpec {
+                transport: Transport::Srt,
+                role: SocketRole::Connect,
+                host: Some("172.31.0.10".to_string()),
+                port: Some(7002),
+                params: SrtParams {
+                    latency: Some(1000),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn path_round_trips_and_defaults_enabled_and_hops() {
+        let path = Path {
+            stream: "contribution".to_string(),
+            enabled: true,
+            hops: vec![sample_hop()],
+        };
+        let round_trip: Path =
+            serde_json::from_str(&serde_json::to_string(&path).unwrap()).unwrap();
+        assert_eq!(path, round_trip);
+
+        let minimal: Path = serde_json::from_value(serde_json::json!({
+            "stream": "contribution"
+        }))
+        .expect("parse minimal path");
+        assert!(minimal.enabled, "enabled defaults to true");
+        assert!(minimal.hops.is_empty(), "hops defaults to empty");
+    }
+
+    #[test]
+    fn socket_spec_omits_absent_host_and_port() {
+        let listen = SocketSpec {
+            transport: Transport::Srt,
+            role: SocketRole::Listen,
+            host: None,
+            port: Some(7001),
+            params: SrtParams::default(),
+        };
+        let value = serde_json::to_value(&listen).unwrap();
+        assert!(value.get("host").is_none(), "absent host is not serialized");
+        assert_eq!(value["role"], "listen");
+        assert_eq!(value["transport"], "srt");
+    }
+
+    #[test]
+    fn hop_status_round_trips_with_optional_fields_absent() {
+        let status = HopStatus {
+            id: "weave-contribution-sender".to_string(),
+            node_id: "strom-node-1".to_string(),
+            state: HopState::Connected,
+            resolved_ingress: Some(ResolvedAddr {
+                host: "0.0.0.0".to_string(),
+                port: 7001,
+            }),
+            resolved_egress: None,
+            stats: Some(LinkStats {
+                connections: 1,
+                connected: true,
+                ..LinkStats::default()
+            }),
+        };
+        let round_trip: HopStatus =
+            serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
+        assert_eq!(status, round_trip);
+    }
+
+    #[test]
+    fn heartbeat_parses_without_hop_status_field() {
+        let heartbeat: NodeHeartbeat = serde_json::from_value(serde_json::json!({
+            "node_id": "strom-node-1",
+            "status": "ready"
+        }))
+        .expect("parse legacy heartbeat");
+        assert!(heartbeat.hop_status.is_empty());
+    }
+
+    #[test]
+    fn is_managed_hop_id_matches_only_prefixed_names() {
+        assert!(is_managed_hop_id("weave-contribution-sender"));
+        assert!(!is_managed_hop_id("contribution"));
+        assert!(!is_managed_hop_id("contribution-recv"));
     }
 }
