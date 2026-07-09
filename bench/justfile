@@ -88,6 +88,15 @@ consumer-up source="172.27.0.10:7003":
 consumer-down:
     {{compose}} --profile consumer rm -sf consumer route-consumer
 
+# Start a second external consumer (for fan-out: one consumer per receiver output).
+# Pass the receiver output as host:port; defaults to the fanout second destination.
+consumer-2-up source="172.26.0.10:7003":
+    CONSUMER_SOURCE_2={{source}} {{compose}} --profile consumer up -d consumer-2 route-consumer-2
+
+# Stop and remove the second external consumer.
+consumer-2-down:
+    {{compose}} --profile consumer rm -sf consumer-2 route-consumer-2
+
 # Impair a node's network via its router, e.g. `just netem node1 delay 200ms loss 5%`.
 netem +ARGS:
     bash {{scripts}}/netem.sh {{ARGS}}

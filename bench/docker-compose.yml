@@ -380,6 +380,48 @@ services:
       router-1:
         condition: service_started
 
+  # Second consumer for fan-out: attach one consumer per receiver output so all
+  # receiver hops can flow simultaneously (rollup needs every hop flowing).
+  consumer-2:
+    image: linuxserver/ffmpeg:latest
+    container_name: ow-consumer-2
+    profiles: ["consumer"]
+    restart: "no"
+    networks:
+      net_core:
+        ipv4_address: 172.25.0.32
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        running=1
+        trap 'running=0; kill -TERM "$$child" 2>/dev/null' TERM INT
+        while [ "$$running" = 1 ]; do
+          ffmpeg -hide_banner -loglevel warning \
+            -i "srt://${CONSUMER_SOURCE_2:-172.26.0.10:7003}?mode=caller&latency=200" \
+            -f null - &
+          child=$$!
+          wait "$$child" || true
+          [ "$$running" = 1 ] && { echo "consumer-2 ffmpeg exited; retrying in 2s" >&2; sleep 2; }
+        done
+        wait "$$child" 2>/dev/null || true
+
+  route-consumer-2:
+    <<: *route-sidecar
+    container_name: ow-route-consumer-2
+    profiles: ["consumer"]
+    network_mode: "service:consumer-2"
+    command:
+      - sh
+      - -c
+      - "for i in $$(seq 1 10); do ip route replace 172.27.0.0/24 via 172.25.0.12 && ip route replace 172.26.0.0/24 via 172.25.0.11 && echo routes-installed && exit 0; echo retry $$i; sleep 1; done; echo ROUTE_FAILED >&2; exit 1"
+    depends_on:
+      consumer-2:
+        condition: service_started
+      router-2:
+        condition: service_started
+      router-1:
+        condition: service_started
+
 volumes:
   strom1-data:
   strom2-data:
