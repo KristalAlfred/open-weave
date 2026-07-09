@@ -1,0 +1,299 @@
+name: ow-bench
+
+x-weave: &weave
+  image: open-weave-bench:local
+  build:
+    context: ..
+    dockerfile: bench/Dockerfile
+  restart: unless-stopped
+
+x-route-sidecar: &route-sidecar
+  image: nicolaka/netshoot:latest
+  cap_add: [NET_ADMIN]
+  restart: "no"
+
+networks:
+  net_core:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.25.0.0/24
+  net_node1:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.26.0.0/24
+  net_node2:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.27.0.0/24
+
+services:
+  # --- control plane (net_core) ---
+  northbound:
+    <<: *weave
+    container_name: ow-northbound
+    command: ["weave-northbound"]
+    environment:
+      WEAVE_NORTHBOUND_ADDR: 0.0.0.0:9080
+    ports:
+      - "29080:9080"
+    networks:
+      net_core:
+        ipv4_address: 172.25.0.20
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  southbound:
+    <<: *weave
+    container_name: ow-southbound
+    command: ["weave-southbound"]
+    environment:
+      WEAVE_SOUTHBOUND_ADDR: 0.0.0.0:8081
+    ports:
+      - "29081:8081"
+    networks:
+      net_core:
+        ipv4_address: 172.25.0.21
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8081/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  route-southbound:
+    <<: *route-sidecar
+    container_name: ow-route-southbound
+    network_mode: "service:southbound"
+    command:
+      - sh
+      - -c
+      - "for i in $$(seq 1 10); do ip route replace 172.26.0.0/24 via 172.25.0.11 && ip route replace 172.27.0.0/24 via 172.25.0.12 && echo routes-installed && exit 0; echo retry $$i; sleep 1; done; echo ROUTE_FAILED >&2; exit 1"
+    depends_on:
+      southbound:
+        condition: service_started
+      router-1:
+        condition: service_started
+      router-2:
+        condition: service_started
+
+  controller:
+    <<: *weave
+    container_name: ow-controller
+    command: ["weave-controller"]
+    environment:
+      WEAVE_CONTROLLER_ADDR: 0.0.0.0:8082
+      WEAVE_NORTHBOUND_URL: http://172.25.0.20:9080
+      WEAVE_STROM_URL: http://172.26.0.10:8080
+      WEAVE_SOUTHBOUND_URL: http://172.25.0.21:8081
+      WEAVE_RECONCILE_INTERVAL_SECS: "5"
+    ports:
+      - "29082:8082"
+    networks:
+      net_core:
+        ipv4_address: 172.25.0.22
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8082/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  route-controller:
+    <<: *route-sidecar
+    container_name: ow-route-controller
+    network_mode: "service:controller"
+    command:
+      - sh
+      - -c
+      - "for i in $$(seq 1 10); do ip route replace 172.26.0.0/24 via 172.25.0.11 && ip route replace 172.27.0.0/24 via 172.25.0.12 && echo routes-installed && exit 0; echo retry $$i; sleep 1; done; echo ROUTE_FAILED >&2; exit 1"
+    depends_on:
+      controller:
+        condition: service_started
+      router-1:
+        condition: service_started
+      router-2:
+        condition: service_started
+
+  # --- routers (L3 hop per node; netem is applied on these) ---
+  router-1:
+    image: nicolaka/netshoot:latest
+    container_name: ow-router-1
+    cap_add: [NET_ADMIN]
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      net_core:
+        ipv4_address: 172.25.0.11
+      net_node1:
+        ipv4_address: 172.26.0.2
+    command:
+      - sh
+      - -c
+      - "ip route replace 172.27.0.0/24 via 172.25.0.12 || true; for d in $$(ls /sys/class/net | grep -v lo); do tc qdisc del dev $$d root 2>/dev/null; done; exec sleep infinity"
+
+  router-2:
+    image: nicolaka/netshoot:latest
+    container_name: ow-router-2
+    cap_add: [NET_ADMIN]
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      net_core:
+        ipv4_address: 172.25.0.12
+      net_node2:
+        ipv4_address: 172.27.0.2
+    command:
+      - sh
+      - -c
+      - "ip route replace 172.26.0.0/24 via 172.25.0.11 || true; for d in $$(ls /sys/class/net | grep -v lo); do tc qdisc del dev $$d root 2>/dev/null; done; exec sleep infinity"
+
+  # --- node 1 (net_node1) ---
+  strom-1:
+    image: eyevinntechnology/strom:latest
+    container_name: ow-strom-1
+    environment:
+      STROM_PORT: "8080"
+      STROM_DATA_DIR: /data
+    volumes:
+      - strom1-data:/data
+    ports:
+      - "28080:8080"
+    networks:
+      net_node1:
+        ipv4_address: 172.26.0.10
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
+  route-strom-1:
+    <<: *route-sidecar
+    container_name: ow-route-strom-1
+    network_mode: "service:strom-1"
+    command:
+      - sh
+      - -c
+      - "for i in $$(seq 1 10); do ip route replace 172.25.0.0/24 via 172.26.0.2 && ip route replace 172.27.0.0/24 via 172.26.0.2 && echo routes-installed && exit 0; echo retry $$i; sleep 1; done; echo ROUTE_FAILED >&2; exit 1"
+    depends_on:
+      strom-1:
+        condition: service_started
+      router-1:
+        condition: service_started
+
+  adapter-1:
+    <<: *weave
+    container_name: ow-adapter-1
+    command: ["weave-adapter-strom"]
+    environment:
+      WEAVE_NODE_ID: strom-node-1
+      WEAVE_STROM_ADAPTER_ADDR: 0.0.0.0:8091
+      WEAVE_STROM_ADAPTER_PUBLIC_ENDPOINT: http://172.26.0.10:8080
+      WEAVE_SOUTHBOUND_URL: http://172.25.0.21:8081
+      WEAVE_STROM_URL: http://172.26.0.10:8080
+      WEAVE_STROM_POLL_INTERVAL_SECS: "5"
+    networks:
+      net_node1:
+        ipv4_address: 172.26.0.11
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8091/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  route-adapter-1:
+    <<: *route-sidecar
+    container_name: ow-route-adapter-1
+    network_mode: "service:adapter-1"
+    command:
+      - sh
+      - -c
+      - "for i in $$(seq 1 10); do ip route replace 172.25.0.0/24 via 172.26.0.2 && ip route replace 172.27.0.0/24 via 172.26.0.2 && echo routes-installed && exit 0; echo retry $$i; sleep 1; done; echo ROUTE_FAILED >&2; exit 1"
+    depends_on:
+      adapter-1:
+        condition: service_started
+      router-1:
+        condition: service_started
+
+  # --- node 2 (net_node2) ---
+  strom-2:
+    image: eyevinntechnology/strom:latest
+    container_name: ow-strom-2
+    environment:
+      STROM_PORT: "8080"
+      STROM_DATA_DIR: /data
+    volumes:
+      - strom2-data:/data
+    ports:
+      - "28081:8080"
+    networks:
+      net_node2:
+        ipv4_address: 172.27.0.10
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
+  route-strom-2:
+    <<: *route-sidecar
+    container_name: ow-route-strom-2
+    network_mode: "service:strom-2"
+    command:
+      - sh
+      - -c
+      - "for i in $$(seq 1 10); do ip route replace 172.25.0.0/24 via 172.27.0.2 && ip route replace 172.26.0.0/24 via 172.27.0.2 && echo routes-installed && exit 0; echo retry $$i; sleep 1; done; echo ROUTE_FAILED >&2; exit 1"
+    depends_on:
+      strom-2:
+        condition: service_started
+      router-2:
+        condition: service_started
+
+  adapter-2:
+    <<: *weave
+    container_name: ow-adapter-2
+    command: ["weave-adapter-strom"]
+    environment:
+      WEAVE_NODE_ID: strom-node-2
+      WEAVE_STROM_ADAPTER_ADDR: 0.0.0.0:8091
+      WEAVE_STROM_ADAPTER_PUBLIC_ENDPOINT: http://172.27.0.10:8080
+      WEAVE_SOUTHBOUND_URL: http://172.25.0.21:8081
+      WEAVE_STROM_URL: http://172.27.0.10:8080
+      WEAVE_STROM_POLL_INTERVAL_SECS: "5"
+    networks:
+      net_node2:
+        ipv4_address: 172.27.0.11
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8091/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  route-adapter-2:
+    <<: *route-sidecar
+    container_name: ow-route-adapter-2
+    network_mode: "service:adapter-2"
+    command:
+      - sh
+      - -c
+      - "for i in $$(seq 1 10); do ip route replace 172.25.0.0/24 via 172.27.0.2 && ip route replace 172.26.0.0/24 via 172.27.0.2 && echo routes-installed && exit 0; echo retry $$i; sleep 1; done; echo ROUTE_FAILED >&2; exit 1"
+    depends_on:
+      adapter-2:
+        condition: service_started
+      router-2:
+        condition: service_started
+
+volumes:
+  strom1-data:
+  strom2-data:

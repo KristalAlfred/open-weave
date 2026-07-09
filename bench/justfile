@@ -1,0 +1,67 @@
+compose := "docker compose -f " + source_directory() / "docker-compose.yml"
+scripts := source_directory() / "scripts"
+nb      := "http://localhost:29080"
+sb      := "http://localhost:29081"
+ctrl    := "http://localhost:29082"
+strom1  := "http://localhost:28080"
+strom2  := "http://localhost:28081"
+
+default:
+    @just --list
+
+# Build images and bring the whole stack up, then wait for it to be healthy.
+up:
+    {{compose}} build
+    {{compose}} up -d
+    @just wait
+
+# Poll every service's health endpoint until the stack is ready.
+wait:
+    @echo "waiting for stack..."
+    @for i in $(seq 1 90); do \
+        curl -sf {{nb}}/health   >/dev/null 2>&1 && \
+        curl -sf {{sb}}/health   >/dev/null 2>&1 && \
+        curl -sf {{ctrl}}/health >/dev/null 2>&1 && \
+        curl -sf {{strom1}}/api/version >/dev/null 2>&1 && \
+        curl -sf {{strom2}}/api/version >/dev/null 2>&1 && \
+        { echo "stack ready"; exit 0; }; \
+        sleep 2; \
+    done; echo "timeout waiting for stack" >&2; {{compose}} ps; exit 1
+
+# Tear everything down: containers, networks, volumes.
+down:
+    {{compose}} down -v --remove-orphans
+
+ps:
+    {{compose}} ps
+
+# Follow logs for a service (e.g. `just logs controller`).
+logs svc="controller":
+    {{compose}} logs -f --tail=40 {{svc}}
+
+# Health of every service + nodes registered with southbound + controller view.
+status:
+    @echo "== health =="
+    @printf "northbound:  "; curl -sf {{nb}}/health   >/dev/null && echo ok || echo DOWN
+    @printf "southbound:  "; curl -sf {{sb}}/health   >/dev/null && echo ok || echo DOWN
+    @printf "controller:  "; curl -sf {{ctrl}}/health >/dev/null && echo ok || echo DOWN
+    @printf "strom-1:     "; curl -sf {{strom1}}/api/version >/dev/null && echo ok || echo DOWN
+    @printf "strom-2:     "; curl -sf {{strom2}}/api/version >/dev/null && echo ok || echo DOWN
+    @echo "== registered nodes (southbound) =="
+    @curl -sf {{sb}}/nodes | (jq . 2>/dev/null || cat)
+    @echo "== controller /status =="
+    @curl -sf {{ctrl}}/status | (jq . 2>/dev/null || cat)
+    @echo "== streams (northbound) =="
+    @curl -sf {{nb}}/streams | (jq . 2>/dev/null || cat)
+
+# Impair a node's network via its router, e.g. `just netem node1 delay 200ms loss 5%`.
+netem +ARGS:
+    bash {{scripts}}/netem.sh {{ARGS}}
+
+# Clear impairment on a node, e.g. `just netem-clear node1`.
+netem-clear node:
+    bash {{scripts}}/netem.sh {{node}} clear
+
+# Show current qdiscs on a node's router, e.g. `just netem-show node1`.
+netem-show node:
+    bash {{scripts}}/netem.sh {{node}} show
