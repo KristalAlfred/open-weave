@@ -15,14 +15,16 @@ The bundled `producer`/`consumer` verification endpoints take an optional
 argument they default to the `basic` scenario (producer `172.26.0.10:7001`,
 consumer `172.27.0.10:7003`). The producer target is the scenario's source
 listener; the consumer source is the receiver output, which is the destination
-port + 1 on the node hosting the destination.
+port + 1 on the node hosting the destination. Fan-out has one receiver output
+per destination, so attach a consumer to each: `consumer-up` for the first and
+`consumer-2-up` for the second.
 
 | Manifest | `producer-up` target | `consumer-up` source |
 |----------|----------------------|----------------------|
 | `basic` | `172.26.0.10:7001` (default) | `172.27.0.10:7003` (default) |
 | `reverse` | `172.27.0.10:7001` | `172.26.0.10:7003` |
 | `same-node` | `172.26.0.10:7001` | `172.26.0.10:7003` |
-| `fanout` | `172.26.0.10:7001` | `172.27.0.10:7003` |
+| `fanout` | `172.26.0.10:7001` | `172.27.0.10:7003` + `172.26.0.10:7003` (`consumer-2-up`) |
 | `srt-latency` | `172.26.0.10:7001` | `172.27.0.10:7003` |
 
 ## Observed behaviour
@@ -36,7 +38,7 @@ not measured.
 | `basic` | listener node-1 → node-2 (canonical contribution) | `awaiting_input` | `degraded` | `flowing` |
 | `reverse` | listener node-2 → node-1 (matrix directionality) | `awaiting_input` | — | `flowing` |
 | `same-node` | source and destination both on node-1 | `awaiting_input` | `degraded` | `flowing` |
-| `fanout` | one source, two destinations | `awaiting_input` | `degraded` | — |
+| `fanout` | one source, two destinations | `awaiting_input` | `degraded` | `flowing` |
 | `unplaceable` | `source.node: strom-node-404` (never registers) | `pending` | `pending` | `pending` |
 | `disabled` | `enabled: false` | `idle` | `idle` | `idle` |
 | `srt-latency` | non-default SRT latency (120ms / 2000ms) | `awaiting_input` | `degraded` | `flowing` |
@@ -47,8 +49,13 @@ Notes:
   node is valid), but the sender hop is pinned to `strom-node-404`, which never
   registers, so it never provisions and the stream stays `pending`. Register a
   node with that id and it would converge — Kubernetes-style unschedulable.
-- **`srt-latency`**: verified the values reach the desired hops — sender ingress
-  `120`, sender egress `2000`; receiver ingress `2000`, receiver egress `200`
-  (the receiver→consumer default).
+- **`fanout`**: the sender tees to both destinations (one srtsink per
+  destination) and there is one receiver hop per destination —
+  `weave-fanout-receiver-0` on node-2 and `weave-fanout-receiver-1` on node-1,
+  co-located with the source. The `flowing` cell requires a consumer on each
+  receiver output at the same time (`consumer-up` + `consumer-2-up`); with the
+  producer but no consumers it is `degraded`, and detaching either consumer drops
+  it back to `degraded` (that receiver's egress falls to `connected`) — observed,
+  so per-destination health is real.
 - **`disabled`**: listed by northbound but reconciled to `idle`; no hops are
   provisioned.
