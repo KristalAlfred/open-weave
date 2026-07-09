@@ -14,7 +14,7 @@ struct Cli {
     #[arg(
         long,
         env = "WEAVE_NORTHBOUND_URL",
-        default_value = "http://127.0.0.1:8080",
+        default_value = "http://127.0.0.1:9080",
         global = true
     )]
     url: String,

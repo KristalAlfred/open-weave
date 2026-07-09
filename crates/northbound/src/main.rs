@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 use weave_core::StreamDefinition;
 
-const DEFAULT_ADDR: &str = "127.0.0.1:8080";
+const DEFAULT_ADDR: &str = "127.0.0.1:9080";
 
 #[derive(Clone, Default)]
 struct AppState {

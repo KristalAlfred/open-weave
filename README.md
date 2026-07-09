@@ -61,10 +61,10 @@ changes should be reconciled back or explicitly adopted into desired state.
 
 ```sh
 just build
-just run-north           # 127.0.0.1:8080
+just run-north           # 127.0.0.1:9080
 just run-south           # 127.0.0.1:8081
 just run-controller      # 127.0.0.1:8082 health endpoint
-just run-strom-adapter   # registers Strom from http://127.0.0.1:8080
+just run-strom-adapter   # registers Strom via southbound http://127.0.0.1:8081
 just run-node            # future first-party edge node stub
 just cli -- --help
 ```
