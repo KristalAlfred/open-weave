@@ -7,6 +7,8 @@ use weave_core::{SrtEndpoint, SrtMode, StreamDefinition, StreamTransport};
 const PLACEHOLDER_ID: &str = "00000000-0000-0000-0000-000000000000";
 const DEFAULT_SRC_LATENCY: u32 = 200;
 const DEFAULT_SINK_LATENCY: u32 = 1000;
+const RECV_NAME_SUFFIX: &str = "-recv";
+const RECV_CONSUMER_LATENCY: u32 = 200;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FlowSpec {
@@ -64,9 +66,63 @@ pub fn flow_spec_from_stream(stream: &StreamDefinition) -> Result<FlowSpec, Mapp
     );
     sink_props.insert("wait-for-connection".to_string(), Value::Bool(false));
 
-    Ok(FlowSpec {
+    Ok(linear_srt_flow(stream.name.clone(), src_props, sink_props))
+}
+
+/// Name of the receiver flow placed on the destination node for a stream.
+#[must_use]
+pub fn receiver_flow_name(stream_name: &str) -> String {
+    format!("{stream_name}{RECV_NAME_SUFFIX}")
+}
+
+/// Build the receiver flow to run on the destination node's Strom.
+///
+/// A listener on the destination port accepts the sender's SRT caller; media is
+/// forwarded to a second listener on `port + 1` where a downstream consumer attaches.
+pub fn receiver_flow_from_stream(stream: &StreamDefinition) -> Result<FlowSpec, MappingError> {
+    let destination = stream
+        .destinations
+        .first()
+        .ok_or(MappingError::NoDestination)?;
+    let dest = as_srt(destination);
+    let (_, port) = split_host_port(&dest.url)?;
+    let consumer_port = port
+        .checked_add(1)
+        .ok_or_else(|| MappingError::InvalidUrl(dest.url.clone()))?;
+
+    let mut src_props = Map::new();
+    src_props.insert(
+        "uri".to_string(),
+        Value::String(format!("srt://:{port}?mode=listener")),
+    );
+    src_props.insert(
+        "latency".to_string(),
+        Value::from(dest.latency.unwrap_or(DEFAULT_SINK_LATENCY)),
+    );
+
+    let mut sink_props = Map::new();
+    sink_props.insert(
+        "uri".to_string(),
+        Value::String(format!("srt://:{consumer_port}?mode=listener")),
+    );
+    sink_props.insert("latency".to_string(), Value::from(RECV_CONSUMER_LATENCY));
+    sink_props.insert("wait-for-connection".to_string(), Value::Bool(false));
+
+    Ok(linear_srt_flow(
+        receiver_flow_name(&stream.name),
+        src_props,
+        sink_props,
+    ))
+}
+
+fn linear_srt_flow(
+    name: String,
+    src_props: Map<String, Value>,
+    sink_props: Map<String, Value>,
+) -> FlowSpec {
+    FlowSpec {
         id: PLACEHOLDER_ID.to_string(),
-        name: stream.name.clone(),
+        name,
         elements: vec![
             Element {
                 id: "srtsrc_0".to_string(),
@@ -97,7 +153,7 @@ pub fn flow_spec_from_stream(stream: &StreamDefinition) -> Result<FlowSpec, Mapp
                 to: "srtsink_0:sink".to_string(),
             },
         ],
-    })
+    }
 }
 
 fn as_srt(transport: &StreamTransport) -> &SrtEndpoint {
@@ -156,13 +212,49 @@ mod tests {
         let spec = flow_spec_from_stream(&demo_stream("bench-ingress")).expect("map");
         let produced = serde_json::to_value(&spec).expect("serialize");
 
-        let golden: Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../bench/flows/ingress.json"
-        )))
-        .expect("parse ingress.json");
+        let golden: Value = serde_json::from_str(include_str!("testdata/ingress.json"))
+            .expect("parse ingress.json");
 
         assert_eq!(produced, golden);
+    }
+
+    #[test]
+    fn maps_demo_stream_to_known_good_receiver_payload() {
+        let spec = receiver_flow_from_stream(&demo_stream("bench")).expect("map");
+        let produced = serde_json::to_value(&spec).expect("serialize");
+
+        let golden: Value = serde_json::from_str(include_str!("testdata/receiver.json"))
+            .expect("parse receiver.json");
+
+        assert_eq!(produced, golden);
+    }
+
+    #[test]
+    fn receiver_flow_name_appends_suffix() {
+        assert_eq!(receiver_flow_name("cam1-to-studio"), "cam1-to-studio-recv");
+    }
+
+    #[test]
+    fn receiver_listens_on_dest_port_and_consumer_on_next_port() {
+        let spec = receiver_flow_from_stream(&demo_stream("x")).expect("map");
+        assert_eq!(
+            spec.elements[0].properties["uri"],
+            Value::from("srt://:7002?mode=listener")
+        );
+        assert_eq!(
+            spec.elements[2].properties["uri"],
+            Value::from("srt://:7003?mode=listener")
+        );
+    }
+
+    #[test]
+    fn receiver_missing_destination_is_an_error() {
+        let mut stream = demo_stream("x");
+        stream.destinations.clear();
+        assert!(matches!(
+            receiver_flow_from_stream(&stream),
+            Err(MappingError::NoDestination)
+        ));
     }
 
     #[test]

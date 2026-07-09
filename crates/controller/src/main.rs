@@ -12,8 +12,13 @@ use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
-use weave_core::{ReconcileReport, ReconcileStatus, StreamDefinition};
-use weave_strom::{StromClient, flow_spec_from_stream, parse_flow_stats};
+use weave_core::{
+    NodeDescriptor, ReconcileReport, ReconcileStatus, StreamDefinition, StreamTransport,
+};
+use weave_strom::{
+    StromClient, flow_spec_from_stream, parse_flow_stats, receiver_flow_from_stream,
+    receiver_flow_name,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "weave-controller", version, about = "open-weave reconciler")]
@@ -30,6 +35,12 @@ struct Args {
         default_value = "http://127.0.0.1:18080"
     )]
     strom_url: String,
+    #[arg(
+        long,
+        env = "WEAVE_SOUTHBOUND_URL",
+        default_value = "http://127.0.0.1:8081"
+    )]
+    southbound_url: String,
     #[arg(long, env = "WEAVE_CONTROLLER_ADDR", default_value = "127.0.0.1:8082")]
     listen: String,
     #[arg(long, env = "WEAVE_RECONCILE_INTERVAL_SECS", default_value_t = 5)]
@@ -83,6 +94,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         northbound_url = %args.northbound_url,
         strom_url = %strom.base_url(),
+        southbound_url = %args.southbound_url,
         interval_secs = args.interval_secs,
         "controller starting"
     );
@@ -95,7 +107,7 @@ async fn main() -> Result<()> {
                 health_server.abort();
                 return Ok(());
             }
-            result = reconcile_once(&northbound, &strom, &args.northbound_url) => {
+            result = reconcile_once(&northbound, &strom, &args.northbound_url, &args.southbound_url) => {
                 match result {
                     Ok(outcome) => {
                         tracing::info!(
@@ -139,11 +151,12 @@ async fn get_status(State(status): State<StatusHolder>) -> Json<Value> {
 }
 
 async fn reconcile_once(
-    northbound: &reqwest::Client,
+    http: &reqwest::Client,
     strom: &StromClient,
     northbound_url: &str,
+    southbound_url: &str,
 ) -> Result<ReconcileOutcome> {
-    let desired = fetch_streams(northbound, northbound_url).await?;
+    let desired = fetch_streams(http, northbound_url).await?;
     let observed = strom.list_flows().await.context("listing strom flows")?;
 
     let mut flow_ids: HashMap<String, String> = observed
@@ -168,6 +181,15 @@ async fn reconcile_once(
         flow_ids.insert(stream.name.clone(), id);
         created.push(stream.name.clone());
     }
+
+    let nodes = match fetch_nodes(http, southbound_url).await {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            tracing::warn!(%error, "fetching registered nodes failed; skipping receiver placement");
+            Vec::new()
+        }
+    };
+    created.extend(reconcile_receivers(http, &nodes, &desired).await);
 
     let flows = collect_flow_status(strom, &desired, &flow_ids).await;
 
@@ -259,6 +281,122 @@ async fn fetch_streams(
         .context("decoding streams")
 }
 
+async fn fetch_nodes(http: &reqwest::Client, southbound_url: &str) -> Result<Vec<NodeDescriptor>> {
+    http.get(format!("{}/nodes", southbound_url.trim_end_matches('/')))
+        .send()
+        .await
+        .context("fetching nodes")?
+        .error_for_status()
+        .context("southbound nodes request failed")?
+        .json::<Vec<NodeDescriptor>>()
+        .await
+        .context("decoding nodes")
+}
+
+/// Ensure a receiver flow exists on each destination node's Strom for every enabled
+/// stream. Returns the names of receiver flows created this tick.
+async fn reconcile_receivers(
+    http: &reqwest::Client,
+    nodes: &[NodeDescriptor],
+    desired: &[StreamDefinition],
+) -> Vec<String> {
+    let mut created = Vec::new();
+    let mut flows_by_node: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for stream in desired.iter().filter(|s| s.enabled) {
+        let Some(host) = first_destination_host(stream) else {
+            tracing::warn!(name = %stream.name, "stream has no destination host; skipping receiver");
+            continue;
+        };
+        let Some(node_url) = node_strom_url_for_host(nodes, &host) else {
+            tracing::info!(
+                name = %stream.name,
+                host = %host,
+                "no registered node matches destination host; skipping receiver placement"
+            );
+            continue;
+        };
+        let node_url = node_url.to_string();
+        let node_strom = StromClient::with_client(&node_url, http.clone());
+
+        if !flows_by_node.contains_key(&node_url) {
+            match node_strom.list_flows().await {
+                Ok(flows) => {
+                    flows_by_node.insert(
+                        node_url.clone(),
+                        flows.into_iter().map(|f| f.name).collect(),
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(name = %stream.name, node = %node_url, %error, "listing destination node flows failed; skipping receiver");
+                    continue;
+                }
+            }
+        }
+
+        let recv_name = receiver_flow_name(&stream.name);
+        if flows_by_node
+            .get(&node_url)
+            .is_some_and(|names| names.contains(&recv_name))
+        {
+            continue;
+        }
+
+        let spec = match receiver_flow_from_stream(stream) {
+            Ok(spec) => spec,
+            Err(error) => {
+                tracing::warn!(name = %stream.name, %error, "mapping receiver flow failed");
+                continue;
+            }
+        };
+
+        match node_strom.create_flow(&spec).await {
+            Ok(id) => {
+                if let Err(error) = node_strom.start_flow(&id).await {
+                    tracing::warn!(name = %recv_name, node = %node_url, %error, "starting receiver flow failed");
+                    continue;
+                }
+                tracing::info!(name = %recv_name, node = %node_url, id = %id, "created+started receiver flow");
+                if let Some(names) = flows_by_node.get_mut(&node_url) {
+                    names.insert(recv_name.clone());
+                }
+                created.push(recv_name);
+            }
+            Err(error) => {
+                tracing::warn!(name = %recv_name, node = %node_url, %error, "creating receiver flow failed");
+            }
+        }
+    }
+
+    created
+}
+
+fn first_destination_host(stream: &StreamDefinition) -> Option<String> {
+    let StreamTransport::Srt(endpoint) = stream.destinations.first()?;
+    url_host(&endpoint.url)
+}
+
+fn node_strom_url_for_host<'a>(nodes: &'a [NodeDescriptor], host: &str) -> Option<&'a str> {
+    nodes
+        .iter()
+        .find(|node| url_host(&node.endpoint).as_deref() == Some(host))
+        .map(|node| node.endpoint.as_str())
+}
+
+/// Extract the host from a URL with or without a scheme (e.g. `srt://h:7002`, `http://h:8080`).
+fn url_host(url: &str) -> Option<String> {
+    let authority = url
+        .rsplit("://")
+        .next()?
+        .split(['/', '?'])
+        .next()
+        .unwrap_or_default();
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host);
+    (!host.is_empty()).then(|| host.to_string())
+}
+
 /// Enabled desired streams that have no same-named flow yet. Pure and idempotent.
 fn streams_to_create<'a>(
     desired: &'a [StreamDefinition],
@@ -308,5 +446,46 @@ mod tests {
         let desired = vec![stream("a", true), stream("b", false)];
         let observed: HashSet<String> = ["a".to_string()].into_iter().collect();
         assert!(streams_to_create(&desired, &observed).is_empty());
+    }
+
+    #[test]
+    fn url_host_handles_scheme_port_and_path() {
+        assert_eq!(
+            url_host("srt://172.27.0.10:7002").as_deref(),
+            Some("172.27.0.10")
+        );
+        assert_eq!(
+            url_host("http://172.27.0.10:8080").as_deref(),
+            Some("172.27.0.10")
+        );
+        assert_eq!(url_host("http://node:8080/api").as_deref(), Some("node"));
+        assert_eq!(url_host("172.27.0.10:7002").as_deref(), Some("172.27.0.10"));
+        assert_eq!(url_host("").as_deref(), None);
+    }
+
+    #[test]
+    fn matches_destination_host_to_registered_node_strom() {
+        use weave_core::{NodeCapabilities, NodeStatus};
+
+        let nodes = vec![
+            NodeDescriptor {
+                id: "strom-node-1".to_string(),
+                endpoint: "http://172.26.0.10:8080".to_string(),
+                status: NodeStatus::Ready,
+                capabilities: NodeCapabilities::default(),
+            },
+            NodeDescriptor {
+                id: "strom-node-2".to_string(),
+                endpoint: "http://172.27.0.10:8080".to_string(),
+                status: NodeStatus::Ready,
+                capabilities: NodeCapabilities::default(),
+            },
+        ];
+
+        assert_eq!(
+            node_strom_url_for_host(&nodes, "172.27.0.10"),
+            Some("http://172.27.0.10:8080")
+        );
+        assert_eq!(node_strom_url_for_host(&nodes, "10.0.0.9"), None);
     }
 }

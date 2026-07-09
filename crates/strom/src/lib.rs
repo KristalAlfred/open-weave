@@ -7,5 +7,8 @@ mod stats;
 
 pub use client::{StromClient, StromError};
 pub use flow::{FlowListResponse, StromBlock, StromElement, StromFlow};
-pub use spec::{Element, FlowSpec, Link, MappingError, flow_spec_from_stream};
+pub use spec::{
+    Element, FlowSpec, Link, MappingError, flow_spec_from_stream, receiver_flow_from_stream,
+    receiver_flow_name,
+};
 pub use stats::{FlowStats, parse_flow_stats};
