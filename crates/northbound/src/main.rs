@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
@@ -48,6 +48,7 @@ fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/streams", get(list_streams).post(submit_stream))
+        .route("/streams/{name}", axum::routing::delete(delete_stream))
         .with_state(state)
 }
 
@@ -89,6 +90,15 @@ async fn submit_stream(
         Json(json!({ "status": "accepted", "name": name })),
     )
         .into_response()
+}
+
+async fn delete_stream(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    if state.streams.write().await.remove(&name).is_some() {
+        tracing::info!(%name, "stream deleted");
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        error(StatusCode::NOT_FOUND, "stream not found")
+    }
 }
 
 fn error(status: StatusCode, message: &str) -> Response {
@@ -188,6 +198,68 @@ mod tests {
         let listed: Vec<StreamDefinition> =
             serde_json::from_value(body_json(get).await).expect("stream list");
         assert_eq!(listed, vec![stream]);
+    }
+
+    #[tokio::test]
+    async fn post_then_delete_removes_stream() {
+        let app = router(AppState::default());
+        let stream = sample_stream();
+
+        let post = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/streams")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&stream).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post.status(), StatusCode::ACCEPTED);
+
+        let delete = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/streams/cam1-to-studio")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+
+        let get = app
+            .oneshot(
+                Request::builder()
+                    .uri("/streams")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let listed: Vec<StreamDefinition> =
+            serde_json::from_value(body_json(get).await).expect("stream list");
+        assert!(listed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_stream_is_not_found() {
+        let app = router(AppState::default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/streams/nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
