@@ -35,48 +35,43 @@ pub fn receiver_hop_id(stream: &str, index: usize) -> String {
 /// Derive the ordered (source→destination) hop chain realising one stream.
 ///
 /// Placement: sender node from `source.node`, else registry host-match on the
-/// source URL host; receiver node from the destination the same way. Address
-/// wiring: the sender's egress connects to the receiver's reported ingress when
+/// source URL host; each receiver node from its destination the same way. Address
+/// wiring: a sender egress connects to its receiver's reported ingress when
 /// resolved to a concrete host, else the static destination host/port.
 ///
-/// Multi-destination fan-out (tee) is not modelled; only the first destination
-/// is realised.
+/// Fan-out is one sender hop teeing to one egress per destination, plus one
+/// receiver hop per destination. Placement is all-or-nothing: if any destination
+/// is unplaceable the whole derivation fails and the stream stays pending.
 pub fn derive_path(
     stream: &StreamDefinition,
     nodes: &[NodeDescriptor],
     observed: &[HopStatus],
 ) -> Result<Path, PlacementError> {
     let StreamTransport::Srt(source) = &stream.source;
-    let StreamTransport::Srt(dest) = stream
-        .destinations
-        .first()
-        .ok_or(PlacementError::NoDestination)?;
+    if stream.destinations.is_empty() {
+        return Err(PlacementError::NoDestination);
+    }
 
     let sender_node = place(source, nodes).ok_or(PlacementError::UnplaceableSource)?;
-    let receiver_node = place(dest, nodes).ok_or(PlacementError::UnplaceableDestination)?;
 
-    let (dest_host, dest_port) = split_host_port(&dest.url)?;
-    let dest_latency = dest.latency.unwrap_or(DEFAULT_SINK_LATENCY);
-    let consumer_port = dest_port
-        .checked_add(1)
-        .ok_or_else(|| PlacementError::InvalidUrl(dest.url.clone()))?;
+    let mut sender_egresses = Vec::with_capacity(stream.destinations.len());
+    let mut receivers = Vec::with_capacity(stream.destinations.len());
 
-    let receiver_id = receiver_hop_id(&stream.name, 0);
-    let receiver = DesiredHop {
-        id: receiver_id.clone(),
-        node_id: receiver_node,
-        role: HopRole::Receiver,
-        ingress: listen_socket(dest_port, dest_latency),
-        egress: listen_socket(consumer_port, RECV_CONSUMER_LATENCY),
-    };
+    for (index, dest) in stream.destinations.iter().enumerate() {
+        let StreamTransport::Srt(dest) = dest;
+        let receiver_node = place(dest, nodes).ok_or(PlacementError::UnplaceableDestination)?;
 
-    let (egress_host, egress_port) = connect_target(observed, &receiver_id, &dest_host, dest_port);
-    let sender = DesiredHop {
-        id: sender_hop_id(&stream.name),
-        node_id: sender_node,
-        role: HopRole::Sender,
-        ingress: source_socket(source)?,
-        egress: SocketSpec {
+        let (dest_host, dest_port) = split_host_port(&dest.url)?;
+        let dest_latency = dest.latency.unwrap_or(DEFAULT_SINK_LATENCY);
+        let consumer_port = dest_port
+            .checked_add(1)
+            .ok_or_else(|| PlacementError::InvalidUrl(dest.url.clone()))?;
+
+        let receiver_id = receiver_hop_id(&stream.name, index);
+        let (egress_host, egress_port) =
+            connect_target(observed, &receiver_id, &dest_host, dest_port);
+
+        sender_egresses.push(SocketSpec {
             transport: Transport::Srt,
             role: SocketRole::Connect,
             host: Some(egress_host),
@@ -84,13 +79,32 @@ pub fn derive_path(
             params: SrtParams {
                 latency: Some(dest_latency),
             },
-        },
+        });
+        receivers.push(DesiredHop {
+            id: receiver_id,
+            node_id: receiver_node,
+            role: HopRole::Receiver,
+            ingress: listen_socket(dest_port, dest_latency),
+            egresses: vec![listen_socket(consumer_port, RECV_CONSUMER_LATENCY)],
+        });
+    }
+
+    let sender = DesiredHop {
+        id: sender_hop_id(&stream.name),
+        node_id: sender_node,
+        role: HopRole::Sender,
+        ingress: source_socket(source)?,
+        egresses: sender_egresses,
     };
+
+    let mut hops = Vec::with_capacity(1 + receivers.len());
+    hops.push(sender);
+    hops.extend(receivers);
 
     Ok(Path {
         stream: stream.name.clone(),
         enabled: stream.enabled,
-        hops: vec![sender, receiver],
+        hops,
     })
 }
 
@@ -253,15 +267,16 @@ mod tests {
         assert_eq!(sender.node_id, "strom-node-1");
         assert_eq!(sender.ingress.role, SocketRole::Listen);
         assert_eq!(sender.ingress.port, Some(7001));
-        assert_eq!(sender.egress.role, SocketRole::Connect);
-        assert_eq!(sender.egress.host.as_deref(), Some("172.27.0.10"));
-        assert_eq!(sender.egress.port, Some(7002));
+        assert_eq!(sender.egresses.len(), 1);
+        assert_eq!(sender.egresses[0].role, SocketRole::Connect);
+        assert_eq!(sender.egresses[0].host.as_deref(), Some("172.27.0.10"));
+        assert_eq!(sender.egresses[0].port, Some(7002));
 
         let receiver = &path.hops[1];
         assert_eq!(receiver.role, HopRole::Receiver);
         assert_eq!(receiver.node_id, "strom-node-2");
         assert_eq!(receiver.ingress.port, Some(7002));
-        assert_eq!(receiver.egress.port, Some(7003));
+        assert_eq!(receiver.egresses[0].port, Some(7003));
     }
 
     #[test]
@@ -317,8 +332,11 @@ mod tests {
     #[test]
     fn sender_egress_uses_static_destination_when_no_resolved_ingress() {
         let path = derive_path(&contribution(), &nodes(), &[]).expect("derive");
-        assert_eq!(path.hops[0].egress.host.as_deref(), Some("172.27.0.10"));
-        assert_eq!(path.hops[0].egress.port, Some(7002));
+        assert_eq!(
+            path.hops[0].egresses[0].host.as_deref(),
+            Some("172.27.0.10")
+        );
+        assert_eq!(path.hops[0].egresses[0].port, Some(7002));
     }
 
     #[test]
@@ -338,8 +356,11 @@ mod tests {
         }];
 
         let path = derive_path(&contribution(), &nodes(), &observed).expect("derive");
-        assert_eq!(path.hops[0].egress.host.as_deref(), Some("172.27.0.99"));
-        assert_eq!(path.hops[0].egress.port, Some(9002));
+        assert_eq!(
+            path.hops[0].egresses[0].host.as_deref(),
+            Some("172.27.0.99")
+        );
+        assert_eq!(path.hops[0].egresses[0].port, Some(9002));
     }
 
     #[test]
@@ -359,8 +380,11 @@ mod tests {
         }];
 
         let path = derive_path(&contribution(), &nodes(), &observed).expect("derive");
-        assert_eq!(path.hops[0].egress.host.as_deref(), Some("172.27.0.10"));
-        assert_eq!(path.hops[0].egress.port, Some(7002));
+        assert_eq!(
+            path.hops[0].egresses[0].host.as_deref(),
+            Some("172.27.0.10")
+        );
+        assert_eq!(path.hops[0].egresses[0].port, Some(7002));
     }
 
     #[test]
@@ -381,6 +405,64 @@ mod tests {
         assert_eq!(
             derive_path(&stream, &nodes(), &[]),
             Err(PlacementError::NoDestination)
+        );
+    }
+
+    fn fanout() -> StreamDefinition {
+        let mut stream = contribution();
+        stream.name = "fanout".to_string();
+        stream.destinations = vec![
+            StreamTransport::Srt(SrtEndpoint {
+                url: "srt://172.27.0.10:7002".to_string(),
+                mode: SrtMode::Caller,
+                latency: Some(1000),
+                node: None,
+            }),
+            StreamTransport::Srt(SrtEndpoint {
+                url: "srt://172.26.0.10:7002".to_string(),
+                mode: SrtMode::Caller,
+                latency: Some(1000),
+                node: None,
+            }),
+        ];
+        stream
+    }
+
+    #[test]
+    fn fanout_builds_a_sender_teeing_to_one_receiver_per_destination() {
+        let path = derive_path(&fanout(), &nodes(), &[]).expect("derive");
+        assert_eq!(path.hops.len(), 3);
+
+        let sender = &path.hops[0];
+        assert_eq!(sender.id, "weave-fanout-sender");
+        assert_eq!(sender.role, HopRole::Sender);
+        assert_eq!(sender.node_id, "strom-node-1");
+        assert_eq!(sender.egresses.len(), 2, "one egress per destination");
+        assert_eq!(sender.egresses[0].host.as_deref(), Some("172.27.0.10"));
+        assert_eq!(sender.egresses[1].host.as_deref(), Some("172.26.0.10"));
+
+        let receiver0 = &path.hops[1];
+        assert_eq!(receiver0.id, "weave-fanout-receiver-0");
+        assert_eq!(receiver0.role, HopRole::Receiver);
+        assert_eq!(receiver0.node_id, "strom-node-2");
+
+        let receiver1 = &path.hops[2];
+        assert_eq!(receiver1.id, "weave-fanout-receiver-1");
+        assert_eq!(receiver1.role, HopRole::Receiver);
+        assert_eq!(
+            receiver1.node_id, "strom-node-1",
+            "second destination is co-located with the source node"
+        );
+    }
+
+    #[test]
+    fn fanout_is_all_or_nothing_when_a_destination_is_unplaceable() {
+        let mut stream = fanout();
+        let StreamTransport::Srt(dest) = &mut stream.destinations[1];
+        dest.url = "srt://10.9.9.9:7002".to_string();
+        assert_eq!(
+            derive_path(&stream, &nodes(), &[]),
+            Err(PlacementError::UnplaceableDestination)
         );
     }
 }

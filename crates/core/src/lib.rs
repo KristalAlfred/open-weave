@@ -62,14 +62,15 @@ pub struct Path {
     pub hops: Vec<DesiredHop>,
 }
 
-/// One provisioning unit placed on a single node: ingress socket → egress socket.
+/// One provisioning unit placed on a single node: one ingress socket fanned out
+/// to one or more egress sockets (a sender tees to every destination).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesiredHop {
     pub id: String,
     pub node_id: String,
     pub role: HopRole,
     pub ingress: SocketSpec,
-    pub egress: SocketSpec,
+    pub egresses: Vec<SocketSpec>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -437,7 +438,7 @@ mod tests {
                 port: Some(7001),
                 params: SrtParams { latency: Some(200) },
             },
-            egress: SocketSpec {
+            egresses: vec![SocketSpec {
                 transport: Transport::Srt,
                 role: SocketRole::Connect,
                 host: Some("172.31.0.10".to_string()),
@@ -445,7 +446,7 @@ mod tests {
                 params: SrtParams {
                     latency: Some(1000),
                 },
-            },
+            }],
         }
     }
 
@@ -466,6 +467,19 @@ mod tests {
         .expect("parse minimal path");
         assert!(minimal.enabled, "enabled defaults to true");
         assert!(minimal.hops.is_empty(), "hops defaults to empty");
+    }
+
+    #[test]
+    fn hop_with_multiple_egresses_round_trips() {
+        let mut hop = sample_hop();
+        let mut second = hop.egresses[0].clone();
+        second.port = Some(7003);
+        hop.egresses.push(second);
+        assert_eq!(hop.egresses.len(), 2);
+
+        let round_trip: DesiredHop =
+            serde_json::from_str(&serde_json::to_string(&hop).unwrap()).unwrap();
+        assert_eq!(hop, round_trip);
     }
 
     #[test]

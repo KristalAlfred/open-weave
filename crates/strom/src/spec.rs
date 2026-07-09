@@ -34,11 +34,15 @@ pub struct Link {
 pub enum MappingError {
     #[error("incomplete socket spec: missing {0}")]
     IncompleteSocket(&'static str),
+    #[error("hop has no egress socket")]
+    NoEgress,
 }
 
-/// Map a desired hop to a linear srtsrc→queue→srtsink Strom flow.
+/// Map a desired hop to a Strom flow.
 ///
-/// The flow name is the hop id, so flows are adopted by name.
+/// A single egress yields a linear srtsrc→queue→srtsink flow; multiple egresses
+/// yield a fan-out srtsrc→tee→N×(queue→srtsink). The flow name is the hop id, so
+/// flows are adopted by name.
 pub fn flow_spec_from_hop(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
     let mut src_props = Map::new();
     src_props.insert("uri".to_string(), Value::String(socket_uri(&hop.ingress)?));
@@ -47,15 +51,32 @@ pub fn flow_spec_from_hop(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
         Value::from(hop.ingress.params.latency.unwrap_or(DEFAULT_SRC_LATENCY)),
     );
 
-    let mut sink_props = Map::new();
-    sink_props.insert("uri".to_string(), Value::String(socket_uri(&hop.egress)?));
-    sink_props.insert(
-        "latency".to_string(),
-        Value::from(hop.egress.params.latency.unwrap_or(DEFAULT_SINK_LATENCY)),
-    );
-    sink_props.insert("wait-for-connection".to_string(), Value::Bool(false));
+    let sinks = hop
+        .egresses
+        .iter()
+        .map(sink_props)
+        .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(linear_srt_flow(hop.id.clone(), src_props, sink_props))
+    match sinks.len() {
+        0 => Err(MappingError::NoEgress),
+        1 => Ok(linear_srt_flow(
+            hop.id.clone(),
+            src_props,
+            sinks.into_iter().next().unwrap_or_default(),
+        )),
+        _ => Ok(tee_srt_flow(hop.id.clone(), src_props, sinks)),
+    }
+}
+
+fn sink_props(spec: &SocketSpec) -> Result<Map<String, Value>, MappingError> {
+    let mut props = Map::new();
+    props.insert("uri".to_string(), Value::String(socket_uri(spec)?));
+    props.insert(
+        "latency".to_string(),
+        Value::from(spec.params.latency.unwrap_or(DEFAULT_SINK_LATENCY)),
+    );
+    props.insert("wait-for-connection".to_string(), Value::Bool(false));
+    Ok(props)
 }
 
 fn socket_uri(spec: &SocketSpec) -> Result<String, MappingError> {
@@ -114,6 +135,66 @@ fn linear_srt_flow(
     }
 }
 
+/// srtsrc→tee→N×(queue→srtsink). The tee's request source pads are named
+/// `src_%u` per GStreamer; unnamed request-pad links are dropped by Strom.
+fn tee_srt_flow(
+    name: String,
+    src_props: Map<String, Value>,
+    sinks: Vec<Map<String, Value>>,
+) -> FlowSpec {
+    let mut elements = vec![
+        Element {
+            id: "srtsrc_0".to_string(),
+            element_type: "srtsrc".to_string(),
+            properties: src_props,
+            position: [100.0, 200.0],
+        },
+        Element {
+            id: "tee_0".to_string(),
+            element_type: "tee".to_string(),
+            properties: Map::new(),
+            position: [300.0, 200.0],
+        },
+    ];
+    let mut links = vec![Link {
+        from: "srtsrc_0:src".to_string(),
+        to: "tee_0:sink".to_string(),
+    }];
+
+    for (i, sink_props) in sinks.into_iter().enumerate() {
+        let queue = format!("queue_{i}");
+        let sink = format!("srtsink_{i}");
+        let y = 200.0 + (i as f64) * 150.0;
+        elements.push(Element {
+            id: queue.clone(),
+            element_type: "queue".to_string(),
+            properties: Map::new(),
+            position: [500.0, y],
+        });
+        elements.push(Element {
+            id: sink.clone(),
+            element_type: "srtsink".to_string(),
+            properties: sink_props,
+            position: [700.0, y],
+        });
+        links.push(Link {
+            from: format!("tee_0:src_{i}"),
+            to: format!("{queue}:sink"),
+        });
+        links.push(Link {
+            from: format!("{queue}:src"),
+            to: format!("{sink}:sink"),
+        });
+    }
+
+    FlowSpec {
+        id: PLACEHOLDER_ID.to_string(),
+        name,
+        elements,
+        links,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,7 +212,7 @@ mod tests {
                 port: Some(7001),
                 params: SrtParams { latency: Some(200) },
             },
-            egress: SocketSpec {
+            egresses: vec![SocketSpec {
                 transport: Transport::Srt,
                 role: SocketRole::Connect,
                 host: Some("172.31.0.10".to_string()),
@@ -139,7 +220,7 @@ mod tests {
                 params: SrtParams {
                     latency: Some(1000),
                 },
-            },
+            }],
         }
     }
 
@@ -157,13 +238,13 @@ mod tests {
                     latency: Some(1000),
                 },
             },
-            egress: SocketSpec {
+            egresses: vec![SocketSpec {
                 transport: Transport::Srt,
                 role: SocketRole::Listen,
                 host: None,
                 port: Some(7003),
                 params: SrtParams { latency: Some(200) },
-            },
+            }],
         }
     }
 
@@ -189,10 +270,39 @@ mod tests {
         assert_eq!(produced, golden);
     }
 
+    fn demo_tee_hop(id: &str) -> DesiredHop {
+        let mut hop = demo_ingress_hop(id);
+        let mut second = hop.egresses[0].clone();
+        second.host = Some("172.31.0.20".to_string());
+        hop.egresses.push(second);
+        hop
+    }
+
+    #[test]
+    fn maps_fanout_hop_to_tee_graph() {
+        let spec = flow_spec_from_hop(&demo_tee_hop("bench-tee")).expect("map");
+        let produced = serde_json::to_value(&spec).expect("serialize");
+
+        let golden: Value =
+            serde_json::from_str(include_str!("testdata/tee.json")).expect("parse tee.json");
+
+        assert_eq!(produced, golden);
+    }
+
+    #[test]
+    fn no_egress_hop_is_an_error() {
+        let mut hop = demo_ingress_hop("x");
+        hop.egresses.clear();
+        assert!(matches!(
+            flow_spec_from_hop(&hop),
+            Err(MappingError::NoEgress)
+        ));
+    }
+
     #[test]
     fn connect_socket_without_host_is_an_error() {
         let mut hop = demo_ingress_hop("x");
-        hop.egress.host = None;
+        hop.egresses[0].host = None;
         assert!(matches!(
             flow_spec_from_hop(&hop),
             Err(MappingError::IncompleteSocket("host"))
@@ -213,7 +323,7 @@ mod tests {
     fn default_latencies_applied_when_hop_latency_absent() {
         let mut hop = demo_ingress_hop("x");
         hop.ingress.params.latency = None;
-        hop.egress.params.latency = None;
+        hop.egresses[0].params.latency = None;
         let spec = flow_spec_from_hop(&hop).expect("map");
         assert_eq!(spec.elements[0].properties["latency"], Value::from(200));
         assert_eq!(spec.elements[2].properties["latency"], Value::from(1000));

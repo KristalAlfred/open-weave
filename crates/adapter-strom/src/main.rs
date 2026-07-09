@@ -13,8 +13,8 @@ use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 use weave_core::{
     AdapterDescriptor, AdapterKind, DesiredHop, EndpointDescriptor, EndpointKind, HopStatus,
-    LinkStats, NodeCapabilities, NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus,
-    TransportDescriptor,
+    LinkCondition, LinkStats, NodeCapabilities, NodeDescriptor, NodeHeartbeat, NodeRegistration,
+    NodeStatus, TransportDescriptor,
 };
 use weave_strom::{FlowStats, StromClient, StromFlow, flow_spec_from_hop, parse_flow_stats};
 
@@ -260,14 +260,17 @@ async fn hop_statuses(
             .and_then(FlowStats::egress)
             .map_or((false, 0.0), |e| (e.connected, e.rate_mbps));
 
+        let egress = hop.egresses.first();
         statuses.push(HopStatus {
             id: hop.id.clone(),
             node_id: hop.node_id.clone(),
             state: hop_state(flow, failed.contains(&hop.id)),
             ingress: socket_condition(hop.ingress.role, ingress_connected, ingress_rate),
-            egress: socket_condition(hop.egress.role, egress_connected, egress_rate),
+            egress: egress.map_or(LinkCondition::Idle, |e| {
+                socket_condition(e.role, egress_connected, egress_rate)
+            }),
             resolved_ingress: resolved_addr(&hop.ingress),
-            resolved_egress: resolved_addr(&hop.egress),
+            resolved_egress: egress.and_then(resolved_addr),
             stats: stats.map(LinkStats::from),
         });
     }

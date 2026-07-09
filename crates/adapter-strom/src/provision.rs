@@ -117,13 +117,13 @@ mod tests {
                 port: Some(7001),
                 params: SrtParams::default(),
             },
-            egress: SocketSpec {
+            egresses: vec![SocketSpec {
                 transport: Transport::Srt,
                 role: SocketRole::Connect,
                 host: Some("10.0.0.2".to_string()),
                 port: Some(7002),
                 params: SrtParams::default(),
-            },
+            }],
         }
     }
 
