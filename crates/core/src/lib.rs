@@ -165,6 +165,9 @@ pub enum LinkCondition {
     Connected,
     /// SRT connection up and media flowing.
     Flowing,
+    /// Ingress once carried media but byte progress has frozen while the flow still
+    /// claims to run — detected across polls, not from any instantaneous field.
+    Stalled,
 }
 
 /// Lifecycle plus both socket conditions of one hop — the unit rolled up per path.
@@ -197,8 +200,9 @@ pub enum PathStatus {
 ///
 /// `None` entries mark desired hops that have not reported yet. Precedence, first
 /// match wins: disabled → `Idle`; any hop failed → `Failed`; any hop pending or
-/// missing → `Pending`; source not yet receiving media → `AwaitingInput`; media
-/// entering but not flowing end to end → `Degraded`; all flowing → `Flowing`.
+/// missing → `Pending`; any hop stalled → `Degraded`; source not yet receiving
+/// media → `AwaitingInput`; media entering but not flowing end to end → `Degraded`;
+/// all flowing → `Flowing`.
 #[must_use]
 pub fn roll_up_path(enabled: bool, hops: &[Option<HopConditions>]) -> PathStatus {
     if !enabled {
@@ -215,6 +219,13 @@ pub fn roll_up_path(enabled: bool, hops: &[Option<HopConditions>]) -> PathStatus
         .any(|hop| hop.is_none_or(|h| h.state == HopState::Pending))
     {
         return PathStatus::Pending;
+    }
+    if hops
+        .iter()
+        .flatten()
+        .any(|h| h.ingress == LinkCondition::Stalled || h.egress == LinkCondition::Stalled)
+    {
+        return PathStatus::Degraded;
     }
 
     let source_flowing =
@@ -622,6 +633,33 @@ mod tests {
                 HopState::Provisioned,
                 LinkCondition::Connected,
                 LinkCondition::Connected,
+            ),
+        ];
+        assert_eq!(roll_up_path(true, &hops), PathStatus::Degraded);
+    }
+
+    #[test]
+    fn rollup_stalled_source_is_degraded_not_awaiting_input() {
+        let stalled_source = [hc(
+            HopState::Provisioned,
+            LinkCondition::Stalled,
+            LinkCondition::Idle,
+        )];
+        assert_eq!(roll_up_path(true, &stalled_source), PathStatus::Degraded);
+    }
+
+    #[test]
+    fn rollup_stalled_downstream_hop_is_degraded() {
+        let hops = [
+            hc(
+                HopState::Provisioned,
+                LinkCondition::Flowing,
+                LinkCondition::Flowing,
+            ),
+            hc(
+                HopState::Provisioned,
+                LinkCondition::Stalled,
+                LinkCondition::Idle,
             ),
         ];
         assert_eq!(roll_up_path(true, &hops), PathStatus::Degraded);
