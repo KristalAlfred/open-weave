@@ -1,3 +1,7 @@
+# Fan-out demonstrating node-referenced addressing: destinations name their node
+# instead of a raw IP. The first uses the node's default data-plane address; the
+# second pins the `wan` alias. The controller resolves both at planning time and
+# assigns ports from each node's declared range.
 name: cam1-to-studio
 enabled: true
 source:
@@ -8,8 +12,9 @@ source:
     node: strom-node-1
 destinations:
   - srt:
-      url: srt://studio:7002
       mode: caller
+      node: strom-node-2
   - srt:
-      url: srt://backup:7002
       mode: caller
+      node: strom-node-2
+      network: wan

@@ -137,6 +137,38 @@
       "createdAt": "2026-07-10T09:10:02.000Z",
       "updatedAt": "2026-07-10T09:10:02.000Z",
       "notes": []
+    },
+    {
+      "id": "t_20260710140000_ndref1",
+      "title": "External peers cannot discover controller-assigned ports for node-referenced endpoints",
+      "description": "Node-referenced addressing assigns the receiver's listen port (and consumer egress port = listen+1) deterministically from the node's declared range, so no manifest IP/port is needed for internal sender->receiver wiring. But external producers/consumers still need a concrete host:port and there is no surface exposing the assigned ports. The bench therefore keeps raw-url pins (srt://IP:PORT + node) so producer/consumer ports stay predictable; the clean node-ref path (examples/*.yaml) is exercised only by unit tests, not end to end. Expose assigned ports (controller /status per hop, or a resolved-endpoint API) so external peers can attach, or let a destination pin only the externally-facing egress port.",
+      "status": "open",
+      "priority": "medium",
+      "tags": [
+        "controller",
+        "addressing",
+        "bench"
+      ],
+      "source": "crates/controller/src/path.rs (port_in_range / resolve_delivery); bench keeps raw pins; node-ref output addressing work",
+      "createdAt": "2026-07-10T14:00:00.000Z",
+      "updatedAt": "2026-07-10T14:00:00.000Z",
+      "notes": []
+    },
+    {
+      "id": "t_20260710140100_alias4x",
+      "title": "Unknown data-plane alias is rejected at placement, not as a northbound 4xx at apply time",
+      "description": "The node-ref design called for an unknown alias to surface as a clear 4xx at apply time, but the northbound has no node registry (nodes live in the southbound), so it cannot validate aliases when a stream is submitted. Currently an unknown alias / missing default / absent port range surfaces at controller placement (derive_path -> PlacementError::UnknownAlias|NoPortRange) and the stream stays pending with a warn log, rather than being rejected on apply. To get apply-time rejection, give the northbound read access to registered node capabilities (e.g. query southbound /nodes) and validate node+alias before accepting.",
+      "status": "open",
+      "priority": "low",
+      "tags": [
+        "northbound",
+        "validation",
+        "addressing"
+      ],
+      "source": "crates/northbound/src/main.rs (no node registry); crates/controller/src/path.rs derive_path UnknownAlias; node-ref output addressing work",
+      "createdAt": "2026-07-10T14:01:00.000Z",
+      "updatedAt": "2026-07-10T14:01:00.000Z",
+      "notes": []
     }
   ]
 }

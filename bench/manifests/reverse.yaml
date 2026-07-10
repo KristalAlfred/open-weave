@@ -12,3 +12,4 @@ destinations:
       url: srt://172.26.0.10:7002
       mode: caller
       latency: 1000
+      node: strom-node-1

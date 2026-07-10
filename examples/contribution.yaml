@@ -1,5 +1,6 @@
 # Single contribution feed: SRT listener on :7001 relayed to the egress node.
-# Maps 1:1 to bench/flows/ingress.json when the controller actuates it.
+# The destination references its node; the controller resolves node-2's data-plane
+# address and assigns a port from the node's declared range.
 name: contribution
 enabled: true
 source:
@@ -10,6 +11,6 @@ source:
     node: strom-node-1
 destinations:
   - srt:
-      url: srt://172.27.0.10:7002
       mode: caller
       latency: 1000
+      node: strom-node-2

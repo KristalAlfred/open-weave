@@ -166,12 +166,17 @@ pub fn socket_condition(
 }
 
 /// Best-effort resolved address for a socket spec. A listener with no explicit
-/// host resolves to the wildcard; a connector with no host cannot be resolved.
+/// host resolves to the node's advertised data-plane host so peers connect to a
+/// concrete address, falling back to the wildcard when the node declares none; a
+/// connector with no host cannot be resolved.
 #[must_use]
-pub fn resolved_addr(spec: &SocketSpec) -> Option<ResolvedAddr> {
+pub fn resolved_addr(spec: &SocketSpec, data_plane_host: Option<&str>) -> Option<ResolvedAddr> {
     let port = spec.port?;
     let host = match spec.role {
-        SocketRole::Listen => spec.host.clone().unwrap_or_else(|| "0.0.0.0".to_string()),
+        SocketRole::Listen => spec
+            .host
+            .clone()
+            .unwrap_or_else(|| data_plane_host.unwrap_or("0.0.0.0").to_string()),
         SocketRole::Connect => spec.host.clone()?,
     };
     Some(ResolvedAddr { host, port })
@@ -440,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_addr_defaults_listener_host_to_wildcard() {
+    fn resolved_addr_uses_data_plane_host_for_listener_else_wildcard() {
         let listen = SocketSpec {
             transport: Transport::Srt,
             role: SocketRole::Listen,
@@ -449,7 +454,14 @@ mod tests {
             params: SrtParams::default(),
         };
         assert_eq!(
-            resolved_addr(&listen),
+            resolved_addr(&listen, Some("172.26.0.10")),
+            Some(ResolvedAddr {
+                host: "172.26.0.10".to_string(),
+                port: 7001
+            })
+        );
+        assert_eq!(
+            resolved_addr(&listen, None),
             Some(ResolvedAddr {
                 host: "0.0.0.0".to_string(),
                 port: 7001
@@ -463,6 +475,6 @@ mod tests {
             port: Some(7002),
             params: SrtParams::default(),
         };
-        assert_eq!(resolved_addr(&connect_no_host), None);
+        assert_eq!(resolved_addr(&connect_no_host, Some("172.26.0.10")), None);
     }
 }

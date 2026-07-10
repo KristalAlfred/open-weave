@@ -150,20 +150,22 @@ destinations:
         assert_eq!(
             stream.source,
             StreamTransport::Srt(SrtEndpoint {
-                url: "srt://0.0.0.0:7001".to_string(),
+                url: Some("srt://0.0.0.0:7001".to_string()),
                 mode: SrtMode::Listener,
                 latency: Some(200),
                 node: None,
+                network: None,
             })
         );
         assert_eq!(stream.destinations.len(), 2);
         assert_eq!(
             stream.destinations[1],
             StreamTransport::Srt(SrtEndpoint {
-                url: "srt://backup:7002".to_string(),
+                url: Some("srt://backup:7002".to_string()),
                 mode: SrtMode::Caller,
                 latency: None,
                 node: None,
+                network: None,
             })
         );
     }

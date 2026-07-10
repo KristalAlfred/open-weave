@@ -1,6 +1,11 @@
 //! Shared domain types for open-weave.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+
+/// Conventional data-plane alias resolved when a manifest pins no network.
+pub const DEFAULT_DATA_PLANE_ALIAS: &str = "default";
 
 /// Operator intent: one source streamed to one or more destinations over a transport.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -25,14 +30,20 @@ pub enum StreamTransport {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SrtEndpoint {
-    pub url: String,
+    /// Raw SRT URL pinning a concrete host+port. Absent for node-referenced
+    /// endpoints, which resolve their address from the placement node instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     pub mode: SrtMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency: Option<u32>,
-    /// Registered node id hosting this endpoint. Required for listener sources,
-    /// which have no host to place them by.
+    /// Registered node id hosting this endpoint. Primary placement key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+    /// Data-plane alias resolved against the node's declared address map.
+    /// Ignored when `url` pins a raw host; absent means [`DEFAULT_DATA_PLANE_ALIAS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,6 +296,31 @@ pub struct NodeCapabilities {
     pub adapters: Vec<AdapterDescriptor>,
     #[serde(default)]
     pub transports: Vec<TransportDescriptor>,
+    /// Data-plane addresses this node advertises, keyed by alias. The
+    /// [`DEFAULT_DATA_PLANE_ALIAS`] entry serves node-referenced endpoints
+    /// that pin no network.
+    #[serde(default)]
+    pub data_plane: BTreeMap<String, String>,
+    /// Inclusive port range the controller may assign from for this node's
+    /// hops. A soft contract: bind failures surface as [`HopState::Failed`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_range: Option<PortRange>,
+}
+
+/// Inclusive `[start, end]` range of ports a node offers for controller-side
+/// assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+impl PortRange {
+    /// Number of ports beyond `start` the range spans (saturating).
+    #[must_use]
+    pub fn span(self) -> u16 {
+        self.end.saturating_sub(self.start)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,19 +443,21 @@ mod tests {
         assert_eq!(
             stream.source,
             StreamTransport::Srt(SrtEndpoint {
-                url: "srt://0.0.0.0:7001".to_string(),
+                url: Some("srt://0.0.0.0:7001".to_string()),
                 mode: SrtMode::Listener,
                 latency: Some(200),
                 node: None,
+                network: None,
             })
         );
         assert_eq!(
             stream.destinations[0],
             StreamTransport::Srt(SrtEndpoint {
-                url: "srt://studio:7002".to_string(),
+                url: Some("srt://studio:7002".to_string()),
                 mode: SrtMode::Caller,
                 latency: None,
                 node: None,
+                network: None,
             })
         );
 

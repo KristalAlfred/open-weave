@@ -199,6 +199,8 @@ services:
       WEAVE_SOUTHBOUND_URL: http://172.25.0.21:8081
       WEAVE_STROM_URL: http://172.26.0.10:8080
       WEAVE_STROM_POLL_INTERVAL_SECS: "5"
+      WEAVE_DATA_PLANE: default=172.26.0.10
+      WEAVE_PORT_RANGE: 20000-20999
     networks:
       net_node1:
         ipv4_address: 172.26.0.11
@@ -269,6 +271,8 @@ services:
       WEAVE_SOUTHBOUND_URL: http://172.25.0.21:8081
       WEAVE_STROM_URL: http://172.27.0.10:8080
       WEAVE_STROM_POLL_INTERVAL_SECS: "5"
+      WEAVE_DATA_PLANE: default=172.27.0.10
+      WEAVE_PORT_RANGE: 20000-20999
     networks:
       net_node2:
         ipv4_address: 172.27.0.11

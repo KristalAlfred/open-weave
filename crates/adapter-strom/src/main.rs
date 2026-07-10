@@ -2,6 +2,7 @@
 
 mod provision;
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -12,9 +13,9 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 use weave_core::{
-    AdapterDescriptor, AdapterKind, DesiredHop, EndpointDescriptor, EndpointKind, HopStatus,
-    LinkCondition, LinkStats, NodeCapabilities, NodeDescriptor, NodeHeartbeat, NodeRegistration,
-    NodeStatus, TransportDescriptor,
+    AdapterDescriptor, AdapterKind, DEFAULT_DATA_PLANE_ALIAS, DesiredHop, EndpointDescriptor,
+    EndpointKind, HopStatus, LinkCondition, LinkStats, NodeCapabilities, NodeDescriptor,
+    NodeHeartbeat, NodeRegistration, NodeStatus, PortRange, TransportDescriptor,
 };
 use weave_strom::{
     FlowSpec, FlowStats, StromClient, StromError, StromFlow, flow_spec_from_hop, parse_flow_stats,
@@ -41,6 +42,14 @@ struct Args {
     listen: String,
     #[arg(long, env = "WEAVE_STROM_ADAPTER_PUBLIC_ENDPOINT")]
     public_endpoint: Option<String>,
+    /// Data-plane addresses advertised for placement, as `alias=host` pairs
+    /// (e.g. `default=10.0.0.5,wan=203.0.113.7`). The `default` alias is used
+    /// when a manifest pins no network.
+    #[arg(long, env = "WEAVE_DATA_PLANE")]
+    data_plane: Option<String>,
+    /// Inclusive port range the controller may assign from, as `start-end`.
+    #[arg(long, env = "WEAVE_PORT_RANGE")]
+    port_range: Option<String>,
     #[arg(
         long,
         env = "WEAVE_SOUTHBOUND_URL",
@@ -76,6 +85,8 @@ async fn main() -> Result<()> {
         .public_endpoint
         .clone()
         .unwrap_or_else(|| format!("http://{}", args.listen));
+    let data_plane = parse_data_plane(args.data_plane.as_deref());
+    let port_range = parse_port_range(args.port_range.as_deref());
     let client = Client::new();
     let strom = StromClient::new(&args.strom_url);
     let health_server = spawn_health_server(args.listen.clone());
@@ -85,6 +96,8 @@ async fn main() -> Result<()> {
         strom_url = %args.strom_url,
         southbound_url = %args.southbound_url,
         poll_interval_secs = args.poll_interval_secs,
+        data_plane = ?data_plane,
+        port_range = ?port_range,
         "Strom adapter starting"
     );
 
@@ -95,11 +108,36 @@ async fn main() -> Result<()> {
             health_server.abort();
             Ok(())
         }
-        result = sync_loop(&client, &strom, &args, &public_endpoint) => {
+        result = sync_loop(&client, &strom, &args, &public_endpoint, &data_plane, port_range) => {
             health_server.abort();
             result
         }
     }
+}
+
+/// Parse `alias=host` pairs into a data-plane map, dropping malformed entries.
+fn parse_data_plane(raw: Option<&str>) -> BTreeMap<String, String> {
+    raw.map(|value| {
+        value
+            .split(',')
+            .filter_map(|pair| {
+                let (alias, host) = pair.split_once('=')?;
+                let (alias, host) = (alias.trim(), host.trim());
+                (!alias.is_empty() && !host.is_empty())
+                    .then(|| (alias.to_string(), host.to_string()))
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Parse an inclusive `start-end` port range.
+fn parse_port_range(raw: Option<&str>) -> Option<PortRange> {
+    let (start, end) = raw?.split_once('-')?;
+    Some(PortRange {
+        start: start.trim().parse().ok()?,
+        end: end.trim().parse().ok()?,
+    })
 }
 
 fn spawn_health_server(addr: String) -> JoinHandle<Result<()>> {
@@ -121,6 +159,8 @@ async fn sync_loop(
     strom: &StromClient,
     args: &Args,
     public_endpoint: &str,
+    data_plane: &BTreeMap<String, String>,
+    port_range: Option<PortRange>,
 ) -> Result<()> {
     let mut registered = false;
     let mut tracker = StallTracker::default();
@@ -132,6 +172,8 @@ async fn sync_loop(
             strom,
             args,
             public_endpoint,
+            data_plane,
+            port_range,
             registered,
             &mut tracker,
         )
@@ -148,11 +190,14 @@ async fn sync_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sync_once(
     client: &Client,
     strom: &StromClient,
     args: &Args,
     public_endpoint: &str,
+    data_plane: &BTreeMap<String, String>,
+    port_range: Option<PortRange>,
     registered: bool,
     tracker: &mut StallTracker,
 ) -> Result<bool> {
@@ -164,6 +209,7 @@ async fn sync_once(
         }
     };
     let endpoints = strom_endpoints(&args.node_id, &flows);
+    let data_plane_host = data_plane.get(DEFAULT_DATA_PLANE_ALIAS).map(String::as_str);
 
     let hop_status = if status == NodeStatus::Ready {
         match provision(
@@ -172,6 +218,7 @@ async fn sync_once(
             &args.southbound_url,
             &args.node_id,
             &flows,
+            data_plane_host,
             tracker,
         )
         .await
@@ -189,6 +236,8 @@ async fn sync_once(
     let registration = registration(
         args,
         public_endpoint,
+        data_plane,
+        port_range,
         status,
         endpoints.clone(),
         hop_status.clone(),
@@ -251,10 +300,11 @@ async fn provision(
     southbound_url: &str,
     node_id: &str,
     flows: &[StromFlow],
+    data_plane_host: Option<&str>,
     tracker: &mut StallTracker,
 ) -> Result<Vec<HopStatus>> {
     let desired = fetch_desired(client, southbound_url, node_id).await?;
-    Ok(reconcile(strom, &desired, flows, tracker).await)
+    Ok(reconcile(strom, &desired, flows, data_plane_host, tracker).await)
 }
 
 /// Reconcile desired hops against observed flows in one poll cycle.
@@ -265,6 +315,7 @@ async fn reconcile(
     flow_api: &dyn FlowApi,
     desired: &[DesiredHop],
     flows: &[StromFlow],
+    data_plane_host: Option<&str>,
     tracker: &mut StallTracker,
 ) -> Vec<HopStatus> {
     let plan = diff_hops(desired, flows);
@@ -300,13 +351,22 @@ async fn reconcile(
     let desired_ids: std::collections::HashSet<&str> =
         desired.iter().map(|h| h.id.as_str()).collect();
     tracker.retain(&desired_ids);
-    hop_statuses(flow_api, desired, current, &failed, tracker).await
+    hop_statuses(
+        flow_api,
+        desired,
+        current,
+        data_plane_host,
+        &failed,
+        tracker,
+    )
+    .await
 }
 
 async fn hop_statuses(
     strom: &dyn FlowApi,
     desired: &[DesiredHop],
     flows: &[StromFlow],
+    data_plane_host: Option<&str>,
     failed: &std::collections::HashSet<String>,
     tracker: &mut StallTracker,
 ) -> Vec<HopStatus> {
@@ -355,8 +415,8 @@ async fn hop_statuses(
             egress: egress.map_or(LinkCondition::Idle, |e| {
                 socket_condition(e.role, egress_connected, egress_rate, false)
             }),
-            resolved_ingress: resolved_addr(&hop.ingress),
-            resolved_egress: egress.and_then(resolved_addr),
+            resolved_ingress: resolved_addr(&hop.ingress, data_plane_host),
+            resolved_egress: egress.and_then(|e| resolved_addr(e, data_plane_host)),
             stats: stats.map(LinkStats::from),
         });
     }
@@ -400,6 +460,8 @@ async fn fetch_desired(
 fn registration(
     args: &Args,
     public_endpoint: &str,
+    data_plane: &BTreeMap<String, String>,
+    port_range: Option<PortRange>,
     status: NodeStatus,
     endpoints: Vec<EndpointDescriptor>,
     hop_status: Vec<HopStatus>,
@@ -419,6 +481,8 @@ fn registration(
                     .iter()
                     .map(|name| TransportDescriptor { name: name.clone() })
                     .collect(),
+                data_plane: data_plane.clone(),
+                port_range,
             },
         },
         endpoints,
@@ -697,7 +761,7 @@ mod tests {
         ]);
 
         let mut tracker = StallTracker::default();
-        let _ = reconcile(&fake, &desired, &flows, &mut tracker).await;
+        let _ = reconcile(&fake, &desired, &flows, None, &mut tracker).await;
 
         let ops = fake.ops();
         let last_delete = ops
@@ -712,5 +776,27 @@ mod tests {
             last_delete < first_create,
             "all deletes must precede all creates within one cycle: {ops:?}"
         );
+    }
+
+    #[test]
+    fn parses_data_plane_pairs_and_skips_malformed() {
+        let map = parse_data_plane(Some("default=10.0.0.5, wan=203.0.113.7 ,bad,=x,y="));
+        assert_eq!(map.get("default").map(String::as_str), Some("10.0.0.5"));
+        assert_eq!(map.get("wan").map(String::as_str), Some("203.0.113.7"));
+        assert_eq!(map.len(), 2);
+        assert!(parse_data_plane(None).is_empty());
+    }
+
+    #[test]
+    fn parses_port_range() {
+        assert_eq!(
+            parse_port_range(Some("7000-7999")),
+            Some(PortRange {
+                start: 7000,
+                end: 7999
+            })
+        );
+        assert_eq!(parse_port_range(Some("nonsense")), None);
+        assert_eq!(parse_port_range(None), None);
     }
 }
