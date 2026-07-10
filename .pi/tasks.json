@@ -5,7 +5,7 @@
       "id": "t_20260702092654_473y5p",
       "title": "Implement Strom adapter command application",
       "description": "Translate open-weave desired definitions into Strom flow create/update/start/stop calls via weave-adapter-strom. README now documents this as future controller work; current adapter only observes /api/flows and reports endpoints.",
-      "status": "open",
+      "status": "done",
       "priority": "high",
       "tags": [
         "adapter",
@@ -14,14 +14,31 @@
       ],
       "source": "README.md; crates/adapter-strom/src/main.rs",
       "createdAt": "2026-07-02T09:26:54.168Z",
-      "updatedAt": "2026-07-02T09:26:54.168Z",
+      "updatedAt": "2026-07-09T12:50:00.000Z",
+      "notes": [
+        "Implemented via the desired-hop loop: adapter pulls GET /nodes/{id}/desired, diffs against Strom /api/flows by hop id, creates/starts/deletes weave-owned flows, reports HopStatus in heartbeats. Controller provisions only through PUT /nodes/{id}/desired and no longer links weave-strom. Spec-change re-provisioning is tracked separately."
+      ]
+    },
+    {
+      "id": "t_20260709125000_sp7h4x",
+      "title": "Edited streams are not re-provisioned (adopt-by-name has no spec-drift detection)",
+      "description": "The adapter diffs desired hops against Strom flows by hop id only; if a stream definition changes but its hop ids stay the same, the existing flows are adopted unchanged and the edit never reaches the node. Add a spec hash to the hop id or a desired_hash the adapter compares so spec changes trigger re-provisioning.",
+      "status": "open",
+      "priority": "medium",
+      "tags": [
+        "adapter",
+        "controller"
+      ],
+      "source": "crates/adapter-strom/src/provision.rs (diff_hops adopt-by-name); refactor plan follow-up",
+      "createdAt": "2026-07-09T12:50:00.000Z",
+      "updatedAt": "2026-07-09T12:50:00.000Z",
       "notes": []
     },
     {
       "id": "t_20260709122940_pvug8q",
       "title": "Fan-out streams only provision the first destination",
       "description": "Controller path derivation builds a hop chain for the first destination only; any additional destinations in a StreamDefinition are silently dropped. Observed on the bench fanout manifest: node-1 gets one sender hop, node-2 one receiver hop, and no hop is placed for the second destination. Expected: every entry in destinations[] is provisioned.",
-      "status": "open",
+      "status": "done",
       "priority": "high",
       "tags": [
         "bug",
@@ -30,14 +47,16 @@
       ],
       "source": "bench/manifests/fanout.yaml; controller path derivation (derive_path)",
       "createdAt": "2026-07-09T12:29:40.006Z",
-      "updatedAt": "2026-07-09T12:29:40.006Z",
-      "notes": []
+      "updatedAt": "2026-07-09T13:10:56.000Z",
+      "notes": [
+        "Fixed in 611e949 (+bench support 6f3b03a, README 16b9c29): DesiredHop.egresses is now a Vec; derive_path emits one tee-based sender hop with N egresses plus one receiver hop per destination (weave-{stream}-receiver-{i}), all-or-nothing placement. Verified on the real bench: fanout with producer + both consumers reached flowing on BOTH destinations (receiver-0 on node-2, receiver-1 co-located on node-1); detaching one consumer degraded the stream and reattaching restored flowing; basic regression still flowing with the unchanged linear flow shape. Sender per-branch stats gap tracked as t_20260709130500_tq4m2n."
+      ]
     },
     {
       "id": "t_20260709122941_6v8pqk",
       "title": "Bench producer/consumer are hardwired to the basic manifest addresses",
       "description": "The bench producer pushes to strom-1:7001 and the consumer pulls from strom-2:7003, matching only the basic scenario. As a result reverse (source listener on node-2) and same-node (receiver output on node-1) cannot be driven to flowing by the bundled verification endpoints. Make the verification endpoints parameterizable per scenario so every manifest can be exercised end to end.",
-      "status": "open",
+      "status": "done",
       "priority": "medium",
       "tags": [
         "bug",
@@ -45,14 +64,16 @@
       ],
       "source": "bench/docker-compose.yml; bench/manifests/README.md",
       "createdAt": "2026-07-09T12:29:41.006Z",
-      "updatedAt": "2026-07-09T12:29:41.006Z",
-      "notes": []
+      "updatedAt": "2026-07-09T12:49:31.000Z",
+      "notes": [
+        "Fixed in 388ae48: producer-up/consumer-up take an optional host:port (defaults = prior basic addresses) passed via PRODUCER_TARGET/CONSUMER_SOURCE compose env vars; route sidecars now install both node-subnet routes. Verified on the real bench: basic (defaults), reverse (producer 172.27.0.10:7001, consumer 172.26.0.10:7003), and same-node (consumer 172.26.0.10:7003) each reached flowing."
+      ]
     },
     {
       "id": "t_20260709122942_ius5ss",
       "title": "Re-applying a manifest on the same ports stays pending ~10-15s after removing the prior stream",
       "description": "Applying a manifest immediately after stream-rm on the same SRT ports leaves the new stream pending for ~10-15s while the prior flow's socket release lags the delete. Reconciliation should free the ports and converge promptly once the prior definition is deleted rather than requiring a wait between apply cycles.",
-      "status": "open",
+      "status": "done",
       "priority": "medium",
       "tags": [
         "bug",
@@ -61,7 +82,26 @@
       ],
       "source": "bench/manifests/README.md; controller/adapter reconcile loop",
       "createdAt": "2026-07-09T12:29:42.006Z",
-      "updatedAt": "2026-07-09T12:29:42.006Z",
+      "updatedAt": "2026-07-10T07:27:55.000Z",
+      "notes": [
+        "Fixed in 772a5a8: adapter reconcile now runs delete->create->start (was create-first, so the new flow's start raced the old flow still holding the listener port and burned a full poll cycle as a spurious failed status). Added FlowApi trait + recording-fake regression test asserting deletes precede creates. Bench before/after on rm->re-apply same ports: baseline awaiting_input at ~12.0/12.0/16.9s with a failed detour at ~7s; after fix ~7.6/7.0/7.0s with no failures. Remaining ~7s is the 5s controller tick + 5s adapter poll cadence floor, not a defect. Strom-side socket release measured sub-second (delete 07:25:23.007 -> provisioned 07:25:23.534 same cycle), so no external residual and no in-cycle retry needed."
+      ]
+    },
+    {
+      "id": "t_20260709130500_tq4m2n",
+      "title": "Sender hop reports only the first tee branch's egress stats for fan-out",
+      "description": "A fan-out sender flow is srtsrc->tee->N x srtsink, but FlowStats::egress() (crates/strom/src/stats.rs:35) returns only the first srtsink, so the sender HopStatus egress condition and LinkStats.egress_rate_mbps reflect branch 0 only; other branches' per-sink rate/connection are invisible and loss counters are summed across callers without per-branch attribution. Status rollup is unaffected because each receiver hop carries its destination's health (verified on the bench fanout manifest: detaching either consumer degrades the stream), so this is an observability gap, not a correctness bug. Expose per-branch/per-destination sender egress stats (e.g. a Vec keyed by srtsink index or destination).",
+      "status": "open",
+      "priority": "low",
+      "tags": [
+        "adapter",
+        "strom",
+        "fanout",
+        "observability"
+      ],
+      "source": "crates/strom/src/stats.rs (FlowStats::egress first-sink only); crates/adapter-strom/src/main.rs hop_statuses; follow-up from t_20260709122940_pvug8q fan-out fix",
+      "createdAt": "2026-07-09T13:05:00.000Z",
+      "updatedAt": "2026-07-09T13:05:00.000Z",
       "notes": []
     }
   ]
