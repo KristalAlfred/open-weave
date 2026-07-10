@@ -20,7 +20,9 @@ use weave_strom::{
     FlowSpec, FlowStats, StromClient, StromError, StromFlow, flow_spec_from_hop, parse_flow_stats,
 };
 
-use provision::{diff_hops, hop_state, resolved_addr, socket_condition};
+use provision::{
+    IngressObservation, StallTracker, diff_hops, hop_state, resolved_addr, socket_condition,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -121,10 +123,20 @@ async fn sync_loop(
     public_endpoint: &str,
 ) -> Result<()> {
     let mut registered = false;
+    let mut tracker = StallTracker::default();
     let interval = Duration::from_secs(args.poll_interval_secs);
 
     loop {
-        match sync_once(client, strom, args, public_endpoint, registered).await {
+        match sync_once(
+            client,
+            strom,
+            args,
+            public_endpoint,
+            registered,
+            &mut tracker,
+        )
+        .await
+        {
             Ok(next_registered) => registered = next_registered,
             Err(error) => {
                 registered = false;
@@ -142,6 +154,7 @@ async fn sync_once(
     args: &Args,
     public_endpoint: &str,
     registered: bool,
+    tracker: &mut StallTracker,
 ) -> Result<bool> {
     let (status, flows) = match strom.list_flows().await {
         Ok(flows) => (NodeStatus::Ready, flows),
@@ -153,7 +166,16 @@ async fn sync_once(
     let endpoints = strom_endpoints(&args.node_id, &flows);
 
     let hop_status = if status == NodeStatus::Ready {
-        match provision(client, strom, &args.southbound_url, &args.node_id, &flows).await {
+        match provision(
+            client,
+            strom,
+            &args.southbound_url,
+            &args.node_id,
+            &flows,
+            tracker,
+        )
+        .await
+        {
             Ok(hop_status) => hop_status,
             Err(error) => {
                 tracing::warn!(%error, "provisioning desired hops failed");
@@ -229,9 +251,10 @@ async fn provision(
     southbound_url: &str,
     node_id: &str,
     flows: &[StromFlow],
+    tracker: &mut StallTracker,
 ) -> Result<Vec<HopStatus>> {
     let desired = fetch_desired(client, southbound_url, node_id).await?;
-    Ok(reconcile(strom, &desired, flows).await)
+    Ok(reconcile(strom, &desired, flows, tracker).await)
 }
 
 /// Reconcile desired hops against observed flows in one poll cycle.
@@ -242,6 +265,7 @@ async fn reconcile(
     flow_api: &dyn FlowApi,
     desired: &[DesiredHop],
     flows: &[StromFlow],
+    tracker: &mut StallTracker,
 ) -> Vec<HopStatus> {
     let plan = diff_hops(desired, flows);
 
@@ -273,7 +297,10 @@ async fn reconcile(
         &refreshed
     };
 
-    hop_statuses(flow_api, desired, current, &failed).await
+    let desired_ids: std::collections::HashSet<&str> =
+        desired.iter().map(|h| h.id.as_str()).collect();
+    tracker.retain(&desired_ids);
+    hop_statuses(flow_api, desired, current, &failed, tracker).await
 }
 
 async fn hop_statuses(
@@ -281,6 +308,7 @@ async fn hop_statuses(
     desired: &[DesiredHop],
     flows: &[StromFlow],
     failed: &std::collections::HashSet<String>,
+    tracker: &mut StallTracker,
 ) -> Vec<HopStatus> {
     let mut statuses = Vec::with_capacity(desired.len());
     for hop in desired {
@@ -296,23 +324,36 @@ async fn hop_statuses(
             None => None,
         };
 
-        let (ingress_connected, ingress_rate) = stats
-            .as_ref()
-            .and_then(FlowStats::ingress)
-            .map_or((false, 0.0), |e| (e.connected, e.rate_mbps));
+        let ingress = stats.as_ref().and_then(FlowStats::ingress);
+        let (ingress_connected, ingress_rate) =
+            ingress.map_or((false, 0.0), |e| (e.connected, e.rate_mbps));
         let (egress_connected, egress_rate) = stats
             .as_ref()
             .and_then(FlowStats::egress)
             .map_or((false, 0.0), |e| (e.connected, e.rate_mbps));
+
+        let ingress_stalled = tracker.observe(
+            &hop.id,
+            IngressObservation {
+                bytes_received: ingress.map(|e| e.bytes_received),
+                running: flow.is_some_and(|f| f.running),
+                gst_paused: flow.and_then(|f| f.gst_state.as_deref()) == Some("Paused"),
+            },
+        );
 
         let egress = hop.egresses.first();
         statuses.push(HopStatus {
             id: hop.id.clone(),
             node_id: hop.node_id.clone(),
             state: hop_state(flow, failed.contains(&hop.id)),
-            ingress: socket_condition(hop.ingress.role, ingress_connected, ingress_rate),
+            ingress: socket_condition(
+                hop.ingress.role,
+                ingress_connected,
+                ingress_rate,
+                ingress_stalled,
+            ),
             egress: egress.map_or(LinkCondition::Idle, |e| {
-                socket_condition(e.role, egress_connected, egress_rate)
+                socket_condition(e.role, egress_connected, egress_rate, false)
             }),
             resolved_ingress: resolved_addr(&hop.ingress),
             resolved_egress: egress.and_then(resolved_addr),
@@ -655,7 +696,8 @@ mod tests {
             ),
         ]);
 
-        let _ = reconcile(&fake, &desired, &flows).await;
+        let mut tracker = StallTracker::default();
+        let _ = reconcile(&fake, &desired, &flows, &mut tracker).await;
 
         let ops = fake.ops();
         let last_delete = ops

@@ -1,11 +1,80 @@
 //! Pure diff between desired hops and Strom's actual flows.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use weave_core::{
     DesiredHop, HopState, LinkCondition, ResolvedAddr, SocketRole, SocketSpec, is_managed_hop_id,
 };
 use weave_strom::StromFlow;
+
+/// Consecutive polls without ingress byte progress before a running, ever-flowed
+/// hop is judged stalled. At the default 5s poll this is ~15s of frozen bytes.
+const STALL_POLLS: u32 = 3;
+
+/// Per-poll ingress observation fed to the [`StallTracker`].
+#[derive(Debug, Clone, Copy)]
+pub struct IngressObservation {
+    /// Cumulative ingress bytes, or `None` when stats are unavailable this cycle.
+    pub bytes_received: Option<i64>,
+    /// Whether the flow still claims to be running.
+    pub running: bool,
+    /// Whether the flow's GStreamer state is `Paused` (healthy-idle listener).
+    pub gst_paused: bool,
+}
+
+#[derive(Debug, Default)]
+struct HopProgress {
+    last_bytes: Option<i64>,
+    stale_polls: u32,
+    ever_flowed: bool,
+}
+
+/// In-memory byte-progress tracker keyed by hop id. Byte progress across polls is
+/// the only reliable signal that a connected ingress is truly flowing; no single
+/// instantaneous field separates a dead flow from a live one.
+#[derive(Debug, Default)]
+pub struct StallTracker {
+    hops: HashMap<String, HopProgress>,
+}
+
+impl StallTracker {
+    /// Fold one poll's ingress observation for `hop_id` and report whether the
+    /// ingress is stalled: it has flowed since we began watching, its bytes have
+    /// been frozen for at least [`STALL_POLLS`] polls, and the flow still runs and
+    /// is not a paused idle listener.
+    pub fn observe(&mut self, hop_id: &str, obs: IngressObservation) -> bool {
+        let progress = self.hops.entry(hop_id.to_string()).or_default();
+
+        if let Some(bytes) = obs.bytes_received {
+            match progress.last_bytes {
+                None => progress.last_bytes = Some(bytes),
+                Some(prev) if bytes > prev => {
+                    progress.ever_flowed = true;
+                    progress.stale_polls = 0;
+                    progress.last_bytes = Some(bytes);
+                }
+                Some(prev) if bytes == prev => {
+                    progress.stale_polls = progress.stale_polls.saturating_add(1);
+                }
+                Some(_) => {
+                    progress.ever_flowed = false;
+                    progress.stale_polls = 0;
+                    progress.last_bytes = Some(bytes);
+                }
+            }
+        }
+
+        progress.ever_flowed
+            && obs.running
+            && !obs.gst_paused
+            && progress.stale_polls >= STALL_POLLS
+    }
+
+    /// Drop tracked hops no longer desired so state cannot grow without bound.
+    pub fn retain(&mut self, desired: &HashSet<&str>) {
+        self.hops.retain(|id, _| desired.contains(id.as_str()));
+    }
+}
 
 #[derive(Debug, Default, PartialEq)]
 pub struct HopPlan {
@@ -75,11 +144,21 @@ pub fn hop_state(flow: Option<&StromFlow>, failed: bool) -> HopState {
 
 /// Map an observed socket to its link condition.
 ///
-/// A socket with no SRT connection is `Idle` when it listens (healthy waiting)
-/// and `Connecting` when it calls (retrying — ambiguous, not degraded). A live
-/// connection is `Flowing` when media moves and `Connected` when it is silent.
+/// A `stalled` verdict overrides all else: the socket carried media but its bytes
+/// froze while the flow claims to run. Otherwise a socket with no SRT connection is
+/// `Idle` when it listens (healthy waiting) and `Connecting` when it calls (retrying
+/// — ambiguous, not degraded). A live connection is `Flowing` when media moves and
+/// `Connected` when it is silent.
 #[must_use]
-pub fn socket_condition(role: SocketRole, connected: bool, rate_mbps: f64) -> LinkCondition {
+pub fn socket_condition(
+    role: SocketRole,
+    connected: bool,
+    rate_mbps: f64,
+    stalled: bool,
+) -> LinkCondition {
+    if stalled {
+        return LinkCondition::Stalled;
+    }
     match (connected, role) {
         (false, SocketRole::Listen) => LinkCondition::Idle,
         (false, SocketRole::Connect) => LinkCondition::Connecting,
@@ -205,11 +284,11 @@ mod tests {
     #[test]
     fn socket_condition_distinguishes_listener_and_caller_when_down() {
         assert_eq!(
-            socket_condition(SocketRole::Listen, false, 0.0),
+            socket_condition(SocketRole::Listen, false, 0.0, false),
             LinkCondition::Idle
         );
         assert_eq!(
-            socket_condition(SocketRole::Connect, false, 0.0),
+            socket_condition(SocketRole::Connect, false, 0.0, false),
             LinkCondition::Connecting
         );
     }
@@ -217,17 +296,132 @@ mod tests {
     #[test]
     fn socket_condition_flows_only_when_connected_with_rate() {
         assert_eq!(
-            socket_condition(SocketRole::Listen, true, 0.0),
+            socket_condition(SocketRole::Listen, true, 0.0, false),
             LinkCondition::Connected
         );
         assert_eq!(
-            socket_condition(SocketRole::Connect, true, 3.2),
+            socket_condition(SocketRole::Connect, true, 3.2, false),
             LinkCondition::Flowing
         );
         assert_eq!(
-            socket_condition(SocketRole::Listen, true, 3.2),
+            socket_condition(SocketRole::Listen, true, 3.2, false),
             LinkCondition::Flowing
         );
+    }
+
+    #[test]
+    fn socket_condition_stalled_overrides_connected_state() {
+        assert_eq!(
+            socket_condition(SocketRole::Listen, true, 0.0, true),
+            LinkCondition::Stalled
+        );
+    }
+
+    fn flowing(bytes: i64) -> IngressObservation {
+        IngressObservation {
+            bytes_received: Some(bytes),
+            running: true,
+            gst_paused: false,
+        }
+    }
+
+    #[test]
+    fn never_flowed_hop_never_stalls() {
+        let mut tracker = StallTracker::default();
+        for _ in 0..6 {
+            assert!(!tracker.observe("weave-a", flowing(0)));
+        }
+    }
+
+    #[test]
+    fn flowed_then_frozen_stalls_after_three_polls() {
+        let mut tracker = StallTracker::default();
+        assert!(!tracker.observe("weave-a", flowing(1000)));
+        assert!(!tracker.observe("weave-a", flowing(2000)));
+        assert!(!tracker.observe("weave-a", flowing(2000)), "1 frozen poll");
+        assert!(!tracker.observe("weave-a", flowing(2000)), "2 frozen polls");
+        assert!(tracker.observe("weave-a", flowing(2000)), "3 frozen polls");
+    }
+
+    #[test]
+    fn byte_progress_clears_a_stall() {
+        let mut tracker = StallTracker::default();
+        tracker.observe("weave-a", flowing(1000));
+        for _ in 0..3 {
+            tracker.observe("weave-a", flowing(2000));
+        }
+        assert!(tracker.observe("weave-a", flowing(2000)), "stalled");
+        assert!(
+            !tracker.observe("weave-a", flowing(3000)),
+            "recovers when bytes advance"
+        );
+    }
+
+    #[test]
+    fn paused_flow_is_never_stalled() {
+        let mut tracker = StallTracker::default();
+        tracker.observe("weave-a", flowing(1000));
+        tracker.observe("weave-a", flowing(2000));
+        for _ in 0..4 {
+            let obs = IngressObservation {
+                bytes_received: Some(2000),
+                running: true,
+                gst_paused: true,
+            };
+            assert!(!tracker.observe("weave-a", obs));
+        }
+    }
+
+    #[test]
+    fn stopped_flow_is_never_stalled() {
+        let mut tracker = StallTracker::default();
+        tracker.observe("weave-a", flowing(1000));
+        tracker.observe("weave-a", flowing(2000));
+        for _ in 0..4 {
+            let obs = IngressObservation {
+                bytes_received: Some(2000),
+                running: false,
+                gst_paused: false,
+            };
+            assert!(!tracker.observe("weave-a", obs));
+        }
+    }
+
+    #[test]
+    fn flow_recreated_with_reset_counter_starts_fresh() {
+        let mut tracker = StallTracker::default();
+        tracker.observe("weave-a", flowing(5000));
+        tracker.observe("weave-a", flowing(6000));
+        // Counter resets (new flow); a frozen low value must not read as stalled.
+        for _ in 0..4 {
+            assert!(!tracker.observe("weave-a", flowing(10)));
+        }
+    }
+
+    #[test]
+    fn missing_stats_do_not_advance_a_stall() {
+        let mut tracker = StallTracker::default();
+        tracker.observe("weave-a", flowing(1000));
+        tracker.observe("weave-a", flowing(2000));
+        let missing = IngressObservation {
+            bytes_received: None,
+            running: true,
+            gst_paused: false,
+        };
+        for _ in 0..5 {
+            assert!(!tracker.observe("weave-a", missing));
+        }
+    }
+
+    #[test]
+    fn retain_drops_undesired_hops() {
+        let mut tracker = StallTracker::default();
+        tracker.observe("weave-a", flowing(1000));
+        tracker.observe("weave-b", flowing(1000));
+        let desired: HashSet<&str> = ["weave-a"].into_iter().collect();
+        tracker.retain(&desired);
+        assert!(tracker.hops.contains_key("weave-a"));
+        assert!(!tracker.hops.contains_key("weave-b"));
     }
 
     #[test]
