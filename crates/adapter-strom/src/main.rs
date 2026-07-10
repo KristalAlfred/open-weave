@@ -16,7 +16,9 @@ use weave_core::{
     LinkCondition, LinkStats, NodeCapabilities, NodeDescriptor, NodeHeartbeat, NodeRegistration,
     NodeStatus, TransportDescriptor,
 };
-use weave_strom::{FlowStats, StromClient, StromFlow, flow_spec_from_hop, parse_flow_stats};
+use weave_strom::{
+    FlowSpec, FlowStats, StromClient, StromError, StromFlow, flow_spec_from_hop, parse_flow_stats,
+};
 
 use provision::{diff_hops, hop_state, resolved_addr, socket_condition};
 
@@ -189,6 +191,36 @@ async fn sync_once(
     Ok(true)
 }
 
+/// Minimal Strom flow operations the reconciler needs, behind a trait so
+/// provisioning order stays testable with a recording fake.
+#[async_trait::async_trait]
+trait FlowApi {
+    async fn list_flows(&self) -> Result<Vec<StromFlow>, StromError>;
+    async fn create_flow(&self, spec: &FlowSpec) -> Result<String, StromError>;
+    async fn start_flow(&self, id: &str) -> Result<(), StromError>;
+    async fn delete_flow(&self, id: &str) -> Result<(), StromError>;
+    async fn srt_stats(&self, id: &str) -> Result<Value, StromError>;
+}
+
+#[async_trait::async_trait]
+impl FlowApi for StromClient {
+    async fn list_flows(&self) -> Result<Vec<StromFlow>, StromError> {
+        StromClient::list_flows(self).await
+    }
+    async fn create_flow(&self, spec: &FlowSpec) -> Result<String, StromError> {
+        StromClient::create_flow(self, spec).await
+    }
+    async fn start_flow(&self, id: &str) -> Result<(), StromError> {
+        StromClient::start_flow(self, id).await
+    }
+    async fn delete_flow(&self, id: &str) -> Result<(), StromError> {
+        StromClient::delete_flow(self, id).await
+    }
+    async fn srt_stats(&self, id: &str) -> Result<Value, StromError> {
+        StromClient::srt_stats(self, id).await
+    }
+}
+
 /// Pull desired hops for this node, reconcile them into Strom flows, and report
 /// each hop's realised status. Inert when no desired hops are set.
 async fn provision(
@@ -199,24 +231,37 @@ async fn provision(
     flows: &[StromFlow],
 ) -> Result<Vec<HopStatus>> {
     let desired = fetch_desired(client, southbound_url, node_id).await?;
-    let plan = diff_hops(&desired, flows);
+    Ok(reconcile(strom, &desired, flows).await)
+}
+
+/// Reconcile desired hops against observed flows in one poll cycle.
+///
+/// Deletes run before creates so a flow being torn down frees its SRT listener
+/// port before a re-applied stream on the same port is created and started.
+async fn reconcile(
+    flow_api: &dyn FlowApi,
+    desired: &[DesiredHop],
+    flows: &[StromFlow],
+) -> Vec<HopStatus> {
+    let plan = diff_hops(desired, flows);
+
+    for flow_id in &plan.delete {
+        match flow_api.delete_flow(flow_id).await {
+            Ok(()) => tracing::info!(flow_id = %flow_id, "deleted undesired managed flow"),
+            Err(error) => tracing::warn!(flow_id = %flow_id, %error, "deleting flow failed"),
+        }
+    }
 
     let mut failed = std::collections::HashSet::new();
     for hop in &plan.create {
-        if let Err(error) = provision_hop(strom, hop).await {
+        if let Err(error) = provision_hop(flow_api, hop).await {
             tracing::warn!(hop = %hop.id, %error, "provisioning hop failed");
             failed.insert(hop.id.clone());
         }
     }
     for flow_id in &plan.start {
-        if let Err(error) = strom.start_flow(flow_id).await {
+        if let Err(error) = flow_api.start_flow(flow_id).await {
             tracing::warn!(flow_id = %flow_id, %error, "starting adopted flow failed");
-        }
-    }
-    for flow_id in &plan.delete {
-        match strom.delete_flow(flow_id).await {
-            Ok(()) => tracing::info!(flow_id = %flow_id, "deleted undesired managed flow"),
-            Err(error) => tracing::warn!(flow_id = %flow_id, %error, "deleting flow failed"),
         }
     }
 
@@ -224,15 +269,15 @@ async fn provision(
     let current: &[StromFlow] = if plan.is_empty() {
         flows
     } else {
-        refreshed = strom.list_flows().await.unwrap_or_default();
+        refreshed = flow_api.list_flows().await.unwrap_or_default();
         &refreshed
     };
 
-    Ok(hop_statuses(strom, &desired, current, &failed).await)
+    hop_statuses(flow_api, desired, current, &failed).await
 }
 
 async fn hop_statuses(
-    strom: &StromClient,
+    strom: &dyn FlowApi,
     desired: &[DesiredHop],
     flows: &[StromFlow],
     failed: &std::collections::HashSet<String>,
@@ -277,7 +322,7 @@ async fn hop_statuses(
     statuses
 }
 
-async fn provision_hop(strom: &StromClient, hop: &DesiredHop) -> Result<()> {
+async fn provision_hop(strom: &dyn FlowApi, hop: &DesiredHop) -> Result<()> {
     let spec = flow_spec_from_hop(hop).with_context(|| format!("mapping hop {}", hop.id))?;
     let id = strom
         .create_flow(&spec)
@@ -492,4 +537,138 @@ fn join_url(base: &str, path: &str) -> String {
 
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use weave_core::{HopRole, SocketRole, SocketSpec, SrtParams, Transport};
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum Op {
+        Delete(String),
+        Create(String),
+        Start(String),
+        List,
+        Stats(String),
+    }
+
+    struct RecordingFlowApi {
+        ops: Mutex<Vec<Op>>,
+        flows_after: Vec<(String, String)>,
+    }
+
+    impl RecordingFlowApi {
+        fn new(flows_after: Vec<(&str, &str)>) -> Self {
+            Self {
+                ops: Mutex::new(Vec::new()),
+                flows_after: flows_after
+                    .into_iter()
+                    .map(|(name, id)| (name.to_string(), id.to_string()))
+                    .collect(),
+            }
+        }
+
+        fn ops(&self) -> Vec<Op> {
+            self.ops.lock().expect("ops lock").clone()
+        }
+
+        fn record(&self, op: Op) {
+            self.ops.lock().expect("ops lock").push(op);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FlowApi for RecordingFlowApi {
+        async fn list_flows(&self) -> Result<Vec<StromFlow>, StromError> {
+            self.record(Op::List);
+            Ok(self
+                .flows_after
+                .iter()
+                .map(|(name, id)| flow(name, id, true))
+                .collect())
+        }
+        async fn create_flow(&self, spec: &FlowSpec) -> Result<String, StromError> {
+            self.record(Op::Create(spec.name.clone()));
+            Ok(format!("id-{}", spec.name))
+        }
+        async fn start_flow(&self, id: &str) -> Result<(), StromError> {
+            self.record(Op::Start(id.to_string()));
+            Ok(())
+        }
+        async fn delete_flow(&self, id: &str) -> Result<(), StromError> {
+            self.record(Op::Delete(id.to_string()));
+            Ok(())
+        }
+        async fn srt_stats(&self, id: &str) -> Result<Value, StromError> {
+            self.record(Op::Stats(id.to_string()));
+            Ok(json!({}))
+        }
+    }
+
+    fn hop(id: &str, port: u16) -> DesiredHop {
+        DesiredHop {
+            id: id.to_string(),
+            node_id: "strom-node-1".to_string(),
+            role: HopRole::Sender,
+            ingress: SocketSpec {
+                transport: Transport::Srt,
+                role: SocketRole::Listen,
+                host: None,
+                port: Some(port),
+                params: SrtParams::default(),
+            },
+            egresses: vec![SocketSpec {
+                transport: Transport::Srt,
+                role: SocketRole::Connect,
+                host: Some("10.0.0.2".to_string()),
+                port: Some(port + 1),
+                params: SrtParams::default(),
+            }],
+        }
+    }
+
+    fn flow(name: &str, id: &str, running: bool) -> StromFlow {
+        serde_json::from_value(json!({ "id": id, "name": name, "running": running }))
+            .expect("flow fixture")
+    }
+
+    #[tokio::test]
+    async fn reconcile_deletes_before_creating_on_same_ports() {
+        // Old flows on ports 7001/7002; a differently-named stream re-applied on
+        // the same ports. Every delete must precede every create so the listener
+        // ports are freed before the new flows are created and started.
+        let desired = vec![
+            hop("weave-srt-latency-sender", 7001),
+            hop("weave-srt-latency-receiver-0", 7002),
+        ];
+        let flows = vec![
+            flow("weave-basic-sender", "id-basic-sender", true),
+            flow("weave-basic-receiver-0", "id-basic-receiver-0", true),
+        ];
+        let fake = RecordingFlowApi::new(vec![
+            ("weave-srt-latency-sender", "id-weave-srt-latency-sender"),
+            (
+                "weave-srt-latency-receiver-0",
+                "id-weave-srt-latency-receiver-0",
+            ),
+        ]);
+
+        let _ = reconcile(&fake, &desired, &flows).await;
+
+        let ops = fake.ops();
+        let last_delete = ops
+            .iter()
+            .rposition(|op| matches!(op, Op::Delete(_)))
+            .expect("a delete was recorded");
+        let first_create = ops
+            .iter()
+            .position(|op| matches!(op, Op::Create(_)))
+            .expect("a create was recorded");
+        assert!(
+            last_delete < first_create,
+            "all deletes must precede all creates within one cycle: {ops:?}"
+        );
+    }
 }
