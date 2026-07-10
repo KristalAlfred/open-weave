@@ -108,7 +108,7 @@
       "id": "t_20260710081500_kls3nr",
       "title": "Adapter cannot detect EOS-dead Strom flows (Strom reports running:true/Playing after EOS)",
       "description": "Observed live during the srtsrc keep-listening incident: a flow whose srtsrc hit an SRT socket error EOSed and stopped serving, but Strom /api/flows kept reporting running:true and gst_state Playing, so HopStatus showed the hop healthy while the listener port was dead. keep-listening:true (95d2dce) removes the common idle-death trigger, but any future EOS would still be invisible to weave. Strom state reporting is external; on our side the adapter could infer death from srt-stats staleness or socket probes.",
-      "status": "open",
+      "status": "done",
       "priority": "low",
       "tags": [
         "adapter",
@@ -117,7 +117,25 @@
       ],
       "source": "strom-1 logs 2026-07-10 07:36 (Error on SRT socket srtsrc_0 -> reached end of stream, flow still running:true/Playing); follow-up from keep-listening fix 95d2dce",
       "createdAt": "2026-07-10T07:59:56.000Z",
-      "updatedAt": "2026-07-10T07:59:56.000Z",
+      "updatedAt": "2026-07-10T09:10:02.000Z",
+      "notes": [
+        "Fixed report-only in b348e03/ac5521f/adf13b1/661b35d: adapter tracks per-hop bytes_received progress across polls (ever_flowed gate, gst_state=Paused filtered, 3-poll threshold); frozen progress emits LinkCondition::Stalled and roll_up_path maps stalled hops to degraded. Verified on the bench via fault injection (weave-basic-sender recreated with keep-listening=false through the adopt-by-name path, killed by producer disconnect): ingress stalled at t+16s, stream degraded at t+20s; fresh never-fed stream stayed awaiting_input 40s without false positive; healthy disconnect/reconnect recovered to flowing in ~8s. Gotcha baked into tests: SRT settles bytes_received DOWNWARD at caller disconnect, so decreases count as no-progress, not flow reset. Remediation deliberately excluded: polling cannot distinguish dead from intentionally quiet, tracked as t_20260710093000_rmed8q."
+      ]
+    },
+    {
+      "id": "t_20260710093000_rmed8q",
+      "title": "Consider auto-remediating stalled weave flows (delete+recreate)",
+      "description": "Stall detection (t_20260710081500_kls3nr) is report-only by design: polled surfaces cannot distinguish an EOS-dead flow from an intentionally quiet one, and keep-listening=true flows recover on their own when the caller returns, so blind restart risks thrashing healthy quiet listeners. If remediation is wanted, gate delete+recreate on a much longer confirmation window plus cooldown, or find a positive death signal (e.g. SRT handshake probe against the listener port).",
+      "status": "open",
+      "priority": "low",
+      "tags": [
+        "adapter",
+        "strom",
+        "reliability"
+      ],
+      "source": "deferred from t_20260710081500_kls3nr stall-detection design (live-bench research 2026-07-10)",
+      "createdAt": "2026-07-10T09:10:02.000Z",
+      "updatedAt": "2026-07-10T09:10:02.000Z",
       "notes": []
     }
   ]
