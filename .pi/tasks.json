@@ -103,6 +103,22 @@
       "createdAt": "2026-07-09T13:05:00.000Z",
       "updatedAt": "2026-07-09T13:05:00.000Z",
       "notes": []
+    },
+    {
+      "id": "t_20260710081500_kls3nr",
+      "title": "Adapter cannot detect EOS-dead Strom flows (Strom reports running:true/Playing after EOS)",
+      "description": "Observed live during the srtsrc keep-listening incident: a flow whose srtsrc hit an SRT socket error EOSed and stopped serving, but Strom /api/flows kept reporting running:true and gst_state Playing, so HopStatus showed the hop healthy while the listener port was dead. keep-listening:true (95d2dce) removes the common idle-death trigger, but any future EOS would still be invisible to weave. Strom state reporting is external; on our side the adapter could infer death from srt-stats staleness or socket probes.",
+      "status": "open",
+      "priority": "low",
+      "tags": [
+        "adapter",
+        "strom",
+        "observability"
+      ],
+      "source": "strom-1 logs 2026-07-10 07:36 (Error on SRT socket srtsrc_0 -> reached end of stream, flow still running:true/Playing); follow-up from keep-listening fix 95d2dce",
+      "createdAt": "2026-07-10T07:59:56.000Z",
+      "updatedAt": "2026-07-10T07:59:56.000Z",
+      "notes": []
     }
   ]
 }
