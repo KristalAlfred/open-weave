@@ -2,7 +2,7 @@
   "id": "00000000-0000-0000-0000-000000000000",
   "name": "bench-tee",
   "elements": [
-    {"id":"srtsrc_0","element_type":"srtsrc","properties":{"uri":"srt://:7001?mode=listener","latency":200},"position":[100.0,200.0]},
+    {"id":"srtsrc_0","element_type":"srtsrc","properties":{"uri":"srt://:7001?mode=listener","latency":200,"keep-listening":true},"position":[100.0,200.0]},
     {"id":"tee_0","element_type":"tee","properties":{},"position":[300.0,200.0]},
     {"id":"queue_0","element_type":"queue","properties":{},"position":[500.0,200.0]},
     {"id":"srtsink_0","element_type":"srtsink","properties":{"uri":"srt://172.31.0.10:7002?mode=caller","latency":1000,"wait-for-connection":false},"position":[700.0,200.0]},

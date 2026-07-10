@@ -44,12 +44,7 @@ pub enum MappingError {
 /// yield a fan-out srtsrc→tee→N×(queue→srtsink). The flow name is the hop id, so
 /// flows are adopted by name.
 pub fn flow_spec_from_hop(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
-    let mut src_props = Map::new();
-    src_props.insert("uri".to_string(), Value::String(socket_uri(&hop.ingress)?));
-    src_props.insert(
-        "latency".to_string(),
-        Value::from(hop.ingress.params.latency.unwrap_or(DEFAULT_SRC_LATENCY)),
-    );
+    let src_props = src_props(&hop.ingress)?;
 
     let sinks = hop
         .egresses
@@ -66,6 +61,21 @@ pub fn flow_spec_from_hop(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
         )),
         _ => Ok(tee_srt_flow(hop.id.clone(), src_props, sinks)),
     }
+}
+
+fn src_props(spec: &SocketSpec) -> Result<Map<String, Value>, MappingError> {
+    let mut props = Map::new();
+    props.insert("uri".to_string(), Value::String(socket_uri(spec)?));
+    props.insert(
+        "latency".to_string(),
+        Value::from(spec.params.latency.unwrap_or(DEFAULT_SRC_LATENCY)),
+    );
+    // A listener srtsrc otherwise EOSes and never re-binds once its peer
+    // disconnects or an idle socket errors; keep-listening reuses the socket.
+    if matches!(spec.role, SocketRole::Listen) {
+        props.insert("keep-listening".to_string(), Value::Bool(true));
+    }
+    Ok(props)
 }
 
 fn sink_props(spec: &SocketSpec) -> Result<Map<String, Value>, MappingError> {
@@ -317,6 +327,21 @@ mod tests {
             flow_spec_from_hop(&hop),
             Err(MappingError::IncompleteSocket("port"))
         ));
+    }
+
+    #[test]
+    fn listener_ingress_keeps_listening_but_caller_ingress_does_not() {
+        let listen = flow_spec_from_hop(&demo_ingress_hop("x")).expect("map");
+        assert_eq!(
+            listen.elements[0].properties["keep-listening"],
+            Value::Bool(true)
+        );
+
+        let mut caller = demo_ingress_hop("x");
+        caller.ingress.role = SocketRole::Connect;
+        caller.ingress.host = Some("172.31.0.99".to_string());
+        let caller = flow_spec_from_hop(&caller).expect("map");
+        assert!(!caller.elements[0].properties.contains_key("keep-listening"));
     }
 
     #[test]

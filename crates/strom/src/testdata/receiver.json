@@ -2,7 +2,7 @@
   "id": "00000000-0000-0000-0000-000000000000",
   "name": "bench-recv",
   "elements": [
-    {"id":"srtsrc_0","element_type":"srtsrc","properties":{"uri":"srt://:7002?mode=listener","latency":1000},"position":[100.0,200.0]},
+    {"id":"srtsrc_0","element_type":"srtsrc","properties":{"uri":"srt://:7002?mode=listener","latency":1000,"keep-listening":true},"position":[100.0,200.0]},
     {"id":"queue_0","element_type":"queue","properties":{},"position":[300.0,200.0]},
     {"id":"srtsink_0","element_type":"srtsink","properties":{"uri":"srt://:7003?mode=listener","latency":200,"wait-for-connection":false},"position":[500.0,200.0]}
   ],
