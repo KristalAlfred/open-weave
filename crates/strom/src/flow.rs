@@ -17,6 +17,10 @@ pub struct StromFlow {
     pub name: String,
     #[serde(default)]
     pub running: bool,
+    /// GStreamer pipeline state (e.g. `Playing`, `Paused`). `Paused` marks a
+    /// listener idling before any caller, which must not count as a stall.
+    #[serde(default)]
+    pub gst_state: Option<String>,
     #[serde(default)]
     pub elements: Vec<StromElement>,
     #[serde(default)]

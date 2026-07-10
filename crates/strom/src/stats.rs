@@ -12,6 +12,9 @@ pub struct ElementStats {
     pub id: String,
     pub connected: bool,
     pub rate_mbps: f64,
+    /// Cumulative bytes received across this element's callers. Byte progress over
+    /// time is the only reliable signal that a connected socket is truly flowing.
+    pub bytes_received: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -82,6 +85,7 @@ pub fn parse_flow_stats(value: &Value) -> FlowStats {
         };
 
         let mut rate_mbps = 0.0;
+        let mut bytes_received = 0;
         if let Some(callers) = connection.get("callers").and_then(Value::as_array) {
             for caller in callers {
                 stats.packets_sent_lost += field_i64(caller, "packets_sent_lost");
@@ -90,6 +94,7 @@ pub fn parse_flow_stats(value: &Value) -> FlowStats {
                 stats.packets_received_retransmitted +=
                     field_i64(caller, "packets_received_retransmitted");
                 rate_mbps += rate_field(caller, rate_keys);
+                bytes_received += field_i64(caller, "bytes_received");
             }
         }
 
@@ -97,6 +102,7 @@ pub fn parse_flow_stats(value: &Value) -> FlowStats {
             id: id.clone(),
             connected,
             rate_mbps,
+            bytes_received,
         });
     }
 
@@ -141,6 +147,23 @@ mod tests {
         assert_eq!(stats.packets_retransmitted, 42);
         assert_eq!(stats.packets_received_lost, 5);
         assert_eq!(stats.packets_received_retransmitted, 5);
+    }
+
+    #[test]
+    fn sums_bytes_received_per_element_from_callers() {
+        let value = serde_json::json!({
+            "stats": { "connections": {
+                "srtsrc_0": { "connected": true, "callers": [
+                    { "recv_rate_mbps": 2.8, "bytes_received": 721_519_840_i64 }
+                ]},
+                "srtsink_0": { "connected": true, "callers": [
+                    { "send_rate_mbps": 2.6, "bytes_received": 0 }
+                ]}
+            }}
+        });
+        let stats = parse_flow_stats(&value);
+        assert_eq!(stats.ingress().map(|e| e.bytes_received), Some(721_519_840));
+        assert_eq!(stats.egress().map(|e| e.bytes_received), Some(0));
     }
 
     #[test]
