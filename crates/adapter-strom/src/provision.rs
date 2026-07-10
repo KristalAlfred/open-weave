@@ -47,21 +47,19 @@ impl StallTracker {
 
         if let Some(bytes) = obs.bytes_received {
             match progress.last_bytes {
-                None => progress.last_bytes = Some(bytes),
+                // First sighting only establishes a baseline: a counter that is
+                // already frozen (e.g. after an adapter restart) reads never-flowed
+                // until we witness it advance.
+                None => {}
                 Some(prev) if bytes > prev => {
                     progress.ever_flowed = true;
                     progress.stale_polls = 0;
-                    progress.last_bytes = Some(bytes);
                 }
-                Some(prev) if bytes == prev => {
-                    progress.stale_polls = progress.stale_polls.saturating_add(1);
-                }
-                Some(_) => {
-                    progress.ever_flowed = false;
-                    progress.stale_polls = 0;
-                    progress.last_bytes = Some(bytes);
-                }
+                // Equal (frozen) or lower (SRT settles the counter down at caller
+                // disconnect, or the flow was recreated) is not forward progress.
+                Some(_) => progress.stale_polls = progress.stale_polls.saturating_add(1),
             }
+            progress.last_bytes = Some(bytes);
         }
 
         progress.ever_flowed
@@ -388,13 +386,30 @@ mod tests {
     }
 
     #[test]
-    fn flow_recreated_with_reset_counter_starts_fresh() {
+    fn counter_settling_lower_then_freezing_still_stalls() {
+        // SRT settles bytes_received down at caller disconnect before freezing; a
+        // hop that has flowed must still be judged stalled, not treated as fresh.
         let mut tracker = StallTracker::default();
-        tracker.observe("weave-a", flowing(5000));
-        tracker.observe("weave-a", flowing(6000));
-        // Counter resets (new flow); a frozen low value must not read as stalled.
-        for _ in 0..4 {
-            assert!(!tracker.observe("weave-a", flowing(10)));
+        tracker.observe("weave-a", flowing(71_416_276));
+        tracker.observe("weave-a", flowing(72_000_000));
+        assert!(
+            !tracker.observe("weave-a", flowing(68_958_964)),
+            "settle-down poll"
+        );
+        assert!(!tracker.observe("weave-a", flowing(68_958_964)));
+        assert!(
+            tracker.observe("weave-a", flowing(68_958_964)),
+            "frozen after settle -> stalled"
+        );
+    }
+
+    #[test]
+    fn frozen_from_first_observation_reads_never_flowed() {
+        // After an adapter restart the tracker adopts an already-dead flow; with no
+        // observed advance it must look never-flowed rather than stall.
+        let mut tracker = StallTracker::default();
+        for _ in 0..6 {
+            assert!(!tracker.observe("weave-a", flowing(9_299_932)));
         }
     }
 
