@@ -70,28 +70,37 @@ stream-rm name:
     @curl -sf -X DELETE {{nb}}/streams/{{name}} && echo "deleted {{name}}" || echo "not found: {{name}}"
 
 # Start the external ffmpeg producer (SRT caller into a source ingress).
-# Pass the source listener as host:port; defaults to the basic scenario.
-# Verification endpoint only — not part of the system under test.
-producer-up target="172.26.0.10:7001":
-    PRODUCER_TARGET={{target}} {{compose}} --profile producer up -d producer route-producer
+# Pass a stream name; the ingress address is resolved via the controller's
+# discovery API. Verification endpoint only — not part of the system under test.
+producer-up stream="basic":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="$(bash {{scripts}}/endpoints.sh {{stream}} ingress)"
+    PRODUCER_TARGET="$target" {{compose}} --profile producer up -d producer route-producer
 
 # Stop and remove the external producer.
 producer-down:
     {{compose}} --profile producer rm -sf producer route-producer
 
 # Start the external ffmpeg consumer (SRT caller pulling a receiver output).
-# Pass the receiver output as host:port; defaults to the basic scenario.
-consumer-up source="172.27.0.10:7003":
-    CONSUMER_SOURCE={{source}} {{compose}} --profile consumer up -d consumer route-consumer
+# Pass a stream name; the first output address is resolved via discovery.
+consumer-up stream="basic":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source="$(bash {{scripts}}/endpoints.sh {{stream}} output 0)"
+    CONSUMER_SOURCE="$source" {{compose}} --profile consumer up -d consumer route-consumer
 
 # Stop and remove the external consumer.
 consumer-down:
     {{compose}} --profile consumer rm -sf consumer route-consumer
 
 # Start a second external consumer (for fan-out: one consumer per receiver output).
-# Pass the receiver output as host:port; defaults to the fanout second destination.
-consumer-2-up source="172.26.0.10:7003":
-    CONSUMER_SOURCE_2={{source}} {{compose}} --profile consumer up -d consumer-2 route-consumer-2
+# Pass a stream name; the second output address is resolved via discovery.
+consumer-2-up stream="fanout":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source="$(bash {{scripts}}/endpoints.sh {{stream}} output 1)"
+    CONSUMER_SOURCE_2="$source" {{compose}} --profile consumer up -d consumer-2 route-consumer-2
 
 # Stop and remove the second external consumer.
 consumer-2-down:

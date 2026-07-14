@@ -6,15 +6,11 @@ name: cam1-to-studio
 enabled: true
 source:
   srt:
-    url: srt://0.0.0.0:7001
-    mode: listener
-    latency: 200
     node: strom-node-1
+    latency: 200
 destinations:
   - srt:
-      mode: caller
       node: strom-node-2
   - srt:
-      mode: caller
       node: strom-node-2
       network: wan

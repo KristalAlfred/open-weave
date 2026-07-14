@@ -75,16 +75,16 @@ async fn submit_stream(
         );
     }
     let StreamTransport::Srt(source) = &stream.source;
-    if source.node.is_none() {
-        return error(StatusCode::BAD_REQUEST, "source node is required");
+    if source.node.trim().is_empty() {
+        return error(StatusCode::BAD_REQUEST, "source node must not be empty");
     }
     if stream.destinations.iter().any(|dest| {
         let StreamTransport::Srt(dest) = dest;
-        dest.node.is_none()
+        dest.node.trim().is_empty()
     }) {
         return error(
             StatusCode::BAD_REQUEST,
-            "each destination must reference a node",
+            "each destination node must not be empty",
         );
     }
 
@@ -119,25 +119,21 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
-    use weave_core::{SrtEndpoint, SrtMode};
+    use weave_core::SrtEndpoint;
 
     fn sample_stream() -> StreamDefinition {
         StreamDefinition {
             name: "cam1-to-studio".to_string(),
             enabled: true,
             source: StreamTransport::Srt(SrtEndpoint {
-                url: Some("srt://0.0.0.0:7001".to_string()),
-                mode: SrtMode::Listener,
-                latency: Some(200),
-                node: Some("strom-node-1".to_string()),
+                node: "strom-node-1".to_string(),
                 network: None,
+                latency: Some(200),
             }),
             destinations: vec![StreamTransport::Srt(SrtEndpoint {
-                url: Some("srt://studio:7002".to_string()),
-                mode: SrtMode::Caller,
-                latency: None,
-                node: Some("strom-node-2".to_string()),
+                node: "strom-node-2".to_string(),
                 network: None,
+                latency: None,
             })],
         }
     }
@@ -278,13 +274,17 @@ mod tests {
     }
 
     async fn post_stream(stream: &StreamDefinition) -> Response {
+        post_raw(serde_json::to_value(stream).unwrap()).await
+    }
+
+    async fn post_raw(body: Value) -> Response {
         router(AppState::default())
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/streams")
                     .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(stream).unwrap()))
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
                     .unwrap(),
             )
             .await
@@ -292,38 +292,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listener_source_without_node_is_rejected() {
-        let mut stream = sample_stream();
-        let StreamTransport::Srt(source) = &mut stream.source;
-        source.node = None;
-
-        let response = post_stream(&stream).await;
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            body_json(response).await["error"]
-                .as_str()
-                .unwrap()
-                .contains("source node is required")
-        );
+    async fn source_without_node_field_is_rejected_by_serde() {
+        let response = post_raw(json!({
+            "name": "cam1-to-studio",
+            "source": { "srt": { "network": "wan" } },
+            "destinations": [{ "srt": { "node": "strom-node-2" } }]
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
-    async fn listener_source_with_node_is_accepted() {
+    async fn destination_without_node_field_is_rejected_by_serde() {
+        let response = post_raw(json!({
+            "name": "cam1-to-studio",
+            "source": { "srt": { "node": "strom-node-1" } },
+            "destinations": [{ "srt": { "network": "wan" } }]
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn source_with_node_is_accepted() {
         let response = post_stream(&sample_stream()).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
-    async fn caller_source_without_node_is_rejected() {
+    async fn blank_source_node_is_rejected() {
         let mut stream = sample_stream();
-        stream.source = StreamTransport::Srt(SrtEndpoint {
-            url: Some("srt://camera:7001".to_string()),
-            mode: SrtMode::Caller,
-            latency: None,
-            node: None,
-            network: None,
-        });
+        let StreamTransport::Srt(source) = &mut stream.source;
+        source.node = "  ".to_string();
 
         let response = post_stream(&stream).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -331,15 +331,15 @@ mod tests {
             body_json(response).await["error"]
                 .as_str()
                 .unwrap()
-                .contains("source node is required")
+                .contains("source node must not be empty")
         );
     }
 
     #[tokio::test]
-    async fn destination_without_node_is_rejected() {
+    async fn blank_destination_node_is_rejected() {
         let mut stream = sample_stream();
         let StreamTransport::Srt(dest) = &mut stream.destinations[0];
-        dest.node = None;
+        dest.node = String::new();
 
         let response = post_stream(&stream).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -347,18 +347,7 @@ mod tests {
             body_json(response).await["error"]
                 .as_str()
                 .unwrap()
-                .contains("destination must reference a node")
+                .contains("destination node must not be empty")
         );
-    }
-
-    #[tokio::test]
-    async fn node_referenced_destination_without_url_is_accepted() {
-        let mut stream = sample_stream();
-        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
-        dest.url = None;
-        dest.network = Some("wan".to_string());
-
-        let response = post_stream(&stream).await;
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 }

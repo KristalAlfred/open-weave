@@ -191,16 +191,9 @@ services:
   adapter-1:
     <<: *weave
     container_name: ow-adapter-1
-    command: ["weave-adapter-strom"]
-    environment:
-      WEAVE_NODE_ID: strom-node-1
-      WEAVE_STROM_ADAPTER_ADDR: 0.0.0.0:8091
-      WEAVE_STROM_ADAPTER_PUBLIC_ENDPOINT: http://172.26.0.10:8080
-      WEAVE_SOUTHBOUND_URL: http://172.25.0.21:8081
-      WEAVE_STROM_URL: http://172.26.0.10:8080
-      WEAVE_STROM_POLL_INTERVAL_SECS: "5"
-      WEAVE_DATA_PLANE: default=172.26.0.10
-      WEAVE_PORT_RANGE: 20000-20999
+    command: ["weave-adapter-strom", "--config", "/etc/weave/node.yaml"]
+    volumes:
+      - ./config/adapter-1.yaml:/etc/weave/node.yaml:ro
     networks:
       net_node1:
         ipv4_address: 172.26.0.11
@@ -263,16 +256,9 @@ services:
   adapter-2:
     <<: *weave
     container_name: ow-adapter-2
-    command: ["weave-adapter-strom"]
-    environment:
-      WEAVE_NODE_ID: strom-node-2
-      WEAVE_STROM_ADAPTER_ADDR: 0.0.0.0:8091
-      WEAVE_STROM_ADAPTER_PUBLIC_ENDPOINT: http://172.27.0.10:8080
-      WEAVE_SOUTHBOUND_URL: http://172.25.0.21:8081
-      WEAVE_STROM_URL: http://172.27.0.10:8080
-      WEAVE_STROM_POLL_INTERVAL_SECS: "5"
-      WEAVE_DATA_PLANE: default=172.27.0.10
-      WEAVE_PORT_RANGE: 20000-20999
+    command: ["weave-adapter-strom", "--config", "/etc/weave/node.yaml"]
+    volumes:
+      - ./config/adapter-2.yaml:/etc/weave/node.yaml:ro
     networks:
       net_node2:
         ipv4_address: 172.27.0.11
@@ -306,6 +292,8 @@ services:
     container_name: ow-producer
     profiles: ["producer"]
     restart: "no"
+    environment:
+      - PRODUCER_TARGET
     networks:
       net_core:
         ipv4_address: 172.25.0.30
@@ -320,7 +308,7 @@ services:
             -f lavfi -i sine=frequency=1000:sample_rate=48000 \
             -c:v libx264 -preset veryfast -tune zerolatency -b:v 2500k -pix_fmt yuv420p -g 60 \
             -c:a aac -b:a 128k \
-            -f mpegts "srt://${PRODUCER_TARGET:-172.26.0.10:7001}?mode=caller&latency=200&streamid=producer" &
+            -f mpegts "srt://$${PRODUCER_TARGET:?PRODUCER_TARGET is required (resolve via scripts/endpoints.sh)}?mode=caller&latency=200&streamid=producer" &
           child=$$!
           wait "$$child" || true
           [ "$$running" = 1 ] && { echo "producer ffmpeg exited; retrying in 2s" >&2; sleep 2; }
@@ -349,6 +337,8 @@ services:
     container_name: ow-consumer
     profiles: ["consumer"]
     restart: "no"
+    environment:
+      - CONSUMER_SOURCE
     networks:
       net_core:
         ipv4_address: 172.25.0.31
@@ -359,7 +349,7 @@ services:
         trap 'running=0; kill -TERM "$$child" 2>/dev/null' TERM INT
         while [ "$$running" = 1 ]; do
           ffmpeg -hide_banner -loglevel warning \
-            -i "srt://${CONSUMER_SOURCE:-172.27.0.10:7003}?mode=caller&latency=200" \
+            -i "srt://$${CONSUMER_SOURCE:?CONSUMER_SOURCE is required (resolve via scripts/endpoints.sh)}?mode=caller&latency=200" \
             -f null - &
           child=$$!
           wait "$$child" || true
@@ -391,6 +381,8 @@ services:
     container_name: ow-consumer-2
     profiles: ["consumer"]
     restart: "no"
+    environment:
+      - CONSUMER_SOURCE_2
     networks:
       net_core:
         ipv4_address: 172.25.0.32
@@ -401,7 +393,7 @@ services:
         trap 'running=0; kill -TERM "$$child" 2>/dev/null' TERM INT
         while [ "$$running" = 1 ]; do
           ffmpeg -hide_banner -loglevel warning \
-            -i "srt://${CONSUMER_SOURCE_2:-172.26.0.10:7003}?mode=caller&latency=200" \
+            -i "srt://$${CONSUMER_SOURCE_2:?CONSUMER_SOURCE_2 is required (resolve via scripts/endpoints.sh)}?mode=caller&latency=200" \
             -f null - &
           child=$$!
           wait "$$child" || true

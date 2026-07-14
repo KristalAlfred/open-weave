@@ -9,23 +9,15 @@ just bench stream basic       # apply bench/manifests/basic.yaml
 just bench stream-rm basic    # delete the stream; controller tears down its hops
 ```
 
-The bundled `producer`/`consumer` verification endpoints take an optional
-`host:port` so any scenario can be driven end to end
-(`just bench producer-up <host:port>` / `consumer-up <host:port>`). With no
-argument they default to the `basic` scenario (producer `172.26.0.10:7001`,
-consumer `172.27.0.10:7003`). The producer target is the scenario's source
-listener; the consumer source is the receiver output, which is the destination
-port + 1 on the node hosting the destination. Fan-out has one receiver output
-per destination, so attach a consumer to each: `consumer-up` for the first and
-`consumer-2-up` for the second.
-
-| Manifest | `producer-up` target | `consumer-up` source |
-|----------|----------------------|----------------------|
-| `basic` | `172.26.0.10:7001` (default) | `172.27.0.10:7003` (default) |
-| `reverse` | `172.27.0.10:7001` | `172.26.0.10:7003` |
-| `same-node` | `172.26.0.10:7001` | `172.26.0.10:7003` |
-| `fanout` | `172.26.0.10:7001` | `172.27.0.10:7003` + `172.26.0.10:7003` (`consumer-2-up`) |
-| `srt-latency` | `172.26.0.10:7001` | `172.27.0.10:7003` |
+The bundled `producer`/`consumer` verification endpoints take a stream name so
+any scenario can be driven end to end
+(`just bench producer-up <stream>` / `consumer-up <stream>`, default `basic`).
+Addresses are not hardcoded: the recipes resolve them from the controller's
+discovery API (`GET :29082/streams/<name>/endpoints`, or the
+`scripts/endpoints.sh` helper) — the producer dials the reported `ingress` and
+each consumer dials an `outputs[]` entry. Fan-out has one output per destination,
+so attach a consumer to each: `consumer-up <stream>` (output 0) and
+`consumer-2-up <stream>` (output 1).
 
 ## Observed behaviour
 

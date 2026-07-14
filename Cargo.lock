@@ -1454,7 +1454,9 @@ dependencies = [
  "axum",
  "clap",
  "reqwest",
+ "serde",
  "serde_json",
+ "serde_norway",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1484,11 +1486,13 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "http-body-util",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "weave-core",
@@ -1500,6 +1504,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -1511,6 +1516,7 @@ dependencies = [
  "clap",
  "reqwest",
  "serde_json",
+ "serde_norway",
  "tokio",
  "tracing",
  "tracing-subscriber",

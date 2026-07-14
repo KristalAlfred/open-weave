@@ -27,8 +27,8 @@ controller→Strom API calls.
 | Port | Service |
 |------|---------|
 | 29080 | northbound (`WEAVE_NORTHBOUND_URL=http://localhost:29080 weave ...`) |
-| 29081 | southbound |
-| 29082 | controller `/status` |
+| 29081 | southbound (`/nodes` shows registered capabilities) |
+| 29082 | controller `/status` and `/streams/{name}/endpoints` (discovery) |
 | 28080 | strom-1 API |
 | 28081 | strom-2 API |
 
@@ -49,15 +49,27 @@ just netem node1 delay 200ms loss 5%   # impair node 1's network
 just netem-show node1
 just netem-clear node1
 
-just producer-up                    # feed the basic source (default 172.26.0.10:7001)
-just producer-up 172.27.0.10:7001   # feed another scenario's source (host:port)
+just producer-up          # feed the basic stream's source ingress
+just producer-up reverse  # feed another stream (resolves its ingress via discovery)
 just producer-down # stop it (drives no-source -> source -> no-source transitions)
-just consumer-up                    # pull the basic receiver output (default 172.27.0.10:7003)
-just consumer-up 172.26.0.10:7003   # pull another scenario's receiver output (host:port)
+just consumer-up          # pull the basic stream's receiver output
+just consumer-up reverse  # pull another stream's output (resolved via discovery)
 just consumer-down
 
 just down          # tear down (containers, networks, volumes)
 ```
+
+Data-plane addresses are never hardcoded in the recipes: they are resolved from
+the controller's discovery API. Query it directly with:
+
+```sh
+curl -s localhost:29082/streams/basic/endpoints | jq
+# { "ingress": {node,host,port,url}, "outputs": [{node,host,port,url}] }
+```
+
+`200` once placed, `503` while known-but-unplaced, `404` if unknown. The
+`scripts/endpoints.sh <stream> ingress|output [index]` helper polls this until
+placed and prints `host:port`; the producer/consumer recipes use it.
 
 ## External verification endpoints
 
@@ -68,17 +80,16 @@ started explicitly by the recipes above — never as part of `just up`. Both sit
 traffic crosses the same impaired hops as real external peers.
 
 - `producer` pushes `testsrc2 + sine` as MPEG-TS over SRT (caller) into a source
-  ingress listener. Target defaults to the `basic` source `172.26.0.10:7001`;
-  pass `host:port` to feed another scenario's source.
+  ingress listener. `producer-up <stream>` resolves that stream's ingress address
+  from discovery (default stream `basic`).
 - `consumer` pulls a receiver flow's output (SRT caller) and discards it
-  (`-f null -`). Source defaults to the `basic` receiver `172.27.0.10:7003`; pass
-  `host:port` to pull another scenario's receiver output.
+  (`-f null -`). `consumer-up <stream>` resolves the stream's first output address
+  from discovery; `consumer-2-up <stream>` resolves the second output (fan-out).
 
 Both sit on `net_core` and route to either node subnet through the netem routers.
-The receiver re-exposes media on the destination port + 1, so a scenario whose
-destination is `srt://<host>:<port>` has its receiver output at `<host>:<port+1>`.
-See `manifests/README.md` for the full manifest library and the address each
-scenario needs.
+Addresses come from the controller's discovery API, not hardcoded tables — see the
+`/streams/{name}/endpoints` note above and `manifests/README.md` for the manifest
+library.
 
 ## Notes
 

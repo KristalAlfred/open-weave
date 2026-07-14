@@ -1,15 +1,11 @@
-# Matrix directionality: listener on node-2 :7001 relayed to node-1 :7002.
+# Matrix directionality: source on node-2 relayed to node-1.
 name: reverse
 enabled: true
 source:
   srt:
-    url: srt://0.0.0.0:7001
-    mode: listener
-    latency: 200
     node: strom-node-2
+    latency: 200
 destinations:
   - srt:
-      url: srt://172.26.0.10:7002
-      mode: caller
-      latency: 1000
       node: strom-node-1
+      latency: 1000

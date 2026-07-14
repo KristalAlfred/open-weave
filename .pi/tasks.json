@@ -169,6 +169,67 @@
       "createdAt": "2026-07-10T14:01:00.000Z",
       "updatedAt": "2026-07-10T14:01:00.000Z",
       "notes": []
+    },
+    {
+      "id": "t_20260714000001_prtcol",
+      "title": "Collision-aware port assignment in controller",
+      "description": "Ports are assigned by FNV-hashing the hop id into the node's shared port_range; sender ingress, receiver ingress, and consumer (dest_port + 1) ports can collide across streams on the same node, and dest_port + 1 can land outside the declared range. Now that url pinning is removed, every stream depends on assignment. Controller sees all hops per node per tick, so make assignment collision-aware there.",
+      "status": "open",
+      "priority": "medium",
+      "tags": [
+        "controller",
+        "ports"
+      ],
+      "source": "crates/controller/src/path.rs (assign_port); name-based addressing follow-up",
+      "createdAt": "2026-07-14T00:00:00.000Z",
+      "updatedAt": "2026-07-14T00:00:00.000Z",
+      "notes": []
+    },
+    {
+      "id": "t_20260714000002_alias1",
+      "title": "resolved_ingress ignores data-plane alias (always default host)",
+      "description": "The adapter reports listener addresses using only the default alias host (provision.rs resolved_addr), and connect_target prefers the reported address; a network: wan delivery can be rewritten to the default host after the receiver reports. Carry the advertised alias host in the receiver's SocketSpec.host or in HopStatus.",
+      "status": "open",
+      "priority": "medium",
+      "tags": [
+        "adapter",
+        "controller",
+        "multi-nic"
+      ],
+      "source": "crates/adapter-strom/src/provision.rs (resolved_addr); crates/controller/src/path.rs (connect_target)",
+      "createdAt": "2026-07-14T00:00:00.000Z",
+      "updatedAt": "2026-07-14T00:00:00.000Z",
+      "notes": []
+    },
+    {
+      "id": "t_20260714000003_pubep1",
+      "title": "Bench adapter public_endpoint points at Strom port, not adapter control API",
+      "description": "bench/config/adapter-*.yaml set public_endpoint to http://172.2x.0.10:8080 (Strom's port) matching the old compose env, but the adapter control API listens on :8091. Harmless today since nothing dials the registered endpoint, but a latent mislabel.",
+      "status": "open",
+      "priority": "low",
+      "tags": [
+        "bench",
+        "config"
+      ],
+      "source": "bench/config/adapter-1.yaml, adapter-2.yaml",
+      "createdAt": "2026-07-14T00:00:00.000Z",
+      "updatedAt": "2026-07-14T00:00:00.000Z",
+      "notes": []
+    },
+    {
+      "id": "t_20260714000004_mncfg1",
+      "title": "Unify media-node and adapter node-config file shapes",
+      "description": "media-node loads a bare NodeConfig while the adapter wraps it under a node: key (plus strom: section). Pick one shape (probably the wrapped form) so node config files are interchangeable.",
+      "status": "open",
+      "priority": "low",
+      "tags": [
+        "media-node",
+        "config"
+      ],
+      "source": "crates/media-node/src/main.rs; crates/adapter-strom/src/config.rs",
+      "createdAt": "2026-07-14T00:00:00.000Z",
+      "updatedAt": "2026-07-14T00:00:00.000Z",
+      "notes": []
     }
   ]
 }

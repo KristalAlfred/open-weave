@@ -1,8 +1,9 @@
 //! `weave-adapter-strom` — southbound adapter for Strom instances.
 
+mod config;
 mod provision;
 
-use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -15,12 +16,13 @@ use tracing_subscriber::EnvFilter;
 use weave_core::{
     AdapterDescriptor, AdapterKind, DEFAULT_DATA_PLANE_ALIAS, DesiredHop, EndpointDescriptor,
     EndpointKind, HopStatus, LinkCondition, LinkStats, NodeCapabilities, NodeDescriptor,
-    NodeHeartbeat, NodeRegistration, NodeStatus, PortRange, TransportDescriptor,
+    NodeHeartbeat, NodeRegistration, NodeStatus, TransportDescriptor,
 };
 use weave_strom::{
     FlowSpec, FlowStats, StromClient, StromError, StromFlow, flow_spec_from_hop, parse_flow_stats,
 };
 
+use config::AdapterConfig;
 use provision::{
     IngressObservation, StallTracker, diff_hops, hop_state, resolved_addr, socket_condition,
 };
@@ -32,44 +34,9 @@ use provision::{
     about = "open-weave southbound adapter for Strom"
 )]
 struct Args {
-    #[arg(long, env = "WEAVE_NODE_ID", default_value = "strom-local")]
-    node_id: String,
-    #[arg(
-        long,
-        env = "WEAVE_STROM_ADAPTER_ADDR",
-        default_value = "127.0.0.1:8091"
-    )]
-    listen: String,
-    #[arg(long, env = "WEAVE_STROM_ADAPTER_PUBLIC_ENDPOINT")]
-    public_endpoint: Option<String>,
-    /// Data-plane addresses advertised for placement, as `alias=host` pairs
-    /// (e.g. `default=10.0.0.5,wan=203.0.113.7`). The `default` alias is used
-    /// when a manifest pins no network.
-    #[arg(long, env = "WEAVE_DATA_PLANE")]
-    data_plane: Option<String>,
-    /// Inclusive port range the controller may assign from, as `start-end`.
-    #[arg(long, env = "WEAVE_PORT_RANGE")]
-    port_range: Option<String>,
-    #[arg(
-        long,
-        env = "WEAVE_SOUTHBOUND_URL",
-        default_value = "http://127.0.0.1:8081"
-    )]
-    southbound_url: String,
-    #[arg(
-        long,
-        env = "WEAVE_STROM_URL",
-        default_value = "http://127.0.0.1:18080"
-    )]
-    strom_url: String,
-    #[arg(
-        long,
-        value_delimiter = ',',
-        default_value = "srt,webrtc,aes67,ndi,decklink"
-    )]
-    transports: Vec<String>,
-    #[arg(long, env = "WEAVE_STROM_POLL_INTERVAL_SECS", default_value_t = 5)]
-    poll_interval_secs: u64,
+    /// Path to the adapter config file (YAML).
+    #[arg(long, env = "WEAVE_NODE_CONFIG")]
+    config: PathBuf,
 }
 
 #[tokio::main]
@@ -81,23 +48,19 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let public_endpoint = args
-        .public_endpoint
-        .clone()
-        .unwrap_or_else(|| format!("http://{}", args.listen));
-    let data_plane = parse_data_plane(args.data_plane.as_deref());
-    let port_range = parse_port_range(args.port_range.as_deref());
+    let config = AdapterConfig::load(&args.config)?;
+    let public_endpoint = config.node.public_endpoint();
     let client = Client::new();
-    let strom = StromClient::new(&args.strom_url);
-    let health_server = spawn_health_server(args.listen.clone());
+    let strom = StromClient::new(&config.strom.url);
+    let health_server = spawn_health_server(config.node.listen.clone());
 
     tracing::info!(
-        node_id = %args.node_id,
-        strom_url = %args.strom_url,
-        southbound_url = %args.southbound_url,
-        poll_interval_secs = args.poll_interval_secs,
-        data_plane = ?data_plane,
-        port_range = ?port_range,
+        node_id = %config.node.id,
+        strom_url = %config.strom.url,
+        southbound_url = %config.node.southbound_url,
+        poll_interval_secs = config.strom.poll_interval_secs,
+        data_plane = ?config.node.data_plane,
+        port_range = ?config.node.port_range,
         "Strom adapter starting"
     );
 
@@ -108,36 +71,11 @@ async fn main() -> Result<()> {
             health_server.abort();
             Ok(())
         }
-        result = sync_loop(&client, &strom, &args, &public_endpoint, &data_plane, port_range) => {
+        result = sync_loop(&client, &strom, &config, &public_endpoint) => {
             health_server.abort();
             result
         }
     }
-}
-
-/// Parse `alias=host` pairs into a data-plane map, dropping malformed entries.
-fn parse_data_plane(raw: Option<&str>) -> BTreeMap<String, String> {
-    raw.map(|value| {
-        value
-            .split(',')
-            .filter_map(|pair| {
-                let (alias, host) = pair.split_once('=')?;
-                let (alias, host) = (alias.trim(), host.trim());
-                (!alias.is_empty() && !host.is_empty())
-                    .then(|| (alias.to_string(), host.to_string()))
-            })
-            .collect()
-    })
-    .unwrap_or_default()
-}
-
-/// Parse an inclusive `start-end` port range.
-fn parse_port_range(raw: Option<&str>) -> Option<PortRange> {
-    let (start, end) = raw?.split_once('-')?;
-    Some(PortRange {
-        start: start.trim().parse().ok()?,
-        end: end.trim().parse().ok()?,
-    })
 }
 
 fn spawn_health_server(addr: String) -> JoinHandle<Result<()>> {
@@ -157,23 +95,19 @@ fn spawn_health_server(addr: String) -> JoinHandle<Result<()>> {
 async fn sync_loop(
     client: &Client,
     strom: &StromClient,
-    args: &Args,
+    config: &AdapterConfig,
     public_endpoint: &str,
-    data_plane: &BTreeMap<String, String>,
-    port_range: Option<PortRange>,
 ) -> Result<()> {
     let mut registered = false;
     let mut tracker = StallTracker::default();
-    let interval = Duration::from_secs(args.poll_interval_secs);
+    let interval = Duration::from_secs(config.strom.poll_interval_secs);
 
     loop {
         match sync_once(
             client,
             strom,
-            args,
+            config,
             public_endpoint,
-            data_plane,
-            port_range,
             registered,
             &mut tracker,
         )
@@ -190,17 +124,16 @@ async fn sync_loop(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn sync_once(
     client: &Client,
     strom: &StromClient,
-    args: &Args,
+    config: &AdapterConfig,
     public_endpoint: &str,
-    data_plane: &BTreeMap<String, String>,
-    port_range: Option<PortRange>,
     registered: bool,
     tracker: &mut StallTracker,
 ) -> Result<bool> {
+    let node_id = &config.node.id;
+    let southbound_url = &config.node.southbound_url;
     let (status, flows) = match strom.list_flows().await {
         Ok(flows) => (NodeStatus::Ready, flows),
         Err(error) => {
@@ -208,15 +141,19 @@ async fn sync_once(
             (NodeStatus::Degraded, Vec::new())
         }
     };
-    let endpoints = strom_endpoints(&args.node_id, &flows);
-    let data_plane_host = data_plane.get(DEFAULT_DATA_PLANE_ALIAS).map(String::as_str);
+    let endpoints = strom_endpoints(node_id, &flows);
+    let data_plane_host = config
+        .node
+        .data_plane
+        .get(DEFAULT_DATA_PLANE_ALIAS)
+        .map(String::as_str);
 
     let hop_status = if status == NodeStatus::Ready {
         match provision(
             client,
             strom,
-            &args.southbound_url,
-            &args.node_id,
+            southbound_url,
+            node_id,
             &flows,
             data_plane_host,
             tracker,
@@ -234,29 +171,27 @@ async fn sync_once(
     };
 
     let registration = registration(
-        args,
+        config,
         public_endpoint,
-        data_plane,
-        port_range,
         status,
         endpoints.clone(),
         hop_status.clone(),
     );
 
     if !registered {
-        register_node(client, &args.southbound_url, &registration).await?;
+        register_node(client, southbound_url, &registration).await?;
         return Ok(true);
     }
 
     let heartbeat = NodeHeartbeat {
-        node_id: args.node_id.clone(),
+        node_id: node_id.clone(),
         status,
         endpoints,
         hop_status,
     };
 
-    if heartbeat_node(client, &args.southbound_url, &heartbeat).await? == StatusCode::NOT_FOUND {
-        register_node(client, &args.southbound_url, &registration).await?;
+    if heartbeat_node(client, southbound_url, &heartbeat).await? == StatusCode::NOT_FOUND {
+        register_node(client, southbound_url, &registration).await?;
     }
 
     Ok(true)
@@ -458,17 +393,15 @@ async fn fetch_desired(
 }
 
 fn registration(
-    args: &Args,
+    config: &AdapterConfig,
     public_endpoint: &str,
-    data_plane: &BTreeMap<String, String>,
-    port_range: Option<PortRange>,
     status: NodeStatus,
     endpoints: Vec<EndpointDescriptor>,
     hop_status: Vec<HopStatus>,
 ) -> NodeRegistration {
     NodeRegistration {
         node: NodeDescriptor {
-            id: args.node_id.clone(),
+            id: config.node.id.clone(),
             endpoint: public_endpoint.to_string(),
             status,
             capabilities: NodeCapabilities {
@@ -476,13 +409,14 @@ fn registration(
                     name: "strom".to_string(),
                     kind: AdapterKind::Strom,
                 }],
-                transports: args
+                transports: config
+                    .node
                     .transports
                     .iter()
                     .map(|name| TransportDescriptor { name: name.clone() })
                     .collect(),
-                data_plane: data_plane.clone(),
-                port_range,
+                data_plane: config.node.data_plane.clone(),
+                port_range: Some(config.node.port_range),
             },
         },
         endpoints,
@@ -776,27 +710,5 @@ mod tests {
             last_delete < first_create,
             "all deletes must precede all creates within one cycle: {ops:?}"
         );
-    }
-
-    #[test]
-    fn parses_data_plane_pairs_and_skips_malformed() {
-        let map = parse_data_plane(Some("default=10.0.0.5, wan=203.0.113.7 ,bad,=x,y="));
-        assert_eq!(map.get("default").map(String::as_str), Some("10.0.0.5"));
-        assert_eq!(map.get("wan").map(String::as_str), Some("203.0.113.7"));
-        assert_eq!(map.len(), 2);
-        assert!(parse_data_plane(None).is_empty());
-    }
-
-    #[test]
-    fn parses_port_range() {
-        assert_eq!(
-            parse_port_range(Some("7000-7999")),
-            Some(PortRange {
-                start: 7000,
-                end: 7999
-            })
-        );
-        assert_eq!(parse_port_range(Some("nonsense")), None);
-        assert_eq!(parse_port_range(None), None);
     }
 }

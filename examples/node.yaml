@@ -1,0 +1,26 @@
+# Strom adapter node config. Pass via --config or WEAVE_NODE_CONFIG.
+node:
+  # Registered node id manifests reference for placement.
+  id: strom-node-1
+  # Southbound API the adapter registers with and polls for desired hops.
+  southbound_url: http://172.25.0.21:8081
+  # Address the adapter's own health/control API binds to.
+  listen: 0.0.0.0:8091
+  # Optional; how peers reach this node's control API. Defaults to http://<listen>.
+  public_endpoint: http://172.25.0.21:8091
+  # Data-plane addresses advertised for placement, keyed by alias. The only place
+  # concrete IPs live. Must contain the `default` alias.
+  data_plane:
+    default: 172.26.0.10
+    # wan: 203.0.113.7
+  # Inclusive port range the controller may assign SRT sockets from.
+  port_range:
+    start: 20000
+    end: 20999
+  # Optional transports advertised to the controller.
+  transports: [srt]
+strom:
+  # Base URL of the Strom instance this adapter drives.
+  url: http://172.26.0.10:8080
+  # Optional; seconds between Strom observation polls. Defaults to 5.
+  poll_interval_secs: 5

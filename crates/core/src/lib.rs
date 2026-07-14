@@ -30,27 +30,14 @@ pub enum StreamTransport {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SrtEndpoint {
-    /// Raw SRT URL pinning a concrete host+port. Absent for node-referenced
-    /// endpoints, which resolve their address from the placement node instead.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    pub mode: SrtMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub latency: Option<u32>,
     /// Registered node id hosting this endpoint. Primary placement key.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node: Option<String>,
+    pub node: String,
     /// Data-plane alias resolved against the node's declared address map.
-    /// Ignored when `url` pins a raw host; absent means [`DEFAULT_DATA_PLANE_ALIAS`].
+    /// Absent means [`DEFAULT_DATA_PLANE_ALIAS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SrtMode {
-    Listener,
-    Caller,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency: Option<u32>,
 }
 
 /// Prefix marking a hop id (and thus its provisioned flow) as owned by open-weave.
@@ -323,6 +310,78 @@ impl PortRange {
     }
 }
 
+/// Static configuration a node loads at startup and self-registers from.
+/// Shared across adapters; adapter-specific sections wrap this type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeConfig {
+    pub id: String,
+    pub southbound_url: String,
+    pub listen: String,
+    /// Endpoint peers use to reach this node's control API. Defaults to
+    /// `http://{listen}` via [`NodeConfig::public_endpoint`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_endpoint: Option<String>,
+    /// Data-plane addresses advertised for placement, keyed by alias. Must
+    /// contain the [`DEFAULT_DATA_PLANE_ALIAS`] entry.
+    pub data_plane: BTreeMap<String, String>,
+    /// Inclusive port range the controller may assign from for this node.
+    pub port_range: PortRange,
+    #[serde(default)]
+    pub transports: Vec<String>,
+}
+
+impl NodeConfig {
+    /// The control endpoint peers use to reach this node, defaulting to
+    /// `http://{listen}` when unset.
+    #[must_use]
+    pub fn public_endpoint(&self) -> String {
+        self.public_endpoint
+            .clone()
+            .unwrap_or_else(|| format!("http://{}", self.listen))
+    }
+
+    /// Enforce the invariants placement depends on: a named node, a `default`
+    /// data-plane alias with no blank entries, and a well-ordered port range.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] describing the first violated invariant.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.id.trim().is_empty() {
+            return Err(ConfigError::EmptyId);
+        }
+        if !self.data_plane.contains_key(DEFAULT_DATA_PLANE_ALIAS) {
+            return Err(ConfigError::MissingDefaultAlias);
+        }
+        if self
+            .data_plane
+            .iter()
+            .any(|(alias, host)| alias.trim().is_empty() || host.trim().is_empty())
+        {
+            return Err(ConfigError::EmptyDataPlaneEntry);
+        }
+        if self.port_range.start > self.port_range.end {
+            return Err(ConfigError::InvalidPortRange {
+                start: self.port_range.start,
+                end: self.port_range.end,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConfigError {
+    #[error("node id must not be empty")]
+    EmptyId,
+    #[error("data_plane must define the '{DEFAULT_DATA_PLANE_ALIAS}' alias")]
+    MissingDefaultAlias,
+    #[error("data_plane has an empty alias or host")]
+    EmptyDataPlaneEntry,
+    #[error("port_range start {start} exceeds end {end}")]
+    InvalidPortRange { start: u16, end: u16 },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdapterDescriptor {
     pub name: String,
@@ -431,9 +490,9 @@ mod tests {
     fn stream_json_uses_snake_case_transport_tag_and_defaults_enabled() {
         let json = serde_json::json!({
             "name": "cam1-to-studio",
-            "source": { "srt": { "url": "srt://0.0.0.0:7001", "mode": "listener", "latency": 200 } },
+            "source": { "srt": { "node": "strom-node-1", "latency": 200 } },
             "destinations": [
-                { "srt": { "url": "srt://studio:7002", "mode": "caller" } }
+                { "srt": { "node": "strom-node-2", "network": "wan" } }
             ]
         });
 
@@ -443,21 +502,17 @@ mod tests {
         assert_eq!(
             stream.source,
             StreamTransport::Srt(SrtEndpoint {
-                url: Some("srt://0.0.0.0:7001".to_string()),
-                mode: SrtMode::Listener,
-                latency: Some(200),
-                node: None,
+                node: "strom-node-1".to_string(),
                 network: None,
+                latency: Some(200),
             })
         );
         assert_eq!(
             stream.destinations[0],
             StreamTransport::Srt(SrtEndpoint {
-                url: Some("srt://studio:7002".to_string()),
-                mode: SrtMode::Caller,
+                node: "strom-node-2".to_string(),
+                network: Some("wan".to_string()),
                 latency: None,
-                node: None,
-                network: None,
             })
         );
 
@@ -740,5 +795,88 @@ mod tests {
                 egress: LinkCondition::Connected,
             }
         );
+    }
+
+    #[test]
+    fn srt_endpoint_without_node_is_rejected() {
+        let result: Result<SrtEndpoint, _> =
+            serde_json::from_value(serde_json::json!({ "network": "wan" }));
+        assert!(result.is_err(), "node is a required field");
+    }
+
+    fn node_config() -> NodeConfig {
+        NodeConfig {
+            id: "strom-node-1".to_string(),
+            southbound_url: "http://127.0.0.1:8081".to_string(),
+            listen: "0.0.0.0:8091".to_string(),
+            public_endpoint: None,
+            data_plane: BTreeMap::from([(
+                DEFAULT_DATA_PLANE_ALIAS.to_string(),
+                "172.26.0.10".to_string(),
+            )]),
+            port_range: PortRange {
+                start: 20000,
+                end: 20999,
+            },
+            transports: vec!["srt".to_string()],
+        }
+    }
+
+    #[test]
+    fn node_config_public_endpoint_defaults_to_listen() {
+        let config = node_config();
+        assert_eq!(config.public_endpoint(), "http://0.0.0.0:8091");
+
+        let mut pinned = node_config();
+        pinned.public_endpoint = Some("http://172.25.0.21:8091".to_string());
+        assert_eq!(pinned.public_endpoint(), "http://172.25.0.21:8091");
+    }
+
+    #[test]
+    fn node_config_validate_accepts_valid_config() {
+        assert_eq!(node_config().validate(), Ok(()));
+    }
+
+    #[test]
+    fn node_config_validate_rejects_invariant_violations() {
+        let mut empty_id = node_config();
+        empty_id.id = "  ".to_string();
+        assert_eq!(empty_id.validate(), Err(ConfigError::EmptyId));
+
+        let mut no_default = node_config();
+        no_default.data_plane = BTreeMap::from([("wan".to_string(), "203.0.113.7".to_string())]);
+        assert_eq!(no_default.validate(), Err(ConfigError::MissingDefaultAlias));
+
+        let mut blank_host = node_config();
+        blank_host
+            .data_plane
+            .insert("wan".to_string(), String::new());
+        assert_eq!(blank_host.validate(), Err(ConfigError::EmptyDataPlaneEntry));
+
+        let mut bad_range = node_config();
+        bad_range.port_range = PortRange {
+            start: 21000,
+            end: 20000,
+        };
+        assert_eq!(
+            bad_range.validate(),
+            Err(ConfigError::InvalidPortRange {
+                start: 21000,
+                end: 20000,
+            })
+        );
+    }
+
+    #[test]
+    fn node_config_rejects_unknown_fields() {
+        let result: Result<NodeConfig, _> = serde_json::from_value(serde_json::json!({
+            "id": "n1",
+            "southbound_url": "http://127.0.0.1:8081",
+            "listen": "0.0.0.0:8091",
+            "data_plane": { "default": "10.0.0.1" },
+            "port_range": { "start": 1, "end": 2 },
+            "bogus": true
+        }));
+        assert!(result.is_err(), "deny_unknown_fields rejects typos");
     }
 }

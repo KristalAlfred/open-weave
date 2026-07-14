@@ -1,6 +1,6 @@
 //! `weave-media-node` — managed edge agent for unmanaged media endpoints.
 
-use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use axum::{Json, Router, routing::get};
@@ -8,8 +8,8 @@ use clap::Parser;
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 use weave_core::{
-    AdapterDescriptor, AdapterKind, NodeCapabilities, NodeDescriptor, NodeRegistration, NodeStatus,
-    PortRange, TransportDescriptor,
+    AdapterDescriptor, AdapterKind, NodeCapabilities, NodeConfig, NodeDescriptor, NodeRegistration,
+    NodeStatus, TransportDescriptor,
 };
 
 #[derive(Debug, Parser)]
@@ -19,27 +19,9 @@ use weave_core::{
     about = "open-weave managed edge node"
 )]
 struct Args {
-    #[arg(long, env = "WEAVE_NODE_ID", default_value = "local-media-node")]
-    node_id: String,
-    #[arg(long, env = "WEAVE_NODE_ADDR", default_value = "127.0.0.1:8090")]
-    listen: String,
-    #[arg(
-        long,
-        env = "WEAVE_SOUTHBOUND_URL",
-        default_value = "http://127.0.0.1:8081"
-    )]
-    southbound_url: String,
-    #[arg(long, env = "WEAVE_NODE_PUBLIC_ENDPOINT")]
-    public_endpoint: Option<String>,
-    #[arg(long, value_delimiter = ',', default_value = "srt,rist,webrtc,st2110")]
-    transports: Vec<String>,
-    /// Data-plane addresses advertised for placement, as `alias=host` pairs
-    /// (e.g. `default=10.0.0.5,wan=203.0.113.7`).
-    #[arg(long, env = "WEAVE_DATA_PLANE")]
-    data_plane: Option<String>,
-    /// Inclusive port range the controller may assign from, as `start-end`.
-    #[arg(long, env = "WEAVE_PORT_RANGE")]
-    port_range: Option<String>,
+    /// Path to the node config file (YAML).
+    #[arg(long, env = "WEAVE_NODE_CONFIG")]
+    config: PathBuf,
 }
 
 #[tokio::main]
@@ -51,72 +33,42 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let public_endpoint = args
-        .public_endpoint
-        .clone()
-        .unwrap_or_else(|| format!("http://{}", args.listen));
-    let data_plane = parse_data_plane(args.data_plane.as_deref());
-    let port_range = parse_port_range(args.port_range.as_deref());
-    let registration = registration(
-        &args.node_id,
-        &public_endpoint,
-        &args.transports,
-        data_plane,
-        port_range,
-    );
+    let config = load_config(&args.config)?;
+    let registration = registration(&config);
 
-    register(&args.southbound_url, &registration).await?;
-    serve_health(args.listen).await
+    register(&config.southbound_url, &registration).await?;
+    serve_health(config.listen).await
 }
 
-/// Parse `alias=host` pairs into a data-plane map, dropping malformed entries.
-fn parse_data_plane(raw: Option<&str>) -> BTreeMap<String, String> {
-    raw.map(|value| {
-        value
-            .split(',')
-            .filter_map(|pair| {
-                let (alias, host) = pair.split_once('=')?;
-                let (alias, host) = (alias.trim(), host.trim());
-                (!alias.is_empty() && !host.is_empty())
-                    .then(|| (alias.to_string(), host.to_string()))
-            })
-            .collect()
-    })
-    .unwrap_or_default()
+fn load_config(path: &Path) -> Result<NodeConfig> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config {}", path.display()))?;
+    let config: NodeConfig = serde_norway::from_str(&text)
+        .with_context(|| format!("parsing config {}", path.display()))?;
+    config
+        .validate()
+        .with_context(|| format!("validating config {}", path.display()))?;
+    Ok(config)
 }
 
-/// Parse an inclusive `start-end` port range.
-fn parse_port_range(raw: Option<&str>) -> Option<PortRange> {
-    let (start, end) = raw?.split_once('-')?;
-    Some(PortRange {
-        start: start.trim().parse().ok()?,
-        end: end.trim().parse().ok()?,
-    })
-}
-
-fn registration(
-    node_id: &str,
-    endpoint: &str,
-    transports: &[String],
-    data_plane: BTreeMap<String, String>,
-    port_range: Option<PortRange>,
-) -> NodeRegistration {
+fn registration(config: &NodeConfig) -> NodeRegistration {
     NodeRegistration {
         node: NodeDescriptor {
-            id: node_id.to_string(),
-            endpoint: endpoint.to_string(),
+            id: config.id.clone(),
+            endpoint: config.public_endpoint(),
             status: NodeStatus::Ready,
             capabilities: NodeCapabilities {
                 adapters: vec![AdapterDescriptor {
                     name: "media-node".to_string(),
                     kind: AdapterKind::MediaNode,
                 }],
-                transports: transports
+                transports: config
+                    .transports
                     .iter()
                     .map(|name| TransportDescriptor { name: name.clone() })
                     .collect(),
-                data_plane,
-                port_range,
+                data_plane: config.data_plane.clone(),
+                port_range: Some(config.port_range),
             },
         },
         endpoints: Vec::new(),

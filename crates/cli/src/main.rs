@@ -123,7 +123,7 @@ fn join_url(base: &str, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weave_core::{SrtEndpoint, SrtMode, StreamTransport};
+    use weave_core::{SrtEndpoint, StreamTransport};
 
     #[test]
     fn parses_fanout_yaml_with_defaults_and_srt_tag() {
@@ -131,16 +131,14 @@ mod tests {
 name: cam1-to-studio
 source:
   srt:
-    url: srt://0.0.0.0:7001
-    mode: listener
+    node: strom-node-1
     latency: 200
 destinations:
   - srt:
-      url: srt://studio:7002
-      mode: caller
+      node: strom-node-2
   - srt:
-      url: srt://backup:7002
-      mode: caller
+      node: strom-node-2
+      network: wan
 "#;
 
         let stream = parse_stream(yaml).expect("parse stream yaml");
@@ -150,22 +148,18 @@ destinations:
         assert_eq!(
             stream.source,
             StreamTransport::Srt(SrtEndpoint {
-                url: Some("srt://0.0.0.0:7001".to_string()),
-                mode: SrtMode::Listener,
-                latency: Some(200),
-                node: None,
+                node: "strom-node-1".to_string(),
                 network: None,
+                latency: Some(200),
             })
         );
         assert_eq!(stream.destinations.len(), 2);
         assert_eq!(
             stream.destinations[1],
             StreamTransport::Srt(SrtEndpoint {
-                url: Some("srt://backup:7002".to_string()),
-                mode: SrtMode::Caller,
+                node: "strom-node-2".to_string(),
+                network: Some("wan".to_string()),
                 latency: None,
-                node: None,
-                network: None,
             })
         );
     }
@@ -177,19 +171,17 @@ name: paused
 enabled: false
 source:
   srt:
-    url: srt://0.0.0.0:7001
-    mode: listener
+    node: strom-node-1
 destinations:
   - srt:
-      url: srt://studio:7002
-      mode: caller
+      node: strom-node-2
 "#;
 
         let stream = parse_stream(yaml).expect("parse stream yaml");
         assert!(!stream.enabled);
 
         let json = serde_json::to_value(&stream).unwrap();
-        assert_eq!(json["source"]["srt"]["mode"], "listener");
-        assert_eq!(json["destinations"][0]["srt"]["url"], "srt://studio:7002");
+        assert_eq!(json["source"]["srt"]["node"], "strom-node-1");
+        assert_eq!(json["destinations"][0]["srt"]["node"], "strom-node-2");
     }
 }

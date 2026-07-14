@@ -1,16 +1,13 @@
-# Single contribution feed: SRT listener on :7001 relayed to the egress node.
+# Single contribution feed: SRT listener relayed to the egress node.
 # The destination references its node; the controller resolves node-2's data-plane
 # address and assigns a port from the node's declared range.
 name: contribution
 enabled: true
 source:
   srt:
-    url: srt://0.0.0.0:7001
-    mode: listener
-    latency: 200
     node: strom-node-1
+    latency: 200
 destinations:
   - srt:
-      mode: caller
-      latency: 1000
       node: strom-node-2
+      latency: 1000
