@@ -23,7 +23,7 @@
       "id": "t_20260709125000_sp7h4x",
       "title": "Edited streams are not re-provisioned (adopt-by-name has no spec-drift detection)",
       "description": "The adapter diffs desired hops against Strom flows by hop id only; if a stream definition changes but its hop ids stay the same, the existing flows are adopted unchanged and the edit never reaches the node. Add a spec hash to the hop id or a desired_hash the adapter compares so spec changes trigger re-provisioning.",
-      "status": "open",
+      "status": "done",
       "priority": "medium",
       "tags": [
         "adapter",
@@ -31,8 +31,10 @@
       ],
       "source": "crates/adapter-strom/src/provision.rs (diff_hops adopt-by-name); refactor plan follow-up",
       "createdAt": "2026-07-09T12:50:00.000Z",
-      "updatedAt": "2026-07-09T12:50:00.000Z",
-      "notes": []
+      "updatedAt": "2026-07-14T00:00:00.000Z",
+      "notes": [
+        "diff_hops now detects drift: an adopted flow whose srt:// element URIs differ from the desired hop (host or port) is deleted+recreated instead of adopted, preserving delete-before-create ordering. A flow with no parseable URI is still adopted (conservative). parse_srt_endpoint helper added to weave-strom. Landed with the collision-aware allocator (t_20260714000001_prtcol)."
+      ]
     },
     {
       "id": "t_20260709122940_pvug8q",
@@ -174,7 +176,7 @@
       "id": "t_20260714000001_prtcol",
       "title": "Collision-aware port assignment in controller",
       "description": "Ports are assigned by FNV-hashing the hop id into the node's shared port_range; sender ingress, receiver ingress, and consumer (dest_port + 1) ports can collide across streams on the same node, and dest_port + 1 can land outside the declared range. Now that url pinning is removed, every stream depends on assignment. Controller sees all hops per node per tick, so make assignment collision-aware there.",
-      "status": "open",
+      "status": "done",
       "priority": "medium",
       "tags": [
         "controller",
@@ -183,13 +185,15 @@
       "source": "crates/controller/src/path.rs (assign_port); name-based addressing follow-up",
       "createdAt": "2026-07-14T00:00:00.000Z",
       "updatedAt": "2026-07-14T00:00:00.000Z",
-      "notes": []
+      "notes": [
+        "Added a per-tick collision-aware PortAllocator in controller path.rs: per-node occupancy set, FNV preferred offset then forward linear probe (wrapping within range), PortRangeExhausted -> Pending. derive_path takes &mut PortAllocator; reconcile_once builds one per tick and iterates streams sorted by name. Consumer port is now a first-class claim (no dest_port+1). Landed with the adapter drift-recreate fix (t_20260709125000_sp7h4x)."
+      ]
     },
     {
       "id": "t_20260714000002_alias1",
       "title": "resolved_ingress ignores data-plane alias (always default host)",
       "description": "The adapter reports listener addresses using only the default alias host (provision.rs resolved_addr), and connect_target prefers the reported address; a network: wan delivery can be rewritten to the default host after the receiver reports. Carry the advertised alias host in the receiver's SocketSpec.host or in HopStatus.",
-      "status": "open",
+      "status": "done",
       "priority": "medium",
       "tags": [
         "adapter",
@@ -199,13 +203,15 @@
       "source": "crates/adapter-strom/src/provision.rs (resolved_addr); crates/controller/src/path.rs (connect_target)",
       "createdAt": "2026-07-14T00:00:00.000Z",
       "updatedAt": "2026-07-14T00:00:00.000Z",
-      "notes": []
+      "notes": [
+        "Root-caused: dropped the resolved_ingress override from egress targeting (removed connect_target/is_wildcard_host); sender egress now unconditionally uses the alias-resolved planned delivery (host + controller-assigned port). resolved_ingress kept for observability. Regression test asserts a wan destination keeps its wan host even when a concrete resolved_ingress reports the default host."
+      ]
     },
     {
       "id": "t_20260714000003_pubep1",
       "title": "Bench adapter public_endpoint points at Strom port, not adapter control API",
       "description": "bench/config/adapter-*.yaml set public_endpoint to http://172.2x.0.10:8080 (Strom's port) matching the old compose env, but the adapter control API listens on :8091. Harmless today since nothing dials the registered endpoint, but a latent mislabel.",
-      "status": "open",
+      "status": "done",
       "priority": "low",
       "tags": [
         "bench",
@@ -220,7 +226,7 @@
       "id": "t_20260714000004_mncfg1",
       "title": "Unify media-node and adapter node-config file shapes",
       "description": "media-node loads a bare NodeConfig while the adapter wraps it under a node: key (plus strom: section). Pick one shape (probably the wrapped form) so node config files are interchangeable.",
-      "status": "open",
+      "status": "done",
       "priority": "low",
       "tags": [
         "media-node",
@@ -229,6 +235,22 @@
       "source": "crates/media-node/src/main.rs; crates/adapter-strom/src/config.rs",
       "createdAt": "2026-07-14T00:00:00.000Z",
       "updatedAt": "2026-07-14T00:00:00.000Z",
+      "notes": []
+    },
+    {
+      "id": "t_20260714120000_rmtsrc",
+      "title": "Support remote: on stream source (pull from external listener)",
+      "description": "remote: destinations shipped (sender dials out to an external SRT listener; no receiver hop, no port assignment). The source side still rejects remote (PlacementError::RemoteSource + northbound 400). Supporting a remote source needs a 'which local node hosts the caller/puller' concept so the controller can place a hop that dials the external listener and re-serves the stream internally.",
+      "status": "open",
+      "priority": "low",
+      "tags": [
+        "controller",
+        "addressing",
+        "srt"
+      ],
+      "source": "crates/controller/src/path.rs (source_node -> RemoteSource); crates/northbound/src/main.rs (validate_endpoint)",
+      "createdAt": "2026-07-14T12:00:00.000Z",
+      "updatedAt": "2026-07-14T12:00:00.000Z",
       "notes": []
     }
   ]

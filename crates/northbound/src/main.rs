@@ -13,7 +13,7 @@ use axum::{
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
-use weave_core::{StreamDefinition, StreamTransport};
+use weave_core::{SrtEndpoint, StreamDefinition, StreamTransport};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:9080";
 
@@ -75,17 +75,14 @@ async fn submit_stream(
         );
     }
     let StreamTransport::Srt(source) = &stream.source;
-    if source.node.trim().is_empty() {
-        return error(StatusCode::BAD_REQUEST, "source node must not be empty");
+    if let Err(message) = validate_endpoint(source, true) {
+        return error(StatusCode::BAD_REQUEST, message);
     }
-    if stream.destinations.iter().any(|dest| {
+    for dest in &stream.destinations {
         let StreamTransport::Srt(dest) = dest;
-        dest.node.trim().is_empty()
-    }) {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "each destination node must not be empty",
-        );
+        if let Err(message) = validate_endpoint(dest, false) {
+            return error(StatusCode::BAD_REQUEST, message);
+        }
     }
 
     let name = stream.name.clone();
@@ -112,6 +109,23 @@ fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
 }
 
+/// Enforce node-XOR-remote on an endpoint: exactly one of `node`/`remote` must be
+/// set, a present node must be non-empty, a present remote must name a host, and a
+/// source may not be remote.
+fn validate_endpoint(endpoint: &SrtEndpoint, is_source: bool) -> Result<(), &'static str> {
+    match (&endpoint.node, &endpoint.remote) {
+        (Some(_), Some(_)) => Err("endpoint must set either node or remote, not both"),
+        (None, None) => Err("endpoint must set either node or remote"),
+        (Some(node), None) if node.trim().is_empty() => Err("node must not be empty"),
+        (Some(_), None) => Ok(()),
+        (None, Some(_)) if is_source => Err("source must be a node, not a remote endpoint"),
+        (None, Some(remote)) if remote.host.trim().is_empty() => {
+            Err("remote host must not be empty")
+        }
+        (None, Some(_)) => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,22 +133,26 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
-    use weave_core::SrtEndpoint;
+    use weave_core::RemoteAddr;
+
+    fn node_ref(id: &str) -> SrtEndpoint {
+        SrtEndpoint {
+            node: Some(id.to_string()),
+            remote: None,
+            network: None,
+            latency: None,
+        }
+    }
 
     fn sample_stream() -> StreamDefinition {
         StreamDefinition {
             name: "cam1-to-studio".to_string(),
             enabled: true,
             source: StreamTransport::Srt(SrtEndpoint {
-                node: "strom-node-1".to_string(),
-                network: None,
                 latency: Some(200),
+                ..node_ref("strom-node-1")
             }),
-            destinations: vec![StreamTransport::Srt(SrtEndpoint {
-                node: "strom-node-2".to_string(),
-                network: None,
-                latency: None,
-            })],
+            destinations: vec![StreamTransport::Srt(node_ref("strom-node-2"))],
         }
     }
 
@@ -292,25 +310,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_without_node_field_is_rejected_by_serde() {
+    async fn source_with_neither_node_nor_remote_is_rejected() {
+        // node is optional at the serde layer now; the missing-placement rule is
+        // enforced by validation, so this is a 400, not a serde 422.
         let response = post_raw(json!({
             "name": "cam1-to-studio",
             "source": { "srt": { "network": "wan" } },
             "destinations": [{ "srt": { "node": "strom-node-2" } }]
         }))
         .await;
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
-    async fn destination_without_node_field_is_rejected_by_serde() {
+    async fn destination_with_neither_node_nor_remote_is_rejected() {
         let response = post_raw(json!({
             "name": "cam1-to-studio",
             "source": { "srt": { "node": "strom-node-1" } },
             "destinations": [{ "srt": { "network": "wan" } }]
         }))
         .await;
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn endpoint_with_both_node_and_remote_is_rejected() {
+        let mut stream = sample_stream();
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        dest.remote = Some(RemoteAddr {
+            host: "198.51.100.5".to_string(),
+            port: 9000,
+        });
+
+        let response = post_stream(&stream).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            body_json(response).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("not both")
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_source_is_rejected() {
+        let mut stream = sample_stream();
+        stream.source = StreamTransport::Srt(SrtEndpoint {
+            node: None,
+            remote: Some(RemoteAddr {
+                host: "198.51.100.5".to_string(),
+                port: 9000,
+            }),
+            network: None,
+            latency: None,
+        });
+
+        let response = post_stream(&stream).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            body_json(response).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("source must be a node")
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_destination_is_accepted() {
+        let mut stream = sample_stream();
+        stream.destinations = vec![StreamTransport::Srt(SrtEndpoint {
+            node: None,
+            remote: Some(RemoteAddr {
+                host: "198.51.100.5".to_string(),
+                port: 9000,
+            }),
+            network: None,
+            latency: None,
+        })];
+
+        let response = post_stream(&stream).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
@@ -323,7 +402,7 @@ mod tests {
     async fn blank_source_node_is_rejected() {
         let mut stream = sample_stream();
         let StreamTransport::Srt(source) = &mut stream.source;
-        source.node = "  ".to_string();
+        source.node = Some("  ".to_string());
 
         let response = post_stream(&stream).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -331,7 +410,7 @@ mod tests {
             body_json(response).await["error"]
                 .as_str()
                 .unwrap()
-                .contains("source node must not be empty")
+                .contains("node must not be empty")
         );
     }
 
@@ -339,7 +418,7 @@ mod tests {
     async fn blank_destination_node_is_rejected() {
         let mut stream = sample_stream();
         let StreamTransport::Srt(dest) = &mut stream.destinations[0];
-        dest.node = String::new();
+        dest.node = Some(String::new());
 
         let response = post_stream(&stream).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -347,7 +426,7 @@ mod tests {
             body_json(response).await["error"]
                 .as_str()
                 .unwrap()
-                .contains("destination node must not be empty")
+                .contains("node must not be empty")
         );
     }
 }

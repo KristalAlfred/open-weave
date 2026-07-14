@@ -148,7 +148,8 @@ destinations:
         assert_eq!(
             stream.source,
             StreamTransport::Srt(SrtEndpoint {
-                node: "strom-node-1".to_string(),
+                node: Some("strom-node-1".to_string()),
+                remote: None,
                 network: None,
                 latency: Some(200),
             })
@@ -157,7 +158,8 @@ destinations:
         assert_eq!(
             stream.destinations[1],
             StreamTransport::Srt(SrtEndpoint {
-                node: "strom-node-2".to_string(),
+                node: Some("strom-node-2".to_string()),
+                remote: None,
                 network: Some("wan".to_string()),
                 latency: None,
             })

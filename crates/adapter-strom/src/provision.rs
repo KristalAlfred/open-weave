@@ -2,10 +2,11 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde_json::Value;
 use weave_core::{
     DesiredHop, HopState, LinkCondition, ResolvedAddr, SocketRole, SocketSpec, is_managed_hop_id,
 };
-use weave_strom::StromFlow;
+use weave_strom::{StromFlow, parse_srt_endpoint};
 
 /// Consecutive polls without ingress byte progress before a running, ever-flowed
 /// hop is judged stalled. At the default 5s poll this is ~15s of frozen bytes.
@@ -93,36 +94,72 @@ impl HopPlan {
 
 /// Reconcile desired hops against observed Strom flows.
 ///
-/// Flows are adopted by name. Only flows carrying the managed hop-id prefix are
-/// ever deleted, so flows created outside open-weave are left untouched.
+/// Flows are adopted by name. A flow whose SRT socket URIs no longer match the
+/// desired hop (host or port changed) is treated as drifted: it is deleted and
+/// recreated rather than adopted, so a re-addressed stream actually reaches the
+/// node. Only flows carrying the managed hop-id prefix are ever deleted, so flows
+/// created outside open-weave are left untouched.
 #[must_use]
 pub fn diff_hops(desired: &[DesiredHop], flows: &[StromFlow]) -> HopPlan {
-    let flow_names: HashSet<&str> = flows.iter().map(|f| f.name.as_str()).collect();
-    let desired_ids: HashSet<&str> = desired.iter().map(|h| h.id.as_str()).collect();
+    let desired_by_id: HashMap<&str, &DesiredHop> =
+        desired.iter().map(|h| (h.id.as_str(), h)).collect();
+    let flow_by_name: HashMap<&str, &StromFlow> =
+        flows.iter().map(|f| (f.name.as_str(), f)).collect();
 
-    let create = desired
-        .iter()
-        .filter(|hop| !flow_names.contains(hop.id.as_str()))
-        .cloned()
-        .collect();
+    let mut create = Vec::new();
+    let mut start = Vec::new();
+    let mut delete = Vec::new();
 
-    let start = flows
-        .iter()
-        .filter(|flow| !flow.running && desired_ids.contains(flow.name.as_str()))
-        .map(|flow| flow.id.clone())
-        .collect();
+    for flow in flows {
+        match desired_by_id.get(flow.name.as_str()) {
+            Some(hop) if flow_drifted(flow, hop) => delete.push(flow.id.clone()),
+            Some(_) if !flow.running => start.push(flow.id.clone()),
+            Some(_) => {}
+            None if is_managed_hop_id(&flow.name) => delete.push(flow.id.clone()),
+            None => {}
+        }
+    }
 
-    let delete = flows
-        .iter()
-        .filter(|flow| is_managed_hop_id(&flow.name) && !desired_ids.contains(flow.name.as_str()))
-        .map(|flow| flow.id.clone())
-        .collect();
+    for hop in desired {
+        match flow_by_name.get(hop.id.as_str()) {
+            Some(flow) if !flow_drifted(flow, hop) => {}
+            _ => create.push(hop.clone()),
+        }
+    }
 
     HopPlan {
         create,
         start,
         delete,
     }
+}
+
+/// Whether an adopted flow's SRT sockets diverge from the desired hop. A flow
+/// exposing no parseable `srt://` URI cannot be compared, so it is adopted rather
+/// than recreated.
+fn flow_drifted(flow: &StromFlow, hop: &DesiredHop) -> bool {
+    let actual = flow_srt_endpoints(flow);
+    !actual.is_empty() && actual != hop_srt_endpoints(hop)
+}
+
+fn flow_srt_endpoints(flow: &StromFlow) -> Vec<(String, u16)> {
+    flow.elements
+        .iter()
+        .filter_map(|element| element.properties.get("uri"))
+        .filter_map(Value::as_str)
+        .filter_map(parse_srt_endpoint)
+        .collect()
+}
+
+fn hop_srt_endpoints(hop: &DesiredHop) -> Vec<(String, u16)> {
+    std::iter::once(&hop.ingress)
+        .chain(hop.egresses.iter())
+        .filter_map(socket_endpoint)
+        .collect()
+}
+
+fn socket_endpoint(spec: &SocketSpec) -> Option<(String, u16)> {
+    Some((spec.host.clone().unwrap_or_default(), spec.port?))
 }
 
 /// Derive a hop's control-plane lifecycle state from its flow presence.
@@ -259,6 +296,54 @@ mod tests {
         let plan = diff_hops(&desired, &flows);
 
         assert!(plan.is_empty(), "old controller flows are left untouched");
+    }
+
+    fn flow_with_uris(name: &str, id: &str, ingress: &str, egress: &str) -> StromFlow {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": name,
+            "running": true,
+            "elements": [
+                { "element_type": "srtsrc", "properties": { "uri": ingress } },
+                { "element_type": "srtsink", "properties": { "uri": egress } },
+            ],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn drifted_flow_is_deleted_and_recreated() {
+        // hop("weave-a") listens on 7001 and dials 10.0.0.2:7002; the adopted flow
+        // still listens on 9999, so its port drifted.
+        let desired = vec![hop("weave-a")];
+        let flows = vec![flow_with_uris(
+            "weave-a",
+            "id-a",
+            "srt://:9999?mode=listener",
+            "srt://10.0.0.2:7002?mode=caller",
+        )];
+
+        let plan = diff_hops(&desired, &flows);
+
+        assert_eq!(plan.delete, vec!["id-a".to_string()]);
+        let created: Vec<_> = plan.create.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(created, vec!["weave-a"]);
+        assert!(plan.start.is_empty(), "recreated flow is not also started in place");
+    }
+
+    #[test]
+    fn matching_flow_uris_are_adopted_not_recreated() {
+        let desired = vec![hop("weave-a")];
+        let flows = vec![flow_with_uris(
+            "weave-a",
+            "id-a",
+            "srt://:7001?mode=listener",
+            "srt://10.0.0.2:7002?mode=caller",
+        )];
+
+        let plan = diff_hops(&desired, &flows);
+
+        assert!(plan.is_empty(), "unchanged flow is adopted as-is: {plan:?}");
     }
 
     #[test]

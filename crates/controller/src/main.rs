@@ -24,7 +24,7 @@ use weave_core::{
     DesiredHop, ObservedState, PathStatus, ReconcileReport, ReconcileStatus, StreamDefinition,
 };
 
-use path::{StreamEndpoints, derive_path, path_status, stream_endpoints};
+use path::{PortAllocator, StreamEndpoints, derive_path, path_status, stream_endpoints};
 
 #[derive(Debug, Parser)]
 #[command(name = "weave-controller", version, about = "open-weave reconciler")]
@@ -197,7 +197,10 @@ async fn reconcile_once(
     northbound_url: &str,
     southbound_url: &str,
 ) -> Result<ReconcileOutcome> {
-    let streams = fetch_streams(http, northbound_url).await?;
+    let mut streams = fetch_streams(http, northbound_url).await?;
+    // Stable order so the per-tick port allocator assigns deterministically for a
+    // given stream set.
+    streams.sort_by(|a, b| a.name.cmp(&b.name));
     let observed = fetch_state(http, southbound_url).await?;
 
     // Seed every registered node with an empty desired list so deleted or disabled
@@ -212,6 +215,7 @@ async fn reconcile_once(
     let mut endpoints_by_stream: BTreeMap<String, StreamEndpoints> = BTreeMap::new();
     let mut enabled = 0usize;
     let mut flowing = 0usize;
+    let mut ports = PortAllocator::new();
 
     for stream in &streams {
         if !stream.enabled {
@@ -225,7 +229,7 @@ async fn reconcile_once(
         }
         enabled += 1;
 
-        let status = match derive_path(stream, &observed.nodes, &observed.hops) {
+        let status = match derive_path(stream, &observed.nodes, &observed.hops, &mut ports) {
             Ok(path) => {
                 let mut nodes = Vec::new();
                 for hop in &path.hops {

@@ -29,15 +29,31 @@ pub enum StreamTransport {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SrtEndpoint {
-    /// Registered node id hosting this endpoint. Primary placement key.
-    pub node: String,
+    /// Registered node id hosting this endpoint. Mutually exclusive with
+    /// [`SrtEndpoint::remote`]; exactly one must be set (enforced at validation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// External SRT listener this endpoint dials out to. Destinations only;
+    /// mutually exclusive with [`SrtEndpoint::node`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteAddr>,
     /// Data-plane alias resolved against the node's declared address map.
     /// Absent means [`DEFAULT_DATA_PLANE_ALIAS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency: Option<u32>,
+}
+
+/// An external SRT listener a stream dials out to. Placed by no node: the sender
+/// simply gains a caller egress to this address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteAddr {
+    pub host: String,
+    pub port: u16,
 }
 
 /// Prefix marking a hop id (and thus its provisioned flow) as owned by open-weave.
@@ -502,7 +518,8 @@ mod tests {
         assert_eq!(
             stream.source,
             StreamTransport::Srt(SrtEndpoint {
-                node: "strom-node-1".to_string(),
+                node: Some("strom-node-1".to_string()),
+                remote: None,
                 network: None,
                 latency: Some(200),
             })
@@ -510,7 +527,8 @@ mod tests {
         assert_eq!(
             stream.destinations[0],
             StreamTransport::Srt(SrtEndpoint {
-                node: "strom-node-2".to_string(),
+                node: Some("strom-node-2".to_string()),
+                remote: None,
                 network: Some("wan".to_string()),
                 latency: None,
             })
@@ -798,10 +816,32 @@ mod tests {
     }
 
     #[test]
-    fn srt_endpoint_without_node_is_rejected() {
-        let result: Result<SrtEndpoint, _> =
-            serde_json::from_value(serde_json::json!({ "network": "wan" }));
-        assert!(result.is_err(), "node is a required field");
+    fn srt_endpoint_serde_allows_node_or_remote_and_denies_unknown_fields() {
+        // node is now optional; the node-XOR-remote rule is enforced at
+        // validation, not by serde, so a bare endpoint still parses.
+        let bare: SrtEndpoint =
+            serde_json::from_value(serde_json::json!({ "network": "wan" })).expect("parse bare");
+        assert_eq!(bare.node, None);
+        assert_eq!(bare.remote, None);
+
+        let remote: SrtEndpoint = serde_json::from_value(serde_json::json!({
+            "remote": { "host": "198.51.100.5", "port": 9000 }
+        }))
+        .expect("parse remote");
+        assert_eq!(
+            remote.remote,
+            Some(RemoteAddr {
+                host: "198.51.100.5".to_string(),
+                port: 9000,
+            })
+        );
+        let round_trip: SrtEndpoint =
+            serde_json::from_str(&serde_json::to_string(&remote).unwrap()).unwrap();
+        assert_eq!(remote, round_trip);
+
+        let bogus: Result<SrtEndpoint, _> =
+            serde_json::from_value(serde_json::json!({ "node": "n", "bogus": true }));
+        assert!(bogus.is_err(), "deny_unknown_fields rejects typos");
     }
 
     fn node_config() -> NodeConfig {

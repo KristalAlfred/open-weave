@@ -14,3 +14,9 @@ destinations:
   - srt:
       node: strom-node-2
       network: wan
+  # A destination may instead dial out to an external SRT listener. No node
+  # hosts it and no port is assigned; the sender just adds a caller egress.
+  # - srt:
+  #     remote:
+  #       host: 198.51.100.5
+  #       port: 9000

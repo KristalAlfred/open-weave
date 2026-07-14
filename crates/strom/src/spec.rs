@@ -89,6 +89,16 @@ fn sink_props(spec: &SocketSpec) -> Result<Map<String, Value>, MappingError> {
     Ok(props)
 }
 
+/// Parse `(host, port)` from an `srt://host:port?...` URI. A listener URI
+/// (`srt://:port`) yields an empty host. Returns `None` when the string is not a
+/// recognisable `srt://` authority with a numeric port.
+#[must_use]
+pub fn parse_srt_endpoint(uri: &str) -> Option<(String, u16)> {
+    let authority = uri.strip_prefix("srt://")?.split(['?', '/']).next()?;
+    let (host, port) = authority.rsplit_once(':')?;
+    Some((host.to_string(), port.parse().ok()?))
+}
+
 fn socket_uri(spec: &SocketSpec) -> Result<String, MappingError> {
     let Transport::Srt = spec.transport;
     let port = spec.port.ok_or(MappingError::IncompleteSocket("port"))?;
@@ -342,6 +352,20 @@ mod tests {
         caller.ingress.host = Some("172.31.0.99".to_string());
         let caller = flow_spec_from_hop(&caller).expect("map");
         assert!(!caller.elements[0].properties.contains_key("keep-listening"));
+    }
+
+    #[test]
+    fn parse_srt_endpoint_reads_host_and_port() {
+        assert_eq!(
+            parse_srt_endpoint("srt://:7001?mode=listener"),
+            Some((String::new(), 7001))
+        );
+        assert_eq!(
+            parse_srt_endpoint("srt://10.0.0.2:7002?mode=caller"),
+            Some(("10.0.0.2".to_string(), 7002))
+        );
+        assert_eq!(parse_srt_endpoint("http://x:1"), None);
+        assert_eq!(parse_srt_endpoint("srt://nohost"), None);
     }
 
     #[test]
