@@ -3,7 +3,7 @@ node:
   id: strom-node-1
   southbound_url: http://172.25.0.21:8081
   listen: 0.0.0.0:8091
-  public_endpoint: http://172.26.0.10:8080
+  public_endpoint: http://172.26.0.11:8091
   data_plane:
     default: 172.26.0.10
   port_range:

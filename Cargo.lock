@@ -1515,6 +1515,7 @@ dependencies = [
  "axum",
  "clap",
  "reqwest",
+ "serde",
  "serde_json",
  "serde_norway",
  "tokio",

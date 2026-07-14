@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use axum::{Json, Router, routing::get};
 use clap::Parser;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 use weave_core::{
@@ -33,19 +34,27 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let config = load_config(&args.config)?;
+    let config = load_config(&args.config)?.node;
     let registration = registration(&config);
 
     register(&config.southbound_url, &registration).await?;
     serve_health(config.listen).await
 }
 
-fn load_config(path: &Path) -> Result<NodeConfig> {
+/// Node-config file wrapper. Accepts an extra `strom:` section (present in
+/// adapter configs) without failing so both share one file shape.
+#[derive(Debug, Deserialize)]
+struct MediaNodeConfig {
+    node: NodeConfig,
+}
+
+fn load_config(path: &Path) -> Result<MediaNodeConfig> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    let config: NodeConfig = serde_norway::from_str(&text)
+    let config: MediaNodeConfig = serde_norway::from_str(&text)
         .with_context(|| format!("parsing config {}", path.display()))?;
     config
+        .node
         .validate()
         .with_context(|| format!("validating config {}", path.display()))?;
     Ok(config)
@@ -106,4 +115,27 @@ async fn serve_health(addr: String) -> Result<()> {
 
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loads_wrapped_config_with_extra_strom_section() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("weave-media-node-adapter-config.yaml");
+        std::fs::write(
+            &path,
+            "node:\n  id: strom-node-1\n  southbound_url: http://10.0.0.1:8081\n  listen: 0.0.0.0:8091\n  public_endpoint: http://10.0.0.2:8091\n  data_plane:\n    default: 10.0.0.2\n  port_range:\n    start: 20000\n    end: 20999\n  transports: [srt]\nstrom:\n  url: http://10.0.0.2:8080\n  poll_interval_secs: 5\n",
+        )
+        .unwrap();
+
+        let config = load_config(&path).expect("adapter-shaped config should parse");
+
+        assert_eq!(config.node.id, "strom-node-1");
+        assert_eq!(config.node.public_endpoint(), "http://10.0.0.2:8091");
+
+        std::fs::remove_file(&path).ok();
+    }
 }
