@@ -414,7 +414,9 @@ fn hop_port(spec: &SocketSpec, hop_id: &str) -> Result<u16, PlacementError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weave_core::{HopState, LinkCondition, NodeCapabilities, NodeStatus, PortRange, ResolvedAddr};
+    use weave_core::{
+        HopState, LinkCondition, NodeCapabilities, NodeStatus, PortRange, ResolvedAddr,
+    };
 
     fn node(id: &str, host: &str) -> NodeDescriptor {
         node_with_aliases(id, &[(DEFAULT_DATA_PLANE_ALIAS, host)])
@@ -775,8 +777,7 @@ mod tests {
             "keeps the wan host"
         );
         assert_eq!(
-            path.hops[0].egresses[0].port,
-            path.hops[1].ingress.port,
+            path.hops[0].egresses[0].port, path.hops[1].ingress.port,
             "keeps the planned port"
         );
     }
@@ -796,7 +797,10 @@ mod tests {
     fn missing_destination_is_an_error() {
         let mut stream = contribution();
         stream.destinations.clear();
-        assert_eq!(derive(&stream, &nodes()), Err(PlacementError::NoDestination));
+        assert_eq!(
+            derive(&stream, &nodes()),
+            Err(PlacementError::NoDestination)
+        );
     }
 
     #[test]
@@ -827,7 +831,11 @@ mod tests {
         ];
 
         let path = derive(&stream, &nodes()).expect("derive");
-        assert_eq!(path.hops.len(), 2, "sender plus one receiver for the node dest");
+        assert_eq!(
+            path.hops.len(),
+            2,
+            "sender plus one receiver for the node dest"
+        );
         let sender = &path.hops[0];
         assert_eq!(sender.egresses.len(), 2, "one egress per destination");
         assert_eq!(sender.egresses[1].host.as_deref(), Some("198.51.100.5"));

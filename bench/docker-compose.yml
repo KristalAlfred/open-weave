@@ -37,6 +37,9 @@ services:
     command: ["weave-northbound"]
     environment:
       WEAVE_NORTHBOUND_ADDR: 0.0.0.0:9080
+      WEAVE_NORTHBOUND_STATE: /var/lib/weave/streams.json
+    volumes:
+      - northbound-state:/var/lib/weave
     ports:
       - "29080:9080"
     networks:
@@ -55,6 +58,9 @@ services:
     command: ["weave-southbound"]
     environment:
       WEAVE_SOUTHBOUND_ADDR: 0.0.0.0:8081
+      WEAVE_SOUTHBOUND_STATE: /var/lib/weave/southbound.json
+    volumes:
+      - southbound-state:/var/lib/weave
     ports:
       - "29081:8081"
     networks:
@@ -421,3 +427,5 @@ services:
 volumes:
   strom1-data:
   strom2-data:
+  northbound-state:
+  southbound-state:

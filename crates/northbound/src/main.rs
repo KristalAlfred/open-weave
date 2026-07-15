@@ -1,6 +1,6 @@
 //! Northbound API — desired-state surface for operators and systems.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -20,6 +20,30 @@ const DEFAULT_ADDR: &str = "127.0.0.1:9080";
 #[derive(Clone, Default)]
 struct AppState {
     streams: Arc<RwLock<BTreeMap<String, StreamDefinition>>>,
+    state_file: Option<Arc<PathBuf>>,
+}
+
+impl AppState {
+    fn new(state_file: Option<PathBuf>) -> Result<Self> {
+        let streams = match &state_file {
+            Some(path) => weave_core::load(path).context("loading northbound state")?,
+            None => None,
+        };
+        Ok(Self {
+            streams: Arc::new(RwLock::new(streams.unwrap_or_default())),
+            state_file: state_file.map(Arc::new),
+        })
+    }
+
+    async fn persist(&self) {
+        let Some(path) = &self.state_file else {
+            return;
+        };
+        let streams = self.streams.read().await;
+        if let Err(err) = weave_core::store(path.as_path(), &*streams) {
+            tracing::error!(%err, "failed to persist northbound state");
+        }
+    }
 }
 
 #[tokio::main]
@@ -31,7 +55,8 @@ async fn main() -> Result<()> {
         .init();
 
     let addr = std::env::var("WEAVE_NORTHBOUND_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
-    let app = router(AppState::default());
+    let state_file = std::env::var_os("WEAVE_NORTHBOUND_STATE").map(PathBuf::from);
+    let app = router(AppState::new(state_file)?);
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
@@ -87,6 +112,7 @@ async fn submit_stream(
 
     let name = stream.name.clone();
     state.streams.write().await.insert(name.clone(), stream);
+    state.persist().await;
 
     tracing::info!(%name, "stream accepted");
     (
@@ -98,6 +124,7 @@ async fn submit_stream(
 
 async fn delete_stream(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     if state.streams.write().await.remove(&name).is_some() {
+        state.persist().await;
         tracing::info!(%name, "stream deleted");
         StatusCode::NO_CONTENT.into_response()
     } else {
@@ -428,5 +455,60 @@ mod tests {
                 .unwrap()
                 .contains("node must not be empty")
         );
+    }
+
+    fn temp_state_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("weave-nb-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(format!("{name}.json"))
+    }
+
+    #[tokio::test]
+    async fn post_persists_stream_to_state_file() {
+        let path = temp_state_path("post-persists");
+        let _ = std::fs::remove_file(&path);
+        let app = router(AppState::new(Some(path.clone())).unwrap());
+        let stream = sample_stream();
+
+        let post = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/streams")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&stream).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post.status(), StatusCode::ACCEPTED);
+
+        let persisted: BTreeMap<String, StreamDefinition> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted.get("cam1-to-studio"), Some(&stream));
+    }
+
+    #[tokio::test]
+    async fn state_loads_from_pre_seeded_file() {
+        let path = temp_state_path("pre-seeded");
+        let stream = sample_stream();
+        let seed: BTreeMap<String, StreamDefinition> =
+            BTreeMap::from([(stream.name.clone(), stream.clone())]);
+        std::fs::write(&path, serde_json::to_vec(&seed).unwrap()).unwrap();
+
+        let app = router(AppState::new(Some(path)).unwrap());
+        let get = app
+            .oneshot(
+                Request::builder()
+                    .uri("/streams")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        let listed: Vec<StreamDefinition> =
+            serde_json::from_value(body_json(get).await).expect("stream list");
+        assert_eq!(listed, vec![stream]);
     }
 }

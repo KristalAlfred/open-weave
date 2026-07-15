@@ -1,8 +1,12 @@
 //! Shared domain types for open-weave.
 
+mod snapshot;
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+
+pub use snapshot::{SnapshotError, load, store};
 
 /// Conventional data-plane alias resolved when a manifest pins no network.
 pub const DEFAULT_DATA_PLANE_ALIAS: &str = "default";

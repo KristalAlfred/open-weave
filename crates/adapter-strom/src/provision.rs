@@ -328,7 +328,10 @@ mod tests {
         assert_eq!(plan.delete, vec!["id-a".to_string()]);
         let created: Vec<_> = plan.create.iter().map(|h| h.id.as_str()).collect();
         assert_eq!(created, vec!["weave-a"]);
-        assert!(plan.start.is_empty(), "recreated flow is not also started in place");
+        assert!(
+            plan.start.is_empty(),
+            "recreated flow is not also started in place"
+        );
     }
 
     #[test]
