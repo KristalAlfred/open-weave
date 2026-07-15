@@ -8,7 +8,7 @@ mod store;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -25,8 +25,8 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 use weave_core::{
-    DesiredHop, EndpointDescriptor, NodeDescriptor, NodeHeartbeat, NodeRegistration, ObservedState,
-    PathStatus, ReconcileReport, ReconcileStatus, StreamDefinition,
+    DesiredHop, EndpointDescriptor, NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus,
+    ObservedState, PathStatus, ReconcileReport, ReconcileStatus, StreamDefinition,
 };
 
 use path::{PortAllocator, StreamEndpoints, derive_path, path_status, stream_endpoints};
@@ -39,6 +39,11 @@ struct Args {
     listen: String,
     #[arg(long, env = "WEAVE_RECONCILE_INTERVAL_SECS", default_value_t = 5)]
     interval_secs: u64,
+    /// A node is marked `Offline` once this many seconds elapse without a
+    /// heartbeat. Its desired hops are still computed and served so a returning
+    /// adapter resumes on the same deterministic ports.
+    #[arg(long, env = "WEAVE_NODE_TTL_SECS", default_value_t = 15)]
+    node_ttl_secs: u64,
     /// Postgres connection URL. When unset the controller runs with an
     /// in-memory store and does not persist state across restarts.
     #[arg(long, env = "DATABASE_URL")]
@@ -58,12 +63,14 @@ struct AppState {
     store: Arc<dyn StateStore>,
     streams: Arc<RwLock<BTreeMap<String, StreamDefinition>>>,
     nodes: Arc<RwLock<BTreeMap<String, NodeRegistration>>>,
+    last_seen: Arc<RwLock<BTreeMap<String, Instant>>>,
+    node_ttl: Duration,
     desired: Arc<RwLock<BTreeMap<String, Vec<DesiredHop>>>>,
     view: Arc<RwLock<ControllerView>>,
 }
 
 impl AppState {
-    async fn hydrate(store: Arc<dyn StateStore>) -> Result<Self> {
+    async fn hydrate(store: Arc<dyn StateStore>, node_ttl: Duration) -> Result<Self> {
         let streams = store
             .load_streams()
             .await
@@ -77,11 +84,15 @@ impl AppState {
             .context("hydrating nodes")?
             .into_iter()
             .map(|registration| (registration.node.id.clone(), registration))
-            .collect();
+            .collect::<BTreeMap<String, NodeRegistration>>();
+        let boot = Instant::now();
+        let last_seen = nodes.keys().map(|id| (id.clone(), boot)).collect();
         Ok(Self {
             store,
             streams: Arc::new(RwLock::new(streams)),
             nodes: Arc::new(RwLock::new(nodes)),
+            last_seen: Arc::new(RwLock::new(last_seen)),
+            node_ttl,
             desired: Arc::new(RwLock::new(BTreeMap::new())),
             view: Arc::new(RwLock::new(ControllerView {
                 status: json!({ "status": "starting" }),
@@ -96,6 +107,8 @@ struct StreamStatus {
     name: String,
     status: PathStatus,
     nodes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     endpoints: Option<StreamEndpoints>,
 }
@@ -127,6 +140,7 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let interval = Duration::from_secs(args.interval_secs);
+    let node_ttl = Duration::from_secs(args.node_ttl_secs);
 
     let store: Arc<dyn StateStore> = match &args.database_url {
         Some(url) => {
@@ -143,7 +157,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    let state = AppState::hydrate(store).await?;
+    let state = AppState::hydrate(store, node_ttl).await?;
     let api = spawn_api_server(args.listen.clone(), state.clone());
 
     tracing::info!(interval_secs = args.interval_secs, "controller starting");
@@ -166,7 +180,12 @@ async fn main() -> Result<()> {
 
 async fn reconcile_tick(state: &AppState) {
     let streams: Vec<StreamDefinition> = state.streams.read().await.values().cloned().collect();
-    let observed = observed_state(&*state.nodes.read().await);
+    let observed = {
+        let mut nodes = state.nodes.write().await;
+        let last_seen = state.last_seen.read().await;
+        mark_offline(&mut nodes, &last_seen, Instant::now(), state.node_ttl);
+        observed_state(&nodes)
+    };
     let outcome = reconcile(streams, &observed);
 
     for stream in &outcome.streams {
@@ -185,6 +204,24 @@ async fn reconcile_tick(state: &AppState) {
     view.status = status_json;
     view.streams = names;
     view.endpoints = outcome.endpoints;
+}
+
+/// Mark nodes whose last heartbeat is older than `ttl` as [`NodeStatus::Offline`].
+/// Nodes seen within the TTL keep their reported status. Pure: the caller supplies
+/// `now`, so the boundary is testable without a clock.
+fn mark_offline(
+    nodes: &mut BTreeMap<String, NodeRegistration>,
+    last_seen: &BTreeMap<String, Instant>,
+    now: Instant,
+    ttl: Duration,
+) {
+    for (id, registration) in nodes.iter_mut() {
+        if let Some(seen) = last_seen.get(id)
+            && now.saturating_duration_since(*seen) > ttl
+        {
+            registration.node.status = NodeStatus::Offline;
+        }
+    }
 }
 
 fn observed_state(nodes: &BTreeMap<String, NodeRegistration>) -> ObservedState {
@@ -348,6 +385,11 @@ async fn register_node(
         }
         nodes.insert(node_id.clone(), registration);
     }
+    state
+        .last_seen
+        .write()
+        .await
+        .insert(node_id.clone(), Instant::now());
     tracing::info!(%node_id, endpoint_count, "node registered");
     (
         StatusCode::ACCEPTED,
@@ -372,6 +414,11 @@ async fn node_heartbeat(
     registration.node.status = heartbeat.status;
     registration.endpoints = heartbeat.endpoints;
     registration.hop_status = heartbeat.hop_status;
+    state
+        .last_seen
+        .write()
+        .await
+        .insert(node_id.clone(), Instant::now());
 
     tracing::debug!(%node_id, status = ?registration.node.status, "node heartbeat");
     (
@@ -416,6 +463,13 @@ fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> Re
         .map(|node| (node.id.clone(), Vec::new()))
         .collect();
 
+    let offline: BTreeSet<&str> = observed
+        .nodes
+        .iter()
+        .filter(|node| node.status == NodeStatus::Offline)
+        .map(|node| node.id.as_str())
+        .collect();
+
     let mut stream_statuses = Vec::with_capacity(streams.len());
     let mut endpoints_by_stream: BTreeMap<String, StreamEndpoints> = BTreeMap::new();
     let mut enabled = 0usize;
@@ -428,6 +482,7 @@ fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> Re
                 name: stream.name.clone(),
                 status: PathStatus::Idle,
                 nodes: Vec::new(),
+                reason: None,
                 endpoints: None,
             });
             continue;
@@ -446,7 +501,10 @@ fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> Re
                         .or_default()
                         .push(hop.clone());
                 }
-                let status = path_status(&path, &observed.hops);
+                let (status, reason) = match nodes.iter().find(|id| offline.contains(id.as_str())) {
+                    Some(id) => (PathStatus::Degraded, Some(format!("node {id} lost"))),
+                    None => (path_status(&path, &observed.hops), None),
+                };
                 let endpoints = match stream_endpoints(stream, &path, &observed.nodes) {
                     Ok(endpoints) => {
                         endpoints_by_stream.insert(stream.name.clone(), endpoints.clone());
@@ -461,6 +519,7 @@ fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> Re
                     name: stream.name.clone(),
                     status,
                     nodes,
+                    reason,
                     endpoints,
                 });
                 status
@@ -471,6 +530,7 @@ fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> Re
                     name: stream.name.clone(),
                     status: PathStatus::Pending,
                     nodes: Vec::new(),
+                    reason: None,
                     endpoints: None,
                 });
                 PathStatus::Pending
@@ -521,7 +581,7 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
-    use weave_core::{NodeCapabilities, NodeStatus, PortRange, SrtEndpoint, StreamTransport};
+    use weave_core::{NodeCapabilities, PortRange, SrtEndpoint, StreamTransport};
 
     fn mem_state() -> (AppState, Arc<MemStore>) {
         let mem = Arc::new(MemStore::new());
@@ -529,6 +589,8 @@ mod tests {
             store: mem.clone(),
             streams: Arc::new(RwLock::new(BTreeMap::new())),
             nodes: Arc::new(RwLock::new(BTreeMap::new())),
+            last_seen: Arc::new(RwLock::new(BTreeMap::new())),
+            node_ttl: Duration::from_secs(15),
             desired: Arc::new(RwLock::new(BTreeMap::new())),
             view: Arc::new(RwLock::new(ControllerView::default())),
         };
@@ -740,5 +802,111 @@ mod tests {
 
         let (status, _) = send(&app, "GET", "/streams/nope/endpoints", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn mark_offline_marks_stale_preserves_fresh_and_spares_exact_ttl() {
+        let mut nodes = BTreeMap::from([
+            (
+                "stale".to_string(),
+                node_registration("stale", "172.26.0.10"),
+            ),
+            (
+                "fresh".to_string(),
+                node_registration("fresh", "172.27.0.10"),
+            ),
+            ("edge".to_string(), node_registration("edge", "172.28.0.10")),
+        ]);
+        nodes.get_mut("fresh").unwrap().node.status = NodeStatus::Degraded;
+
+        let ttl = Duration::from_secs(15);
+        let now = Instant::now();
+        let last_seen = BTreeMap::from([
+            ("stale".to_string(), now - Duration::from_secs(20)),
+            ("fresh".to_string(), now - Duration::from_secs(5)),
+            ("edge".to_string(), now - ttl),
+        ]);
+
+        mark_offline(&mut nodes, &last_seen, now, ttl);
+
+        assert_eq!(nodes["stale"].node.status, NodeStatus::Offline);
+        assert_eq!(
+            nodes["fresh"].node.status,
+            NodeStatus::Degraded,
+            "fresh node keeps its reported status"
+        );
+        assert_eq!(
+            nodes["edge"].node.status,
+            NodeStatus::Ready,
+            "age == ttl is not yet offline"
+        );
+    }
+
+    #[test]
+    fn reconcile_degrades_stream_when_a_hop_node_is_offline() {
+        let mut nodes = BTreeMap::from([
+            (
+                "strom-node-1".to_string(),
+                node_registration("strom-node-1", "172.26.0.10"),
+            ),
+            (
+                "strom-node-2".to_string(),
+                node_registration("strom-node-2", "172.27.0.10"),
+            ),
+        ]);
+        nodes.get_mut("strom-node-1").unwrap().node.status = NodeStatus::Offline;
+        let observed = observed_state(&nodes);
+
+        let outcome = reconcile(vec![stream("basic")], &observed);
+
+        let basic = outcome.streams.iter().find(|s| s.name == "basic").unwrap();
+        assert_eq!(basic.status, PathStatus::Degraded);
+        assert_eq!(basic.reason.as_deref(), Some("node strom-node-1 lost"));
+        assert!(
+            !outcome.desired_by_node["strom-node-1"].is_empty(),
+            "desired hops for the offline node are still computed"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_marks_offline_node_but_still_serves_its_desired_hops() {
+        let (state, _mem) = mem_state();
+        {
+            let mut nodes = state.nodes.write().await;
+            nodes.insert(
+                "strom-node-1".to_string(),
+                node_registration("strom-node-1", "172.26.0.10"),
+            );
+            nodes.insert(
+                "strom-node-2".to_string(),
+                node_registration("strom-node-2", "172.27.0.10"),
+            );
+            state
+                .streams
+                .write()
+                .await
+                .insert("basic".to_string(), stream("basic"));
+            let now = Instant::now();
+            let mut seen = state.last_seen.write().await;
+            seen.insert("strom-node-1".to_string(), now - Duration::from_secs(60));
+            seen.insert("strom-node-2".to_string(), now);
+        }
+
+        reconcile_tick(&state).await;
+
+        let app = router(state);
+        let (status, body) = send(&app, "GET", "/nodes", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let nodes: Vec<NodeDescriptor> = serde_json::from_value(body).unwrap();
+        let node1 = nodes.iter().find(|n| n.id == "strom-node-1").unwrap();
+        assert_eq!(node1.status, NodeStatus::Offline);
+
+        let (status, body) = send(&app, "GET", "/nodes/strom-node-1/desired", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
+        assert!(
+            !hops.is_empty(),
+            "offline node still receives its desired hops"
+        );
     }
 }
