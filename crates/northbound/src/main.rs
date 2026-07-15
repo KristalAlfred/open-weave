@@ -1,47 +1,34 @@
-//! Northbound API — desired-state surface for operators and systems.
-
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+//! Northbound API — desired-state surface for operators and systems. Stateless:
+//! it validates stream submissions at the boundary and proxies every request to
+//! the controller, which owns all state.
 
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
 };
 use serde_json::{Value, json};
-use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 use weave_core::{SrtEndpoint, StreamDefinition, StreamTransport};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:9080";
+const DEFAULT_CONTROLLER_URL: &str = "http://127.0.0.1:8082";
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct AppState {
-    streams: Arc<RwLock<BTreeMap<String, StreamDefinition>>>,
-    state_file: Option<Arc<PathBuf>>,
+    http: reqwest::Client,
+    controller_url: String,
 }
 
 impl AppState {
-    fn new(state_file: Option<PathBuf>) -> Result<Self> {
-        let streams = match &state_file {
-            Some(path) => weave_core::load(path).context("loading northbound state")?,
-            None => None,
-        };
-        Ok(Self {
-            streams: Arc::new(RwLock::new(streams.unwrap_or_default())),
-            state_file: state_file.map(Arc::new),
-        })
-    }
-
-    async fn persist(&self) {
-        let Some(path) = &self.state_file else {
-            return;
-        };
-        let streams = self.streams.read().await;
-        if let Err(err) = weave_core::store(path.as_path(), &*streams) {
-            tracing::error!(%err, "failed to persist northbound state");
+    fn new(controller_url: String) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            controller_url,
         }
     }
 }
@@ -55,13 +42,14 @@ async fn main() -> Result<()> {
         .init();
 
     let addr = std::env::var("WEAVE_NORTHBOUND_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
-    let state_file = std::env::var_os("WEAVE_NORTHBOUND_STATE").map(PathBuf::from);
-    let app = router(AppState::new(state_file)?);
+    let controller_url = std::env::var("WEAVE_CONTROLLER_URL")
+        .unwrap_or_else(|_| DEFAULT_CONTROLLER_URL.to_string());
+    let app = router(AppState::new(controller_url.clone()));
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("binding northbound listener on {addr}"))?;
-    tracing::info!(%addr, "northbound API listening");
+    tracing::info!(%addr, %controller_url, "northbound API listening");
 
     axum::serve(listener, app)
         .await
@@ -81,9 +69,8 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-async fn list_streams(State(state): State<AppState>) -> Json<Vec<StreamDefinition>> {
-    let streams = state.streams.read().await;
-    Json(streams.values().cloned().collect())
+async fn list_streams(State(state): State<AppState>) -> Response {
+    proxy(&state, reqwest::Method::GET, "/streams", None).await
 }
 
 async fn submit_stream(
@@ -110,26 +97,24 @@ async fn submit_stream(
         }
     }
 
-    let name = stream.name.clone();
-    state.streams.write().await.insert(name.clone(), stream);
-    state.persist().await;
-
-    tracing::info!(%name, "stream accepted");
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({ "status": "accepted", "name": name })),
-    )
-        .into_response()
+    let body = match serde_json::to_vec(&stream) {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::error!(%err, "serializing validated stream failed");
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "failed to encode stream");
+        }
+    };
+    proxy(&state, reqwest::Method::POST, "/streams", Some(body.into())).await
 }
 
 async fn delete_stream(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    if state.streams.write().await.remove(&name).is_some() {
-        state.persist().await;
-        tracing::info!(%name, "stream deleted");
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        error(StatusCode::NOT_FOUND, "stream not found")
-    }
+    proxy(
+        &state,
+        reqwest::Method::DELETE,
+        &format!("/streams/{name}"),
+        None,
+    )
+    .await
 }
 
 fn error(status: StatusCode, message: &str) -> Response {
@@ -153,14 +138,96 @@ fn validate_endpoint(endpoint: &SrtEndpoint, is_source: bool) -> Result<(), &'st
     }
 }
 
+/// Forward a request to the controller, passing its status and body back faithfully.
+async fn proxy(
+    state: &AppState,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Bytes>,
+) -> Response {
+    let url = format!("{}{path}", state.controller_url.trim_end_matches('/'));
+    let mut request = state.http.request(method, &url);
+    if let Some(body) = body {
+        request = request
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+    }
+    match request.send().await {
+        Ok(response) => relay(response).await,
+        Err(err) => {
+            tracing::warn!(%err, %url, "proxying to controller failed");
+            error(StatusCode::BAD_GATEWAY, "controller unreachable")
+        }
+    }
+}
+
+async fn relay(response: reqwest::Response) -> Response {
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = response.bytes().await.unwrap_or_default();
+    let mut out = (status, body).into_response();
+    if let Some(value) = content_type.and_then(|ct| ct.parse().ok()) {
+        out.headers_mut()
+            .insert(reqwest::header::CONTENT_TYPE, value);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
+    use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
     use weave_core::RemoteAddr;
+
+    #[derive(Clone, Default)]
+    struct Captured {
+        method: String,
+        path: String,
+        body: Vec<u8>,
+    }
+
+    /// A stub controller listening on a real socket. Records the last request and
+    /// returns a canned status + JSON body so proxy fidelity can be asserted.
+    async fn stub_controller(status: StatusCode) -> (String, Arc<Mutex<Option<Captured>>>) {
+        use axum::extract::State as AxState;
+        let captured: Arc<Mutex<Option<Captured>>> = Arc::new(Mutex::new(None));
+
+        async fn record(
+            AxState((captured, status)): AxState<(Arc<Mutex<Option<Captured>>>, StatusCode)>,
+            request: Request<Body>,
+        ) -> Response {
+            let method = request.method().to_string();
+            let path = request.uri().path().to_string();
+            let body = request
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec();
+            *captured.lock().unwrap() = Some(Captured { method, path, body });
+            (status, Json(json!({ "ok": true }))).into_response()
+        }
+
+        let app = Router::new()
+            .fallback(record)
+            .with_state((captured.clone(), status));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), captured)
+    }
 
     fn node_ref(id: &str) -> SrtEndpoint {
         SrtEndpoint {
@@ -175,127 +242,20 @@ mod tests {
         StreamDefinition {
             name: "cam1-to-studio".to_string(),
             enabled: true,
-            source: StreamTransport::Srt(SrtEndpoint {
-                latency: Some(200),
-                ..node_ref("strom-node-1")
-            }),
+            source: StreamTransport::Srt(node_ref("strom-node-1")),
             destinations: vec![StreamTransport::Srt(node_ref("strom-node-2"))],
         }
     }
 
     async fn body_json(response: Response) -> Value {
-        let bytes = response
-            .into_body()
-            .collect()
-            .await
-            .expect("collect body")
-            .to_bytes();
-        serde_json::from_slice(&bytes).expect("json body")
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     #[tokio::test]
-    async fn post_then_get_returns_stored_stream() {
-        let app = router(AppState::default());
-        let stream = sample_stream();
-
-        let post = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/streams")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&stream).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(post.status(), StatusCode::ACCEPTED);
-        assert_eq!(body_json(post).await["name"], "cam1-to-studio");
-
-        let get = app
-            .oneshot(
-                Request::builder()
-                    .uri("/streams")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(get.status(), StatusCode::OK);
-
-        let listed: Vec<StreamDefinition> =
-            serde_json::from_value(body_json(get).await).expect("stream list");
-        assert_eq!(listed, vec![stream]);
-    }
-
-    #[tokio::test]
-    async fn post_then_delete_removes_stream() {
-        let app = router(AppState::default());
-        let stream = sample_stream();
-
-        let post = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/streams")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&stream).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(post.status(), StatusCode::ACCEPTED);
-
-        let delete = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri("/streams/cam1-to-studio")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(delete.status(), StatusCode::NO_CONTENT);
-
-        let get = app
-            .oneshot(
-                Request::builder()
-                    .uri("/streams")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let listed: Vec<StreamDefinition> =
-            serde_json::from_value(body_json(get).await).expect("stream list");
-        assert!(listed.is_empty());
-    }
-
-    #[tokio::test]
-    async fn delete_unknown_stream_is_not_found() {
-        let app = router(AppState::default());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri("/streams/nope")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn post_empty_destinations_is_rejected() {
-        let app = router(AppState::default());
-        let mut stream = sample_stream();
-        stream.destinations.clear();
+    async fn post_forwards_body_and_passes_status_through() {
+        let (url, captured) = stub_controller(StatusCode::ACCEPTED).await;
+        let app = router(AppState::new(url));
 
         let response = app
             .oneshot(
@@ -303,65 +263,73 @@ mod tests {
                     .method("POST")
                     .uri("/streams")
                     .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&stream).unwrap()))
+                    .body(Body::from(serde_json::to_vec(&sample_stream()).unwrap()))
                     .unwrap(),
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(body_json(response).await["ok"], true);
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            body_json(response).await["error"]
-                .as_str()
-                .unwrap()
-                .contains("destination")
-        );
-    }
-
-    async fn post_stream(stream: &StreamDefinition) -> Response {
-        post_raw(serde_json::to_value(stream).unwrap()).await
-    }
-
-    async fn post_raw(body: Value) -> Response {
-        router(AppState::default())
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/streams")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                    .unwrap(),
-            )
-            .await
+        let seen = captured
+            .lock()
             .unwrap()
+            .clone()
+            .expect("controller saw a request");
+        assert_eq!(seen.method, "POST");
+        assert_eq!(seen.path, "/streams");
+        let forwarded: StreamDefinition = serde_json::from_slice(&seen.body).unwrap();
+        assert_eq!(forwarded, sample_stream());
     }
 
     #[tokio::test]
-    async fn source_with_neither_node_nor_remote_is_rejected() {
-        // node is optional at the serde layer now; the missing-placement rule is
-        // enforced by validation, so this is a 400, not a serde 422.
-        let response = post_raw(json!({
-            "name": "cam1-to-studio",
-            "source": { "srt": { "network": "wan" } },
-            "destinations": [{ "srt": { "node": "strom-node-2" } }]
-        }))
-        .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    async fn delete_forwards_method_and_path() {
+        let (url, captured) = stub_controller(StatusCode::NO_CONTENT).await;
+        let app = router(AppState::new(url));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/streams/basic")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let seen = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("controller saw a request");
+        assert_eq!(seen.method, "DELETE");
+        assert_eq!(seen.path, "/streams/basic");
     }
 
     #[tokio::test]
-    async fn destination_with_neither_node_nor_remote_is_rejected() {
-        let response = post_raw(json!({
-            "name": "cam1-to-studio",
-            "source": { "srt": { "node": "strom-node-1" } },
-            "destinations": [{ "srt": { "network": "wan" } }]
-        }))
-        .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    async fn get_passes_controller_status_through() {
+        let (url, _captured) = stub_controller(StatusCode::OK).await;
+        let app = router(AppState::new(url));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/streams")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn endpoint_with_both_node_and_remote_is_rejected() {
+    async fn invalid_stream_is_rejected_before_proxying() {
+        let (url, captured) = stub_controller(StatusCode::ACCEPTED).await;
+        let app = router(AppState::new(url));
+
         let mut stream = sample_stream();
         let StreamTransport::Srt(dest) = &mut stream.destinations[0];
         dest.remote = Some(RemoteAddr {
@@ -369,108 +337,7 @@ mod tests {
             port: 9000,
         });
 
-        let response = post_stream(&stream).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            body_json(response).await["error"]
-                .as_str()
-                .unwrap()
-                .contains("not both")
-        );
-    }
-
-    #[tokio::test]
-    async fn remote_source_is_rejected() {
-        let mut stream = sample_stream();
-        stream.source = StreamTransport::Srt(SrtEndpoint {
-            node: None,
-            remote: Some(RemoteAddr {
-                host: "198.51.100.5".to_string(),
-                port: 9000,
-            }),
-            network: None,
-            latency: None,
-        });
-
-        let response = post_stream(&stream).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            body_json(response).await["error"]
-                .as_str()
-                .unwrap()
-                .contains("source must be a node")
-        );
-    }
-
-    #[tokio::test]
-    async fn remote_destination_is_accepted() {
-        let mut stream = sample_stream();
-        stream.destinations = vec![StreamTransport::Srt(SrtEndpoint {
-            node: None,
-            remote: Some(RemoteAddr {
-                host: "198.51.100.5".to_string(),
-                port: 9000,
-            }),
-            network: None,
-            latency: None,
-        })];
-
-        let response = post_stream(&stream).await;
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-    }
-
-    #[tokio::test]
-    async fn source_with_node_is_accepted() {
-        let response = post_stream(&sample_stream()).await;
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-    }
-
-    #[tokio::test]
-    async fn blank_source_node_is_rejected() {
-        let mut stream = sample_stream();
-        let StreamTransport::Srt(source) = &mut stream.source;
-        source.node = Some("  ".to_string());
-
-        let response = post_stream(&stream).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            body_json(response).await["error"]
-                .as_str()
-                .unwrap()
-                .contains("node must not be empty")
-        );
-    }
-
-    #[tokio::test]
-    async fn blank_destination_node_is_rejected() {
-        let mut stream = sample_stream();
-        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
-        dest.node = Some(String::new());
-
-        let response = post_stream(&stream).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            body_json(response).await["error"]
-                .as_str()
-                .unwrap()
-                .contains("node must not be empty")
-        );
-    }
-
-    fn temp_state_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("weave-nb-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(format!("{name}.json"))
-    }
-
-    #[tokio::test]
-    async fn post_persists_stream_to_state_file() {
-        let path = temp_state_path("post-persists");
-        let _ = std::fs::remove_file(&path);
-        let app = router(AppState::new(Some(path.clone())).unwrap());
-        let stream = sample_stream();
-
-        let post = app
+        let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -481,34 +348,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(post.status(), StatusCode::ACCEPTED);
-
-        let persisted: BTreeMap<String, StreamDefinition> =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted.get("cam1-to-studio"), Some(&stream));
-    }
-
-    #[tokio::test]
-    async fn state_loads_from_pre_seeded_file() {
-        let path = temp_state_path("pre-seeded");
-        let stream = sample_stream();
-        let seed: BTreeMap<String, StreamDefinition> =
-            BTreeMap::from([(stream.name.clone(), stream.clone())]);
-        std::fs::write(&path, serde_json::to_vec(&seed).unwrap()).unwrap();
-
-        let app = router(AppState::new(Some(path)).unwrap());
-        let get = app
-            .oneshot(
-                Request::builder()
-                    .uri("/streams")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(get.status(), StatusCode::OK);
-        let listed: Vec<StreamDefinition> =
-            serde_json::from_value(body_json(get).await).expect("stream list");
-        assert_eq!(listed, vec![stream]);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "invalid stream never reaches the controller"
+        );
     }
 }

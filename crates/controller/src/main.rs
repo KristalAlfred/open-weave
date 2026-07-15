@@ -1,6 +1,10 @@
-//! `weave-controller` — reconciles desired streams into per-node desired hops.
+//! `weave-controller` — the single stateful control-plane service. It owns the
+//! stream and node registries (persisted to Postgres), serves the northbound and
+//! southbound HTTP surfaces, and reconciles desired streams into per-node desired
+//! hops on a fixed interval, entirely from in-memory state.
 
 mod path;
+mod store;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -12,7 +16,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use clap::Parser;
 use serde::Serialize;
@@ -21,30 +25,24 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 use weave_core::{
-    DesiredHop, ObservedState, PathStatus, ReconcileReport, ReconcileStatus, StreamDefinition,
+    DesiredHop, EndpointDescriptor, NodeDescriptor, NodeHeartbeat, NodeRegistration, ObservedState,
+    PathStatus, ReconcileReport, ReconcileStatus, StreamDefinition,
 };
 
 use path::{PortAllocator, StreamEndpoints, derive_path, path_status, stream_endpoints};
+use store::{MemStore, PgStore, StateStore};
 
 #[derive(Debug, Parser)]
 #[command(name = "weave-controller", version, about = "open-weave reconciler")]
 struct Args {
-    #[arg(
-        long,
-        env = "WEAVE_NORTHBOUND_URL",
-        default_value = "http://127.0.0.1:9080"
-    )]
-    northbound_url: String,
-    #[arg(
-        long,
-        env = "WEAVE_SOUTHBOUND_URL",
-        default_value = "http://127.0.0.1:8081"
-    )]
-    southbound_url: String,
     #[arg(long, env = "WEAVE_CONTROLLER_ADDR", default_value = "127.0.0.1:8082")]
     listen: String,
     #[arg(long, env = "WEAVE_RECONCILE_INTERVAL_SECS", default_value_t = 5)]
     interval_secs: u64,
+    /// Postgres connection URL. When unset the controller runs with an
+    /// in-memory store and does not persist state across restarts.
+    #[arg(long, env = "DATABASE_URL")]
+    database_url: Option<String>,
 }
 
 /// Latest reconcile snapshot served by the read-only status/discovery API.
@@ -55,7 +53,43 @@ struct ControllerView {
     endpoints: BTreeMap<String, StreamEndpoints>,
 }
 
-type SharedView = Arc<RwLock<ControllerView>>;
+#[derive(Clone)]
+struct AppState {
+    store: Arc<dyn StateStore>,
+    streams: Arc<RwLock<BTreeMap<String, StreamDefinition>>>,
+    nodes: Arc<RwLock<BTreeMap<String, NodeRegistration>>>,
+    desired: Arc<RwLock<BTreeMap<String, Vec<DesiredHop>>>>,
+    view: Arc<RwLock<ControllerView>>,
+}
+
+impl AppState {
+    async fn hydrate(store: Arc<dyn StateStore>) -> Result<Self> {
+        let streams = store
+            .load_streams()
+            .await
+            .context("hydrating streams")?
+            .into_iter()
+            .map(|stream| (stream.name.clone(), stream))
+            .collect();
+        let nodes = store
+            .load_nodes()
+            .await
+            .context("hydrating nodes")?
+            .into_iter()
+            .map(|registration| (registration.node.id.clone(), registration))
+            .collect();
+        Ok(Self {
+            store,
+            streams: Arc::new(RwLock::new(streams)),
+            nodes: Arc::new(RwLock::new(nodes)),
+            desired: Arc::new(RwLock::new(BTreeMap::new())),
+            view: Arc::new(RwLock::new(ControllerView {
+                status: json!({ "status": "starting" }),
+                ..ControllerView::default()
+            })),
+        })
+    }
+}
 
 #[derive(Debug, Serialize)]
 struct StreamStatus {
@@ -70,6 +104,7 @@ struct ReconcileOutcome {
     report: ReconcileReport,
     streams: Vec<StreamStatus>,
     endpoints: BTreeMap<String, StreamEndpoints>,
+    desired_by_node: BTreeMap<String, Vec<DesiredHop>>,
 }
 
 impl ReconcileOutcome {
@@ -91,74 +126,101 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let http = reqwest::Client::new();
     let interval = Duration::from_secs(args.interval_secs);
 
-    let view: SharedView = Arc::new(RwLock::new(ControllerView {
-        status: json!({ "status": "starting" }),
-        ..ControllerView::default()
-    }));
-    let health_server = spawn_health_server(args.listen.clone(), view.clone());
+    let store: Arc<dyn StateStore> = match &args.database_url {
+        Some(url) => {
+            tracing::info!("connecting controller store to postgres");
+            Arc::new(
+                PgStore::connect(url)
+                    .await
+                    .context("opening postgres store")?,
+            )
+        }
+        None => {
+            tracing::warn!("DATABASE_URL unset; using in-memory store (state is not persisted)");
+            Arc::new(MemStore::new())
+        }
+    };
 
-    tracing::info!(
-        northbound_url = %args.northbound_url,
-        southbound_url = %args.southbound_url,
-        interval_secs = args.interval_secs,
-        "controller starting"
-    );
+    let state = AppState::hydrate(store).await?;
+    let api = spawn_api_server(args.listen.clone(), state.clone());
+
+    tracing::info!(interval_secs = args.interval_secs, "controller starting");
 
     loop {
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 result.context("waiting for shutdown signal")?;
                 tracing::info!("controller shutting down");
-                health_server.abort();
+                api.abort();
                 return Ok(());
             }
-            result = reconcile_once(&http, &args.northbound_url, &args.southbound_url) => {
-                match result {
-                    Ok(outcome) => {
-                        for stream in &outcome.streams {
-                            tracing::info!(stream = %stream.name, status = ?stream.status, "stream status");
-                        }
-                        tracing::info!(
-                            status = ?outcome.report.status,
-                            summary = %outcome.report.summary,
-                            "reconcile tick"
-                        );
-                        let status_json = outcome.status_json();
-                        let names = outcome.streams.iter().map(|s| s.name.clone()).collect();
-                        let mut guard = view.write().await;
-                        guard.status = status_json;
-                        guard.streams = names;
-                        guard.endpoints = outcome.endpoints;
-                    }
-                    Err(error) => tracing::warn!(%error, "reconcile tick failed"),
-                }
+            () = async {
+                reconcile_tick(&state).await;
                 tokio::time::sleep(interval).await;
-            }
+            } => {}
         }
     }
 }
 
-fn router(view: SharedView) -> Router {
+async fn reconcile_tick(state: &AppState) {
+    let streams: Vec<StreamDefinition> = state.streams.read().await.values().cloned().collect();
+    let observed = observed_state(&*state.nodes.read().await);
+    let outcome = reconcile(streams, &observed);
+
+    for stream in &outcome.streams {
+        tracing::info!(stream = %stream.name, status = ?stream.status, "stream status");
+    }
+    tracing::info!(
+        status = ?outcome.report.status,
+        summary = %outcome.report.summary,
+        "reconcile tick"
+    );
+
+    let status_json = outcome.status_json();
+    let names = outcome.streams.iter().map(|s| s.name.clone()).collect();
+    *state.desired.write().await = outcome.desired_by_node;
+    let mut view = state.view.write().await;
+    view.status = status_json;
+    view.streams = names;
+    view.endpoints = outcome.endpoints;
+}
+
+fn observed_state(nodes: &BTreeMap<String, NodeRegistration>) -> ObservedState {
+    ObservedState {
+        nodes: nodes.values().map(|r| r.node.clone()).collect(),
+        endpoints: nodes.values().flat_map(|r| r.endpoints.clone()).collect(),
+        hops: nodes.values().flat_map(|r| r.hop_status.clone()).collect(),
+    }
+}
+
+fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/status", get(get_status))
+        .route("/streams", get(list_streams).post(submit_stream))
+        .route("/streams/{name}", axum::routing::delete(delete_stream))
         .route("/streams/{name}/endpoints", get(get_endpoints))
-        .with_state(view)
+        .route("/nodes", get(list_nodes))
+        .route("/nodes/register", post(register_node))
+        .route("/nodes/{node_id}/heartbeat", post(node_heartbeat))
+        .route("/nodes/{node_id}/desired", get(get_desired))
+        .route("/endpoints", get(list_endpoints))
+        .route("/state", get(get_state))
+        .with_state(state)
 }
 
-fn spawn_health_server(addr: String, view: SharedView) -> JoinHandle<Result<()>> {
+fn spawn_api_server(addr: String, state: AppState) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
-        let app = router(view);
+        let app = router(state);
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
-            .with_context(|| format!("binding controller health listener on {addr}"))?;
-        tracing::info!(%addr, "controller health API listening");
+            .with_context(|| format!("binding controller listener on {addr}"))?;
+        tracing::info!(%addr, "controller API listening");
         axum::serve(listener, app)
             .await
-            .context("controller health server error")?;
+            .context("controller server error")?;
         Ok(())
     })
 }
@@ -167,14 +229,61 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-async fn get_status(State(view): State<SharedView>) -> Json<Value> {
-    Json(view.read().await.status.clone())
+async fn get_status(State(state): State<AppState>) -> Json<Value> {
+    Json(state.view.read().await.status.clone())
+}
+
+// --- stream registry (northbound surface) ---
+
+async fn list_streams(State(state): State<AppState>) -> Json<Vec<StreamDefinition>> {
+    Json(state.streams.read().await.values().cloned().collect())
+}
+
+async fn submit_stream(
+    State(state): State<AppState>,
+    Json(stream): Json<StreamDefinition>,
+) -> Response {
+    if stream.name.trim().is_empty() {
+        return error(StatusCode::BAD_REQUEST, "stream name must not be empty");
+    }
+    let name = stream.name.clone();
+    {
+        let mut streams = state.streams.write().await;
+        if let Err(err) = state.store.upsert_stream(&stream).await {
+            tracing::error!(%err, %name, "persisting stream failed");
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to persist stream",
+            );
+        }
+        streams.insert(name.clone(), stream);
+    }
+    tracing::info!(%name, "stream accepted");
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "status": "accepted", "name": name })),
+    )
+        .into_response()
+}
+
+async fn delete_stream(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    let mut streams = state.streams.write().await;
+    if !streams.contains_key(&name) {
+        return error(StatusCode::NOT_FOUND, "stream not found");
+    }
+    if let Err(err) = state.store.delete_stream(&name).await {
+        tracing::error!(%err, %name, "deleting stream failed");
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "failed to delete stream");
+    }
+    streams.remove(&name);
+    tracing::info!(%name, "stream deleted");
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Concrete `srt://` endpoints for a placed stream: `200` when placed, `503` when
 /// the stream is known but not yet placed, `404` when unknown.
-async fn get_endpoints(State(view): State<SharedView>, Path(name): Path<String>) -> Response {
-    let view = view.read().await;
+async fn get_endpoints(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    let view = state.view.read().await;
     if let Some(endpoints) = view.endpoints.get(&name) {
         (StatusCode::OK, Json(endpoints)).into_response()
     } else if view.streams.contains(&name) {
@@ -192,19 +301,115 @@ async fn get_endpoints(State(view): State<SharedView>, Path(name): Path<String>)
     }
 }
 
-async fn reconcile_once(
-    http: &reqwest::Client,
-    northbound_url: &str,
-    southbound_url: &str,
-) -> Result<ReconcileOutcome> {
-    let mut streams = fetch_streams(http, northbound_url).await?;
+// --- node registry (southbound surface) ---
+
+async fn list_nodes(State(state): State<AppState>) -> Json<Vec<NodeDescriptor>> {
+    Json(
+        state
+            .nodes
+            .read()
+            .await
+            .values()
+            .map(|r| r.node.clone())
+            .collect(),
+    )
+}
+
+async fn list_endpoints(State(state): State<AppState>) -> Json<Vec<EndpointDescriptor>> {
+    Json(
+        state
+            .nodes
+            .read()
+            .await
+            .values()
+            .flat_map(|r| r.endpoints.clone())
+            .collect(),
+    )
+}
+
+async fn get_state(State(state): State<AppState>) -> Json<ObservedState> {
+    Json(observed_state(&*state.nodes.read().await))
+}
+
+async fn register_node(
+    State(state): State<AppState>,
+    Json(registration): Json<NodeRegistration>,
+) -> Response {
+    let node_id = registration.node.id.clone();
+    let endpoint_count = registration.endpoints.len();
+    {
+        let mut nodes = state.nodes.write().await;
+        if let Err(err) = state.store.upsert_node(&registration).await {
+            tracing::error!(%err, %node_id, "persisting node registration failed");
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to persist node registration",
+            );
+        }
+        nodes.insert(node_id.clone(), registration);
+    }
+    tracing::info!(%node_id, endpoint_count, "node registered");
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "status": "accepted", "node_id": node_id })),
+    )
+        .into_response()
+}
+
+/// Heartbeats update only in-memory observed fields; they never touch the store.
+async fn node_heartbeat(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    Json(heartbeat): Json<NodeHeartbeat>,
+) -> Response {
+    if node_id != heartbeat.node_id {
+        return error(StatusCode::BAD_REQUEST, "node id mismatch");
+    }
+    let mut nodes = state.nodes.write().await;
+    let Some(registration) = nodes.get_mut(&node_id) else {
+        return error(StatusCode::NOT_FOUND, "unknown node");
+    };
+    registration.node.status = heartbeat.status;
+    registration.endpoints = heartbeat.endpoints;
+    registration.hop_status = heartbeat.hop_status;
+
+    tracing::debug!(%node_id, status = ?registration.node.status, "node heartbeat");
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "status": "accepted", "node_id": node_id })),
+    )
+        .into_response()
+}
+
+/// Serve the desired hops computed for a node on the last reconcile tick.
+async fn get_desired(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+) -> Json<Vec<DesiredHop>> {
+    Json(
+        state
+            .desired
+            .read()
+            .await
+            .get(&node_id)
+            .cloned()
+            .unwrap_or_default(),
+    )
+}
+
+fn error(status: StatusCode, message: &str) -> Response {
+    (status, Json(json!({ "error": message }))).into_response()
+}
+
+/// Compute per-node desired hops, endpoints, and an aggregate report from the
+/// current stream and node state. Pure: no IO, deterministic for a given input.
+fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> ReconcileOutcome {
     // Stable order so the per-tick port allocator assigns deterministically for a
     // given stream set.
     streams.sort_by(|a, b| a.name.cmp(&b.name));
-    let observed = fetch_state(http, southbound_url).await?;
 
     // Seed every registered node with an empty desired list so deleted or disabled
-    // streams' hops are cleared by the full-replace PUT below.
+    // streams' hops are cleared.
     let mut desired_by_node: BTreeMap<String, Vec<DesiredHop>> = observed
         .nodes
         .iter()
@@ -276,12 +481,6 @@ async fn reconcile_once(
         }
     }
 
-    for (node_id, hops) in &desired_by_node {
-        if let Err(error) = put_desired(http, southbound_url, node_id, hops).await {
-            tracing::warn!(node = %node_id, %error, "setting desired hops failed");
-        }
-    }
-
     // Control-plane convergence, not media flow: a fully provisioned path that is
     // only waiting for its source (AwaitingInput) is converged, not degraded.
     let status = if enabled == 0 {
@@ -307,57 +506,12 @@ async fn reconcile_once(
         ),
     };
 
-    Ok(ReconcileOutcome {
+    ReconcileOutcome {
         report,
         streams: stream_statuses,
         endpoints: endpoints_by_stream,
-    })
-}
-
-async fn fetch_streams(
-    http: &reqwest::Client,
-    northbound_url: &str,
-) -> Result<Vec<StreamDefinition>> {
-    http.get(format!("{}/streams", northbound_url.trim_end_matches('/')))
-        .send()
-        .await
-        .context("fetching streams")?
-        .error_for_status()
-        .context("northbound streams request failed")?
-        .json::<Vec<StreamDefinition>>()
-        .await
-        .context("decoding streams")
-}
-
-async fn fetch_state(http: &reqwest::Client, southbound_url: &str) -> Result<ObservedState> {
-    http.get(format!("{}/state", southbound_url.trim_end_matches('/')))
-        .send()
-        .await
-        .context("fetching observed state")?
-        .error_for_status()
-        .context("southbound state request failed")?
-        .json::<ObservedState>()
-        .await
-        .context("decoding observed state")
-}
-
-async fn put_desired(
-    http: &reqwest::Client,
-    southbound_url: &str,
-    node_id: &str,
-    hops: &[DesiredHop],
-) -> Result<()> {
-    http.put(format!(
-        "{}/nodes/{node_id}/desired",
-        southbound_url.trim_end_matches('/')
-    ))
-    .json(hops)
-    .send()
-    .await
-    .context("sending desired hops")?
-    .error_for_status()
-    .context("southbound desired PUT failed")?;
-    Ok(())
+        desired_by_node,
+    }
 }
 
 #[cfg(test)]
@@ -365,67 +519,226 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use path::EndpointAddr;
+    use http_body_util::BodyExt;
     use tower::ServiceExt;
+    use weave_core::{NodeCapabilities, NodeStatus, PortRange, SrtEndpoint, StreamTransport};
 
-    fn endpoint(node: &str, host: &str, port: u16) -> EndpointAddr {
-        EndpointAddr {
-            node: node.to_string(),
-            host: host.to_string(),
-            port,
-            url: format!("srt://{host}:{port}"),
+    fn mem_state() -> (AppState, Arc<MemStore>) {
+        let mem = Arc::new(MemStore::new());
+        let state = AppState {
+            store: mem.clone(),
+            streams: Arc::new(RwLock::new(BTreeMap::new())),
+            nodes: Arc::new(RwLock::new(BTreeMap::new())),
+            desired: Arc::new(RwLock::new(BTreeMap::new())),
+            view: Arc::new(RwLock::new(ControllerView::default())),
+        };
+        (state, mem)
+    }
+
+    fn node_registration(id: &str, host: &str) -> NodeRegistration {
+        NodeRegistration {
+            node: NodeDescriptor {
+                id: id.to_string(),
+                endpoint: format!("http://{id}:8080"),
+                status: NodeStatus::Ready,
+                capabilities: NodeCapabilities {
+                    data_plane: BTreeMap::from([(
+                        weave_core::DEFAULT_DATA_PLANE_ALIAS.to_string(),
+                        host.to_string(),
+                    )]),
+                    port_range: Some(PortRange {
+                        start: 7000,
+                        end: 7999,
+                    }),
+                    ..NodeCapabilities::default()
+                },
+            },
+            endpoints: Vec::new(),
+            hop_status: Vec::new(),
         }
     }
 
-    fn view_with(streams: &[&str], placed: &[(&str, StreamEndpoints)]) -> SharedView {
-        Arc::new(RwLock::new(ControllerView {
-            status: json!({ "status": "converged" }),
-            streams: streams.iter().map(|s| (*s).to_string()).collect(),
-            endpoints: placed
-                .iter()
-                .map(|(name, endpoints)| ((*name).to_string(), endpoints.clone()))
-                .collect(),
-        }))
+    fn stream(name: &str) -> StreamDefinition {
+        StreamDefinition {
+            name: name.to_string(),
+            enabled: true,
+            source: StreamTransport::Srt(SrtEndpoint {
+                node: Some("strom-node-1".to_string()),
+                remote: None,
+                network: None,
+                latency: Some(200),
+            }),
+            destinations: vec![StreamTransport::Srt(SrtEndpoint {
+                node: Some("strom-node-2".to_string()),
+                remote: None,
+                network: None,
+                latency: Some(1000),
+            })],
+        }
     }
 
-    async fn get_endpoints_status(view: SharedView, name: &str) -> StatusCode {
-        router(view)
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/streams/{name}/endpoints"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-            .status()
-    }
-
-    #[tokio::test]
-    async fn endpoints_route_returns_placed_stream() {
-        let endpoints = StreamEndpoints {
-            ingress: endpoint("strom-node-1", "172.26.0.10", 20001),
-            outputs: vec![endpoint("strom-node-2", "172.27.0.10", 20002)],
+    async fn send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(body.map_or(Body::empty(), |v| {
+                Body::from(serde_json::to_vec(&v).unwrap())
+            }))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
         };
-        let view = view_with(&["basic"], &[("basic", endpoints)]);
-        assert_eq!(get_endpoints_status(view, "basic").await, StatusCode::OK);
+        (status, value)
     }
 
     #[tokio::test]
-    async fn endpoints_route_pending_for_known_but_unplaced_stream() {
-        let view = view_with(&["unplaceable"], &[]);
+    async fn post_stream_then_get_returns_it_and_writes_through() {
+        let (state, mem) = mem_state();
+        let app = router(state);
+
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/streams",
+            Some(serde_json::to_value(stream("basic")).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let (status, body) = send(&app, "GET", "/streams", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let listed: Vec<StreamDefinition> = serde_json::from_value(body).unwrap();
+        assert_eq!(listed, vec![stream("basic")]);
+
         assert_eq!(
-            get_endpoints_status(view, "unplaceable").await,
-            StatusCode::SERVICE_UNAVAILABLE
+            mem.upsert_stream_calls(),
+            1,
+            "stream was written through the store"
         );
+        assert_eq!(mem.load_streams().await.unwrap(), vec![stream("basic")]);
     }
 
     #[tokio::test]
-    async fn endpoints_route_not_found_for_unknown_stream() {
-        let view = view_with(&[], &[]);
+    async fn delete_stream_removes_and_writes_through() {
+        let (state, mem) = mem_state();
+        let app = router(state);
+
+        send(
+            &app,
+            "POST",
+            "/streams",
+            Some(serde_json::to_value(stream("basic")).unwrap()),
+        )
+        .await;
+        let (status, _) = send(&app, "DELETE", "/streams/basic", None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(mem.delete_stream_calls(), 1);
+
+        let (_, body) = send(&app, "GET", "/streams", None).await;
+        let listed: Vec<StreamDefinition> = serde_json::from_value(body).unwrap();
+        assert!(listed.is_empty());
+
+        let (status, _) = send(&app, "DELETE", "/streams/basic", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "second delete is a miss");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_updates_memory_but_never_the_store() {
+        let (state, mem) = mem_state();
+        let app = router(state);
+
+        send(
+            &app,
+            "POST",
+            "/nodes/register",
+            Some(serde_json::to_value(node_registration("strom-node-1", "172.26.0.10")).unwrap()),
+        )
+        .await;
+        assert_eq!(mem.upsert_node_calls(), 1);
+
+        let heartbeat = NodeHeartbeat {
+            node_id: "strom-node-1".to_string(),
+            status: NodeStatus::Degraded,
+            endpoints: Vec::new(),
+            hop_status: Vec::new(),
+        };
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/nodes/strom-node-1/heartbeat",
+            Some(serde_json::to_value(&heartbeat).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(
-            get_endpoints_status(view, "nope").await,
-            StatusCode::NOT_FOUND
+            mem.upsert_node_calls(),
+            1,
+            "heartbeat must not write through to the store"
         );
+
+        let (_, body) = send(&app, "GET", "/state", None).await;
+        let observed: ObservedState = serde_json::from_value(body).unwrap();
+        assert_eq!(observed.nodes[0].status, NodeStatus::Degraded);
+    }
+
+    #[tokio::test]
+    async fn desired_reflects_computed_hops_after_a_reconcile_tick() {
+        let (state, _mem) = mem_state();
+        {
+            let mut nodes = state.nodes.write().await;
+            nodes.insert(
+                "strom-node-1".to_string(),
+                node_registration("strom-node-1", "172.26.0.10"),
+            );
+            nodes.insert(
+                "strom-node-2".to_string(),
+                node_registration("strom-node-2", "172.27.0.10"),
+            );
+            state
+                .streams
+                .write()
+                .await
+                .insert("basic".to_string(), stream("basic"));
+        }
+
+        reconcile_tick(&state).await;
+
+        let app = router(state);
+        let (status, body) = send(&app, "GET", "/nodes/strom-node-1/desired", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
+        assert_eq!(hops.len(), 1, "sender hop placed on node 1");
+        assert_eq!(hops[0].id, "weave-basic-sender");
+
+        let (_, body) = send(&app, "GET", "/nodes/strom-node-2/desired", None).await;
+        let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
+        assert_eq!(hops.len(), 1, "receiver hop placed on node 2");
+        assert_eq!(hops[0].id, "weave-basic-receiver-0");
+    }
+
+    #[tokio::test]
+    async fn endpoints_route_pending_then_placed() {
+        let (state, _mem) = mem_state();
+        {
+            let mut view = state.view.write().await;
+            view.streams = BTreeSet::from(["basic".to_string()]);
+        }
+        let app = router(state);
+        let (status, _) = send(&app, "GET", "/streams/basic/endpoints", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let (status, _) = send(&app, "GET", "/streams/nope/endpoints", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

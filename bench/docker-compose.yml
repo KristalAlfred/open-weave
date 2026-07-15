@@ -37,14 +37,15 @@ services:
     command: ["weave-northbound"]
     environment:
       WEAVE_NORTHBOUND_ADDR: 0.0.0.0:9080
-      WEAVE_NORTHBOUND_STATE: /var/lib/weave/streams.json
-    volumes:
-      - northbound-state:/var/lib/weave
+      WEAVE_CONTROLLER_URL: http://172.25.0.22:8082
     ports:
       - "29080:9080"
     networks:
       net_core:
         ipv4_address: 172.25.0.20
+    depends_on:
+      controller:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:9080/health"]
       interval: 5s
@@ -58,14 +59,15 @@ services:
     command: ["weave-southbound"]
     environment:
       WEAVE_SOUTHBOUND_ADDR: 0.0.0.0:8081
-      WEAVE_SOUTHBOUND_STATE: /var/lib/weave/southbound.json
-    volumes:
-      - southbound-state:/var/lib/weave
+      WEAVE_CONTROLLER_URL: http://172.25.0.22:8082
     ports:
       - "29081:8081"
     networks:
       net_core:
         ipv4_address: 172.25.0.21
+    depends_on:
+      controller:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:8081/health"]
       interval: 5s
@@ -95,16 +97,38 @@ services:
     command: ["weave-controller"]
     environment:
       WEAVE_CONTROLLER_ADDR: 0.0.0.0:8082
-      WEAVE_NORTHBOUND_URL: http://172.25.0.20:9080
-      WEAVE_SOUTHBOUND_URL: http://172.25.0.21:8081
       WEAVE_RECONCILE_INTERVAL_SECS: "5"
+      DATABASE_URL: postgres://weave:weave@172.25.0.23:5432/weave
     ports:
       - "29082:8082"
     networks:
       net_core:
         ipv4_address: 172.25.0.22
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:8082/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  postgres:
+    image: postgres:16
+    container_name: ow-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: weave
+      POSTGRES_PASSWORD: weave
+      POSTGRES_DB: weave
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      net_core:
+        ipv4_address: 172.25.0.23
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U weave -d weave"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -427,5 +451,4 @@ services:
 volumes:
   strom1-data:
   strom2-data:
-  northbound-state:
-  southbound-state:
+  pgdata:

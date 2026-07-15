@@ -17,7 +17,6 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates curl && \
     rm -rf /var/lib/apt/lists/* && \
-    useradd --system --create-home --uid 10001 weave && \
-    mkdir -p /var/lib/weave && chown weave:weave /var/lib/weave
+    useradd --system --create-home --uid 10001 weave
 COPY --from=builder /out/ /usr/local/bin/
 USER weave
