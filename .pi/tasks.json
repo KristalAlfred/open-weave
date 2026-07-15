@@ -252,6 +252,20 @@
       "createdAt": "2026-07-14T12:00:00.000Z",
       "updatedAt": "2026-07-14T12:00:00.000Z",
       "notes": []
+    },
+    {
+      "id": "t_20260715080000_rtsdcr",
+      "title": "Route sidecar routes are lost when a bench service container is restarted",
+      "description": "docker compose restart <svc> recreates the container netns, dropping routes installed by its route-* sidecar (restart: \"no\"). After restarting southbound during persistence verification, adapters could not reach it until route-southbound was re-run manually. Make route sidecars restart: unless-stopped or re-assert routes automatically.",
+      "status": "open",
+      "priority": "low",
+      "tags": [
+        "bench",
+        "bug"
+      ],
+      "source": "bench/docker-compose.yml; observed during persistence-layer bench verification (commit 211efb5)",
+      "createdAt": "2026-07-15T08:00:00.000Z",
+      "updatedAt": "2026-07-15T08:00:00.000Z"
     }
   ]
 }
