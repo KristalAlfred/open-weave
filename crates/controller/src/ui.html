@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>open-weave</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1a1d21;
+    --muted: #6b7280;
+    --faint: #9ca3af;
+    --hairline: #e5e7eb;
+    --chip: #f3f4f6;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+    --green: #16a34a;
+    --blue: #2563eb;
+    --amber: #d97706;
+    --red: #dc2626;
+    --gray: #9ca3af;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101214;
+      --fg: #e6e8ea;
+      --muted: #9aa2ab;
+      --faint: #6b7280;
+      --hairline: #23272c;
+      --chip: #191d21;
+      --green: #4ade80;
+      --blue: #60a5fa;
+      --amber: #fbbf24;
+      --red: #f87171;
+      --gray: #6b7280;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.5 system-ui, -apple-system, sans-serif;
+  }
+  main { max-width: 64rem; margin: 0 auto; padding: 1.5rem 2rem 4rem; }
+
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--hairline);
+  }
+  header h1 { font-size: 1rem; font-weight: 600; margin: 0; }
+  header .summary { color: var(--muted); }
+  header .poll { margin-left: auto; color: var(--faint); font-size: 0.75rem; }
+  header .poll.err { color: var(--red); }
+
+  section { margin-top: 1.75rem; }
+  h2 {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--faint);
+    margin: 0 0 0.75rem;
+  }
+  .empty { color: var(--muted); }
+  .empty code { font-family: var(--mono); font-size: 0.8125rem; }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    font-size: 0.8125rem;
+    font-weight: 500;
+  }
+  .dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background: currentColor;
+    flex: none;
+  }
+  .dot.hollow { background: transparent; box-shadow: inset 0 0 0 1.5px currentColor; }
+
+  .node {
+    display: flex;
+    align-items: baseline;
+    gap: 0.625rem;
+    padding: 0.25rem 0;
+  }
+  .node .id { font-weight: 500; }
+  .node .detail { color: var(--muted); font-family: var(--mono); font-size: 0.75rem; }
+  .node .age { margin-left: auto; color: var(--faint); font-size: 0.75rem; }
+
+  .stream { padding: 0.875rem 0; }
+  .stream + .stream { border-top: 1px solid var(--hairline); }
+  .stream-head { display: flex; align-items: baseline; gap: 0.75rem; }
+  .stream-head .name { font-weight: 600; }
+  .stream-head .reason { color: var(--amber); font-size: 0.8125rem; }
+
+  .path {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-top: 0.625rem;
+  }
+  .trunk, .branch { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+  .branch { margin-left: 1.5rem; }
+  .arrow, .fork { color: var(--faint); flex: none; }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: var(--chip);
+    border-radius: 6px;
+    padding: 0.25rem 0.625rem;
+    line-height: 1.4rem;
+    white-space: nowrap;
+  }
+  .chip.addr { font-family: var(--mono); font-size: 0.75rem; color: var(--muted); }
+  .chip .tag {
+    font-size: 0.625rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--faint);
+  }
+  .chip.hop .role { font-weight: 500; }
+  .chip.hop .on { color: var(--muted); font-size: 0.8125rem; }
+  .chip.hop.unreported { box-shadow: inset 0 0 0 1px var(--hairline); background: transparent; }
+  .chip.hop .conds { display: inline-flex; align-items: center; gap: 0.25rem; }
+  .chip.hop .conds .sep { color: var(--faint); font-size: 0.6875rem; }
+  .chip .rate { font-family: var(--mono); font-size: 0.6875rem; color: var(--muted); }
+  .chip .flag { font-size: 0.6875rem; color: var(--red); font-weight: 600; }
+
+  .legend { margin-top: 1.25rem; display: flex; gap: 1rem; color: var(--faint); font-size: 0.75rem; }
+  .legend .pill { font-size: inherit; font-weight: 400; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>open-weave</h1>
+    <span class="pill" id="report-pill"><span class="dot"></span><span id="report-status">starting</span></span>
+    <span class="summary" id="report-summary"></span>
+    <span class="poll" id="poll">…</span>
+  </header>
+  <section>
+    <h2>Nodes</h2>
+    <div id="nodes" class="empty">no nodes registered</div>
+  </section>
+  <section>
+    <h2>Streams</h2>
+    <div id="streams" class="empty">no streams — apply one: <code>just stream basic</code></div>
+    <div class="legend" id="legend"></div>
+  </section>
+</main>
+<script>
+"use strict";
+
+const COLORS = {
+  // stream / path status
+  flowing: "var(--green)", awaiting_input: "var(--blue)", degraded: "var(--amber)",
+  failed: "var(--red)", pending: "var(--gray)", idle: "var(--gray)",
+  // reconcile status
+  converged: "var(--green)", converging: "var(--amber)", starting: "var(--gray)",
+  // node status
+  ready: "var(--green)", offline: "var(--red)",
+  // link conditions
+  connecting: "var(--amber)", connected: "var(--blue)", stalled: "var(--red)",
+};
+const HOLLOW = new Set(["idle", "pending", "connecting", "starting", "unreported"]);
+
+function h(tag, cls, ...children) {
+  const el = document.createElement(tag);
+  if (cls) el.className = cls;
+  for (const child of children) {
+    if (child == null) continue;
+    el.append(typeof child === "string" ? document.createTextNode(child) : child);
+  }
+  return el;
+}
+
+function dot(status, title) {
+  const el = h("span", "dot" + (HOLLOW.has(status) ? " hollow" : ""));
+  el.style.color = COLORS[status] || "var(--gray)";
+  if (title) el.title = title;
+  return el;
+}
+
+function pill(status) {
+  const el = h("span", "pill", dot(status), status);
+  el.style.color = COLORS[status] || "var(--gray)";
+  return el;
+}
+
+function renderHeader(report) {
+  const status = report ? report.status : "starting";
+  const pillEl = document.getElementById("report-pill");
+  pillEl.style.color = COLORS[status] || "var(--gray)";
+  pillEl.querySelector(".dot").className = "dot" + (HOLLOW.has(status) ? " hollow" : "");
+  document.getElementById("report-status").textContent = status;
+  document.getElementById("report-summary").textContent = report ? report.summary : "";
+}
+
+function renderNodes(nodes) {
+  const root = document.getElementById("nodes");
+  if (!nodes.length) { root.className = "empty"; root.textContent = "no nodes registered"; return; }
+  root.className = "";
+  root.replaceChildren(...nodes.map(node => {
+    const details = Object.entries(node.data_plane || {}).map(([alias, host]) => `${alias} ${host}`);
+    if (node.port_range) details.push(`ports ${node.port_range.start}–${node.port_range.end}`);
+    return h("div", "node",
+      dot(node.status, node.status),
+      h("span", "id", node.id),
+      h("span", "detail", details.join(" · ")),
+      node.last_seen_secs == null ? null : h("span", "age", `seen ${node.last_seen_secs}s ago`),
+    );
+  }));
+}
+
+function rate(stats) {
+  if (!stats) return null;
+  const fmt = v => (v >= 10 ? v.toFixed(0) : v.toFixed(1));
+  const el = h("span", "rate", `↓${fmt(stats.ingress_rate_mbps)} ↑${fmt(stats.egress_rate_mbps)} Mb/s`);
+  el.title = "ingress / egress rate";
+  return el;
+}
+
+function hopChip(hop) {
+  const short = hop.role === "sender" ? "sender" : hop.id.replace(/^weave-.*-(receiver-\d+)$/, "$1");
+  const reported = hop.state != null;
+  const chip = h("span", "chip hop" + (reported ? "" : " unreported"),
+    h("span", "role", short),
+    h("span", "on", `@ ${hop.node}`),
+  );
+  if (reported) {
+    chip.append(h("span", "conds",
+      dot(hop.ingress_condition, `ingress: ${hop.ingress_condition}`),
+      h("span", "sep", "→"),
+      dot(hop.egress_condition, `egress: ${hop.egress_condition}`),
+    ));
+    if (hop.state === "failed") chip.append(h("span", "flag", "failed"));
+    const rateEl = rate(hop.stats);
+    if (rateEl) chip.append(rateEl);
+  } else {
+    chip.append(dot("unreported", "not reported by the node yet"));
+  }
+  chip.title = hop.id + (reported ? ` · ${hop.state}` : "");
+  return chip;
+}
+
+function addrChip(tag, text, title) {
+  const el = h("span", "chip addr", h("span", "tag", tag), text);
+  if (title) el.title = title;
+  return el;
+}
+
+const arrow = () => h("span", "arrow", "→");
+
+// A trunk line (ingress address -> sender), then one indented branch line per
+// destination: its receiver hop and consumer address, or the remote address
+// the sender dials out to.
+function renderPath(stream) {
+  const path = h("div", "path");
+  const [sender, ...receivers] = stream.hops;
+  const endpoints = stream.endpoints;
+
+  const trunk = h("div", "trunk");
+  if (endpoints) trunk.append(addrChip("in", endpoints.ingress.url, "producers dial this ingress"), arrow());
+  if (sender) trunk.append(hopChip(sender));
+  if (trunk.childNodes.length) path.append(trunk);
+
+  const outputs = endpoints ? endpoints.outputs : [];
+  const count = Math.max(receivers.length, outputs.length, sender ? sender.egresses.length : 0);
+  for (let i = 0; i < count; i++) {
+    const branch = h("div", "branch", h("span", "fork", "↳"));
+    const output = outputs[i];
+    const receiver = output && output.node === ""
+      ? null // remote destination: the sender dials out, no receiver hop
+      : receivers.find(r => r.id.endsWith(`-receiver-${i}`));
+    if (receiver) branch.append(hopChip(receiver), arrow());
+    if (output) {
+      branch.append(receiver
+        ? addrChip("out", output.url, "consumers dial this output")
+        : addrChip("remote", output.url, "remote listener the sender dials"));
+    }
+    if (branch.childNodes.length > 1) path.append(branch);
+  }
+  return path;
+}
+
+function renderStreams(streams) {
+  const root = document.getElementById("streams");
+  if (!streams.length) {
+    root.className = "empty";
+    root.replaceChildren("no streams — apply one: ", h("code", null, "just stream basic"));
+    return;
+  }
+  root.className = "";
+  root.replaceChildren(...streams.map(stream =>
+    h("div", "stream",
+      h("div", "stream-head",
+        h("span", "name", stream.name),
+        pill(stream.status),
+        stream.reason ? h("span", "reason", stream.reason) : null,
+      ),
+      stream.hops.length ? renderPath(stream) : null,
+    )
+  ));
+}
+
+function renderLegend() {
+  document.getElementById("legend").replaceChildren(
+    ...["idle", "connecting", "connected", "flowing", "stalled"].map(c => pill(c)),
+  );
+}
+
+async function poll() {
+  const el = document.getElementById("poll");
+  try {
+    const response = await fetch("/view");
+    if (!response.ok) throw new Error(response.status);
+    const view = await response.json();
+    renderHeader(view.report);
+    renderNodes(view.nodes);
+    renderStreams(view.streams);
+    el.className = "poll";
+    el.textContent = new Date().toLocaleTimeString();
+  } catch {
+    el.className = "poll err";
+    el.textContent = "controller unreachable";
+  }
+}
+
+renderLegend();
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>

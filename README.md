@@ -18,6 +18,8 @@ future vendor adapters into one observed/control model.
 - **`weave-controller`** — reconciler loop. It reads desired streams from
   northbound and observed state from southbound, derives a per-stream hop path,
   and writes desired hops to southbound per node for the adapters to realise.
+  Serves a live dashboard at `/ui` (backed by the `/view` JSON document) showing
+  nodes, streams, and per-hop link conditions.
 - **`weave-southbound`** — adapter/media-node-facing API for registration,
   telemetry, endpoint discovery, and future command streams.
 - **`weave-adapter-strom`** — southbound adapter for existing

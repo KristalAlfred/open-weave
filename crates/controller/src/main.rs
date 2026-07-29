@@ -25,8 +25,8 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 use weave_core::{
-    DesiredHop, EndpointDescriptor, NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus,
-    ObservedState, PathStatus, ReconcileReport, ReconcileStatus, StreamDefinition,
+    DesiredHop, EndpointDescriptor, HopStatus, NodeDescriptor, NodeHeartbeat, NodeRegistration,
+    NodeStatus, ObservedState, PathStatus, ReconcileReport, ReconcileStatus, StreamDefinition,
 };
 
 use path::{PortAllocator, StreamEndpoints, derive_path, path_status, stream_endpoints};
@@ -53,9 +53,12 @@ struct Args {
 /// Latest reconcile snapshot served by the read-only status/discovery API.
 #[derive(Default)]
 struct ControllerView {
-    status: Value,
-    streams: BTreeSet<String>,
+    /// `None` until the first reconcile tick completes.
+    report: Option<ReconcileReport>,
+    streams: Vec<StreamStatus>,
     endpoints: BTreeMap<String, StreamEndpoints>,
+    /// Desired hops per stream, as derived on the last tick.
+    hops: BTreeMap<String, Vec<DesiredHop>>,
 }
 
 #[derive(Clone)]
@@ -94,15 +97,12 @@ impl AppState {
             last_seen: Arc::new(RwLock::new(last_seen)),
             node_ttl,
             desired: Arc::new(RwLock::new(BTreeMap::new())),
-            view: Arc::new(RwLock::new(ControllerView {
-                status: json!({ "status": "starting" }),
-                ..ControllerView::default()
-            })),
+            view: Arc::new(RwLock::new(ControllerView::default())),
         })
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct StreamStatus {
     name: String,
     status: PathStatus,
@@ -113,21 +113,83 @@ struct StreamStatus {
     endpoints: Option<StreamEndpoints>,
 }
 
+/// Everything the dashboard renders, in one response. See [`get_view`].
+#[derive(Debug, Serialize)]
+struct SystemView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    report: Option<ReconcileReport>,
+    nodes: Vec<NodeView>,
+    streams: Vec<StreamView>,
+}
+
+#[derive(Debug, Serialize)]
+struct NodeView {
+    id: String,
+    status: NodeStatus,
+    endpoint: String,
+    data_plane: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port_range: Option<weave_core::PortRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_seen_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamView {
+    name: String,
+    status: PathStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    nodes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoints: Option<StreamEndpoints>,
+    hops: Vec<HopView>,
+}
+
+/// A desired hop joined with the status its node last reported. The observed
+/// fields are `None` until the node's adapter has picked the hop up.
+#[derive(Debug, Serialize)]
+struct HopView {
+    id: String,
+    node: String,
+    role: weave_core::HopRole,
+    ingress: SocketView,
+    egresses: Vec<SocketView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<weave_core::HopState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ingress_condition: Option<weave_core::LinkCondition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    egress_condition: Option<weave_core::LinkCondition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats: Option<weave_core::LinkStats>,
+}
+
+#[derive(Debug, Serialize)]
+struct SocketView {
+    mode: weave_core::SocketRole,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+}
+
+impl From<&weave_core::SocketSpec> for SocketView {
+    fn from(spec: &weave_core::SocketSpec) -> Self {
+        Self {
+            mode: spec.role,
+            host: spec.host.clone(),
+            port: spec.port,
+        }
+    }
+}
+
 struct ReconcileOutcome {
     report: ReconcileReport,
     streams: Vec<StreamStatus>,
     endpoints: BTreeMap<String, StreamEndpoints>,
+    hops_by_stream: BTreeMap<String, Vec<DesiredHop>>,
     desired_by_node: BTreeMap<String, Vec<DesiredHop>>,
-}
-
-impl ReconcileOutcome {
-    fn status_json(&self) -> Value {
-        json!({
-            "status": self.report.status,
-            "summary": self.report.summary,
-            "streams": self.streams,
-        })
-    }
 }
 
 #[tokio::main]
@@ -197,13 +259,12 @@ async fn reconcile_tick(state: &AppState) {
         "reconcile tick"
     );
 
-    let status_json = outcome.status_json();
-    let names = outcome.streams.iter().map(|s| s.name.clone()).collect();
     *state.desired.write().await = outcome.desired_by_node;
     let mut view = state.view.write().await;
-    view.status = status_json;
-    view.streams = names;
+    view.report = Some(outcome.report);
+    view.streams = outcome.streams;
     view.endpoints = outcome.endpoints;
+    view.hops = outcome.hops_by_stream;
 }
 
 /// Mark nodes whose last heartbeat is older than `ttl` as [`NodeStatus::Offline`].
@@ -234,8 +295,11 @@ fn observed_state(nodes: &BTreeMap<String, NodeRegistration>) -> ObservedState {
 
 fn router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(ui))
+        .route("/ui", get(ui))
         .route("/health", get(health))
         .route("/status", get(get_status))
+        .route("/view", get(get_view))
         .route("/streams", get(list_streams).post(submit_stream))
         .route("/streams/{name}", axum::routing::delete(delete_stream))
         .route("/streams/{name}/endpoints", get(get_endpoints))
@@ -267,7 +331,87 @@ async fn health() -> Json<Value> {
 }
 
 async fn get_status(State(state): State<AppState>) -> Json<Value> {
-    Json(state.view.read().await.status.clone())
+    let view = state.view.read().await;
+    Json(match &view.report {
+        Some(report) => json!({
+            "status": report.status,
+            "summary": report.summary,
+            "streams": view.streams,
+        }),
+        None => json!({ "status": "starting" }),
+    })
+}
+
+/// One UI-shaped document describing the whole system: the last reconcile
+/// report, every registered node, and every stream with its desired hops
+/// merged against the hop status the nodes report. This is what `/ui` polls.
+async fn get_view(State(state): State<AppState>) -> Json<SystemView> {
+    let nodes = state.nodes.read().await;
+    let last_seen = state.last_seen.read().await;
+    let view = state.view.read().await;
+    let now = Instant::now();
+
+    let observed: Vec<&HopStatus> = nodes.values().flat_map(|r| &r.hop_status).collect();
+
+    let node_views = nodes
+        .values()
+        .map(|r| NodeView {
+            id: r.node.id.clone(),
+            status: r.node.status,
+            endpoint: r.node.endpoint.clone(),
+            data_plane: r.node.capabilities.data_plane.clone(),
+            port_range: r.node.capabilities.port_range,
+            last_seen_secs: last_seen
+                .get(&r.node.id)
+                .map(|seen| now.saturating_duration_since(*seen).as_secs()),
+        })
+        .collect();
+
+    let streams = view
+        .streams
+        .iter()
+        .map(|stream| StreamView {
+            name: stream.name.clone(),
+            status: stream.status,
+            reason: stream.reason.clone(),
+            nodes: stream.nodes.clone(),
+            endpoints: stream.endpoints.clone(),
+            hops: view
+                .hops
+                .get(&stream.name)
+                .into_iter()
+                .flatten()
+                .map(|hop| {
+                    let status = observed
+                        .iter()
+                        .find(|s| s.id == hop.id && s.node_id == hop.node_id);
+                    HopView {
+                        id: hop.id.clone(),
+                        node: hop.node_id.clone(),
+                        role: hop.role,
+                        ingress: SocketView::from(&hop.ingress),
+                        egresses: hop.egresses.iter().map(SocketView::from).collect(),
+                        state: status.map(|s| s.state),
+                        ingress_condition: status.map(|s| s.ingress),
+                        egress_condition: status.map(|s| s.egress),
+                        stats: status.and_then(|s| s.stats),
+                    }
+                })
+                .collect(),
+        })
+        .collect();
+
+    Json(SystemView {
+        report: view.report.clone(),
+        nodes: node_views,
+        streams,
+    })
+}
+
+/// The embedded single-file dashboard. It polls [`get_view`] and needs no
+/// build step or external assets.
+async fn ui() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("ui.html"))
 }
 
 // --- stream registry (northbound surface) ---
@@ -323,7 +467,7 @@ async fn get_endpoints(State(state): State<AppState>, Path(name): Path<String>) 
     let view = state.view.read().await;
     if let Some(endpoints) = view.endpoints.get(&name) {
         (StatusCode::OK, Json(endpoints)).into_response()
-    } else if view.streams.contains(&name) {
+    } else if view.streams.iter().any(|s| s.name == name) {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "status": "pending", "stream": name })),
@@ -472,6 +616,7 @@ fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> Re
 
     let mut stream_statuses = Vec::with_capacity(streams.len());
     let mut endpoints_by_stream: BTreeMap<String, StreamEndpoints> = BTreeMap::new();
+    let mut hops_by_stream: BTreeMap<String, Vec<DesiredHop>> = BTreeMap::new();
     let mut enabled = 0usize;
     let mut flowing = 0usize;
     let mut ports = PortAllocator::new();
@@ -491,6 +636,7 @@ fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> Re
 
         let status = match derive_path(stream, &observed.nodes, &observed.hops, &mut ports) {
             Ok(path) => {
+                hops_by_stream.insert(stream.name.clone(), path.hops.clone());
                 let mut nodes = Vec::new();
                 for hop in &path.hops {
                     if !nodes.contains(&hop.node_id) {
@@ -570,6 +716,7 @@ fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> Re
         report,
         streams: stream_statuses,
         endpoints: endpoints_by_stream,
+        hops_by_stream,
         desired_by_node,
     }
 }
@@ -794,7 +941,13 @@ mod tests {
         let (state, _mem) = mem_state();
         {
             let mut view = state.view.write().await;
-            view.streams = BTreeSet::from(["basic".to_string()]);
+            view.streams = vec![StreamStatus {
+                name: "basic".to_string(),
+                status: PathStatus::Pending,
+                nodes: Vec::new(),
+                reason: None,
+                endpoints: None,
+            }];
         }
         let app = router(state);
         let (status, _) = send(&app, "GET", "/streams/basic/endpoints", None).await;
@@ -802,6 +955,114 @@ mod tests {
 
         let (status, _) = send(&app, "GET", "/streams/nope/endpoints", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn view_joins_desired_hops_with_reported_status() {
+        let (state, _mem) = mem_state();
+        {
+            let mut nodes = state.nodes.write().await;
+            nodes.insert(
+                "strom-node-1".to_string(),
+                node_registration("strom-node-1", "172.26.0.10"),
+            );
+            nodes.insert(
+                "strom-node-2".to_string(),
+                node_registration("strom-node-2", "172.27.0.10"),
+            );
+            state
+                .streams
+                .write()
+                .await
+                .insert("basic".to_string(), stream("basic"));
+            let now = Instant::now();
+            let mut seen = state.last_seen.write().await;
+            seen.insert("strom-node-1".to_string(), now);
+            seen.insert("strom-node-2".to_string(), now);
+        }
+
+        reconcile_tick(&state).await;
+
+        // Node 1 reports its sender hop; node 2 has not picked its hop up yet.
+        state
+            .nodes
+            .write()
+            .await
+            .get_mut("strom-node-1")
+            .unwrap()
+            .hop_status = vec![weave_core::HopStatus {
+            id: "weave-basic-sender".to_string(),
+            node_id: "strom-node-1".to_string(),
+            state: weave_core::HopState::Provisioned,
+            ingress: weave_core::LinkCondition::Flowing,
+            egress: weave_core::LinkCondition::Connected,
+            resolved_ingress: None,
+            resolved_egress: None,
+            stats: Some(weave_core::LinkStats {
+                ingress_rate_mbps: 3.2,
+                ..weave_core::LinkStats::default()
+            }),
+        }];
+
+        let app = router(state);
+        let (status, body) = send(&app, "GET", "/view", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert_eq!(body["report"]["status"], "converging");
+        assert_eq!(body["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(body["nodes"][0]["last_seen_secs"], 0);
+
+        let basic = &body["streams"][0];
+        assert_eq!(basic["name"], "basic");
+        let hops = basic["hops"].as_array().unwrap();
+        assert_eq!(hops.len(), 2, "sender + receiver");
+
+        let sender = &hops[0];
+        assert_eq!(sender["id"], "weave-basic-sender");
+        assert_eq!(sender["node"], "strom-node-1");
+        assert_eq!(sender["state"], "provisioned");
+        assert_eq!(sender["ingress_condition"], "flowing");
+        assert_eq!(sender["egress_condition"], "connected");
+        assert_eq!(sender["stats"]["ingress_rate_mbps"], 3.2);
+        assert_eq!(sender["ingress"]["mode"], "listen");
+        assert_eq!(sender["egresses"][0]["mode"], "connect");
+        assert_eq!(sender["egresses"][0]["host"], "172.27.0.10");
+
+        let receiver = &hops[1];
+        assert_eq!(receiver["node"], "strom-node-2");
+        assert!(
+            receiver.get("state").is_none(),
+            "unreported hop carries no observed fields"
+        );
+    }
+
+    #[tokio::test]
+    async fn view_before_first_tick_has_no_report() {
+        let (state, _mem) = mem_state();
+        let app = router(state);
+        let (status, body) = send(&app, "GET", "/view", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("report").is_none());
+        assert_eq!(body["streams"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn ui_is_served_at_root_and_ui() {
+        let (state, _mem) = mem_state();
+        let app = router(state);
+        for uri in ["/", "/ui"] {
+            let request = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let content_type = response.headers()["content-type"].to_str().unwrap();
+            assert!(content_type.starts_with("text/html"), "{content_type}");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(String::from_utf8_lossy(&bytes).contains("open-weave"));
+        }
     }
 
     #[test]

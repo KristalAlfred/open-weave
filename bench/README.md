@@ -28,9 +28,14 @@ controller→Strom API calls.
 |------|---------|
 | 29080 | northbound (`WEAVE_NORTHBOUND_URL=http://localhost:29080 weave ...`) |
 | 29081 | southbound (`/nodes` shows registered capabilities) |
-| 29082 | controller `/status` and `/streams/{name}/endpoints` (discovery) |
+| 29082 | controller: dashboard at `/ui`, `/view`, `/status`, `/streams/{name}/endpoints` |
 | 28080 | strom-1 API |
 | 28081 | strom-2 API |
+
+Open <http://localhost:29082/ui> to watch the system live: registered nodes,
+every stream's path across them (per-hop link conditions and rates), and the
+addresses external peers dial. It polls the controller's `/view` endpoint,
+which serves the same joined picture as JSON.
 
 Ports are offset (29xxx/28xxx) to avoid colliding with a stale prior bench that
 may still hold 9080/8082/18080/18081. Point the CLI at northbound with
