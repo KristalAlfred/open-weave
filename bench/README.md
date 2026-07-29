@@ -16,11 +16,17 @@ it with the `weave` CLI against the host-published northbound.
    strom-1 + adapter-1       strom-2 + adapter-2
 ```
 
-Each node subnet reaches everything else only through its router
-(`route-*` sidecars install the routes; the Strom image has no `ip` tool, so the
-sidecars share its netns). Applying netem on a router impairs both directions of
-that node's traffic: SRT media between Stroms, adapter heartbeats, and
-controller→Strom API calls.
+Each node subnet reaches everything else only through its router. Applying netem
+on a router impairs both directions of that node's traffic: SRT media between
+Stroms, adapter heartbeats, and controller→Strom API calls.
+
+Those cross-subnet routes are installed by the `route-manager` service, which
+re-asserts them every few seconds inside each container's network namespace
+(some images, Strom and ffmpeg among them, have no `ip` tool of their own).
+Because routes live in the netns, they are lost whenever a container restarts or
+is recreated — so asserting them on a loop is what makes `docker compose
+restart`, `stop`/`start`, and a rebuild+recreate all recover on their own. It
+also picks up the profiled producer/consumer whenever they come up.
 
 ## Host ports
 
@@ -98,6 +104,10 @@ library.
 
 ## Notes
 
+- Any service can be restarted, stopped/started, or rebuilt and recreated
+  individually; `route-manager` repairs its routes within a tick and the system
+  reconverges without manual steps. `docker compose logs route-manager` shows a
+  line per repair and is otherwise quiet.
 - The controller never talks to Strom. Per stream it derives an ordered hop chain
   — a **sender** hop and a **receiver** hop — places each on a node (sender by
   `source.node` or host-match on the source URL; receiver by host-match on the

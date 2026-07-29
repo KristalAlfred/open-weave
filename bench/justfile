@@ -76,11 +76,11 @@ producer-up stream="basic":
     #!/usr/bin/env bash
     set -euo pipefail
     target="$(bash {{scripts}}/endpoints.sh {{stream}} ingress)"
-    PRODUCER_TARGET="$target" {{compose}} --profile producer up -d producer route-producer
+    PRODUCER_TARGET="$target" {{compose}} --profile producer up -d producer
 
 # Stop and remove the external producer.
 producer-down:
-    {{compose}} --profile producer rm -sf producer route-producer
+    {{compose}} --profile producer rm -sf producer
 
 # Start the external ffmpeg consumer (SRT caller pulling a receiver output).
 # Pass a stream name; the first output address is resolved via discovery.
@@ -88,11 +88,11 @@ consumer-up stream="basic":
     #!/usr/bin/env bash
     set -euo pipefail
     source="$(bash {{scripts}}/endpoints.sh {{stream}} output 0)"
-    CONSUMER_SOURCE="$source" {{compose}} --profile consumer up -d consumer route-consumer
+    CONSUMER_SOURCE="$source" {{compose}} --profile consumer up -d consumer
 
 # Stop and remove the external consumer.
 consumer-down:
-    {{compose}} --profile consumer rm -sf consumer route-consumer
+    {{compose}} --profile consumer rm -sf consumer
 
 # Start a second external consumer (for fan-out: one consumer per receiver output).
 # Pass a stream name; the second output address is resolved via discovery.
@@ -100,11 +100,11 @@ consumer-2-up stream="fanout":
     #!/usr/bin/env bash
     set -euo pipefail
     source="$(bash {{scripts}}/endpoints.sh {{stream}} output 1)"
-    CONSUMER_SOURCE_2="$source" {{compose}} --profile consumer up -d consumer-2 route-consumer-2
+    CONSUMER_SOURCE_2="$source" {{compose}} --profile consumer up -d consumer-2
 
 # Stop and remove the second external consumer.
 consumer-2-down:
-    {{compose}} --profile consumer rm -sf consumer-2 route-consumer-2
+    {{compose}} --profile consumer rm -sf consumer-2
 
 # Impair a node's network via its router, e.g. `just netem node1 delay 200ms loss 5%`.
 netem +ARGS:
