@@ -14,7 +14,7 @@ use axum::{
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Guard, Token, require_bearer};
-use weave_core::{SrtEndpoint, StreamDefinition, StreamTransport};
+use weave_core::{API_V1, SrtEndpoint, StreamDefinition, StreamTransport};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:9080";
 const DEFAULT_CONTROLLER_URL: &str = "http://127.0.0.1:8082";
@@ -74,8 +74,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// `/health` stays open for compose healthchecks and load balancers; every
-/// stream route requires the northbound bearer token.
+/// The operator contract is served under [`API_V1`]; `/health` stays unversioned
+/// and open for compose healthchecks and load balancers. Every stream route
+/// requires the northbound bearer token.
 fn router(state: AppState, guard: Guard) -> Router {
     let streams = Router::new()
         .route("/streams", get(list_streams).post(submit_stream))
@@ -84,7 +85,7 @@ fn router(state: AppState, guard: Guard) -> Router {
 
     Router::new()
         .route("/health", get(health))
-        .merge(streams)
+        .nest(API_V1, streams)
         .with_state(state)
 }
 
@@ -161,14 +162,19 @@ fn validate_endpoint(endpoint: &SrtEndpoint, is_source: bool) -> Result<(), &'st
     }
 }
 
-/// Forward a request to the controller, passing its status and body back faithfully.
+/// Forward a request to the controller, passing its status and body back
+/// faithfully. `path` is contract-relative: [`API_V1`] is applied here, so the
+/// handlers name the same paths this service serves.
 async fn proxy(
     state: &AppState,
     method: reqwest::Method,
     path: &str,
     body: Option<Bytes>,
 ) -> Response {
-    let url = format!("{}{path}", state.controller_url.trim_end_matches('/'));
+    let url = format!(
+        "{}{API_V1}{path}",
+        state.controller_url.trim_end_matches('/')
+    );
     let mut request = state.http.request(method, &url);
     if let Some(token) = &state.token {
         request = request.header(reqwest::header::AUTHORIZATION, token.header_value());
@@ -317,7 +323,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/streams")
+                    .uri("/v1/streams")
                     .header("content-type", "application/json")
                     .body(Body::from(serde_json::to_vec(&sample_stream()).unwrap()))
                     .unwrap(),
@@ -333,7 +339,7 @@ mod tests {
             .clone()
             .expect("controller saw a request");
         assert_eq!(seen.method, "POST");
-        assert_eq!(seen.path, "/streams");
+        assert_eq!(seen.path, "/v1/streams");
         let forwarded: StreamDefinition = serde_json::from_slice(&seen.body).unwrap();
         assert_eq!(forwarded, sample_stream());
     }
@@ -347,7 +353,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri("/streams/basic")
+                    .uri("/v1/streams/basic")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -361,7 +367,7 @@ mod tests {
             .clone()
             .expect("controller saw a request");
         assert_eq!(seen.method, "DELETE");
-        assert_eq!(seen.path, "/streams/basic");
+        assert_eq!(seen.path, "/v1/streams/basic");
     }
 
     #[tokio::test]
@@ -372,7 +378,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/streams")
+                    .uri("/v1/streams")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -397,7 +403,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/streams")
+                    .uri("/v1/streams")
                     .header("content-type", "application/json")
                     .body(Body::from(serde_json::to_vec(&stream).unwrap()))
                     .unwrap(),
@@ -408,6 +414,38 @@ mod tests {
         assert!(
             captured.lock().unwrap().is_none(),
             "invalid stream never reaches the controller"
+        );
+    }
+
+    /// The prefix is a clean break, not an alias: the paths this service used to
+    /// serve are gone, and nothing is forwarded on their behalf.
+    #[tokio::test]
+    async fn unversioned_stream_paths_are_not_served() {
+        let (url, captured) = stub_controller(StatusCode::OK).await;
+        let app = open_app(url);
+
+        for (method, uri) in [
+            ("GET", "/streams"),
+            ("POST", "/streams"),
+            ("DELETE", "/streams/basic"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&sample_stream()).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "an unversioned path never reaches the controller"
         );
     }
 
@@ -435,13 +473,13 @@ mod tests {
             let app = guarded_app(url);
 
             for (method, uri, body) in [
-                ("GET", "/streams", Body::empty()),
+                ("GET", "/v1/streams", Body::empty()),
                 (
                     "POST",
-                    "/streams",
+                    "/v1/streams",
                     Body::from(serde_json::to_vec(&sample_stream()).unwrap()),
                 ),
-                ("DELETE", "/streams/basic", Body::empty()),
+                ("DELETE", "/v1/streams/basic", Body::empty()),
             ] {
                 let mut request = Request::builder()
                     .method(method)
@@ -479,7 +517,7 @@ mod tests {
         let response = guarded_app(url)
             .oneshot(
                 Request::builder()
-                    .uri("/streams")
+                    .uri("/v1/streams")
                     .header("authorization", format!("Bearer {TOKEN}"))
                     .body(Body::empty())
                     .unwrap(),

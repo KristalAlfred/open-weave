@@ -2293,6 +2293,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_norway",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",

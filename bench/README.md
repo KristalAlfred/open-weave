@@ -33,8 +33,8 @@ also picks up the profiled producer/consumer whenever they come up.
 | Port | Service |
 |------|---------|
 | 29080 | northbound (`WEAVE_NORTHBOUND_URL=http://localhost:29080 weave ...`) |
-| 29081 | southbound (`/nodes` shows registered capabilities) |
-| 29082 | controller: dashboard at `/ui`, `/view`, `/status`, `/streams/{name}/endpoints` |
+| 29081 | southbound (`/v1/nodes` shows registered capabilities) |
+| 29082 | controller: dashboard at `/ui`, `/view`; API at `/v1/status`, `/v1/streams/{name}/endpoints` |
 | 28080 | strom-1 API |
 | 28081 | strom-2 API |
 
@@ -46,6 +46,18 @@ which serves the same joined picture as JSON.
 Ports are offset (29xxx/28xxx) to avoid colliding with a stale prior bench that
 may still hold 9080/8082/18080/18081. Point the CLI at northbound with
 `WEAVE_NORTHBOUND_URL`.
+
+## API versioning
+
+Both contracts live under `/v1` (see the root README). `/health` and the
+controller's `/`, `/ui`, `/view` sit outside it and are unchanged. There are no
+unprefixed aliases, so `curl localhost:29081/nodes` now returns `404` — add the
+prefix. The recipes carry it in the `v` variable at the top of the `justfile`.
+
+The adapters declare `protocol_version` when they register; a mismatch is refused
+with `409` and the adapter exits rather than retrying, so `docker compose logs
+adapter-1` naming an incompatible protocol version means the adapter image and the
+controller image are out of step. Rebuild with `just up`.
 
 ## Authentication
 
@@ -66,8 +78,8 @@ The `just` recipes add the right header for you. Calling the APIs by hand needs 
 explicitly:
 
 ```sh
-curl -s -H "Authorization: Bearer bench-southbound-token" localhost:29081/nodes | jq
-curl -s -H "Authorization: Bearer bench-northbound-token" localhost:29080/streams | jq
+curl -s -H "Authorization: Bearer bench-southbound-token" localhost:29081/v1/nodes | jq
+curl -s -H "Authorization: Bearer bench-northbound-token" localhost:29080/v1/streams | jq
 ```
 
 Without a valid token these return `401` and `WWW-Authenticate: Bearer`. Every
@@ -76,8 +88,8 @@ service **refuses to start** if its token variable is missing, so a
 error is the fail-closed default working, not a bug. `WEAVE_AUTH_DISABLED=1`
 opts out for local runs.
 
-`/health` on all three services and the controller's dashboard (`/ui`, `/view`,
-`/status`) need no token, so anyone who can reach port 29082 can read the full
+`/health` on all three services, the controller's dashboard (`/ui`, `/view`), and
+the `/v1/status` rollup need no token, so anyone who can reach port 29082 can read the full
 topology and allocated ports. Compose publishes it on all interfaces: fine on a
 laptop, but **do not expose a controller port on a shared or public host.**
 
@@ -109,7 +121,7 @@ the controller's discovery API. Query it directly with:
 
 ```sh
 curl -s -H "Authorization: Bearer bench-northbound-token" \
-  localhost:29082/streams/basic/endpoints | jq
+  localhost:29082/v1/streams/basic/endpoints | jq
 # { "ingress": {node,host,port,url}, "outputs": [{node,host,port,url}] }
 ```
 
@@ -136,7 +148,7 @@ traffic crosses the same impaired hops as real external peers.
 
 Both sit on `net_core` and route to either node subnet through the netem routers.
 Addresses come from the controller's discovery API, not hardcoded tables — see the
-`/streams/{name}/endpoints` note above and `manifests/README.md` for the manifest
+`/v1/streams/{name}/endpoints` note above and `manifests/README.md` for the manifest
 library.
 
 ## Notes
@@ -149,12 +161,12 @@ library.
   — a **sender** hop and a **receiver** hop — places each on a node (sender by
   `source.node` or host-match on the source URL; receiver by host-match on the
   destination), and groups the desired hops per node. The per-node **adapters**
-  pull their own hops (`GET /nodes/{id}/desired` via southbound, full replace of
+  pull their own hops (`GET /v1/nodes/{id}/desired` via southbound, full replace of
   what that node should run) and create/start/delete the `weave-…` Strom flows.
   Hops for a node that has not registered yet just wait until it does.
 - Per-stream status is rolled up from adapter-reported hop conditions:
   `awaiting_input` (no source media) → `degraded` (source flowing, not end to end)
-  → `flowing`. See the controller `/status` endpoint.
+  → `flowing`. See the controller `/v1/status` endpoint.
 - The receiver hop listens on the destination port and re-exposes the media on
   `port + 1` for a downstream consumer.
 - No pre-configured flows are shipped — create them through the CLI.

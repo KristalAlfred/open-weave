@@ -6,8 +6,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use reqwest::RequestBuilder;
 use tracing_subscriber::EnvFilter;
-use weave_core::StreamDefinition;
 use weave_core::auth::{self, Token};
+use weave_core::{API_V1, StreamDefinition};
 
 #[derive(Parser)]
 #[command(name = "weave", version, about = "open-weave control plane CLI")]
@@ -114,14 +114,11 @@ async fn apply(url: &str, token: Option<&Token>, file: &Path) -> Result<()> {
     let stream =
         parse_stream(&text).with_context(|| format!("parsing stream from {}", file.display()))?;
 
-    let response = authorized(
-        reqwest::Client::new().post(join_url(url, "/streams")),
-        token,
-    )
-    .json(&stream)
-    .send()
-    .await
-    .context("posting stream to northbound")?;
+    let response = authorized(reqwest::Client::new().post(api_url(url, "/streams")), token)
+        .json(&stream)
+        .send()
+        .await
+        .context("posting stream to northbound")?;
 
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
@@ -140,7 +137,7 @@ async fn apply(url: &str, token: Option<&Token>, file: &Path) -> Result<()> {
 }
 
 async fn get_streams(url: &str, token: Option<&Token>) -> Result<()> {
-    let response = authorized(reqwest::Client::new().get(join_url(url, "/streams")), token)
+    let response = authorized(reqwest::Client::new().get(api_url(url, "/streams")), token)
         .send()
         .await
         .context("fetching streams")?;
@@ -168,8 +165,10 @@ fn nodes() -> Result<()> {
     Ok(())
 }
 
-fn join_url(base: &str, path: &str) -> String {
-    format!("{}{}", base.trim_end_matches('/'), path)
+/// Build a northbound API URL from a contract-relative `path`, inserting the
+/// version prefix so the literal lives only in [`weave_core::API_V1`].
+fn api_url(base: &str, path: &str) -> String {
+    format!("{}{}{path}", base.trim_end_matches('/'), API_V1)
 }
 
 #[cfg(test)]
@@ -215,6 +214,19 @@ destinations:
                 network: Some("wan".to_string()),
                 latency: None,
             })
+        );
+    }
+
+    #[test]
+    fn api_url_inserts_the_version_prefix_once() {
+        assert_eq!(
+            api_url("http://127.0.0.1:9080", "/streams"),
+            "http://127.0.0.1:9080/v1/streams"
+        );
+        assert_eq!(
+            api_url("http://127.0.0.1:9080/", "/streams"),
+            "http://127.0.0.1:9080/v1/streams",
+            "a trailing slash on the base does not double up"
         );
     }
 

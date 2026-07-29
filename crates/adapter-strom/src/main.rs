@@ -15,9 +15,10 @@ use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Token};
 use weave_core::{
-    AdapterDescriptor, AdapterKind, DEFAULT_DATA_PLANE_ALIAS, DesiredHop, EndpointDescriptor,
-    EndpointKind, HopStatus, LinkCondition, LinkStats, NodeCapabilities, NodeDescriptor,
-    NodeHeartbeat, NodeRegistration, NodeStatus, TransportDescriptor,
+    API_V1, AdapterDescriptor, AdapterKind, DEFAULT_DATA_PLANE_ALIAS, DesiredHop,
+    EndpointDescriptor, EndpointKind, HopStatus, LinkCondition, LinkStats, NodeCapabilities,
+    NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus, PROTOCOL_VERSION,
+    TransportDescriptor,
 };
 use weave_strom::{
     FlowSpec, FlowStats, StromClient, StromError, StromFlow, flow_spec_from_hop, parse_flow_stats,
@@ -92,6 +93,9 @@ async fn main() -> Result<()> {
 /// The southbound API as this adapter sees it: a base URL plus the bearer token
 /// presented on every request. Bundling them keeps the token from having to be
 /// threaded through the sync loop alongside the client.
+///
+/// Call sites name contract-relative paths; [`API_V1`] is applied in
+/// [`Southbound::join`], so the version prefix appears once.
 struct Southbound {
     http: Client,
     url: String,
@@ -124,7 +128,7 @@ impl Southbound {
     }
 
     fn join(&self, path: &str) -> String {
-        format!("{}{path}", self.url.trim_end_matches('/'))
+        format!("{}{API_V1}{path}", self.url.trim_end_matches('/'))
     }
 }
 
@@ -164,6 +168,16 @@ async fn sync_loop(
         .await
         {
             Ok(next_registered) => registered = next_registered,
+            // A rejected registration never converges by retrying, so surface it
+            // and exit rather than logging the same warning every interval.
+            Err(error) if error.is::<RegistrationRejected>() => {
+                tracing::error!(
+                    node_id = %config.node.id,
+                    %error,
+                    "Strom adapter cannot register with this control plane; exiting"
+                );
+                return Err(error);
+            }
             Err(error) => {
                 registered = false;
                 tracing::warn!(%error, "Strom adapter sync failed");
@@ -431,6 +445,7 @@ fn registration(
     hop_status: Vec<HopStatus>,
 ) -> NodeRegistration {
     NodeRegistration {
+        protocol_version: PROTOCOL_VERSION,
         node: NodeDescriptor {
             id: config.node.id.clone(),
             endpoint: public_endpoint.to_string(),
@@ -455,6 +470,17 @@ fn registration(
     }
 }
 
+/// Registration the control plane will never accept, however long this adapter
+/// keeps dialling — currently only a protocol-version mismatch, which the
+/// controller answers with `409`. Kept distinct from a transient failure so the
+/// sync loop can stop instead of retrying forever.
+#[derive(Debug, thiserror::Error)]
+#[error("southbound rejected registration permanently: {status}: {body}")]
+struct RegistrationRejected {
+    status: StatusCode,
+    body: String,
+}
+
 async fn register_node(southbound: &Southbound, registration: &NodeRegistration) -> Result<()> {
     let response = southbound
         .post("/nodes/register")
@@ -463,8 +489,20 @@ async fn register_node(southbound: &Southbound, registration: &NodeRegistration)
         .await
         .context("registering Strom adapter")?;
 
+    if response.status() == StatusCode::CONFLICT {
+        return Err(RegistrationRejected {
+            status: response.status(),
+            body: response_body(response).await,
+        }
+        .into());
+    }
+
     ensure_success(response, "southbound node registration failed").await?;
-    tracing::info!(node_id = %registration.node.id, "Strom adapter registered");
+    tracing::info!(
+        node_id = %registration.node.id,
+        protocol_version = registration.protocol_version,
+        "Strom adapter registered"
+    );
     Ok(())
 }
 

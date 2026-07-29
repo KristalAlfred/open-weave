@@ -9,6 +9,36 @@ use serde::{Deserialize, Serialize};
 /// Conventional data-plane alias resolved when a manifest pins no network.
 pub const DEFAULT_DATA_PLANE_ALIAS: &str = "default";
 
+/// Path prefix every control-plane API route is served under. Servers nest their
+/// routes behind it and clients build their paths from it, so the literal exists
+/// once for the whole workspace.
+///
+/// The operator (northbound) and adapter (southbound) contracts share one prefix:
+/// they are two halves of the same control plane and move to a `/v2` together.
+///
+/// Deliberately outside it: `/health` on every service, which healthchecks and
+/// load balancers address directly, and the controller's `/`, `/ui`, and `/view` —
+/// the dashboard ships inside the controller binary and versions with it.
+pub const API_V1: &str = "/v1";
+
+/// Wire-protocol version an adapter declares when it registers.
+///
+/// [`API_V1`] tells an adapter *where* to send a request; this tells the
+/// controller *what* the adapter on the other end speaks, so a stale adapter is
+/// rejected at registration instead of being served desired state it cannot
+/// realise. The two move together — a breaking southbound change bumps both.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Whether the controller can serve an adapter declaring protocol `version`.
+///
+/// Exactly one version is supported at a time, so equality is the whole rule.
+/// `0` is what an adapter predating the handshake deserializes to (the field
+/// defaults) and is never compatible.
+#[must_use]
+pub fn protocol_compatible(version: u32) -> bool {
+    version == PROTOCOL_VERSION
+}
+
 /// Operator intent: one source streamed to one or more destinations over a transport.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StreamDefinition {
@@ -479,6 +509,11 @@ pub enum EndpointKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeRegistration {
+    /// Southbound protocol version the registering adapter speaks. Absent means
+    /// an adapter predating the handshake, which reads as `0` and is rejected —
+    /// see [`protocol_compatible`].
+    #[serde(default)]
+    pub protocol_version: u32,
     pub node: NodeDescriptor,
     #[serde(default)]
     pub endpoints: Vec<EndpointDescriptor>,
@@ -683,6 +718,31 @@ mod tests {
         }))
         .expect("parse legacy heartbeat");
         assert!(heartbeat.hop_status.is_empty());
+    }
+
+    #[test]
+    fn registration_without_protocol_version_reads_as_incompatible_zero() {
+        let registration: NodeRegistration = serde_json::from_value(serde_json::json!({
+            "node": {
+                "id": "strom-node-1",
+                "endpoint": "http://strom-node-1:8091",
+                "status": "ready"
+            }
+        }))
+        .expect("parse pre-handshake registration");
+
+        assert_eq!(registration.protocol_version, 0);
+        assert!(
+            !protocol_compatible(registration.protocol_version),
+            "an adapter that declares no version is not compatible"
+        );
+    }
+
+    #[test]
+    fn protocol_compatible_accepts_only_the_supported_version() {
+        assert!(protocol_compatible(PROTOCOL_VERSION));
+        assert!(!protocol_compatible(PROTOCOL_VERSION + 1));
+        assert!(!protocol_compatible(0));
     }
 
     #[test]

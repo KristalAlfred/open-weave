@@ -7,6 +7,10 @@ ctrl    := "http://localhost:29082"
 strom1  := "http://localhost:28080"
 strom2  := "http://localhost:28081"
 
+# Version prefix carrying both control-plane contracts, matching weave_core::API_V1.
+# `/health` and the controller dashboard (`/`, `/ui`, `/view`) sit outside it.
+v       := "/v1"
+
 # Bearer tokens per API surface. Defaults match docker-compose.yml so the bench
 # needs no exports; override by exporting either variable. `/health` and the
 # controller dashboard need no token.
@@ -57,11 +61,11 @@ status:
     @printf "strom-1:     "; curl -sf {{strom1}}/api/version >/dev/null && echo ok || echo DOWN
     @printf "strom-2:     "; curl -sf {{strom2}}/api/version >/dev/null && echo ok || echo DOWN
     @echo "== registered nodes (southbound) =="
-    @curl -sf {{sb_auth}} {{sb}}/nodes | (jq . 2>/dev/null || cat)
-    @echo "== controller /status =="
-    @curl -sf {{ctrl}}/status | (jq . 2>/dev/null || cat)
+    @curl -sf {{sb_auth}} {{sb}}{{v}}/nodes | (jq . 2>/dev/null || cat)
+    @echo "== controller {{v}}/status =="
+    @curl -sf {{ctrl}}{{v}}/status | (jq . 2>/dev/null || cat)
     @echo "== streams (northbound) =="
-    @curl -sf {{nb_auth}} {{nb}}/streams | (jq . 2>/dev/null || cat)
+    @curl -sf {{nb_auth}} {{nb}}{{v}}/streams | (jq . 2>/dev/null || cat)
 
 # List the available stream manifests with their one-line description.
 stream-ls:
@@ -76,7 +80,7 @@ stream name:
 
 # Remove a stream by name, e.g. `just stream-rm basic`. Controller tears down its hops next tick.
 stream-rm name:
-    @curl -sf {{nb_auth}} -X DELETE {{nb}}/streams/{{name}} && echo "deleted {{name}}" || echo "not found: {{name}}"
+    @curl -sf {{nb_auth}} -X DELETE {{nb}}{{v}}/streams/{{name}} && echo "deleted {{name}}" || echo "not found: {{name}}"
 
 # Start the external ffmpeg producer (SRT caller into a source ingress).
 # Pass a stream name; the ingress address is resolved via the controller's

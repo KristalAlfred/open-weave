@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Token};
 use weave_core::{
-    AdapterDescriptor, AdapterKind, NodeCapabilities, NodeConfig, NodeDescriptor, NodeRegistration,
-    NodeStatus, TransportDescriptor,
+    API_V1, AdapterDescriptor, AdapterKind, NodeCapabilities, NodeConfig, NodeDescriptor,
+    NodeRegistration, NodeStatus, PROTOCOL_VERSION, TransportDescriptor,
 };
 
 #[derive(Debug, Parser)]
@@ -73,6 +73,7 @@ fn load_config(path: &Path) -> Result<MediaNodeConfig> {
 
 fn registration(config: &NodeConfig) -> NodeRegistration {
     NodeRegistration {
+        protocol_version: PROTOCOL_VERSION,
         node: NodeDescriptor {
             id: config.id.clone(),
             endpoint: config.public_endpoint(),
@@ -101,7 +102,11 @@ async fn register(
     token: Option<&Token>,
     registration: &NodeRegistration,
 ) -> Result<()> {
-    let mut request = reqwest::Client::new().post(format!("{southbound_url}/nodes/register"));
+    let url = format!(
+        "{}{API_V1}/nodes/register",
+        southbound_url.trim_end_matches('/')
+    );
+    let mut request = reqwest::Client::new().post(url);
     if let Some(token) = token {
         request = request.header(reqwest::header::AUTHORIZATION, token.header_value());
     }
