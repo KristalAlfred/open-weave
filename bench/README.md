@@ -47,6 +47,40 @@ Ports are offset (29xxx/28xxx) to avoid colliding with a stale prior bench that
 may still hold 9080/8082/18080/18081. Point the CLI at northbound with
 `WEAVE_NORTHBOUND_URL`.
 
+## Authentication
+
+The API surfaces require a bearer token (see the root README for the model). The
+bench defaults to development values so `just up` stays a single command:
+
+| Variable | Default | Used by |
+|---|---|---|
+| `WEAVE_NORTHBOUND_TOKEN` | `bench-northbound-token` | northbound, controller, CLI, `endpoints.sh` |
+| `WEAVE_SOUTHBOUND_TOKEN` | `bench-southbound-token` | southbound, controller, adapter-1, adapter-2 |
+
+Export either variable to override it; `docker-compose.yml` and the recipes read
+the same defaults, so both stay in step. The adapter configs deliberately leave
+`node.southbound_token` unset and inherit the env var instead, keeping the value
+out of the repo.
+
+The `just` recipes add the right header for you. Calling the APIs by hand needs it
+explicitly:
+
+```sh
+curl -s -H "Authorization: Bearer bench-southbound-token" localhost:29081/nodes | jq
+curl -s -H "Authorization: Bearer bench-northbound-token" localhost:29080/streams | jq
+```
+
+Without a valid token these return `401` and `WWW-Authenticate: Bearer`. Every
+service **refuses to start** if its token variable is missing, so a
+`docker compose up` that exits immediately with a `WEAVE_..._TOKEN is unset`
+error is the fail-closed default working, not a bug. `WEAVE_AUTH_DISABLED=1`
+opts out for local runs.
+
+`/health` on all three services and the controller's dashboard (`/ui`, `/view`,
+`/status`) need no token, so anyone who can reach port 29082 can read the full
+topology and allocated ports. Compose publishes it on all interfaces: fine on a
+laptop, but **do not expose a controller port on a shared or public host.**
+
 ## Usage
 
 ```sh
@@ -74,13 +108,16 @@ Data-plane addresses are never hardcoded in the recipes: they are resolved from
 the controller's discovery API. Query it directly with:
 
 ```sh
-curl -s localhost:29082/streams/basic/endpoints | jq
+curl -s -H "Authorization: Bearer bench-northbound-token" \
+  localhost:29082/streams/basic/endpoints | jq
 # { "ingress": {node,host,port,url}, "outputs": [{node,host,port,url}] }
 ```
 
-`200` once placed, `503` while known-but-unplaced, `404` if unknown. The
-`scripts/endpoints.sh <stream> ingress|output [index]` helper polls this until
-placed and prints `host:port`; the producer/consumer recipes use it.
+`200` once placed, `503` while known-but-unplaced, `404` if unknown, `401` without
+the northbound token. The `scripts/endpoints.sh <stream> ingress|output [index]`
+helper polls this until placed and prints `host:port`; the producer/consumer
+recipes use it and pass the token in. It reads `WEAVE_NORTHBOUND_TOKEN` from its
+environment and fails fast on `401` rather than polling a rejected token.
 
 ## External verification endpoints
 
@@ -111,10 +148,10 @@ library.
 - The controller never talks to Strom. Per stream it derives an ordered hop chain
   — a **sender** hop and a **receiver** hop — places each on a node (sender by
   `source.node` or host-match on the source URL; receiver by host-match on the
-  destination), and writes the grouped desired hops to southbound per node
-  (`PUT /nodes/{id}/desired`, full replace). The per-node **adapters** pull their
-  desired hops and create/start/delete the `weave-…` Strom flows. Hops for a node
-  that has not registered yet just wait until it does.
+  destination), and groups the desired hops per node. The per-node **adapters**
+  pull their own hops (`GET /nodes/{id}/desired` via southbound, full replace of
+  what that node should run) and create/start/delete the `weave-…` Strom flows.
+  Hops for a node that has not registered yet just wait until it does.
 - Per-stream status is rolled up from adapter-reported hop conditions:
   `awaiting_input` (no source media) → `degraded` (source flowing, not end to end)
   → `flowing`. See the controller `/status` endpoint.

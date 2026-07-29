@@ -9,10 +9,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use axum::{Json, Router, routing::get};
 use clap::Parser;
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
+use weave_core::auth::{self, Token};
 use weave_core::{
     AdapterDescriptor, AdapterKind, DEFAULT_DATA_PLANE_ALIAS, DesiredHop, EndpointDescriptor,
     EndpointKind, HopStatus, LinkCondition, LinkStats, NodeCapabilities, NodeDescriptor,
@@ -50,7 +51,17 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config = AdapterConfig::load(&args.config)?;
     let public_endpoint = config.node.public_endpoint();
-    let client = Client::new();
+
+    // Fail closed: an adapter with no token would retry a 401 forever, so refuse
+    // to start instead.
+    let token = config.node.resolve_southbound_token()?;
+    if token.is_none() {
+        tracing::warn!(
+            "{}=1: calling southbound without authentication",
+            auth::AUTH_DISABLED_VAR
+        );
+    }
+    let southbound = Southbound::new(config.node.southbound_url.clone(), token);
     let strom = StromClient::new(&config.strom.url);
     let health_server = spawn_health_server(config.node.listen.clone());
 
@@ -71,10 +82,49 @@ async fn main() -> Result<()> {
             health_server.abort();
             Ok(())
         }
-        result = sync_loop(&client, &strom, &config, &public_endpoint) => {
+        result = sync_loop(&southbound, &strom, &config, &public_endpoint) => {
             health_server.abort();
             result
         }
+    }
+}
+
+/// The southbound API as this adapter sees it: a base URL plus the bearer token
+/// presented on every request. Bundling them keeps the token from having to be
+/// threaded through the sync loop alongside the client.
+struct Southbound {
+    http: Client,
+    url: String,
+    /// `None` only when authentication is explicitly disabled.
+    token: Option<Token>,
+}
+
+impl Southbound {
+    fn new(url: String, token: Option<Token>) -> Self {
+        Self {
+            http: Client::new(),
+            url,
+            token,
+        }
+    }
+
+    fn get(&self, path: &str) -> RequestBuilder {
+        self.authorized(self.http.get(self.join(path)))
+    }
+
+    fn post(&self, path: &str) -> RequestBuilder {
+        self.authorized(self.http.post(self.join(path)))
+    }
+
+    fn authorized(&self, request: RequestBuilder) -> RequestBuilder {
+        match &self.token {
+            Some(token) => request.header(reqwest::header::AUTHORIZATION, token.header_value()),
+            None => request,
+        }
+    }
+
+    fn join(&self, path: &str) -> String {
+        format!("{}{path}", self.url.trim_end_matches('/'))
     }
 }
 
@@ -93,7 +143,7 @@ fn spawn_health_server(addr: String) -> JoinHandle<Result<()>> {
 }
 
 async fn sync_loop(
-    client: &Client,
+    southbound: &Southbound,
     strom: &StromClient,
     config: &AdapterConfig,
     public_endpoint: &str,
@@ -104,7 +154,7 @@ async fn sync_loop(
 
     loop {
         match sync_once(
-            client,
+            southbound,
             strom,
             config,
             public_endpoint,
@@ -125,7 +175,7 @@ async fn sync_loop(
 }
 
 async fn sync_once(
-    client: &Client,
+    southbound: &Southbound,
     strom: &StromClient,
     config: &AdapterConfig,
     public_endpoint: &str,
@@ -133,7 +183,6 @@ async fn sync_once(
     tracker: &mut StallTracker,
 ) -> Result<bool> {
     let node_id = &config.node.id;
-    let southbound_url = &config.node.southbound_url;
     let (status, flows) = match strom.list_flows().await {
         Ok(flows) => (NodeStatus::Ready, flows),
         Err(error) => {
@@ -149,17 +198,7 @@ async fn sync_once(
         .map(String::as_str);
 
     let hop_status = if status == NodeStatus::Ready {
-        match provision(
-            client,
-            strom,
-            southbound_url,
-            node_id,
-            &flows,
-            data_plane_host,
-            tracker,
-        )
-        .await
-        {
+        match provision(southbound, strom, node_id, &flows, data_plane_host, tracker).await {
             Ok(hop_status) => hop_status,
             Err(error) => {
                 tracing::warn!(%error, "provisioning desired hops failed");
@@ -179,7 +218,7 @@ async fn sync_once(
     );
 
     if !registered {
-        register_node(client, southbound_url, &registration).await?;
+        register_node(southbound, &registration).await?;
         return Ok(true);
     }
 
@@ -190,8 +229,8 @@ async fn sync_once(
         hop_status,
     };
 
-    if heartbeat_node(client, southbound_url, &heartbeat).await? == StatusCode::NOT_FOUND {
-        register_node(client, southbound_url, &registration).await?;
+    if heartbeat_node(southbound, &heartbeat).await? == StatusCode::NOT_FOUND {
+        register_node(southbound, &registration).await?;
     }
 
     Ok(true)
@@ -230,15 +269,14 @@ impl FlowApi for StromClient {
 /// Pull desired hops for this node, reconcile them into Strom flows, and report
 /// each hop's realised status. Inert when no desired hops are set.
 async fn provision(
-    client: &Client,
+    southbound: &Southbound,
     strom: &StromClient,
-    southbound_url: &str,
     node_id: &str,
     flows: &[StromFlow],
     data_plane_host: Option<&str>,
     tracker: &mut StallTracker,
 ) -> Result<Vec<HopStatus>> {
-    let desired = fetch_desired(client, southbound_url, node_id).await?;
+    let desired = fetch_desired(southbound, node_id).await?;
     Ok(reconcile(strom, &desired, flows, data_plane_host, tracker).await)
 }
 
@@ -372,16 +410,9 @@ async fn provision_hop(strom: &dyn FlowApi, hop: &DesiredHop) -> Result<()> {
     Ok(())
 }
 
-async fn fetch_desired(
-    client: &Client,
-    southbound_url: &str,
-    node_id: &str,
-) -> Result<Vec<DesiredHop>> {
-    client
-        .get(join_url(
-            southbound_url,
-            &format!("/nodes/{node_id}/desired"),
-        ))
+async fn fetch_desired(southbound: &Southbound, node_id: &str) -> Result<Vec<DesiredHop>> {
+    southbound
+        .get(&format!("/nodes/{node_id}/desired"))
         .send()
         .await
         .context("fetching desired hops")?
@@ -424,13 +455,9 @@ fn registration(
     }
 }
 
-async fn register_node(
-    client: &Client,
-    southbound_url: &str,
-    registration: &NodeRegistration,
-) -> Result<()> {
-    let response = client
-        .post(join_url(southbound_url, "/nodes/register"))
+async fn register_node(southbound: &Southbound, registration: &NodeRegistration) -> Result<()> {
+    let response = southbound
+        .post("/nodes/register")
         .json(registration)
         .send()
         .await
@@ -441,16 +468,9 @@ async fn register_node(
     Ok(())
 }
 
-async fn heartbeat_node(
-    client: &Client,
-    southbound_url: &str,
-    heartbeat: &NodeHeartbeat,
-) -> Result<StatusCode> {
-    let response = client
-        .post(join_url(
-            southbound_url,
-            &format!("/nodes/{}/heartbeat", heartbeat.node_id),
-        ))
+async fn heartbeat_node(southbound: &Southbound, heartbeat: &NodeHeartbeat) -> Result<StatusCode> {
+    let response = southbound
+        .post(&format!("/nodes/{}/heartbeat", heartbeat.node_id))
         .json(heartbeat)
         .send()
         .await
@@ -568,10 +588,6 @@ fn push_unique(values: &mut Vec<String>, value: &str) {
         return;
     }
     values.push(value.to_string());
-}
-
-fn join_url(base: &str, path: &str) -> String {
-    format!("{}{}", base.trim_end_matches('/'), path)
 }
 
 async fn health() -> Json<Value> {

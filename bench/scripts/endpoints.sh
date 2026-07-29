@@ -9,6 +9,14 @@ ctrl="${WEAVE_CONTROLLER_URL:-http://localhost:29082}"
 interval=2
 attempts=30
 
+# The discovery route is part of the northbound API surface, so it needs that
+# surface's bearer token. Unset is only valid against a stack running with
+# WEAVE_AUTH_DISABLED=1.
+auth=()
+if [ -n "${WEAVE_NORTHBOUND_TOKEN:-}" ]; then
+  auth=(-H "Authorization: Bearer ${WEAVE_NORTHBOUND_TOKEN}")
+fi
+
 usage() {
   cat >&2 <<EOF
 usage: endpoints.sh <stream> ingress|output [index]
@@ -32,9 +40,19 @@ esac
 url="$ctrl/streams/$stream/endpoints"
 
 for _ in $(seq 1 "$attempts"); do
-  body="$(curl -s -o - -w '\n%{http_code}' "$url" 2>/dev/null || true)"
+  body="$(curl -s -o - -w '\n%{http_code}' "${auth[@]}" "$url" 2>/dev/null || true)"
   code="${body##*$'\n'}"
   json="${body%$'\n'*}"
+  # Retrying a rejected token never converges, so fail fast and say why.
+  if [ "$code" = "401" ]; then
+    echo "controller rejected the bearer token (401) for $url" >&2
+    if [ -n "${WEAVE_NORTHBOUND_TOKEN:-}" ]; then
+      echo "WEAVE_NORTHBOUND_TOKEN does not match the controller's" >&2
+    else
+      echo "WEAVE_NORTHBOUND_TOKEN is unset" >&2
+    fi
+    exit 1
+  fi
   if [ "$code" = "200" ]; then
     addr="$(printf '%s' "$json" | jq -r "$filter | \"\(.host):\(.port)\"" 2>/dev/null || true)"
     if [ -n "$addr" ] && [ "$addr" != "null:null" ]; then

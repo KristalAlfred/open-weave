@@ -1,5 +1,7 @@
 //! Shared domain types for open-weave.
 
+pub mod auth;
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -333,6 +335,12 @@ impl PortRange {
 pub struct NodeConfig {
     pub id: String,
     pub southbound_url: String,
+    /// Bearer token presented to southbound. Falls back to
+    /// [`auth::SOUTHBOUND_TOKEN_VAR`] when unset here, so a deployment can keep
+    /// the secret out of the config file — see
+    /// [`NodeConfig::resolve_southbound_token`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub southbound_token: Option<String>,
     pub listen: String,
     /// Endpoint peers use to reach this node's control API. Defaults to
     /// `http://{listen}` via [`NodeConfig::public_endpoint`].
@@ -355,6 +363,30 @@ impl NodeConfig {
         self.public_endpoint
             .clone()
             .unwrap_or_else(|| format!("http://{}", self.listen))
+    }
+
+    /// Resolve the bearer token this node presents to southbound: the config
+    /// value when set, otherwise [`auth::SOUTHBOUND_TOKEN_VAR`] from the
+    /// environment. `None` means authentication is switched off.
+    ///
+    /// Fails closed like a server would: a node with no token will never
+    /// register, so it is better to refuse to start than to retry forever.
+    ///
+    /// # Errors
+    /// Returns [`auth::AuthError::MissingToken`] when neither source carries a
+    /// token and [`auth::AUTH_DISABLED_VAR`] is not engaged.
+    pub fn resolve_southbound_token(&self) -> Result<Option<auth::Token>, auth::AuthError> {
+        if auth::auth_disabled() {
+            return Ok(None);
+        }
+        self.southbound_token
+            .as_deref()
+            .and_then(auth::Token::new)
+            .or_else(|| auth::Token::from_env(auth::SOUTHBOUND_TOKEN_VAR))
+            .map(Some)
+            .ok_or_else(|| auth::AuthError::MissingToken {
+                var: auth::SOUTHBOUND_TOKEN_VAR.to_string(),
+            })
     }
 
     /// Enforce the invariants placement depends on: a named node, a `default`
@@ -848,6 +880,7 @@ mod tests {
         NodeConfig {
             id: "strom-node-1".to_string(),
             southbound_url: "http://127.0.0.1:8081".to_string(),
+            southbound_token: None,
             listen: "0.0.0.0:8091".to_string(),
             public_endpoint: None,
             data_plane: BTreeMap::from([(

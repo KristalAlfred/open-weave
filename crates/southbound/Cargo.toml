@@ -10,7 +10,7 @@ name = "weave-southbound"
 path = "src/main.rs"
 
 [dependencies]
-weave-core = { workspace = true }
+weave-core = { workspace = true, features = ["server"] }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

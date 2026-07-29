@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
+use weave_core::auth::{self, Guard, require_bearer};
 use weave_core::{
     DesiredHop, EndpointDescriptor, HopStatus, NodeDescriptor, NodeHeartbeat, NodeRegistration,
     NodeStatus, ObservedState, PathStatus, ReconcileReport, ReconcileStatus, StreamDefinition,
@@ -219,8 +220,19 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Fail closed on both surfaces: the controller owns all state, so serving it
+    // open is strictly worse than refusing to start.
+    let north = Guard::from_env(auth::NORTHBOUND_TOKEN_VAR)?;
+    let south = Guard::from_env(auth::SOUTHBOUND_TOKEN_VAR)?;
+    if north.is_disabled() {
+        tracing::warn!(
+            "{}=1: controller serves its API without authentication",
+            auth::AUTH_DISABLED_VAR
+        );
+    }
+
     let state = AppState::hydrate(store, node_ttl).await?;
-    let api = spawn_api_server(args.listen.clone(), state.clone());
+    let api = spawn_api_server(args.listen.clone(), state.clone(), north, south);
 
     tracing::info!(interval_secs = args.interval_secs, "controller starting");
 
@@ -293,28 +305,51 @@ fn observed_state(nodes: &BTreeMap<String, NodeRegistration>) -> ObservedState {
     }
 }
 
-fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(ui))
-        .route("/ui", get(ui))
-        .route("/health", get(health))
-        .route("/status", get(get_status))
-        .route("/view", get(get_view))
+/// The controller backs both API surfaces, so it validates both tokens and
+/// requires the one matching the surface a route belongs to — an adapter's
+/// southbound token cannot create streams.
+///
+/// The dashboard surface (`/`, `/ui`, `/view`, `/status`) is deliberately left
+/// open: it is browser-loaded and polls `/view`, which a bearer token cannot
+/// carry without a cookie/session mechanism or a reverse proxy. It exposes
+/// topology and allocated ports, so **the controller port must not be publicly
+/// exposed** — put it behind a proxy or keep it on a private network. `/health`
+/// is open for compose healthchecks and load balancers.
+fn router(state: AppState, north: Guard, south: Guard) -> Router {
+    let streams = Router::new()
         .route("/streams", get(list_streams).post(submit_stream))
         .route("/streams/{name}", axum::routing::delete(delete_stream))
         .route("/streams/{name}/endpoints", get(get_endpoints))
+        .layer(axum::middleware::from_fn_with_state(north, require_bearer));
+
+    let nodes = Router::new()
         .route("/nodes", get(list_nodes))
         .route("/nodes/register", post(register_node))
         .route("/nodes/{node_id}/heartbeat", post(node_heartbeat))
         .route("/nodes/{node_id}/desired", get(get_desired))
         .route("/endpoints", get(list_endpoints))
         .route("/state", get(get_state))
+        .layer(axum::middleware::from_fn_with_state(south, require_bearer));
+
+    Router::new()
+        .route("/", get(ui))
+        .route("/ui", get(ui))
+        .route("/health", get(health))
+        .route("/status", get(get_status))
+        .route("/view", get(get_view))
+        .merge(streams)
+        .merge(nodes)
         .with_state(state)
 }
 
-fn spawn_api_server(addr: String, state: AppState) -> JoinHandle<Result<()>> {
+fn spawn_api_server(
+    addr: String,
+    state: AppState,
+    north: Guard,
+    south: Guard,
+) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
-        let app = router(state);
+        let app = router(state, north, south);
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .with_context(|| format!("binding controller listener on {addr}"))?;
@@ -730,6 +765,23 @@ mod tests {
     use tower::ServiceExt;
     use weave_core::{NodeCapabilities, PortRange, SrtEndpoint, StreamTransport};
 
+    const NORTH_TOKEN: &str = "controller-north-test-token";
+    const SOUTH_TOKEN: &str = "controller-south-test-token";
+
+    /// A router with authentication switched off, for the behavioural tests.
+    fn open_router(state: AppState) -> Router {
+        router(state, Guard::Disabled, Guard::Disabled)
+    }
+
+    /// A router requiring a distinct token per surface.
+    fn guarded_router(state: AppState) -> Router {
+        router(
+            state,
+            Guard::Required(auth::Token::new(NORTH_TOKEN).unwrap()),
+            Guard::Required(auth::Token::new(SOUTH_TOKEN).unwrap()),
+        )
+    }
+
     fn mem_state() -> (AppState, Arc<MemStore>) {
         let mem = Arc::new(MemStore::new());
         let state = AppState {
@@ -814,7 +866,7 @@ mod tests {
     #[tokio::test]
     async fn post_stream_then_get_returns_it_and_writes_through() {
         let (state, mem) = mem_state();
-        let app = router(state);
+        let app = open_router(state);
 
         let (status, _) = send(
             &app,
@@ -841,7 +893,7 @@ mod tests {
     #[tokio::test]
     async fn delete_stream_removes_and_writes_through() {
         let (state, mem) = mem_state();
-        let app = router(state);
+        let app = open_router(state);
 
         send(
             &app,
@@ -865,7 +917,7 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_updates_memory_but_never_the_store() {
         let (state, mem) = mem_state();
-        let app = router(state);
+        let app = open_router(state);
 
         send(
             &app,
@@ -923,7 +975,7 @@ mod tests {
 
         reconcile_tick(&state).await;
 
-        let app = router(state);
+        let app = open_router(state);
         let (status, body) = send(&app, "GET", "/nodes/strom-node-1/desired", None).await;
         assert_eq!(status, StatusCode::OK);
         let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
@@ -949,7 +1001,7 @@ mod tests {
                 endpoints: None,
             }];
         }
-        let app = router(state);
+        let app = open_router(state);
         let (status, _) = send(&app, "GET", "/streams/basic/endpoints", None).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
@@ -1004,7 +1056,7 @@ mod tests {
             }),
         }];
 
-        let app = router(state);
+        let app = open_router(state);
         let (status, body) = send(&app, "GET", "/view", None).await;
         assert_eq!(status, StatusCode::OK);
 
@@ -1039,7 +1091,7 @@ mod tests {
     #[tokio::test]
     async fn view_before_first_tick_has_no_report() {
         let (state, _mem) = mem_state();
-        let app = router(state);
+        let app = open_router(state);
         let (status, body) = send(&app, "GET", "/view", None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.get("report").is_none());
@@ -1049,7 +1101,7 @@ mod tests {
     #[tokio::test]
     async fn ui_is_served_at_root_and_ui() {
         let (state, _mem) = mem_state();
-        let app = router(state);
+        let app = open_router(state);
         for uri in ["/", "/ui"] {
             let request = Request::builder()
                 .method("GET")
@@ -1155,7 +1207,7 @@ mod tests {
 
         reconcile_tick(&state).await;
 
-        let app = router(state);
+        let app = open_router(state);
         let (status, body) = send(&app, "GET", "/nodes", None).await;
         assert_eq!(status, StatusCode::OK);
         let nodes: Vec<NodeDescriptor> = serde_json::from_value(body).unwrap();
@@ -1169,5 +1221,132 @@ mod tests {
             !hops.is_empty(),
             "offline node still receives its desired hops"
         );
+    }
+
+    /// Send a request carrying an optional `Authorization` header, returning the
+    /// status and the `WWW-Authenticate` challenge if one was issued.
+    async fn send_auth(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        authorization: Option<&str>,
+    ) -> (StatusCode, Option<String>) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(authorization) = authorization {
+            request = request.header("authorization", authorization);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from("{}")).unwrap())
+            .await
+            .unwrap();
+        let challenge = response
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .map(|value| value.to_str().unwrap().to_string());
+        (response.status(), challenge)
+    }
+
+    const NORTH_ROUTES: [(&str, &str); 4] = [
+        ("GET", "/streams"),
+        ("POST", "/streams"),
+        ("DELETE", "/streams/basic"),
+        ("GET", "/streams/basic/endpoints"),
+    ];
+
+    const SOUTH_ROUTES: [(&str, &str); 6] = [
+        ("GET", "/nodes"),
+        ("POST", "/nodes/register"),
+        ("POST", "/nodes/strom-node-1/heartbeat"),
+        ("GET", "/nodes/strom-node-1/desired"),
+        ("GET", "/endpoints"),
+        ("GET", "/state"),
+    ];
+
+    /// The dashboard surface is deliberately unauthenticated — it is browser-
+    /// loaded and cannot carry a bearer token. `/health` is open for healthchecks.
+    #[tokio::test]
+    async fn dashboard_and_health_stay_open() {
+        let (state, _mem) = mem_state();
+        let app = guarded_router(state);
+        for uri in ["/", "/ui", "/health", "/view", "/status"] {
+            let (status, _) = send_auth(&app, "GET", uri, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri} must not require a token");
+        }
+    }
+
+    #[tokio::test]
+    async fn api_routes_reject_missing_and_wrong_tokens() {
+        let (state, _mem) = mem_state();
+        let app = guarded_router(state);
+
+        for authorization in [None, Some("Bearer wrong-token"), Some("Basic ignored")] {
+            for (method, uri) in NORTH_ROUTES.iter().chain(&SOUTH_ROUTES) {
+                let (status, challenge) = send_auth(&app, method, uri, authorization).await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "{method} {uri} with authorization={authorization:?}"
+                );
+                assert_eq!(challenge.as_deref(), Some("Bearer"));
+            }
+        }
+    }
+
+    /// The surfaces are separated, not merely authenticated: a node's southbound
+    /// token cannot create or delete streams, and the operator token cannot
+    /// register nodes or read their desired hops.
+    #[tokio::test]
+    async fn each_surface_rejects_the_other_surfaces_token() {
+        let (state, _mem) = mem_state();
+        let app = guarded_router(state);
+        let north = format!("Bearer {NORTH_TOKEN}");
+        let south = format!("Bearer {SOUTH_TOKEN}");
+
+        for (method, uri) in NORTH_ROUTES {
+            let (status, _) = send_auth(&app, method, uri, Some(&south)).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} must reject the southbound token"
+            );
+        }
+        for (method, uri) in SOUTH_ROUTES {
+            let (status, _) = send_auth(&app, method, uri, Some(&north)).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} must reject the northbound token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn each_surface_accepts_its_own_token() {
+        let (state, _mem) = mem_state();
+        let app = guarded_router(state);
+
+        // Past the guard is enough: these are covered behaviourally elsewhere, so
+        // only "not 401" matters here.
+        let (status, _) = send_auth(
+            &app,
+            "GET",
+            "/streams",
+            Some(&format!("Bearer {NORTH_TOKEN}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = send_auth(
+            &app,
+            "GET",
+            "/state",
+            Some(&format!("Bearer {SOUTH_TOKEN}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 }

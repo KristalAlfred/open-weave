@@ -5,10 +5,18 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Enables the axum bearer-token middleware in `auth`. Servers opt in; client
+# crates (CLI, adapters) use the same module without pulling axum in.
+server = ["axum"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true, optional = true }
 
 [lints]
 workspace = true

@@ -2,6 +2,10 @@
 node:
   id: strom-node-2
   southbound_url: http://172.25.0.21:8081
+  # Bearer token presented to southbound. Left unset here so the value stays
+  # out of the repo: it falls back to WEAVE_SOUTHBOUND_TOKEN, which
+  # docker-compose.yml passes in. Set it inline to pin it per node:
+  #   southbound_token: <token>
   listen: 0.0.0.0:8091
   public_endpoint: http://172.27.0.11:8091
   data_plane:

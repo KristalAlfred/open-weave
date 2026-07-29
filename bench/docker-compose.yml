@@ -26,6 +26,10 @@ networks:
 
 services:
   # --- control plane (net_core) ---
+  # Every service authenticates with a shared bearer token per API surface, and
+  # refuses to start without one. The bench defaults below keep `just up` a single
+  # command; export WEAVE_{NORTHBOUND,SOUTHBOUND}_TOKEN to override. They are
+  # development values, not secrets — the bench sits on a private subnet.
   northbound:
     <<: *weave
     container_name: ow-northbound
@@ -33,6 +37,7 @@ services:
     environment:
       WEAVE_NORTHBOUND_ADDR: 0.0.0.0:9080
       WEAVE_CONTROLLER_URL: http://172.25.0.22:8082
+      WEAVE_NORTHBOUND_TOKEN: ${WEAVE_NORTHBOUND_TOKEN:-bench-northbound-token}
     ports:
       - "29080:9080"
     networks:
@@ -55,6 +60,7 @@ services:
     environment:
       WEAVE_SOUTHBOUND_ADDR: 0.0.0.0:8081
       WEAVE_CONTROLLER_URL: http://172.25.0.22:8082
+      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_SOUTHBOUND_TOKEN:-bench-southbound-token}
     ports:
       - "29081:8081"
     networks:
@@ -78,6 +84,8 @@ services:
       WEAVE_CONTROLLER_ADDR: 0.0.0.0:8082
       WEAVE_RECONCILE_INTERVAL_SECS: "5"
       DATABASE_URL: postgres://weave:weave@172.25.0.23:5432/weave
+      WEAVE_NORTHBOUND_TOKEN: ${WEAVE_NORTHBOUND_TOKEN:-bench-northbound-token}
+      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_SOUTHBOUND_TOKEN:-bench-southbound-token}
     ports:
       - "29082:8082"
     networks:
@@ -193,6 +201,8 @@ services:
     <<: *weave
     container_name: ow-adapter-1
     command: ["weave-adapter-strom", "--config", "/etc/weave/node.yaml"]
+    environment:
+      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_SOUTHBOUND_TOKEN:-bench-southbound-token}
     volumes:
       - ./config/adapter-1.yaml:/etc/weave/node.yaml:ro
     networks:
@@ -230,6 +240,8 @@ services:
     <<: *weave
     container_name: ow-adapter-2
     command: ["weave-adapter-strom", "--config", "/etc/weave/node.yaml"]
+    environment:
+      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_SOUTHBOUND_TOKEN:-bench-southbound-token}
     volumes:
       - ./config/adapter-2.yaml:/etc/weave/node.yaml:ro
     networks:

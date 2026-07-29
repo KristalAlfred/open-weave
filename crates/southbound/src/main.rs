@@ -13,6 +13,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
+use weave_core::auth::{self, Guard, Token, require_bearer};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8081";
 const DEFAULT_CONTROLLER_URL: &str = "http://127.0.0.1:8082";
@@ -21,13 +22,17 @@ const DEFAULT_CONTROLLER_URL: &str = "http://127.0.0.1:8082";
 struct AppState {
     http: reqwest::Client,
     controller_url: String,
+    /// Re-presented to the controller on every proxied request. `None` when
+    /// authentication is disabled.
+    token: Option<Token>,
 }
 
 impl AppState {
-    fn new(controller_url: String) -> Self {
+    fn new(controller_url: String, token: Option<Token>) -> Self {
         Self {
             http: reqwest::Client::new(),
             controller_url,
+            token,
         }
     }
 }
@@ -43,7 +48,19 @@ async fn main() -> Result<()> {
     let addr = std::env::var("WEAVE_SOUTHBOUND_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
     let controller_url = std::env::var("WEAVE_CONTROLLER_URL")
         .unwrap_or_else(|_| DEFAULT_CONTROLLER_URL.to_string());
-    let app = router(AppState::new(controller_url.clone()));
+
+    // Fail closed: this surface is the one operators expose to remote nodes.
+    let guard = Guard::from_env(auth::SOUTHBOUND_TOKEN_VAR)?;
+    if guard.is_disabled() {
+        tracing::warn!(
+            "{}=1: southbound serves and proxies without authentication",
+            auth::AUTH_DISABLED_VAR
+        );
+    }
+    let app = router(
+        AppState::new(controller_url.clone(), guard.token().cloned()),
+        guard,
+    );
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
@@ -56,15 +73,22 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
+/// `/health` stays open for compose healthchecks and load balancers. Everything
+/// else — registration, heartbeats, and the desired-state and topology reads —
+/// requires the southbound bearer token.
+fn router(state: AppState, guard: Guard) -> Router {
+    let nodes = Router::new()
         .route("/nodes", get(list_nodes))
         .route("/nodes/register", post(register_node))
         .route("/nodes/{node_id}/heartbeat", post(node_heartbeat))
         .route("/nodes/{node_id}/desired", get(get_desired))
         .route("/endpoints", get(list_endpoints))
         .route("/state", get(get_state))
+        .layer(axum::middleware::from_fn_with_state(guard, require_bearer));
+
+    Router::new()
+        .route("/health", get(health))
+        .merge(nodes)
         .with_state(state)
 }
 
@@ -121,6 +145,9 @@ async fn proxy(
 ) -> Response {
     let url = format!("{}{path}", state.controller_url.trim_end_matches('/'));
     let mut request = state.http.request(method, &url);
+    if let Some(token) = &state.token {
+        request = request.header(reqwest::header::AUTHORIZATION, token.header_value());
+    }
     if let Some(body) = body {
         request = request
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -166,11 +193,14 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
 
+    const TOKEN: &str = "southbound-test-token";
+
     #[derive(Clone, Default)]
     struct Captured {
         method: String,
         path: String,
         body: Vec<u8>,
+        authorization: Option<String>,
     }
 
     async fn stub_controller(status: StatusCode) -> (String, Arc<Mutex<Option<Captured>>>) {
@@ -182,6 +212,11 @@ mod tests {
         ) -> Response {
             let method = request.method().to_string();
             let path = request.uri().path().to_string();
+            let authorization = request
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
             let body = request
                 .into_body()
                 .collect()
@@ -189,7 +224,12 @@ mod tests {
                 .unwrap()
                 .to_bytes()
                 .to_vec();
-            *captured.lock().unwrap() = Some(Captured { method, path, body });
+            *captured.lock().unwrap() = Some(Captured {
+                method,
+                path,
+                body,
+                authorization,
+            });
             (status, Json(json!({ "ok": true }))).into_response()
         }
 
@@ -204,10 +244,27 @@ mod tests {
         (format!("http://{addr}"), captured)
     }
 
+    fn token() -> Token {
+        Token::new(TOKEN).unwrap()
+    }
+
+    /// A router with authentication switched off, for the proxy-fidelity tests.
+    fn open_app(controller_url: String) -> Router {
+        router(AppState::new(controller_url, None), Guard::Disabled)
+    }
+
+    /// A router requiring [`TOKEN`], which it also re-presents to the controller.
+    fn guarded_app(controller_url: String) -> Router {
+        router(
+            AppState::new(controller_url, Some(token())),
+            Guard::Required(token()),
+        )
+    }
+
     #[tokio::test]
     async fn register_forwards_post_body_and_status() {
         let (url, captured) = stub_controller(StatusCode::ACCEPTED).await;
-        let app = router(AppState::new(url));
+        let app = open_app(url);
 
         let payload = json!({ "node": { "id": "strom-node-1" } });
         let response = app
@@ -237,7 +294,7 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_forwards_node_scoped_path() {
         let (url, captured) = stub_controller(StatusCode::ACCEPTED).await;
-        let app = router(AppState::new(url));
+        let app = open_app(url);
 
         let response = app
             .oneshot(
@@ -264,7 +321,7 @@ mod tests {
     #[tokio::test]
     async fn get_desired_forwards_and_relays_status() {
         let (url, captured) = stub_controller(StatusCode::OK).await;
-        let app = router(AppState::new(url));
+        let app = open_app(url);
 
         let response = app
             .oneshot(
@@ -288,7 +345,7 @@ mod tests {
 
     #[tokio::test]
     async fn unreachable_controller_is_bad_gateway() {
-        let app = router(AppState::new("http://127.0.0.1:1".to_string()));
+        let app = open_app("http://127.0.0.1:1".to_string());
         let response = app
             .oneshot(
                 Request::builder()
@@ -299,5 +356,94 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn health_is_reachable_without_a_token() {
+        let (url, _captured) = stub_controller(StatusCode::OK).await;
+        let response = guarded_app(url)
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The leak the token exists to close: registering a node id, then pulling
+    /// that node's topology and allocated ports, must both be unreachable without
+    /// the token — and must never reach the controller.
+    #[tokio::test]
+    async fn node_routes_reject_missing_and_wrong_tokens() {
+        for header in [None, Some("Bearer wrong-token"), Some("Basic ignored")] {
+            let (url, captured) = stub_controller(StatusCode::ACCEPTED).await;
+            let app = guarded_app(url);
+
+            for (method, uri) in [
+                ("POST", "/nodes/register"),
+                ("GET", "/nodes/strom-node-1/desired"),
+                ("POST", "/nodes/strom-node-1/heartbeat"),
+                ("GET", "/nodes"),
+                ("GET", "/endpoints"),
+                ("GET", "/state"),
+            ] {
+                let mut request = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json");
+                if let Some(header) = header {
+                    request = request.header("authorization", header);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::from("{}")).unwrap())
+                    .await
+                    .unwrap();
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{method} {uri} with authorization={header:?}"
+                );
+                assert_eq!(
+                    response.headers()[axum::http::header::WWW_AUTHENTICATE],
+                    "Bearer"
+                );
+            }
+            assert!(
+                captured.lock().unwrap().is_none(),
+                "an unauthenticated request never reaches the controller"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn correct_token_is_accepted_and_re_presented_to_the_controller() {
+        let (url, captured) = stub_controller(StatusCode::OK).await;
+        let response = guarded_app(url)
+            .oneshot(
+                Request::builder()
+                    .uri("/nodes/strom-node-1/desired")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let seen = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("controller saw a request");
+        assert_eq!(
+            seen.authorization.as_deref(),
+            Some(format!("Bearer {TOKEN}").as_str()),
+            "southbound authenticates its own hop to the controller"
+        );
     }
 }

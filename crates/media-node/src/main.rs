@@ -8,6 +8,7 @@ use clap::Parser;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
+use weave_core::auth::{self, Token};
 use weave_core::{
     AdapterDescriptor, AdapterKind, NodeCapabilities, NodeConfig, NodeDescriptor, NodeRegistration,
     NodeStatus, TransportDescriptor,
@@ -37,7 +38,17 @@ async fn main() -> Result<()> {
     let config = load_config(&args.config)?.node;
     let registration = registration(&config);
 
-    register(&config.southbound_url, &registration).await?;
+    // Fail closed, like the Strom adapter: a node with no token can never
+    // register, so surface that at startup rather than as a 401.
+    let token = config.resolve_southbound_token()?;
+    if token.is_none() {
+        tracing::warn!(
+            "{}=1: calling southbound without authentication",
+            auth::AUTH_DISABLED_VAR
+        );
+    }
+
+    register(&config.southbound_url, token.as_ref(), &registration).await?;
     serve_health(config.listen).await
 }
 
@@ -85,10 +96,16 @@ fn registration(config: &NodeConfig) -> NodeRegistration {
     }
 }
 
-async fn register(southbound_url: &str, registration: &NodeRegistration) -> Result<()> {
-    let client = reqwest::Client::new();
-    client
-        .post(format!("{southbound_url}/nodes/register"))
+async fn register(
+    southbound_url: &str,
+    token: Option<&Token>,
+    registration: &NodeRegistration,
+) -> Result<()> {
+    let mut request = reqwest::Client::new().post(format!("{southbound_url}/nodes/register"));
+    if let Some(token) = token {
+        request = request.header(reqwest::header::AUTHORIZATION, token.header_value());
+    }
+    request
         .json(registration)
         .send()
         .await

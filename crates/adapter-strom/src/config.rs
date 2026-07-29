@@ -77,6 +77,25 @@ strom:
         assert_eq!(config.node.validate(), Ok(()));
     }
 
+    /// The token may live in the node YAML instead of the environment. Which
+    /// source wins is [`NodeConfig::resolve_southbound_token`]'s job and depends
+    /// on process env, so it is covered on the bench rather than here.
+    #[test]
+    fn accepts_an_inline_southbound_token() {
+        let config: AdapterConfig = serde_norway::from_str(VALID).expect("parse");
+        assert_eq!(
+            config.node.southbound_token, None,
+            "the field is optional; deployments may use the env var instead"
+        );
+
+        let yaml = VALID.replace(
+            "southbound_url: http://127.0.0.1:8081",
+            "southbound_url: http://127.0.0.1:8081\n  southbound_token: from-yaml",
+        );
+        let config: AdapterConfig = serde_norway::from_str(&yaml).expect("parse");
+        assert_eq!(config.node.southbound_token.as_deref(), Some("from-yaml"));
+    }
+
     #[test]
     fn rejects_unknown_fields() {
         let yaml = format!("{VALID}  bogus: true\n");
