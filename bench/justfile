@@ -74,17 +74,84 @@ stream-ls:
     done
 
 # Apply a manifest by name (stem == stream name), e.g. `just stream basic`.
+# Control plane only: the stream is registered and placed, but nothing feeds it,
+# so it settles at `awaiting_input`. Use `just stream-up` to also drive media.
+[doc("Apply a manifest by name, control plane only (no media).")]
 stream name:
-    WEAVE_NORTHBOUND_URL={{nb}} WEAVE_NORTHBOUND_TOKEN={{nb_token}} \
+    @WEAVE_NORTHBOUND_URL={{nb}} WEAVE_NORTHBOUND_TOKEN={{nb_token}} \
         cargo run --quiet -p weave-cli -- apply -f {{manifests}}/{{name}}.yaml
+    @[ -n "${WEAVE_BENCH_DRIVING:-}" ] || \
+        echo "applied {{name}} (no media yet — 'just bench stream-up {{name}}' drives it end to end)"
+
+# Attach the external producer to the stream's ingress and one consumer per
+# receiver output, then wait for `flowing`. This is the recipe to reach for;
+# `just stream` alone leaves the path unfed.
+#
+# The producer/consumer containers are singletons, so this re-points them at
+# <name>: a previously driven stream loses its media and falls back to `degraded`.
+[doc("Apply a manifest AND drive it end to end, waiting for `flowing`.")]
+stream-up name="basic":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    WEAVE_BENCH_DRIVING=1 just stream {{name}}
+    # Not every manifest is drivable. Wait for placement to resolve, then say why
+    # rather than letting endpoint discovery poll a stream that will never place.
+    for _ in $(seq 1 10); do
+        placed="$(curl -sf {{ctrl}}{{v}}/status \
+            | jq -r --arg n {{name}} '.streams[] | select(.name==$n) | .status' 2>/dev/null || true)"
+        [ -n "$placed" ] && [ "$placed" != "pending" ] && break
+        sleep 2
+    done
+    case "${placed:-}" in
+        idle)
+            echo "{{name}} is disabled (enabled: false) — no hops provisioned, nothing to drive"
+            exit 0 ;;
+        pending|"")
+            echo "{{name}} never placed (status ${placed:-unknown}) — no node matched its hops," \
+                 "so there is no ingress to feed. 'just bench status' shows registered nodes." >&2
+            exit 1 ;;
+    esac
+    outputs="$(WEAVE_NORTHBOUND_TOKEN={{nb_token}} bash {{scripts}}/endpoints.sh {{name}} outputs)"
+    echo "{{name}} placed with $outputs receiver output(s); attaching endpoints"
+    just producer-up {{name}}
+    just consumer-up {{name}}
+    # Only two consumer slots exist; say so rather than silently under-driving a
+    # path, which would look like a stuck `degraded`.
+    if [ "$outputs" -ge 2 ]; then just consumer-2-up {{name}}; fi
+    if [ "$outputs" -gt 2 ]; then
+        echo "warning: {{name}} has $outputs outputs but the bench has 2 consumers;" \
+             "outputs 2+ stay unattached and the stream will report degraded" >&2
+    fi
+    just stream-wait {{name}} flowing
+
+# Stop driving a stream and remove it: detach the external endpoints, then delete.
+stream-down name="basic":
+    -@just producer-down
+    -@just consumer-down
+    -@just consumer-2-down
+    @just stream-rm {{name}}
+
+# Poll the controller until a stream reports `status`, e.g. `just stream-wait basic flowing`.
+stream-wait name status="flowing" attempts="45":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for _ in $(seq 1 {{attempts}}); do
+        got="$(curl -sf {{ctrl}}{{v}}/status \
+            | jq -r --arg n {{name}} '.streams[] | select(.name==$n) | .status' 2>/dev/null || true)"
+        if [ "$got" = "{{status}}" ]; then echo "{{name}}: {{status}}"; exit 0; fi
+        sleep 2
+    done
+    echo "{{name}}: timed out waiting for {{status}} (last: ${got:-unknown})" >&2
+    echo "inspect with 'just bench status' or the dashboard at {{ctrl}}/ui" >&2
+    exit 1
 
 # Remove a stream by name, e.g. `just stream-rm basic`. Controller tears down its hops next tick.
 stream-rm name:
     @curl -sf {{nb_auth}} -X DELETE {{nb}}{{v}}/streams/{{name}} && echo "deleted {{name}}" || echo "not found: {{name}}"
 
-# Start the external ffmpeg producer (SRT caller into a source ingress).
 # Pass a stream name; the ingress address is resolved via the controller's
 # discovery API. Verification endpoint only — not part of the system under test.
+[doc("Start the external ffmpeg producer (SRT caller into a source ingress).")]
 producer-up stream="basic":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -95,8 +162,8 @@ producer-up stream="basic":
 producer-down:
     {{compose}} --profile producer rm -sf producer
 
-# Start the external ffmpeg consumer (SRT caller pulling a receiver output).
 # Pass a stream name; the first output address is resolved via discovery.
+[doc("Start the external ffmpeg consumer (SRT caller pulling a receiver output).")]
 consumer-up stream="basic":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -107,8 +174,9 @@ consumer-up stream="basic":
 consumer-down:
     {{compose}} --profile consumer rm -sf consumer
 
-# Start a second external consumer (for fan-out: one consumer per receiver output).
+# For fan-out: one consumer per receiver output, so every receiver hop can flow.
 # Pass a stream name; the second output address is resolved via discovery.
+[doc("Start a second external consumer, attached to a stream's output 1.")]
 consumer-2-up stream="fanout":
     #!/usr/bin/env bash
     set -euo pipefail

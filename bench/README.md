@@ -99,22 +99,52 @@ laptop, but **do not expose a controller port on a shared or public host.**
 just up            # build + start + wait for healthy
 just status        # health, registered nodes, controller view, streams
 
-just stream-ls     # list the stream manifests (see manifests/README.md)
-just stream basic  # apply a manifest; `just stream-rm basic` removes it
+just stream-ls        # list the stream manifests (see manifests/README.md)
+just stream-up basic  # apply + drive end to end, wait for `flowing`
+just stream-down basic  # detach the endpoints and delete the stream
 
 just netem node1 delay 200ms loss 5%   # impair node 1's network
 just netem-show node1
 just netem-clear node1
 
-just producer-up          # feed the basic stream's source ingress
-just producer-up reverse  # feed another stream (resolves its ingress via discovery)
-just producer-down # stop it (drives no-source -> source -> no-source transitions)
-just consumer-up          # pull the basic stream's receiver output
-just consumer-up reverse  # pull another stream's output (resolved via discovery)
-just consumer-down
-
 just down          # tear down (containers, networks, volumes)
 ```
+
+`stream-up` is the recipe to reach for: it applies the manifest, attaches the
+external producer to the stream's ingress and **one consumer per receiver
+output**, and then waits until the controller reports `flowing`. Fan-out needs
+two consumers to be fully driven, and `stream-up` reads the output count from
+discovery, so it attaches the right number without being told.
+
+The lower-level pieces are still there when a scenario wants them separately —
+applying a stream without media, or detaching a producer mid-run to watch the
+status transition:
+
+```sh
+just stream basic         # control plane only: placed, but unfed -> `awaiting_input`
+just stream-rm basic      # delete the stream; controller tears down its hops
+
+just producer-up basic    # feed a stream's source ingress
+just producer-down        # stop it (drives source -> no-source transitions)
+just consumer-up basic    # pull output 0
+just consumer-2-up fanout # pull output 1 (fan-out's second destination)
+just consumer-down
+just consumer-2-down
+
+just stream-wait basic flowing   # poll the controller until a status is reached
+```
+
+The `producer`, `consumer`, and `consumer-2` containers are **singletons**, so
+only one stream can be driven with media at a time. `stream-up <other>` re-points
+them, and the previously driven stream loses its source — it reports `degraded`
+(a path that was flowing and went quiet is a fault, distinct from one that never
+received input, which is `awaiting_input`). Applying several streams at once is
+fine; only the media endpoints are shared.
+
+Two manifests are deliberately not drivable, and `stream-up` says so instead of
+waiting for an ingress that will never exist: `disabled` reports that it is
+disabled and exits `0`, `unplaceable` reports that nothing matched its hops and
+exits `1`.
 
 Data-plane addresses are never hardcoded in the recipes: they are resolved from
 the controller's discovery API. Query it directly with:
@@ -126,10 +156,12 @@ curl -s -H "Authorization: Bearer bench-northbound-token" \
 ```
 
 `200` once placed, `503` while known-but-unplaced, `404` if unknown, `401` without
-the northbound token. The `scripts/endpoints.sh <stream> ingress|output [index]`
-helper polls this until placed and prints `host:port`; the producer/consumer
-recipes use it and pass the token in. It reads `WEAVE_NORTHBOUND_TOKEN` from its
-environment and fails fast on `401` rather than polling a rejected token.
+the northbound token. The `scripts/endpoints.sh <stream> ingress|output|outputs [index]`
+helper polls this until placed and prints `host:port` — or, for `outputs`, how many
+receiver outputs the stream has, which is how `stream-up` knows how many consumers
+to attach. The producer/consumer recipes use it and pass the token in. It reads
+`WEAVE_NORTHBOUND_TOKEN` from its environment and fails fast on `401` rather than
+polling a rejected token.
 
 ## External verification endpoints
 

@@ -19,10 +19,11 @@ fi
 
 usage() {
   cat >&2 <<EOF
-usage: endpoints.sh <stream> ingress|output [index]
-  endpoints.sh basic ingress      producer target (source ingress) host:port
+usage: endpoints.sh <stream> ingress|output|outputs [index]
+  endpoints.sh basic ingress       producer target (source ingress) host:port
   endpoints.sh basic output        first consumer output host:port
   endpoints.sh fanout output 1     second consumer output host:port
+  endpoints.sh fanout outputs      number of receiver outputs (one per destination)
 EOF
   exit 2
 }
@@ -31,9 +32,12 @@ stream="${1:-}"; [ -n "$stream" ] || usage
 role="${2:-}"; [ -n "$role" ] || usage
 index="${3:-0}"
 
+# `outputs` reports how many consumers a stream needs; the others resolve one
+# concrete address. Both wait for placement, so they share the polling loop.
 case "$role" in
-  ingress) filter='.ingress' ;;
-  output)  filter=".outputs[$index]" ;;
+  ingress) filter='.ingress | "\(.host):\(.port)"' ;;
+  output)  filter=".outputs[$index] | \"\(.host):\(.port)\"" ;;
+  outputs) filter='.outputs | length' ;;
   *) usage ;;
 esac
 
@@ -56,9 +60,9 @@ for _ in $(seq 1 "$attempts"); do
     exit 1
   fi
   if [ "$code" = "200" ]; then
-    addr="$(printf '%s' "$json" | jq -r "$filter | \"\(.host):\(.port)\"" 2>/dev/null || true)"
-    if [ -n "$addr" ] && [ "$addr" != "null:null" ]; then
-      printf '%s\n' "$addr"
+    value="$(printf '%s' "$json" | jq -r "$filter" 2>/dev/null || true)"
+    if [ -n "$value" ] && [ "$value" != "null" ] && [ "$value" != "null:null" ]; then
+      printf '%s\n' "$value"
       exit 0
     fi
     echo "stream '$stream' has no $role[$index]" >&2

@@ -5,7 +5,10 @@ name is also the stream `name`, so the recipes take a bare name:
 
 ```sh
 just bench stream-ls          # list manifests + one-line description
-just bench stream basic       # apply bench/manifests/basic.yaml
+just bench stream-up basic    # apply + drive end to end, wait for `flowing`
+just bench stream-down basic  # detach endpoints and delete the stream
+
+just bench stream basic       # apply only: placed but unfed -> `awaiting_input`
 just bench stream-rm basic    # delete the stream; controller tears down its hops
 ```
 
@@ -13,11 +16,17 @@ The bundled `producer`/`consumer` verification endpoints take a stream name so
 any scenario can be driven end to end
 (`just bench producer-up <stream>` / `consumer-up <stream>`, default `basic`).
 Addresses are not hardcoded: the recipes resolve them from the controller's
-discovery API (`GET :29082/streams/<name>/endpoints`, or the
+discovery API (`GET :29082/v1/streams/<name>/endpoints`, or the
 `scripts/endpoints.sh` helper) — the producer dials the reported `ingress` and
 each consumer dials an `outputs[]` entry. Fan-out has one output per destination,
-so attach a consumer to each: `consumer-up <stream>` (output 0) and
+so a consumer attaches to each: `consumer-up <stream>` (output 0) and
 `consumer-2-up <stream>` (output 1).
+
+`stream-up` does all of that in one step — it reads the output count from
+discovery (`endpoints.sh <stream> outputs`) and attaches that many consumers, so
+the "With producer + consumer" column below is what a bare `stream-up <name>`
+produces. The media endpoints are singletons, so driving a second stream takes
+them from the first.
 
 ## Observed behaviour
 
