@@ -2348,23 +2348,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "weave-media-node"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "reqwest",
- "serde",
- "serde_json",
- "serde_norway",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "weave-core",
-]
-
-[[package]]
 name = "weave-northbound"
 version = "0.1.0"
 dependencies = [

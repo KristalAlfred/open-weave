@@ -21,12 +21,10 @@ future vendor adapters into one observed/control model.
   node's desired hops for that node's adapter to pull. Also serves a live
   dashboard at `/ui` (backed by the `/view` JSON document) showing nodes,
   streams, and per-hop link conditions.
-- **`weave-southbound`** — adapter/media-node-facing API for registration,
-  telemetry, endpoint discovery, and future command streams.
+- **`weave-southbound`** — adapter-facing API for registration, telemetry,
+  endpoint discovery, and future command streams.
 - **`weave-adapter-strom`** — southbound adapter for existing
   [Strom](https://github.com/Eyevinn/strom) media runtimes.
-- **`weave-media-node`** — future managed edge agent for unmanaged media endpoints
-  that do not fit an existing runtime.
 
 Adapter crates can be split out as needed, for example:
 

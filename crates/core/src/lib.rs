@@ -16,7 +16,7 @@ pub const DEFAULT_DATA_PLANE_ALIAS: &str = "default";
 /// The operator (northbound) and adapter (southbound) contracts share one prefix:
 /// they are two halves of the same control plane and move to a `/v2` together.
 ///
-/// Deliberately outside it: `/health` on every service, which healthchecks and
+/// Outside it: `/health` on every service, which healthchecks and
 /// load balancers address directly, and the controller's `/`, `/ui`, and `/view` —
 /// the dashboard ships inside the controller binary and versions with it.
 pub const API_V1: &str = "/v1";
@@ -399,9 +399,6 @@ impl NodeConfig {
     /// value when set, otherwise [`auth::SOUTHBOUND_TOKEN_VAR`] from the
     /// environment. `None` means authentication is switched off.
     ///
-    /// Fails closed like a server would: a node with no token will never
-    /// register, so it is better to refuse to start than to retry forever.
-    ///
     /// # Errors
     /// Returns [`auth::AuthError::MissingToken`] when neither source carries a
     /// token and [`auth::AUTH_DISABLED_VAR`] is not engaged.
@@ -469,7 +466,6 @@ pub struct AdapterDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdapterKind {
-    MediaNode,
     Strom,
     Nmos,
     MxlDomain,

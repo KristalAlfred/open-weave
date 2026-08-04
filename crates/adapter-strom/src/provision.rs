@@ -48,9 +48,8 @@ impl StallTracker {
 
         if let Some(bytes) = obs.bytes_received {
             match progress.last_bytes {
-                // First sighting only establishes a baseline: a counter that is
-                // already frozen (e.g. after an adapter restart) reads never-flowed
-                // until we witness it advance.
+                // First sighting only establishes a baseline, so a counter that is
+                // already frozen reads never-flowed until it is seen to advance.
                 None => {}
                 Some(prev) if bytes > prev => {
                     progress.ever_flowed = true;
@@ -481,7 +480,7 @@ mod tests {
     #[test]
     fn counter_settling_lower_then_freezing_still_stalls() {
         // SRT settles bytes_received down at caller disconnect before freezing; a
-        // hop that has flowed must still be judged stalled, not treated as fresh.
+        // hop that has flowed is still judged stalled, not treated as fresh.
         let mut tracker = StallTracker::default();
         tracker.observe("weave-a", flowing(71_416_276));
         tracker.observe("weave-a", flowing(72_000_000));
@@ -499,7 +498,7 @@ mod tests {
     #[test]
     fn frozen_from_first_observation_reads_never_flowed() {
         // After an adapter restart the tracker adopts an already-dead flow; with no
-        // observed advance it must look never-flowed rather than stall.
+        // observed advance it reads never-flowed rather than stalled.
         let mut tracker = StallTracker::default();
         for _ in 0..6 {
             assert!(!tracker.observe("weave-a", flowing(9_299_932)));

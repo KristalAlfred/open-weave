@@ -48,7 +48,7 @@ enum Command {
         #[command(subcommand)]
         resource: GetResource,
     },
-    /// List known media nodes.
+    /// List registered nodes.
     Nodes,
 }
 

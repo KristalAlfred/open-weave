@@ -1,15 +1,14 @@
 //! Shared bearer-token authentication for the control-plane HTTP surfaces.
 //!
 //! One shared secret per surface, supplied through the environment. Operators and
-//! the CLI present [`NORTHBOUND_TOKEN_VAR`] to northbound; adapters and media
-//! nodes present [`SOUTHBOUND_TOKEN_VAR`] to southbound. Northbound and
-//! southbound are stateless proxies, so each re-presents its own surface token to
-//! the controller, which validates both — one token per surface all the way down.
+//! the CLI present [`NORTHBOUND_TOKEN_VAR`] to northbound; adapters present
+//! [`SOUTHBOUND_TOKEN_VAR`] to southbound. Northbound and southbound are
+//! stateless proxies, so each re-presents its own surface token to the controller,
+//! which validates both — one token per surface all the way down.
 //!
-//! Resolution is **fail closed**: [`Guard::from_env`] errors when the surface's
-//! token is unset or blank, so a service refuses to start rather than silently
-//! serving unauthenticated traffic. [`AUTH_DISABLED_VAR`] is the explicit
-//! local-development escape hatch.
+//! [`Guard::from_env`] errors when the surface's token is unset or blank, so a
+//! service with no token does not start. [`AUTH_DISABLED_VAR`] switches
+//! authentication off for local development.
 
 use std::fmt;
 
@@ -18,14 +17,13 @@ pub const NORTHBOUND_TOKEN_VAR: &str = "WEAVE_NORTHBOUND_TOKEN";
 /// Environment variable holding the token for the southbound (node) surface.
 pub const SOUTHBOUND_TOKEN_VAR: &str = "WEAVE_SOUTHBOUND_TOKEN";
 /// Set to `1` or `true` to serve and call without authentication. Local
-/// development only — it disables the fail-closed default.
+/// development only.
 pub const AUTH_DISABLED_VAR: &str = "WEAVE_AUTH_DISABLED";
 
 /// A shared bearer token.
 ///
-/// The value is deliberately hard to leak: [`fmt::Debug`] redacts it, no
-/// [`fmt::Display`] is implemented, and the only way out is
-/// [`Token::header_value`], which is named for the one place it belongs.
+/// [`fmt::Debug`] redacts the value, no [`fmt::Display`] is implemented, and
+/// [`Token::header_value`] is the only accessor.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Token(String);
 
@@ -92,7 +90,7 @@ pub enum Guard {
     /// Every request must present this token.
     Required(Token),
     /// Authentication is switched off via [`AUTH_DISABLED_VAR`]; every request
-    /// passes. Never the default — only an explicit opt-out reaches this.
+    /// passes.
     Disabled,
 }
 
@@ -101,9 +99,7 @@ impl Guard {
     ///
     /// # Errors
     /// Returns [`AuthError::MissingToken`] when `var` is unset or blank and the
-    /// [`AUTH_DISABLED_VAR`] escape hatch is not engaged. Callers are expected to
-    /// propagate this and exit: serving the surface unauthenticated is not a
-    /// fallback.
+    /// [`AUTH_DISABLED_VAR`] escape hatch is not engaged.
     pub fn from_env(var: &str) -> Result<Self, AuthError> {
         if auth_disabled() {
             return Ok(Self::Disabled);
@@ -127,7 +123,7 @@ impl Guard {
         }
     }
 
-    /// Whether authentication is switched off. Worth logging loudly at startup.
+    /// Whether authentication is switched off.
     #[must_use]
     pub fn is_disabled(&self) -> bool {
         matches!(self, Self::Disabled)
@@ -136,8 +132,8 @@ impl Guard {
 
 /// Whether the [`AUTH_DISABLED_VAR`] escape hatch is engaged.
 ///
-/// Only an explicit `1` or `true` counts, so `WEAVE_AUTH_DISABLED=0` leaves
-/// authentication on rather than disabling it by mere presence.
+/// Only an explicit `1` or `true` counts; `WEAVE_AUTH_DISABLED=0` leaves
+/// authentication on.
 #[must_use]
 pub fn auth_disabled() -> bool {
     std::env::var(AUTH_DISABLED_VAR).is_ok_and(|value| {

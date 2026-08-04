@@ -221,8 +221,6 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Fail closed on both surfaces: the controller owns all state, so serving it
-    // open is strictly worse than refusing to start.
     let north = Guard::from_env(auth::NORTHBOUND_TOKEN_VAR)?;
     let south = Guard::from_env(auth::SOUTHBOUND_TOKEN_VAR)?;
     if north.is_disabled() {
@@ -314,13 +312,13 @@ fn observed_state(nodes: &BTreeMap<String, NodeRegistration>) -> ObservedState {
 /// matching the surface a route belongs to — an adapter's southbound token cannot
 /// create streams.
 ///
-/// Unversioned by design: `/health`, which compose healthchecks and load
-/// balancers address directly, and the dashboard (`/`, `/ui`, `/view`), which
-/// ships inside this binary. `/view` carries no stability guarantee.
+/// Unversioned: `/health`, which compose healthchecks and load balancers address
+/// directly, and the dashboard (`/`, `/ui`, `/view`), which ships inside this
+/// binary. `/view` carries no stability guarantee.
 ///
-/// The dashboard is also deliberately left open, as is the `/v1/status` rollup it
-/// shares its data with: both are browser-reachable, and a bearer token cannot
-/// travel with a page load without a cookie/session mechanism or a reverse proxy.
+/// The dashboard is unauthenticated, as is the `/v1/status` rollup it shares its
+/// data with: both are browser-reachable, and a bearer token cannot travel with a
+/// page load without a cookie/session mechanism or a reverse proxy.
 /// They expose topology and allocated ports, so **the controller port must not be
 /// publicly exposed** — put it behind a proxy or keep it on a private network.
 fn router(state: AppState, north: Guard, south: Guard) -> Router {
@@ -339,8 +337,8 @@ fn router(state: AppState, north: Guard, south: Guard) -> Router {
         .route("/state", get(get_state))
         .layer(axum::middleware::from_fn_with_state(south, require_bearer));
 
-    // `/status` is part of the operator contract — it is a scriptable rollup, not
-    // a dashboard detail — so it is versioned, but unauthenticated like `/view`.
+    // `/status` is versioned as part of the operator contract, but unauthenticated
+    // like `/view`.
     let v1 = Router::new()
         .route("/status", get(get_status))
         .merge(streams)
@@ -561,8 +559,7 @@ async fn get_state(State(state): State<AppState>) -> Json<ObservedState> {
 }
 
 /// Registration is also the version handshake: an adapter declaring a protocol
-/// this controller does not speak is turned away here rather than accepted and
-/// then served desired state it cannot realise.
+/// this controller does not speak is turned away here.
 async fn register_node(
     State(state): State<AppState>,
     Json(registration): Json<NodeRegistration>,
@@ -991,7 +988,7 @@ mod tests {
     }
 
     /// A stale adapter is turned away at the handshake, and nothing about it is
-    /// recorded — a registration the controller cannot serve is worse than none.
+    /// recorded.
     #[tokio::test]
     async fn registration_with_an_incompatible_protocol_version_is_rejected() {
         let (state, mem) = mem_state();
@@ -1337,8 +1334,8 @@ mod tests {
         ("GET", "/v1/state"),
     ];
 
-    /// The prefix is a clean break, not an alias: the paths this service used to
-    /// serve are gone, so a client that never moved fails loudly.
+    /// The paths this service served before the `/v1` prefix are gone: it is a
+    /// clean break, not an alias.
     #[tokio::test]
     async fn unversioned_api_paths_are_not_served() {
         let (state, _mem) = mem_state();
@@ -1356,8 +1353,8 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
-    /// The dashboard surface is deliberately unauthenticated — it is browser-
-    /// loaded and cannot carry a bearer token. `/health` is open for healthchecks.
+    /// The dashboard surface is unauthenticated — it is browser-loaded and cannot
+    /// carry a bearer token. `/health` is open for healthchecks.
     #[tokio::test]
     async fn dashboard_and_health_stay_open() {
         let (state, _mem) = mem_state();

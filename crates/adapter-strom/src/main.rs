@@ -53,8 +53,6 @@ async fn main() -> Result<()> {
     let config = AdapterConfig::load(&args.config)?;
     let public_endpoint = config.node.public_endpoint();
 
-    // Fail closed: an adapter with no token would retry a 401 forever, so refuse
-    // to start instead.
     let token = config.node.resolve_southbound_token()?;
     if token.is_none() {
         tracing::warn!(
@@ -168,8 +166,6 @@ async fn sync_loop(
         .await
         {
             Ok(next_registered) => registered = next_registered,
-            // A rejected registration never converges by retrying, so surface it
-            // and exit rather than logging the same warning every interval.
             Err(error) if error.is::<RegistrationRejected>() => {
                 tracing::error!(
                     node_id = %config.node.id,
@@ -472,8 +468,8 @@ fn registration(
 
 /// Registration the control plane will never accept, however long this adapter
 /// keeps dialling — currently only a protocol-version mismatch, which the
-/// controller answers with `409`. Kept distinct from a transient failure so the
-/// sync loop can stop instead of retrying forever.
+/// controller answers with `409`. Distinct from a transient failure: the sync loop
+/// stops on it instead of retrying.
 #[derive(Debug, thiserror::Error)]
 #[error("southbound rejected registration permanently: {status}: {body}")]
 struct RegistrationRejected {

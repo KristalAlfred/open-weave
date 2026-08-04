@@ -18,7 +18,7 @@ pub struct StromFlow {
     #[serde(default)]
     pub running: bool,
     /// GStreamer pipeline state (e.g. `Playing`, `Paused`). `Paused` marks a
-    /// listener idling before any caller, which must not count as a stall.
+    /// listener idling before any caller, which the adapter excludes from stalls.
     #[serde(default)]
     pub gst_state: Option<String>,
     #[serde(default)]

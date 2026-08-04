@@ -28,9 +28,6 @@ run-south:
 run-controller:
     cargo run -p weave-controller
 
-run-node *ARGS:
-    cargo run -p weave-media-node -- {{ARGS}}
-
 run-strom-adapter *ARGS:
     cargo run -p weave-adapter-strom -- {{ARGS}}
 

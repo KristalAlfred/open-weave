@@ -6,7 +6,6 @@ members = [
     "crates/northbound",
     "crates/southbound",
     "crates/controller",
-    "crates/media-node",
     "crates/adapter-strom",
     "crates/strom",
 ]

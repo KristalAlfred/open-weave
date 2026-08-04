@@ -1,4 +1,4 @@
-//! Southbound API — adapter and media-node surface. Stateless: every request is
+//! Southbound API — the adapter-facing surface. Stateless: every request is
 //! proxied to the controller, which owns all node and desired state. Adapters
 //! keep dialing this service; it simply relays to the controller.
 
@@ -50,7 +50,6 @@ async fn main() -> Result<()> {
     let controller_url = std::env::var("WEAVE_CONTROLLER_URL")
         .unwrap_or_else(|_| DEFAULT_CONTROLLER_URL.to_string());
 
-    // Fail closed: this surface is the one operators expose to remote nodes.
     let guard = Guard::from_env(auth::SOUTHBOUND_TOKEN_VAR)?;
     if guard.is_disabled() {
         tracing::warn!(
@@ -366,9 +365,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
-    /// The prefix is a clean break, not an alias: the paths adapters used to dial
-    /// are gone, so an adapter that never moved fails loudly instead of silently
-    /// working against an unversioned surface.
+    /// The paths adapters used to dial before the `/v1` prefix are gone: it is a
+    /// clean break, not an alias.
     #[tokio::test]
     async fn unversioned_node_paths_are_not_served() {
         let (url, captured) = stub_controller(StatusCode::OK).await;
@@ -417,9 +415,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    /// The leak the token exists to close: registering a node id, then pulling
-    /// that node's topology and allocated ports, must both be unreachable without
-    /// the token — and must never reach the controller.
+    /// Registering a node id and pulling that node's topology and allocated ports
+    /// are both unreachable without the token, and neither reaches the controller.
     #[tokio::test]
     async fn node_routes_reject_missing_and_wrong_tokens() {
         for header in [None, Some("Bearer wrong-token"), Some("Basic ignored")] {

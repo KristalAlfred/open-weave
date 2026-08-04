@@ -50,7 +50,6 @@ async fn main() -> Result<()> {
     let controller_url = std::env::var("WEAVE_CONTROLLER_URL")
         .unwrap_or_else(|_| DEFAULT_CONTROLLER_URL.to_string());
 
-    // Fail closed: refuse to start rather than serve the operator surface open.
     let guard = Guard::from_env(auth::NORTHBOUND_TOKEN_VAR)?;
     if guard.is_disabled() {
         tracing::warn!(
@@ -417,8 +416,8 @@ mod tests {
         );
     }
 
-    /// The prefix is a clean break, not an alias: the paths this service used to
-    /// serve are gone, and nothing is forwarded on their behalf.
+    /// The paths this service served before the `/v1` prefix are gone, and nothing
+    /// is forwarded on their behalf.
     #[tokio::test]
     async fn unversioned_stream_paths_are_not_served() {
         let (url, captured) = stub_controller(StatusCode::OK).await;
