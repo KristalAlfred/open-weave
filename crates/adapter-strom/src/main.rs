@@ -205,7 +205,7 @@ async fn sync_once(
         .node
         .data_plane
         .get(DEFAULT_DATA_PLANE_ALIAS)
-        .map(String::as_str);
+        .map(|addr| addr.host.as_str());
 
     let hop_status = if status == NodeStatus::Ready {
         match provision(southbound, strom, node_id, &flows, data_plane_host, tracker).await {
@@ -459,6 +459,7 @@ fn registration(
                     .collect(),
                 data_plane: config.node.data_plane.clone(),
                 port_range: Some(config.node.port_range),
+                relay: config.node.relay,
             },
         },
         endpoints,

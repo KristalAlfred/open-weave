@@ -15,15 +15,26 @@ node:
   public_endpoint: http://172.25.0.21:8091
   # Data-plane addresses advertised for placement, keyed by alias. The only place
   # concrete IPs live. Must contain the `default` alias.
+  #
+  # A bare host means peers can dial it. Spell an address out to say otherwise —
+  # a node behind NAT publishes where it dials *from*, and the controller plans
+  # around it by having the other end listen, or by relaying through a third node
+  # when neither end can be dialled.
   data_plane:
     default: 172.26.0.10
-    # wan: 203.0.113.7
+    # wan:
+    #   host: 203.0.113.7
+    #   reachability: outbound_only   # or `dialable`, the default
   # Inclusive port range the controller may assign SRT sockets from.
   port_range:
     start: 20000
     end: 20999
   # Optional transports advertised to the controller.
   transports: [srt]
+  # Optional; offer this node as transit for streams that neither start nor end
+  # on it. The controller draws relays from nodes that set this and whose default
+  # alias is dialable. A `via` pin in a manifest does not consult it.
+  # relay: true
 strom:
   # Base URL of the Strom instance this adapter drives.
   url: http://172.26.0.10:8080

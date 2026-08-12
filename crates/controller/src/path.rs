@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 use weave_core::{
-    DEFAULT_DATA_PLANE_ALIAS, DesiredHop, HOP_ID_PREFIX, HopConditions, HopRole, HopStatus,
-    NodeDescriptor, Path, PathStatus, PortRange, RemoteAddr, SocketRole, SocketSpec, SrtEndpoint,
-    SrtParams, StreamDefinition, StreamTransport, Transport, roll_up_path,
+    DEFAULT_DATA_PLANE_ALIAS, DataPlaneAddr, DesiredHop, HOP_ID_PREFIX, HopConditions, HopRole,
+    HopStatus, NodeDescriptor, Path, PathStatus, PortRange, RemoteAddr, SocketRole, SocketSpec,
+    SrtEndpoint, SrtParams, StreamDefinition, StreamTransport, Transport, roll_up_path,
 };
 
 const DEFAULT_SRC_LATENCY: u32 = 200;
@@ -31,6 +31,13 @@ pub enum PlacementError {
     RemoteSource,
     #[error("endpoint must set exactly one of node or remote")]
     EndpointPlacement,
+    #[error("neither {upstream} nor {downstream} can be dialled and no relay node is available")]
+    NoRelayAvailable {
+        upstream: String,
+        downstream: String,
+    },
+    #[error("a source endpoint must not pin via")]
+    SourceVia,
 }
 
 #[must_use]
@@ -41,6 +48,14 @@ pub fn sender_hop_id(stream: &str) -> String {
 #[must_use]
 pub fn receiver_hop_id(stream: &str, index: usize) -> String {
     format!("{HOP_ID_PREFIX}{stream}-receiver-{index}")
+}
+
+/// Id of the bridge at `position` along the chain carrying destination `dest`.
+/// Position is counted after relay insertion, so an auto-inserted relay and a
+/// pinned one are named the same way.
+#[must_use]
+pub fn bridge_hop_id(stream: &str, dest: usize, position: usize) -> String {
+    format!("{HOP_ID_PREFIX}{stream}-bridge-{dest}-{position}")
 }
 
 /// Where a stream endpoint is placed: on a registered node, or dialed out to an
@@ -92,19 +107,26 @@ impl PortAllocator {
 /// Derive the ordered (source→destination) hop chain realising one stream.
 ///
 /// Placement is by `node`: the sender runs on `source.node`, each node-referenced
-/// receiver on its destination's `node`. Delivery addresses resolve at planning
-/// time — the receiver node's data-plane alias supplies the host and every port
-/// is claimed from `ports`, the per-tick collision-aware allocator. Sender egress
-/// always targets this planned delivery; the receiver's reported `resolved_ingress`
-/// is observability only and never rewrites egress.
+/// receiver on its destination's `node`, and a bridge on every node the
+/// destination relays through. Addresses resolve at planning time from the
+/// station's data-plane alias, and every port is claimed from `ports`, the
+/// per-tick collision-aware allocator. A hop's reported `resolved_ingress` is
+/// observability only and never rewrites a planned socket.
 ///
-/// A `remote` destination places no receiver hop and claims no port: the sender
-/// gains one caller egress to the external listener. The source must be a node;
-/// a remote source is rejected.
+/// Which end of a link listens follows [`Reachability`](weave_core::Reachability)
+/// rather than a fixed template: the downstream listens when it can be dialled,
+/// otherwise the upstream listens and the downstream calls it. When neither end
+/// can be dialled the link needs transit, and [`splice_relays`] inserts a relay
+/// node both ends can call — the NAT-to-NAT case, which resolves into two links
+/// under the same rule rather than a special path.
 ///
-/// Fan-out is one sender hop teeing to one egress per destination. Placement is
-/// all-or-nothing: if any destination is unplaceable the whole derivation fails
-/// and the stream stays pending.
+/// A `remote` destination places no receiver hop and claims no port for its
+/// terminal link: whichever hop precedes it gains one caller egress to the
+/// external listener. The source must be a node; a remote source is rejected.
+///
+/// Fan-out is one sender hop teeing to one egress per destination, each with its
+/// own chain. Placement is all-or-nothing: if any destination is unplaceable the
+/// whole derivation fails and the stream stays pending.
 pub fn derive_path(
     stream: &StreamDefinition,
     nodes: &[NodeDescriptor],
@@ -115,38 +137,89 @@ pub fn derive_path(
     if stream.destinations.is_empty() {
         return Err(PlacementError::NoDestination);
     }
+    if !source.via.is_empty() {
+        return Err(PlacementError::SourceVia);
+    }
 
     let sender_node = source_node(source)?;
     let sender_id = sender_hop_id(&stream.name);
+    let source_station = Station {
+        node_id: sender_node.clone(),
+        network: source.network.clone(),
+    };
 
     let mut sender_egresses = Vec::with_capacity(stream.destinations.len());
-    let mut receivers = Vec::new();
+    let mut downstream = Vec::new();
 
     for (index, dest) in stream.destinations.iter().enumerate() {
         let StreamTransport::Srt(dest) = dest;
-        let dest_latency = dest.latency.unwrap_or(DEFAULT_SINK_LATENCY);
+        let latency = dest.latency.unwrap_or(DEFAULT_SINK_LATENCY);
+        let placement = endpoint_placement(dest)?;
 
-        match endpoint_placement(dest)? {
+        let chain = chain_hops(
+            &stream.name,
+            index,
+            &source_station,
+            dest,
+            &placement,
+            nodes,
+        )?;
+
+        // Each link attaches its upstream socket to the hop before it, which is
+        // the sender for the first link and the previous chain hop after that.
+        let mut hops: Vec<DesiredHop> = Vec::with_capacity(chain.len());
+        let mut upstream = LinkEnd {
+            station: &source_station,
+            hop_id: &sender_id,
+        };
+
+        for entry in &chain {
+            let (up_socket, down_socket) = plan_link(
+                &upstream,
+                &LinkEnd {
+                    station: &entry.station,
+                    hop_id: &entry.id,
+                },
+                latency,
+                nodes,
+                ports,
+            )?;
+            push_egress(&mut sender_egresses, &mut hops, up_socket);
+            hops.push(DesiredHop {
+                id: entry.id.clone(),
+                node_id: entry.station.node_id.clone(),
+                role: entry.role,
+                ingress: down_socket,
+                egresses: Vec::new(),
+            });
+            upstream = LinkEnd {
+                station: &entry.station,
+                hop_id: &entry.id,
+            };
+        }
+
+        match &placement {
+            // An external listener terminates the chain: the last hop dials it
+            // and no hop is placed for it.
             Placement::Remote(remote) => {
-                sender_egresses.push(connect_socket(remote.host, remote.port, dest_latency));
+                let socket = connect_socket(remote.host.clone(), remote.port, latency);
+                push_egress(&mut sender_egresses, &mut hops, socket);
             }
-            Placement::Node(receiver_node) => {
-                let receiver_id = receiver_hop_id(&stream.name, index);
-                let (dest_host, dest_port) =
-                    resolve_delivery(dest, &receiver_node, &receiver_id, nodes, ports)?;
-                let consumer_port =
-                    claim_port(&receiver_node, &consumer_key(&receiver_id), nodes, ports)?;
-
-                sender_egresses.push(connect_socket(dest_host, dest_port, dest_latency));
-                receivers.push(DesiredHop {
-                    id: receiver_id,
-                    node_id: receiver_node,
-                    role: HopRole::Receiver,
-                    ingress: listen_socket(dest_port, dest_latency),
-                    egresses: vec![listen_socket(consumer_port, RECV_CONSUMER_LATENCY)],
-                });
+            // The last hop is the receiver; its remaining egress is the socket
+            // the consumer dials.
+            Placement::Node(_) => {
+                let receiver = hops
+                    .last_mut()
+                    .ok_or_else(|| PlacementError::UnassignedPort(stream.name.clone()))?;
+                let port =
+                    claim_port(&receiver.node_id, &consumer_key(&receiver.id), nodes, ports)?;
+                receiver
+                    .egresses
+                    .push(listen_socket(port, RECV_CONSUMER_LATENCY));
             }
         }
+
+        downstream.extend(hops);
     }
 
     let sender = DesiredHop {
@@ -157,15 +230,216 @@ pub fn derive_path(
         egresses: sender_egresses,
     };
 
-    let mut hops = Vec::with_capacity(1 + receivers.len());
+    let mut hops = Vec::with_capacity(1 + downstream.len());
     hops.push(sender);
-    hops.extend(receivers);
+    hops.extend(downstream);
 
     Ok(Path {
         stream: stream.name.clone(),
         enabled: stream.enabled,
         hops,
     })
+}
+
+/// Attach a link's upstream socket to the hop it leaves from: the sender when the
+/// chain is still empty, otherwise the chain's last hop.
+fn push_egress(
+    sender_egresses: &mut Vec<SocketSpec>,
+    chain: &mut [DesiredHop],
+    socket: SocketSpec,
+) {
+    match chain.last_mut() {
+        Some(hop) => hop.egresses.push(socket),
+        None => sender_egresses.push(socket),
+    }
+}
+
+/// One node a stream passes through, with the alias its peers address it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Station {
+    node_id: String,
+    network: Option<String>,
+}
+
+impl Station {
+    /// A relay is addressed on its default alias: `via` names a node, not a
+    /// network, and an auto-inserted relay was chosen for that alias too.
+    fn relay(node_id: &str) -> Self {
+        Self {
+            node_id: node_id.to_string(),
+            network: None,
+        }
+    }
+}
+
+/// One hop to place along a destination's chain.
+struct ChainHop {
+    station: Station,
+    id: String,
+    role: HopRole,
+}
+
+/// One end of a link: where it sits and which hop owns the socket.
+struct LinkEnd<'a> {
+    station: &'a Station,
+    hop_id: &'a str,
+}
+
+/// Build the hops between the sender and one destination's terminal: a bridge per
+/// relayed node, then the receiver when the destination is a node.
+fn chain_hops(
+    stream: &str,
+    dest_index: usize,
+    source: &Station,
+    dest: &SrtEndpoint,
+    placement: &Placement,
+    nodes: &[NodeDescriptor],
+) -> Result<Vec<ChainHop>, PlacementError> {
+    let mut stations: Vec<Station> = dest.via.iter().map(|id| Station::relay(id)).collect();
+    if let Placement::Node(node_id) = placement {
+        stations.push(Station {
+            node_id: node_id.clone(),
+            network: dest.network.clone(),
+        });
+    }
+
+    let stations = splice_relays(source, stations, nodes)?;
+    let terminal_is_node = matches!(placement, Placement::Node(_));
+    let last = stations.len().saturating_sub(1);
+
+    Ok(stations
+        .into_iter()
+        .enumerate()
+        .map(|(position, station)| {
+            if terminal_is_node && position == last {
+                ChainHop {
+                    station,
+                    id: receiver_hop_id(stream, dest_index),
+                    role: HopRole::Receiver,
+                }
+            } else {
+                ChainHop {
+                    station,
+                    id: bridge_hop_id(stream, dest_index, position),
+                    role: HopRole::Bridge,
+                }
+            }
+        })
+        .collect())
+}
+
+/// Insert a relay ahead of any link whose ends cannot dial each other.
+///
+/// A spliced relay is dialable by construction, so both halves of the split link
+/// resolve under the ordinary rule — the upstream calls the relay, and the
+/// downstream calls it too. One pass is enough; no inserted link can itself need
+/// a relay.
+fn splice_relays(
+    source: &Station,
+    stations: Vec<Station>,
+    nodes: &[NodeDescriptor],
+) -> Result<Vec<Station>, PlacementError> {
+    let mut resolved = Vec::with_capacity(stations.len());
+    let mut upstream = source.clone();
+
+    for station in stations {
+        if !link_dialable(&upstream, &station, nodes)? {
+            let relay = pick_relay(nodes, &upstream, &station)?;
+            resolved.push(relay);
+        }
+        upstream = station.clone();
+        resolved.push(station);
+    }
+
+    Ok(resolved)
+}
+
+/// Whether either end of a link can be dialled by the other.
+fn link_dialable(
+    upstream: &Station,
+    downstream: &Station,
+    nodes: &[NodeDescriptor],
+) -> Result<bool, PlacementError> {
+    if station_addr(downstream, nodes)?.is_dialable() {
+        return Ok(true);
+    }
+    Ok(station_addr(upstream, nodes)?.is_dialable())
+}
+
+/// The lowest-id relay node both ends of an undialable link can call. Sorting
+/// keeps the choice stable across ticks, so a stream does not migrate between
+/// equally eligible relays.
+fn pick_relay(
+    nodes: &[NodeDescriptor],
+    upstream: &Station,
+    downstream: &Station,
+) -> Result<Station, PlacementError> {
+    nodes
+        .iter()
+        .filter(|node| node.capabilities.relay)
+        .filter(|node| node.id != upstream.node_id && node.id != downstream.node_id)
+        .filter(|node| {
+            node.capabilities
+                .data_plane
+                .get(DEFAULT_DATA_PLANE_ALIAS)
+                .is_some_and(DataPlaneAddr::is_dialable)
+        })
+        .min_by(|a, b| a.id.cmp(&b.id))
+        .map(|node| Station::relay(&node.id))
+        .ok_or_else(|| PlacementError::NoRelayAvailable {
+            upstream: upstream.node_id.clone(),
+            downstream: downstream.node_id.clone(),
+        })
+}
+
+/// Plan one link's socket pair: `(upstream egress, downstream ingress)`.
+///
+/// The downstream listens whenever it can be dialled, which keeps the common case
+/// identical to a fixed sender-calls-receiver template. Otherwise the direction
+/// reverses and the downstream dials the upstream. The port is claimed on
+/// whichever node listens, always keyed by the downstream hop id so an assignment
+/// stays stable when a link's direction is the same across ticks.
+fn plan_link(
+    upstream: &LinkEnd,
+    downstream: &LinkEnd,
+    latency: u32,
+    nodes: &[NodeDescriptor],
+    ports: &mut PortAllocator,
+) -> Result<(SocketSpec, SocketSpec), PlacementError> {
+    let down_addr = station_addr(downstream.station, nodes)?.clone();
+    if down_addr.is_dialable() {
+        let port = claim_port(&downstream.station.node_id, downstream.hop_id, nodes, ports)?;
+        return Ok((
+            connect_socket(down_addr.host, port, latency),
+            listen_socket(port, latency),
+        ));
+    }
+
+    let up_addr = station_addr(upstream.station, nodes)?.clone();
+    if up_addr.is_dialable() {
+        let port = claim_port(&upstream.station.node_id, downstream.hop_id, nodes, ports)?;
+        return Ok((
+            listen_socket(port, latency),
+            connect_socket(up_addr.host, port, latency),
+        ));
+    }
+
+    Err(PlacementError::NoRelayAvailable {
+        upstream: upstream.station.node_id.clone(),
+        downstream: downstream.station.node_id.clone(),
+    })
+}
+
+/// The data-plane address a station is reached at, via its node's alias map.
+fn station_addr<'a>(
+    station: &Station,
+    nodes: &'a [NodeDescriptor],
+) -> Result<&'a DataPlaneAddr, PlacementError> {
+    let node =
+        find_node(nodes, &station.node_id).ok_or_else(|| PlacementError::NodeNotRegistered {
+            node: station.node_id.clone(),
+        })?;
+    resolve_addr(node, station.network.as_deref())
 }
 
 /// Roll the path's hops up into one end-to-end status via observed hop conditions.
@@ -211,23 +485,6 @@ fn source_socket(
     Ok(listen_socket(port, latency))
 }
 
-/// Resolve the concrete `(host, port)` a peer uses to reach this endpoint: the
-/// node's data-plane alias supplies the host and a port is claimed from the
-/// node's declared range.
-fn resolve_delivery(
-    endpoint: &SrtEndpoint,
-    node_id: &str,
-    hop_id: &str,
-    nodes: &[NodeDescriptor],
-    ports: &mut PortAllocator,
-) -> Result<(String, u16), PlacementError> {
-    let node = find_node(nodes, node_id).ok_or_else(|| PlacementError::NodeNotRegistered {
-        node: node_id.to_string(),
-    })?;
-    let host = resolve_host(node, endpoint.network.as_deref())?;
-    Ok((host, ports.claim(node, hop_id)?))
-}
-
 fn claim_port(
     node_id: &str,
     key: &str,
@@ -246,14 +503,16 @@ fn consumer_key(receiver_id: &str) -> String {
     format!("{receiver_id}-consumer")
 }
 
-/// The node's data-plane host for a manifest `network` alias, defaulting to
+/// The node's data-plane address for a manifest `network` alias, defaulting to
 /// [`DEFAULT_DATA_PLANE_ALIAS`] when unset.
-fn resolve_host(node: &NodeDescriptor, network: Option<&str>) -> Result<String, PlacementError> {
+fn resolve_addr<'a>(
+    node: &'a NodeDescriptor,
+    network: Option<&str>,
+) -> Result<&'a DataPlaneAddr, PlacementError> {
     let alias = network.unwrap_or(DEFAULT_DATA_PLANE_ALIAS);
     node.capabilities
         .data_plane
         .get(alias)
-        .cloned()
         .ok_or_else(|| PlacementError::UnknownAlias {
             node: node.id.clone(),
             alias: alias.to_string(),
@@ -387,7 +646,7 @@ fn endpoint_addr(
     let node = find_node(nodes, node_id).ok_or_else(|| PlacementError::NodeNotRegistered {
         node: node_id.to_string(),
     })?;
-    let host = resolve_host(node, network)?;
+    let host = resolve_addr(node, network)?.host.clone();
     let url = format!("srt://{host}:{port}");
     Ok(EndpointAddr {
         node: node_id.to_string(),
@@ -414,8 +673,10 @@ fn hop_port(spec: &SocketSpec, hop_id: &str) -> Result<u16, PlacementError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use weave_core::{
-        HopState, LinkCondition, NodeCapabilities, NodeStatus, PortRange, ResolvedAddr,
+        HopState, LinkCondition, NodeCapabilities, NodeStatus, PortRange, Reachability,
+        ResolvedAddr,
     };
 
     fn node(id: &str, host: &str) -> NodeDescriptor {
@@ -423,15 +684,43 @@ mod tests {
     }
 
     fn node_with_aliases(id: &str, aliases: &[(&str, &str)]) -> NodeDescriptor {
+        node_from_addrs(
+            id,
+            aliases
+                .iter()
+                .map(|(alias, host)| ((*alias).to_string(), DataPlaneAddr::dialable(*host)))
+                .collect(),
+        )
+    }
+
+    /// A node reachable only outbound on its default alias: it can dial peers but
+    /// no peer can dial it.
+    fn nat_node(id: &str, host: &str) -> NodeDescriptor {
+        node_from_addrs(
+            id,
+            BTreeMap::from([(
+                DEFAULT_DATA_PLANE_ALIAS.to_string(),
+                DataPlaneAddr {
+                    host: host.to_string(),
+                    reachability: Reachability::OutboundOnly,
+                },
+            )]),
+        )
+    }
+
+    fn relay_node(id: &str, host: &str) -> NodeDescriptor {
+        let mut node = node(id, host);
+        node.capabilities.relay = true;
+        node
+    }
+
+    fn node_from_addrs(id: &str, data_plane: BTreeMap<String, DataPlaneAddr>) -> NodeDescriptor {
         NodeDescriptor {
             id: id.to_string(),
             endpoint: format!("http://{id}:8080"),
             status: NodeStatus::Ready,
             capabilities: NodeCapabilities {
-                data_plane: aliases
-                    .iter()
-                    .map(|(alias, host)| ((*alias).to_string(), (*host).to_string()))
-                    .collect(),
+                data_plane,
                 port_range: Some(PortRange {
                     start: 7000,
                     end: 7999,
@@ -451,6 +740,7 @@ mod tests {
         SrtEndpoint {
             node: Some(id.to_string()),
             remote: None,
+            via: Vec::new(),
             network: None,
             latency: Some(latency),
         }
@@ -463,6 +753,7 @@ mod tests {
                 host: "198.51.100.5".to_string(),
                 port: 9000,
             }),
+            via: Vec::new(),
             network: None,
             latency: Some(800),
         }
@@ -860,6 +1151,7 @@ mod tests {
         stream.destinations = vec![StreamTransport::Srt(SrtEndpoint {
             node: None,
             remote: None,
+            via: Vec::new(),
             network: None,
             latency: None,
         })];
@@ -917,6 +1209,376 @@ mod tests {
                 node: "ghost".to_string()
             })
         );
+    }
+
+    // --- link direction and transit ---
+
+    #[test]
+    fn dialable_destination_keeps_the_sender_calling() {
+        let path = derive(&contribution(), &nodes()).expect("derive");
+        assert_eq!(path.hops[0].egresses[0].role, SocketRole::Connect);
+        assert_eq!(path.hops[1].ingress.role, SocketRole::Listen);
+    }
+
+    #[test]
+    fn outbound_only_destination_reverses_the_link() {
+        let nodes = vec![
+            node("strom-node-1", "172.26.0.10"),
+            nat_node("strom-node-2", "172.27.0.10"),
+        ];
+
+        let path = derive(&contribution(), &nodes).expect("derive");
+        assert_eq!(path.hops.len(), 2, "no relay is needed; the link reverses");
+
+        let sender_egress = &path.hops[0].egresses[0];
+        let receiver = &path.hops[1];
+        assert_eq!(
+            sender_egress.role,
+            SocketRole::Listen,
+            "the dialable end listens"
+        );
+        assert_eq!(
+            receiver.ingress.role,
+            SocketRole::Connect,
+            "the NAT'd end dials out"
+        );
+        assert_eq!(
+            receiver.ingress.host.as_deref(),
+            Some("172.26.0.10"),
+            "it dials the source node's data-plane address"
+        );
+        assert_eq!(receiver.ingress.port, sender_egress.port);
+    }
+
+    #[test]
+    fn reversed_link_claims_its_port_on_the_listening_node() {
+        // Disjoint ranges make the owning node legible from the port alone: an
+        // egress in 7xxx was claimed on node-1, in 8xxx on node-2.
+        let mut nat = nat_node("strom-node-2", "172.27.0.10");
+        nat.capabilities.port_range = Some(PortRange {
+            start: 8000,
+            end: 8999,
+        });
+        let nodes = vec![node("strom-node-1", "172.26.0.10"), nat];
+
+        let path = derive(&contribution(), &nodes).expect("derive");
+        let sender = &path.hops[0];
+        let receiver = &path.hops[1];
+
+        let egress_port = sender.egresses[0].port.expect("egress port");
+        assert!(
+            (7000..=7999).contains(&egress_port),
+            "the reversed link listens on node-1, so its port comes from node-1's range"
+        );
+        assert_ne!(sender.ingress.port, sender.egresses[0].port);
+        assert!(
+            (8000..=8999).contains(&receiver.egresses[0].port.expect("consumer port")),
+            "the consumer socket still belongs to the destination node"
+        );
+    }
+
+    #[test]
+    fn outbound_only_pair_relays_through_a_node_both_dial() {
+        let nodes = vec![
+            nat_node("strom-node-1", "172.26.0.10"),
+            nat_node("strom-node-2", "172.27.0.10"),
+            relay_node("edge-relay", "198.51.100.9"),
+        ];
+
+        let path = derive(&contribution(), &nodes).expect("derive");
+        assert_eq!(path.hops.len(), 3, "sender, bridge, receiver");
+
+        let sender = &path.hops[0];
+        let bridge = &path.hops[1];
+        let receiver = &path.hops[2];
+
+        assert_eq!(bridge.role, HopRole::Bridge);
+        assert_eq!(bridge.node_id, "edge-relay");
+        assert_eq!(bridge.id, "weave-contribution-bridge-0-0");
+
+        assert_eq!(
+            sender.egresses[0].role,
+            SocketRole::Connect,
+            "the NAT'd source calls out"
+        );
+        assert_eq!(sender.egresses[0].host.as_deref(), Some("198.51.100.9"));
+        assert_eq!(
+            receiver.ingress.role,
+            SocketRole::Connect,
+            "the NAT'd destination calls out too"
+        );
+        assert_eq!(receiver.ingress.host.as_deref(), Some("198.51.100.9"));
+
+        assert_eq!(
+            bridge.ingress.role,
+            SocketRole::Listen,
+            "the relay listens on both sides"
+        );
+        assert_eq!(bridge.egresses[0].role, SocketRole::Listen);
+        assert_eq!(bridge.ingress.port, sender.egresses[0].port);
+        assert_eq!(bridge.egresses[0].port, receiver.ingress.port);
+        assert_ne!(
+            bridge.ingress.port, bridge.egresses[0].port,
+            "the relay's two sockets are distinct"
+        );
+    }
+
+    #[test]
+    fn outbound_only_pair_without_a_relay_is_unplaceable() {
+        let nodes = vec![
+            nat_node("strom-node-1", "172.26.0.10"),
+            nat_node("strom-node-2", "172.27.0.10"),
+            // Dialable, but not offered as transit.
+            node("bystander", "198.51.100.9"),
+        ];
+
+        assert_eq!(
+            derive(&contribution(), &nodes),
+            Err(PlacementError::NoRelayAvailable {
+                upstream: "strom-node-1".to_string(),
+                downstream: "strom-node-2".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn an_outbound_only_relay_is_never_chosen() {
+        let mut unreachable_relay = nat_node("edge-relay", "198.51.100.9");
+        unreachable_relay.capabilities.relay = true;
+        let nodes = vec![
+            nat_node("strom-node-1", "172.26.0.10"),
+            nat_node("strom-node-2", "172.27.0.10"),
+            unreachable_relay,
+        ];
+
+        assert!(
+            matches!(
+                derive(&contribution(), &nodes),
+                Err(PlacementError::NoRelayAvailable { .. })
+            ),
+            "a relay nobody can dial cannot bridge anything"
+        );
+    }
+
+    #[test]
+    fn relay_choice_is_the_lowest_id_and_stable_across_ticks() {
+        let nodes = vec![
+            nat_node("strom-node-1", "172.26.0.10"),
+            nat_node("strom-node-2", "172.27.0.10"),
+            relay_node("relay-b", "198.51.100.20"),
+            relay_node("relay-a", "198.51.100.10"),
+        ];
+
+        let first = derive(&contribution(), &nodes).expect("derive");
+        let second = derive(&contribution(), &nodes).expect("derive");
+        assert_eq!(first.hops[1].node_id, "relay-a");
+        assert_eq!(first, second, "re-derivation is stable");
+    }
+
+    #[test]
+    fn via_pins_a_bridge_on_an_otherwise_direct_link() {
+        let mut stream = contribution();
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        dest.via = vec!["edge-relay".to_string()];
+
+        let mut nodes = nodes();
+        nodes.push(relay_node("edge-relay", "198.51.100.9"));
+
+        let path = derive(&stream, &nodes).expect("derive");
+        assert_eq!(
+            path.hops.len(),
+            3,
+            "the pin is honoured, not optimised away"
+        );
+        assert_eq!(path.hops[1].node_id, "edge-relay");
+        assert_eq!(path.hops[1].role, HopRole::Bridge);
+        assert_eq!(
+            path.hops[2].ingress.role,
+            SocketRole::Listen,
+            "both ends are dialable, so the relay calls the receiver"
+        );
+        assert_eq!(path.hops[1].egresses[0].role, SocketRole::Connect);
+    }
+
+    #[test]
+    fn via_pins_a_node_that_need_not_advertise_as_a_relay() {
+        // `relay: true` gates automatic selection. An explicit pin is operator
+        // intent and does not consult it.
+        let mut stream = contribution();
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        dest.via = vec!["transit".to_string()];
+
+        let mut nodes = nodes();
+        nodes.push(node("transit", "198.51.100.9"));
+
+        let path = derive(&stream, &nodes).expect("derive");
+        assert_eq!(path.hops[1].node_id, "transit");
+    }
+
+    #[test]
+    fn via_chains_multiple_relays_in_order() {
+        let mut stream = contribution();
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        dest.via = vec!["relay-first".to_string(), "relay-second".to_string()];
+
+        let mut nodes = nodes();
+        nodes.push(relay_node("relay-first", "198.51.100.10"));
+        nodes.push(relay_node("relay-second", "198.51.100.20"));
+
+        let path = derive(&stream, &nodes).expect("derive");
+        assert_eq!(path.hops.len(), 4);
+        assert_eq!(path.hops[1].node_id, "relay-first");
+        assert_eq!(path.hops[2].node_id, "relay-second");
+        assert_eq!(path.hops[3].node_id, "strom-node-2");
+        assert_eq!(path.hops[1].id, "weave-contribution-bridge-0-0");
+        assert_eq!(path.hops[2].id, "weave-contribution-bridge-0-1");
+        assert_eq!(
+            path.hops[1].egresses[0].host.as_deref(),
+            Some("198.51.100.20"),
+            "each bridge dials the next"
+        );
+    }
+
+    #[test]
+    fn via_relays_out_to_a_remote_destination() {
+        let mut stream = contribution();
+        let mut dest = remote_dest();
+        dest.via = vec!["edge-relay".to_string()];
+        stream.destinations = vec![StreamTransport::Srt(dest)];
+
+        let mut nodes = nodes();
+        nodes.push(relay_node("edge-relay", "198.51.100.9"));
+
+        let path = derive(&stream, &nodes).expect("derive");
+        assert_eq!(path.hops.len(), 2, "sender and bridge; no receiver hop");
+        let bridge = &path.hops[1];
+        assert_eq!(bridge.role, HopRole::Bridge);
+        assert_eq!(
+            bridge.egresses[0].host.as_deref(),
+            Some("198.51.100.5"),
+            "the bridge dials the external listener"
+        );
+        assert_eq!(bridge.egresses[0].port, Some(9000));
+
+        let endpoints = stream_endpoints(&stream, &path, &nodes).expect("endpoints");
+        assert_eq!(endpoints.outputs[0].url, "srt://198.51.100.5:9000");
+    }
+
+    #[test]
+    fn a_pinned_via_still_gets_a_relay_when_its_own_link_is_undialable() {
+        // node-1 and the pinned transit node are both outbound-only, so the link
+        // between them needs a relay of its own on top of the pin.
+        let mut stream = contribution();
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        dest.via = vec!["transit".to_string()];
+
+        let nodes = vec![
+            nat_node("strom-node-1", "172.26.0.10"),
+            node("strom-node-2", "172.27.0.10"),
+            nat_node("transit", "172.28.0.10"),
+            relay_node("edge-relay", "198.51.100.9"),
+        ];
+
+        let path = derive(&stream, &nodes).expect("derive");
+        let via_nodes: Vec<&str> = path.hops[1..].iter().map(|h| h.node_id.as_str()).collect();
+        assert_eq!(via_nodes, vec!["edge-relay", "transit", "strom-node-2"]);
+    }
+
+    #[test]
+    fn fanout_relays_only_the_destination_that_needs_it() {
+        let mut stream = fanout();
+        stream.destinations = vec![
+            StreamTransport::Srt(node_ref("strom-node-2", 1000)),
+            StreamTransport::Srt(node_ref("nat-node", 1000)),
+        ];
+
+        let nodes = vec![
+            nat_node("strom-node-1", "172.26.0.10"),
+            node("strom-node-2", "172.27.0.10"),
+            nat_node("nat-node", "172.28.0.10"),
+            relay_node("edge-relay", "198.51.100.9"),
+        ];
+
+        let path = derive(&stream, &nodes).expect("derive");
+        let placed: Vec<(&str, &str)> = path
+            .hops
+            .iter()
+            .map(|h| (h.id.as_str(), h.node_id.as_str()))
+            .collect();
+        assert_eq!(
+            placed,
+            vec![
+                ("weave-fanout-sender", "strom-node-1"),
+                ("weave-fanout-receiver-0", "strom-node-2"),
+                ("weave-fanout-bridge-1-0", "edge-relay"),
+                ("weave-fanout-receiver-1", "nat-node"),
+            ]
+        );
+        assert_eq!(
+            path.hops[0].egresses.len(),
+            2,
+            "the sender still tees once per destination"
+        );
+    }
+
+    #[test]
+    fn source_via_is_rejected() {
+        let mut stream = contribution();
+        let StreamTransport::Srt(source) = &mut stream.source;
+        source.via = vec!["edge-relay".to_string()];
+        assert_eq!(derive(&stream, &nodes()), Err(PlacementError::SourceVia));
+    }
+
+    #[test]
+    fn via_to_an_unregistered_node_is_not_registered() {
+        let mut stream = contribution();
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        dest.via = vec!["ghost".to_string()];
+
+        assert_eq!(
+            derive(&stream, &nodes()),
+            Err(PlacementError::NodeNotRegistered {
+                node: "ghost".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn bridge_hops_are_managed_and_deterministic() {
+        let mut stream = contribution();
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        dest.via = vec!["edge-relay".to_string()];
+
+        let mut nodes = nodes();
+        nodes.push(relay_node("edge-relay", "198.51.100.9"));
+
+        let a = derive(&stream, &nodes).expect("derive");
+        let b = derive(&stream, &nodes).expect("derive");
+        assert_eq!(a, b);
+        assert!(weave_core::is_managed_hop_id(&a.hops[1].id));
+    }
+
+    #[test]
+    fn stream_endpoints_are_unchanged_by_an_intervening_bridge() {
+        let mut stream = contribution();
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        dest.via = vec!["edge-relay".to_string()];
+
+        let mut nodes = nodes();
+        nodes.push(relay_node("edge-relay", "198.51.100.9"));
+
+        let path = derive(&stream, &nodes).expect("derive");
+        let endpoints = stream_endpoints(&stream, &path, &nodes).expect("endpoints");
+
+        assert_eq!(endpoints.ingress.node, "strom-node-1");
+        assert_eq!(endpoints.ingress.port, path.hops[0].ingress.port.unwrap());
+        assert_eq!(endpoints.outputs.len(), 1);
+        assert_eq!(
+            endpoints.outputs[0].node, "strom-node-2",
+            "the consumer still attaches at the destination, not the relay"
+        );
+        let consumer_port = path.hops[2].egresses[0].port.expect("consumer port");
+        assert_eq!(endpoints.outputs[0].port, consumer_port);
     }
 
     #[test]

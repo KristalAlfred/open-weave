@@ -71,6 +71,12 @@ pub struct SrtEndpoint {
     /// mutually exclusive with [`SrtEndpoint::node`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteAddr>,
+    /// Registered node ids to relay through, upstream-first, before reaching this
+    /// destination. Destinations only. Pins transit the planner would otherwise
+    /// choose itself; it still inserts a relay of its own when a link needs one
+    /// and none is pinned.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub via: Vec<String>,
     /// Data-plane alias resolved against the node's declared address map.
     /// Absent means [`DEFAULT_DATA_PLANE_ALIAS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -335,11 +341,83 @@ pub struct NodeCapabilities {
     /// [`DEFAULT_DATA_PLANE_ALIAS`] entry serves node-referenced endpoints
     /// that pin no network.
     #[serde(default)]
-    pub data_plane: BTreeMap<String, String>,
+    pub data_plane: BTreeMap<String, DataPlaneAddr>,
     /// Inclusive port range the controller may assign from for this node's
     /// hops. A soft contract: bind failures surface as [`HopState::Failed`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_range: Option<PortRange>,
+    /// Whether this node may carry transit for streams that neither terminate
+    /// nor originate on it — the pool the planner draws a relay from when two
+    /// endpoints cannot dial each other.
+    #[serde(default)]
+    pub relay: bool,
+}
+
+/// One data-plane address a node advertises, plus whether peers can open
+/// connections to it.
+///
+/// Deserializes from either a bare host string or a full mapping, so
+/// `default: 172.26.0.10` and
+/// `wan: { host: 203.0.113.7, reachability: outbound_only }` are both valid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DataPlaneAddr {
+    pub host: String,
+    pub reachability: Reachability,
+}
+
+impl DataPlaneAddr {
+    /// An address peers can dial — the shorthand form's meaning.
+    #[must_use]
+    pub fn dialable(host: impl Into<String>) -> Self {
+        Self {
+            host: host.into(),
+            reachability: Reachability::Dialable,
+        }
+    }
+
+    #[must_use]
+    pub fn is_dialable(&self) -> bool {
+        self.reachability == Reachability::Dialable
+    }
+}
+
+impl<'de> Deserialize<'de> for DataPlaneAddr {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Full {
+            host: String,
+            #[serde(default)]
+            reachability: Reachability,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Host(String),
+            Full(Full),
+        }
+
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Host(host) => Self::dialable(host),
+            Repr::Full(Full { host, reachability }) => Self { host, reachability },
+        })
+    }
+}
+
+/// Whether peers can open a connection to an address, or the node behind it can
+/// only dial out. Planning reads this to decide which end of a link listens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Reachability {
+    /// Peers can connect to this address.
+    #[default]
+    Dialable,
+    /// Behind NAT or a firewall: this node must initiate every connection.
+    OutboundOnly,
 }
 
 /// Inclusive `[start, end]` range of ports a node offers for controller-side
@@ -377,12 +455,16 @@ pub struct NodeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_endpoint: Option<String>,
     /// Data-plane addresses advertised for placement, keyed by alias. Must
-    /// contain the [`DEFAULT_DATA_PLANE_ALIAS`] entry.
-    pub data_plane: BTreeMap<String, String>,
+    /// contain the [`DEFAULT_DATA_PLANE_ALIAS`] entry. Each is either a bare
+    /// host (dialable) or a mapping pinning its [`Reachability`].
+    pub data_plane: BTreeMap<String, DataPlaneAddr>,
     /// Inclusive port range the controller may assign from for this node.
     pub port_range: PortRange,
     #[serde(default)]
     pub transports: Vec<String>,
+    /// Whether this node offers itself as transit for other nodes' streams.
+    #[serde(default)]
+    pub relay: bool,
 }
 
 impl NodeConfig {
@@ -431,7 +513,7 @@ impl NodeConfig {
         if self
             .data_plane
             .iter()
-            .any(|(alias, host)| alias.trim().is_empty() || host.trim().is_empty())
+            .any(|(alias, addr)| alias.trim().is_empty() || addr.host.trim().is_empty())
         {
             return Err(ConfigError::EmptyDataPlaneEntry);
         }
@@ -583,6 +665,7 @@ mod tests {
             StreamTransport::Srt(SrtEndpoint {
                 node: Some("strom-node-1".to_string()),
                 remote: None,
+                via: Vec::new(),
                 network: None,
                 latency: Some(200),
             })
@@ -592,6 +675,7 @@ mod tests {
             StreamTransport::Srt(SrtEndpoint {
                 node: Some("strom-node-2".to_string()),
                 remote: None,
+                via: Vec::new(),
                 network: Some("wan".to_string()),
                 latency: None,
             })
@@ -912,6 +996,17 @@ mod tests {
         assert_eq!(bare.node, None);
         assert_eq!(bare.remote, None);
 
+        let via: SrtEndpoint = serde_json::from_value(serde_json::json!({
+            "node": "strom-node-2",
+            "via": ["edge-relay"]
+        }))
+        .expect("parse via");
+        assert_eq!(via.via, vec!["edge-relay".to_string()]);
+        assert!(
+            serde_json::to_value(&bare).unwrap().get("via").is_none(),
+            "an empty via is not serialized"
+        );
+
         let remote: SrtEndpoint = serde_json::from_value(serde_json::json!({
             "remote": { "host": "198.51.100.5", "port": 9000 }
         }))
@@ -941,13 +1036,14 @@ mod tests {
             public_endpoint: None,
             data_plane: BTreeMap::from([(
                 DEFAULT_DATA_PLANE_ALIAS.to_string(),
-                "172.26.0.10".to_string(),
+                DataPlaneAddr::dialable("172.26.0.10"),
             )]),
             port_range: PortRange {
                 start: 20000,
                 end: 20999,
             },
             transports: vec!["srt".to_string()],
+            relay: false,
         }
     }
 
@@ -973,13 +1069,14 @@ mod tests {
         assert_eq!(empty_id.validate(), Err(ConfigError::EmptyId));
 
         let mut no_default = node_config();
-        no_default.data_plane = BTreeMap::from([("wan".to_string(), "203.0.113.7".to_string())]);
+        no_default.data_plane =
+            BTreeMap::from([("wan".to_string(), DataPlaneAddr::dialable("203.0.113.7"))]);
         assert_eq!(no_default.validate(), Err(ConfigError::MissingDefaultAlias));
 
         let mut blank_host = node_config();
         blank_host
             .data_plane
-            .insert("wan".to_string(), String::new());
+            .insert("wan".to_string(), DataPlaneAddr::dialable(""));
         assert_eq!(blank_host.validate(), Err(ConfigError::EmptyDataPlaneEntry));
 
         let mut bad_range = node_config();
@@ -994,6 +1091,70 @@ mod tests {
                 end: 20000,
             })
         );
+    }
+
+    #[test]
+    fn data_plane_addr_parses_shorthand_and_full_forms() {
+        let capabilities: NodeCapabilities = serde_json::from_value(serde_json::json!({
+            "data_plane": {
+                "default": "172.26.0.10",
+                "wan": { "host": "203.0.113.7", "reachability": "outbound_only" },
+                "lan": { "host": "10.0.0.4" }
+            }
+        }))
+        .expect("parse capabilities");
+
+        assert_eq!(
+            capabilities.data_plane["default"],
+            DataPlaneAddr::dialable("172.26.0.10"),
+            "a bare host is dialable"
+        );
+        assert_eq!(
+            capabilities.data_plane["wan"].reachability,
+            Reachability::OutboundOnly
+        );
+        assert!(
+            capabilities.data_plane["lan"].is_dialable(),
+            "an omitted reachability defaults to dialable"
+        );
+        assert!(!capabilities.relay, "relay defaults off");
+
+        let round_trip: NodeCapabilities =
+            serde_json::from_str(&serde_json::to_string(&capabilities).unwrap()).unwrap();
+        assert_eq!(capabilities, round_trip);
+    }
+
+    /// Registrations persisted before reachability existed carry bare host
+    /// strings and no `relay`. They are read back, not migrated, so the shorthand
+    /// has to keep meaning what it always did.
+    #[test]
+    fn a_registration_stored_before_reachability_still_hydrates() {
+        let stored: NodeRegistration = serde_json::from_value(serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "node": {
+                "id": "strom-node-1",
+                "endpoint": "http://strom-node-1:8091",
+                "status": "ready",
+                "capabilities": {
+                    "data_plane": { "default": "172.26.0.10" },
+                    "port_range": { "start": 20000, "end": 20999 }
+                }
+            }
+        }))
+        .expect("hydrate stored registration");
+
+        let capabilities = &stored.node.capabilities;
+        assert!(capabilities.data_plane["default"].is_dialable());
+        assert!(!capabilities.relay);
+    }
+
+    #[test]
+    fn data_plane_addr_rejects_a_misspelled_field() {
+        let result: Result<DataPlaneAddr, _> = serde_json::from_value(serde_json::json!({
+            "host": "10.0.0.4",
+            "reachablity": "outbound_only"
+        }));
+        assert!(result.is_err(), "a typo must not read as dialable");
     }
 
     #[test]

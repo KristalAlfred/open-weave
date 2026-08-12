@@ -20,3 +20,11 @@ destinations:
   #     remote:
   #       host: 198.51.100.5
   #       port: 9000
+  # A destination may pin the nodes it relays through, upstream-first. Each
+  # becomes a bridge hop. Pins are policy — forcing traffic through a site — and
+  # are honoured even when the link would have resolved directly. The controller
+  # inserts a relay on its own when neither end of a link can be dialled, so NAT
+  # traversal needs no pin.
+  # - srt:
+  #     node: strom-node-2
+  #     via: [edge-relay]

@@ -201,6 +201,7 @@ destinations:
             StreamTransport::Srt(SrtEndpoint {
                 node: Some("strom-node-1".to_string()),
                 remote: None,
+                via: Vec::new(),
                 network: None,
                 latency: Some(200),
             })
@@ -211,6 +212,7 @@ destinations:
             StreamTransport::Srt(SrtEndpoint {
                 node: Some("strom-node-2".to_string()),
                 remote: None,
+                via: Vec::new(),
                 network: Some("wan".to_string()),
                 latency: None,
             })

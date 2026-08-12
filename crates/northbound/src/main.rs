@@ -146,8 +146,10 @@ fn error(status: StatusCode, message: &str) -> Response {
 
 /// Enforce node-XOR-remote on an endpoint: exactly one of `node`/`remote` must be
 /// set, a present node must be non-empty, a present remote must name a host, and a
-/// source may not be remote.
+/// source may not be remote. `via` names transit for a destination only, so a
+/// source may not pin it and its entries must be usable node ids.
 fn validate_endpoint(endpoint: &SrtEndpoint, is_source: bool) -> Result<(), &'static str> {
+    validate_via(endpoint, is_source)?;
     match (&endpoint.node, &endpoint.remote) {
         (Some(_), Some(_)) => Err("endpoint must set either node or remote, not both"),
         (None, None) => Err("endpoint must set either node or remote"),
@@ -159,6 +161,25 @@ fn validate_endpoint(endpoint: &SrtEndpoint, is_source: bool) -> Result<(), &'st
         }
         (None, Some(_)) => Ok(()),
     }
+}
+
+fn validate_via(endpoint: &SrtEndpoint, is_source: bool) -> Result<(), &'static str> {
+    if endpoint.via.is_empty() {
+        return Ok(());
+    }
+    if is_source {
+        return Err("via belongs on a destination, not the source");
+    }
+    if endpoint.via.iter().any(|node| node.trim().is_empty()) {
+        return Err("via must not contain an empty node id");
+    }
+    // A relay appearing twice would place two bridges on one node for the same
+    // destination, which is never what a pin means.
+    let mut seen = std::collections::HashSet::new();
+    if !endpoint.via.iter().all(|node| seen.insert(node.as_str())) {
+        return Err("via must not repeat a node");
+    }
+    Ok(())
 }
 
 /// Forward a request to the controller, passing its status and body back
@@ -294,6 +315,7 @@ mod tests {
         SrtEndpoint {
             node: Some(id.to_string()),
             remote: None,
+            via: Vec::new(),
             network: None,
             latency: None,
         }
@@ -413,6 +435,34 @@ mod tests {
         assert!(
             captured.lock().unwrap().is_none(),
             "invalid stream never reaches the controller"
+        );
+    }
+
+    #[test]
+    fn via_is_accepted_on_a_destination_and_refused_on_a_source() {
+        let mut dest = node_ref("strom-node-2");
+        dest.via = vec!["edge-relay".to_string()];
+        assert_eq!(validate_endpoint(&dest, false), Ok(()));
+        assert_eq!(
+            validate_endpoint(&dest, true),
+            Err("via belongs on a destination, not the source")
+        );
+    }
+
+    #[test]
+    fn via_rejects_blank_and_repeated_entries() {
+        let mut blank = node_ref("strom-node-2");
+        blank.via = vec!["  ".to_string()];
+        assert_eq!(
+            validate_endpoint(&blank, false),
+            Err("via must not contain an empty node id")
+        );
+
+        let mut repeated = node_ref("strom-node-2");
+        repeated.via = vec!["edge-relay".to_string(), "edge-relay".to_string()];
+        assert_eq!(
+            validate_endpoint(&repeated, false),
+            Err("via must not repeat a node")
         );
     }
 

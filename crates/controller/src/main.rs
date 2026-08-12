@@ -129,9 +129,11 @@ struct NodeView {
     id: String,
     status: NodeStatus,
     endpoint: String,
-    data_plane: BTreeMap<String, String>,
+    data_plane: BTreeMap<String, weave_core::DataPlaneAddr>,
     #[serde(skip_serializing_if = "Option::is_none")]
     port_range: Option<weave_core::PortRange>,
+    /// Whether the planner may draw this node as transit for other nodes' streams.
+    relay: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_seen_secs: Option<u64>,
 }
@@ -407,6 +409,7 @@ async fn get_view(State(state): State<AppState>) -> Json<SystemView> {
             endpoint: r.node.endpoint.clone(),
             data_plane: r.node.capabilities.data_plane.clone(),
             port_range: r.node.capabilities.port_range,
+            relay: r.node.capabilities.relay,
             last_seen_secs: last_seen
                 .get(&r.node.id)
                 .map(|seen| now.saturating_duration_since(*seen).as_secs()),
@@ -839,7 +842,7 @@ mod tests {
                 capabilities: NodeCapabilities {
                     data_plane: BTreeMap::from([(
                         weave_core::DEFAULT_DATA_PLANE_ALIAS.to_string(),
-                        host.to_string(),
+                        weave_core::DataPlaneAddr::dialable(host),
                     )]),
                     port_range: Some(PortRange {
                         start: 7000,
@@ -860,12 +863,14 @@ mod tests {
             source: StreamTransport::Srt(SrtEndpoint {
                 node: Some("strom-node-1".to_string()),
                 remote: None,
+                via: Vec::new(),
                 network: None,
                 latency: Some(200),
             }),
             destinations: vec![StreamTransport::Srt(SrtEndpoint {
                 node: Some("strom-node-2".to_string()),
                 remote: None,
+                via: Vec::new(),
                 network: None,
                 latency: Some(1000),
             })],

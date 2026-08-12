@@ -254,12 +254,14 @@ mod tests {
             source: StreamTransport::Srt(SrtEndpoint {
                 node: Some("strom-node-1".to_string()),
                 remote: None,
+                via: Vec::new(),
                 network: None,
                 latency: None,
             }),
             destinations: vec![StreamTransport::Srt(SrtEndpoint {
                 node: Some("strom-node-2".to_string()),
                 remote: None,
+                via: Vec::new(),
                 network: None,
                 latency: None,
             })],

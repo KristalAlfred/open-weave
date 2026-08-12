@@ -155,6 +155,64 @@ Left unauthenticated on purpose:
 There is no TLS: terminate it at a reverse proxy. Per-node tokens issued at
 registration and mTLS are follow-ups, not implemented here.
 
+## Reachability, link direction, and jump nodes
+
+A node advertises each data-plane address with whether peers can dial it. A bare
+host is dialable, the unremarkable case; spell the entry out to say otherwise:
+
+```yaml
+data_plane:
+  default: 172.26.0.10
+  wan:
+    host: 203.0.113.7
+    reachability: outbound_only
+```
+
+Planning reads this instead of assuming a fixed direction. Per link, upstream to
+downstream:
+
+| Dialable | Who listens | Who calls |
+|---|---|---|
+| downstream | downstream | upstream |
+| upstream only | upstream | downstream |
+| neither | a relay, on both sockets | both ends |
+
+The first row is what a sender-calls-receiver template always did, so ordinary
+streams plan exactly as before. The second reverses the link — useful whenever
+the receiving side sits behind NAT — and costs nothing but a socket role, since
+SRT listeners and callers both work as source or sink.
+
+The third row is the jump node. When neither end can be dialled, the controller
+inserts a **bridge hop** on a relay node that both ends call out to, sidestepping
+the NAT boundary in the only direction it permits. It is not a special path: the
+relay is dialable, so the two halves of the split link resolve under the same
+rule as everything else.
+
+A node offers itself as transit with `relay: true`; the controller draws the
+lowest-id eligible relay so the choice stays stable across ticks. A stream that
+needs transit and finds none stays `pending` and reports why, the same as any
+other unplaceable stream.
+
+Destinations may also pin transit themselves, upstream-first:
+
+```yaml
+destinations:
+  - srt:
+      node: studio-node
+      via: [edge-relay]
+```
+
+A pin is policy — forcing traffic through a site or region — so it is honoured
+even when the link would have resolved directly, and it does not consult
+`relay: true`. Pins and automatic insertion compose: if a pinned relay cannot be
+dialled from the hop before it, the controller relays into it as well.
+
+A relay carries bytes and terminates nothing. Consumers still attach at the
+destination node, and `GET /v1/streams/{name}/endpoints` is unchanged by transit.
+One consequence worth stating: a consumer output on an `outbound_only` node is
+only dialable from inside that node's network, because that is what the node
+declared about itself.
+
 ## Strom adapter and drift policy
 
 Strom is the first media runtime target. `weave-adapter-strom` runs beside one

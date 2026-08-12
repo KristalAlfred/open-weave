@@ -69,9 +69,14 @@ strom:
         let config: AdapterConfig = serde_norway::from_str(VALID).expect("parse");
         assert_eq!(config.node.id, "strom-node-1");
         assert_eq!(
-            config.node.data_plane.get("default").unwrap(),
+            config.node.data_plane.get("default").unwrap().host,
             "172.26.0.10"
         );
+        assert!(
+            config.node.data_plane["default"].is_dialable(),
+            "a bare host is dialable"
+        );
+        assert!(!config.node.relay, "relay is opt-in");
         assert_eq!(config.strom.url, "http://172.26.0.10:8080");
         assert_eq!(config.strom.poll_interval_secs, 5);
         assert_eq!(config.node.validate(), Ok(()));

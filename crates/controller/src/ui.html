@@ -210,8 +210,11 @@ function renderNodes(nodes) {
   if (!nodes.length) { root.className = "empty"; root.textContent = "no nodes registered"; return; }
   root.className = "";
   root.replaceChildren(...nodes.map(node => {
-    const details = Object.entries(node.data_plane || {}).map(([alias, host]) => `${alias} ${host}`);
+    // An outbound-only address is marked; a dialable one is the unremarkable case.
+    const details = Object.entries(node.data_plane || {}).map(([alias, addr]) =>
+      `${alias} ${addr.host}${addr.reachability === "outbound_only" ? " (outbound-only)" : ""}`);
     if (node.port_range) details.push(`ports ${node.port_range.start}–${node.port_range.end}`);
+    if (node.relay) details.push("relay");
     return h("div", "node",
       dot(node.status, node.status),
       h("span", "id", node.id),
@@ -230,7 +233,9 @@ function rate(stats) {
 }
 
 function hopChip(hop) {
-  const short = hop.role === "sender" ? "sender" : hop.id.replace(/^weave-.*-(receiver-\d+)$/, "$1");
+  const short = hop.role === "receiver"
+    ? hop.id.replace(/^weave-.*-(receiver-\d+)$/, "$1")
+    : hop.role;
   const reported = hop.state != null;
   const chip = h("span", "chip hop" + (reported ? "" : " unreported"),
     h("span", "role", short),
@@ -260,12 +265,22 @@ function addrChip(tag, text, title) {
 
 const arrow = () => h("span", "arrow", "→");
 
+// Bridges on destination `i`'s chain, upstream-first. A bridge id carries both
+// the destination it serves and its position along that destination's chain.
+function bridgesFor(hops, i) {
+  return hops
+    .map(hop => ({ hop, at: hop.id.match(/-bridge-(\d+)-(\d+)$/) }))
+    .filter(({ at }) => at && Number(at[1]) === i)
+    .sort((a, b) => Number(a.at[2]) - Number(b.at[2]))
+    .map(({ hop }) => hop);
+}
+
 // A trunk line (ingress address -> sender), then one indented branch line per
-// destination: its receiver hop and consumer address, or the remote address
-// the sender dials out to.
+// destination: the relays it transits, then its receiver hop and consumer
+// address, or the remote address the last hop dials out to.
 function renderPath(stream) {
   const path = h("div", "path");
-  const [sender, ...receivers] = stream.hops;
+  const [sender, ...downstream] = stream.hops;
   const endpoints = stream.endpoints;
 
   const trunk = h("div", "trunk");
@@ -274,18 +289,19 @@ function renderPath(stream) {
   if (trunk.childNodes.length) path.append(trunk);
 
   const outputs = endpoints ? endpoints.outputs : [];
-  const count = Math.max(receivers.length, outputs.length, sender ? sender.egresses.length : 0);
+  const count = Math.max(outputs.length, sender ? sender.egresses.length : 0);
   for (let i = 0; i < count; i++) {
     const branch = h("div", "branch", h("span", "fork", "↳"));
     const output = outputs[i];
+    for (const bridge of bridgesFor(downstream, i)) branch.append(hopChip(bridge), arrow());
     const receiver = output && output.node === ""
-      ? null // remote destination: the sender dials out, no receiver hop
-      : receivers.find(r => r.id.endsWith(`-receiver-${i}`));
+      ? null // remote destination: the chain dials out, no receiver hop
+      : downstream.find(r => r.id.endsWith(`-receiver-${i}`));
     if (receiver) branch.append(hopChip(receiver), arrow());
     if (output) {
       branch.append(receiver
         ? addrChip("out", output.url, "consumers dial this output")
-        : addrChip("remote", output.url, "remote listener the sender dials"));
+        : addrChip("remote", output.url, "remote listener the chain dials"));
     }
     if (branch.childNodes.length > 1) path.append(branch);
   }
