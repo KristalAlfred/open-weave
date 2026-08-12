@@ -9,16 +9,36 @@ it with the `weave` CLI against the host-published northbound.
 ```
         net_core 172.25.0.0/24
    northbound  southbound  controller
-        |          |           |
-     router-1 (172.25.0.11) router-2 (172.25.0.12)
-        |                       |
-  net_node1 172.26.0.0/24   net_node2 172.27.0.0/24
-   strom-1 + adapter-1       strom-2 + adapter-2
+        |          |           |          \
+   router-1     router-2       |        router-3  (NAT)
+  (172.25.0.11) (172.25.0.12)  |       (172.25.0.13)
+        |            |                      |
+  net_node1      net_node2            net_node3
+  172.26.0.0/24  172.27.0.0/24        172.29.0.0/24
+  strom-1        strom-2              strom-3
+  adapter-1      adapter-2            adapter-3
+  (relay)                             (outbound-only)
 ```
 
 Each node subnet reaches everything else only through its router. Applying netem
 on a router impairs both directions of that node's traffic: SRT media between
 Stroms, adapter heartbeats, and controller→Strom API calls.
+
+**Node 3 sits behind a NAT.** Its router masquerades outbound traffic, and no
+route to `172.29.0.0/24` is installed anywhere outside net_node3 — not in the
+core containers, not in routers 1 and 2. Docker's inter-network isolation blocks
+the bridge-level path, so node 3 can open connections outward and nothing can
+open one toward it. That asymmetry is deliberate and load-bearing: adding a
+return route would silently delete the boundary and the `nat-*` manifests would
+start passing for the wrong reason.
+
+Node 1 is the only node advertising `relay: true`, so it is what the controller
+picks when a link needs transit.
+
+Because a NAT'd node's sockets can only be dialled from inside its network, the
+bench carries a second pair of media endpoints (`producer-3`, `consumer-3`) on
+net_node3. The producer/consumer recipes choose between them and the net_core
+pair from the resolved address, so `just stream-up <name>` works uniformly.
 
 Those cross-subnet routes are installed by the `route-manager` service, which
 re-asserts them every few seconds inside each container's network namespace
@@ -37,6 +57,7 @@ also picks up the profiled producer/consumer whenever they come up.
 | 29082 | controller: dashboard at `/ui`, `/view`; API at `/v1/status`, `/v1/streams/{name}/endpoints` |
 | 28080 | strom-1 API |
 | 28081 | strom-2 API |
+| 28082 | strom-3 API (host→container; grants no route into net_node3) |
 
 Open <http://localhost:29082/ui> to watch the system live: registered nodes,
 every stream's path across them (per-hop link conditions and rates), and the

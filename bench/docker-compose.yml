@@ -7,6 +7,46 @@ x-weave: &weave
     dockerfile: bench/Dockerfile
   restart: unless-stopped
 
+# External verification endpoints share one ffmpeg loop each; only the container
+# name, address and subnet differ. Every consumer reads CONSUMER_SOURCE, so a
+# service that takes its value from a different host variable remaps it in its
+# own `environment` block rather than forking the command.
+x-media: &media
+  image: linuxserver/ffmpeg:latest
+  restart: "no"
+  entrypoint: ["/bin/bash", "-c"]
+
+x-producer-command: &producer-command
+  - |
+    running=1
+    trap 'running=0; kill -TERM "$$child" 2>/dev/null' TERM INT
+    while [ "$$running" = 1 ]; do
+      ffmpeg -hide_banner -loglevel warning -re \
+        -f lavfi -i testsrc2=size=1280x720:rate=30 \
+        -f lavfi -i sine=frequency=1000:sample_rate=48000 \
+        -c:v libx264 -preset veryfast -tune zerolatency -b:v 2500k -pix_fmt yuv420p -g 60 \
+        -c:a aac -b:a 128k \
+        -f mpegts "srt://$${PRODUCER_TARGET:?PRODUCER_TARGET is required (resolve via scripts/endpoints.sh)}?mode=caller&latency=200&streamid=producer" &
+      child=$$!
+      wait "$$child" || true
+      [ "$$running" = 1 ] && { echo "producer ffmpeg exited; retrying in 2s" >&2; sleep 2; }
+    done
+    wait "$$child" 2>/dev/null || true
+
+x-consumer-command: &consumer-command
+  - |
+    running=1
+    trap 'running=0; kill -TERM "$$child" 2>/dev/null' TERM INT
+    while [ "$$running" = 1 ]; do
+      ffmpeg -hide_banner -loglevel warning \
+        -i "srt://$${CONSUMER_SOURCE:?CONSUMER_SOURCE is required (resolve via scripts/endpoints.sh)}?mode=caller&latency=200" \
+        -f null - &
+      child=$$!
+      wait "$$child" || true
+      [ "$$running" = 1 ] && { echo "consumer ffmpeg exited; retrying in 2s" >&2; sleep 2; }
+    done
+    wait "$$child" 2>/dev/null || true
+
 networks:
   net_core:
     driver: bridge
@@ -23,6 +63,13 @@ networks:
     ipam:
       config:
         - subnet: 172.27.0.0/24
+  # Node 3 sits behind a NAT: its router masquerades outbound traffic and nothing
+  # outside is given a route back in. See router-3.
+  net_node3:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
 
 services:
   # --- control plane (net_core) ---
@@ -142,6 +189,8 @@ services:
         condition: service_started
       router-2:
         condition: service_started
+      router-3:
+        condition: service_started
 
   # --- routers (L3 hop per node; netem is applied on these) ---
   router-1:
@@ -175,6 +224,37 @@ services:
       - sh
       - -c
       - "ip route replace 172.26.0.0/24 via 172.25.0.11 || true; for d in $$(ls /sys/class/net | grep -v lo); do tc qdisc del dev $$d root 2>/dev/null; done; exec sleep infinity"
+
+  # Node 3's router is a NAT gateway, not a plain L3 hop like routers 1 and 2.
+  # Two things make it one, and both matter:
+  #
+  #   * MASQUERADE rewrites node-3's source address to this router's core-side
+  #     IP, so replies come back here and conntrack returns them. Without it,
+  #     node-3's outbound traffic would be answered to an address nobody routes.
+  #   * Nothing outside net_node3 is ever given a route to 172.29.0.0/24 — not
+  #     the core containers, not routers 1 and 2 (see scripts/route-manager.sh).
+  #     Docker's inter-network isolation blocks the bridge-level path, so with no
+  #     route installed there is genuinely no way to dial in.
+  #
+  # That is the whole NAT: node-3 can open connections outward and nothing can
+  # open one toward it. The routes out are one-way on purpose; do not "fix" the
+  # asymmetry by adding a return route, which would quietly delete the boundary
+  # every NAT test here depends on.
+  router-3:
+    image: nicolaka/netshoot:latest
+    container_name: ow-router-3
+    cap_add: [NET_ADMIN]
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      net_core:
+        ipv4_address: 172.25.0.13
+      net_node3:
+        ipv4_address: 172.29.0.2
+    command:
+      - sh
+      - -c
+      - "ip route replace 172.26.0.0/24 via 172.25.0.11 || true; ip route replace 172.27.0.0/24 via 172.25.0.12 || true; iptables -t nat -C POSTROUTING -s 172.29.0.0/24 ! -d 172.29.0.0/24 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 172.29.0.0/24 ! -d 172.29.0.0/24 -j MASQUERADE; for d in $$(ls /sys/class/net | grep -v lo); do tc qdisc del dev $$d root 2>/dev/null; done; exec sleep infinity"
 
   # --- node 1 (net_node1) ---
   strom-1:
@@ -254,91 +334,116 @@ services:
       retries: 10
       start_period: 5s
 
+  # --- node 3 (net_node3, behind NAT) ---
+  strom-3:
+    image: eyevinntechnology/strom:latest
+    container_name: ow-strom-3
+    environment:
+      STROM_PORT: "8080"
+      STROM_DATA_DIR: /data
+    volumes:
+      - strom3-data:/data
+    # Published for debugging from the host. This is a host→container path
+    # through docker-proxy and gives no container a route into net_node3, so the
+    # NAT boundary the media crosses is unaffected.
+    ports:
+      - "28082:8080"
+    networks:
+      net_node3:
+        ipv4_address: 172.29.0.10
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
+  adapter-3:
+    <<: *weave
+    container_name: ow-adapter-3
+    command: ["weave-adapter-strom", "--config", "/etc/weave/node.yaml"]
+    environment:
+      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_SOUTHBOUND_TOKEN:-bench-southbound-token}
+    volumes:
+      - ./config/adapter-3.yaml:/etc/weave/node.yaml:ro
+    networks:
+      net_node3:
+        ipv4_address: 172.29.0.11
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8091/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
   # --- external verification endpoints (NOT part of the system) ---
   # Off by default (profiles). Started explicitly via the bench producer/consumer
-  # recipes so status transitions can be demonstrated. They sit on net_core and
-  # route to the node subnets through the netem routers, like real external peers.
+  # recipes so status transitions can be demonstrated.
+  #
+  # The net_core pair act as real external peers, routing to node subnets through
+  # the netem routers. The net_node3 pair exist because node 3 is behind NAT: its
+  # sockets listen, but nothing outside can dial them, so a peer that drives them
+  # has to sit inside the site. That is not a bench workaround — it is the same
+  # constraint that makes a NAT'd site run its own encoder and decoder.
   producer:
-    image: linuxserver/ffmpeg:latest
+    <<: *media
     container_name: ow-producer
     profiles: ["producer"]
-    restart: "no"
     environment:
       - PRODUCER_TARGET
     networks:
       net_core:
         ipv4_address: 172.25.0.30
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        running=1
-        trap 'running=0; kill -TERM "$$child" 2>/dev/null' TERM INT
-        while [ "$$running" = 1 ]; do
-          ffmpeg -hide_banner -loglevel warning -re \
-            -f lavfi -i testsrc2=size=1280x720:rate=30 \
-            -f lavfi -i sine=frequency=1000:sample_rate=48000 \
-            -c:v libx264 -preset veryfast -tune zerolatency -b:v 2500k -pix_fmt yuv420p -g 60 \
-            -c:a aac -b:a 128k \
-            -f mpegts "srt://$${PRODUCER_TARGET:?PRODUCER_TARGET is required (resolve via scripts/endpoints.sh)}?mode=caller&latency=200&streamid=producer" &
-          child=$$!
-          wait "$$child" || true
-          [ "$$running" = 1 ] && { echo "producer ffmpeg exited; retrying in 2s" >&2; sleep 2; }
-        done
-        wait "$$child" 2>/dev/null || true
+    command: *producer-command
 
   consumer:
-    image: linuxserver/ffmpeg:latest
+    <<: *media
     container_name: ow-consumer
     profiles: ["consumer"]
-    restart: "no"
     environment:
       - CONSUMER_SOURCE
     networks:
       net_core:
         ipv4_address: 172.25.0.31
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        running=1
-        trap 'running=0; kill -TERM "$$child" 2>/dev/null' TERM INT
-        while [ "$$running" = 1 ]; do
-          ffmpeg -hide_banner -loglevel warning \
-            -i "srt://$${CONSUMER_SOURCE:?CONSUMER_SOURCE is required (resolve via scripts/endpoints.sh)}?mode=caller&latency=200" \
-            -f null - &
-          child=$$!
-          wait "$$child" || true
-          [ "$$running" = 1 ] && { echo "consumer ffmpeg exited; retrying in 2s" >&2; sleep 2; }
-        done
-        wait "$$child" 2>/dev/null || true
+    command: *consumer-command
 
   # Second consumer for fan-out: attach one consumer per receiver output so all
   # receiver hops can flow simultaneously (rollup needs every hop flowing).
   consumer-2:
-    image: linuxserver/ffmpeg:latest
+    <<: *media
     container_name: ow-consumer-2
     profiles: ["consumer"]
-    restart: "no"
     environment:
-      - CONSUMER_SOURCE_2
+      CONSUMER_SOURCE: ${CONSUMER_SOURCE_2:-}
     networks:
       net_core:
         ipv4_address: 172.25.0.32
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        running=1
-        trap 'running=0; kill -TERM "$$child" 2>/dev/null' TERM INT
-        while [ "$$running" = 1 ]; do
-          ffmpeg -hide_banner -loglevel warning \
-            -i "srt://$${CONSUMER_SOURCE_2:?CONSUMER_SOURCE_2 is required (resolve via scripts/endpoints.sh)}?mode=caller&latency=200" \
-            -f null - &
-          child=$$!
-          wait "$$child" || true
-          [ "$$running" = 1 ] && { echo "consumer-2 ffmpeg exited; retrying in 2s" >&2; sleep 2; }
-        done
-        wait "$$child" 2>/dev/null || true
+    command: *consumer-command
+
+  producer-3:
+    <<: *media
+    container_name: ow-producer-3
+    profiles: ["producer"]
+    environment:
+      - PRODUCER_TARGET
+    networks:
+      net_node3:
+        ipv4_address: 172.29.0.30
+    command: *producer-command
+
+  consumer-3:
+    <<: *media
+    container_name: ow-consumer-3
+    profiles: ["consumer"]
+    environment:
+      - CONSUMER_SOURCE
+    networks:
+      net_node3:
+        ipv4_address: 172.29.0.31
+    command: *consumer-command
 
 volumes:
   strom1-data:
   strom2-data:
+  strom3-data:
   pgdata:

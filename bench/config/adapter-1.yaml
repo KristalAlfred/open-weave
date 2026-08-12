@@ -14,6 +14,9 @@ node:
     start: 20000
     end: 20999
   transports: [srt]
+  # Dialable from every subnet, so it can serve as transit when two endpoints
+  # cannot reach each other directly — node 3 behind its NAT, for one.
+  relay: true
 strom:
   url: http://172.26.0.10:8080
   poll_interval_secs: 5

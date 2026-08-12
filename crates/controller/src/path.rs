@@ -31,7 +31,9 @@ pub enum PlacementError {
     RemoteSource,
     #[error("endpoint must set exactly one of node or remote")]
     EndpointPlacement,
-    #[error("neither {upstream} nor {downstream} can be dialled and no relay node is available")]
+    #[error(
+        "no route from {upstream} to {downstream}: neither can be dialled and no relay node is available"
+    )]
     NoRelayAvailable {
         upstream: String,
         downstream: String,

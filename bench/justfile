@@ -6,6 +6,7 @@ sb      := "http://localhost:29081"
 ctrl    := "http://localhost:29082"
 strom1  := "http://localhost:28080"
 strom2  := "http://localhost:28081"
+strom3  := "http://localhost:28082"
 
 # Version prefix carrying both control-plane contracts, matching weave_core::API_V1.
 # `/health` and the controller dashboard (`/`, `/ui`, `/view`) sit outside it.
@@ -37,6 +38,7 @@ wait:
         curl -sf {{ctrl}}/health >/dev/null 2>&1 && \
         curl -sf {{strom1}}/api/version >/dev/null 2>&1 && \
         curl -sf {{strom2}}/api/version >/dev/null 2>&1 && \
+        curl -sf {{strom3}}/api/version >/dev/null 2>&1 && \
         { echo "stack ready"; exit 0; }; \
         sleep 2; \
     done; echo "timeout waiting for stack" >&2; {{compose}} ps; exit 1
@@ -60,6 +62,7 @@ status:
     @printf "controller:  "; curl -sf {{ctrl}}/health >/dev/null && echo ok || echo DOWN
     @printf "strom-1:     "; curl -sf {{strom1}}/api/version >/dev/null && echo ok || echo DOWN
     @printf "strom-2:     "; curl -sf {{strom2}}/api/version >/dev/null && echo ok || echo DOWN
+    @printf "strom-3:     "; curl -sf {{strom3}}/api/version >/dev/null && echo ok || echo DOWN
     @echo "== registered nodes (southbound) =="
     @curl -sf {{sb_auth}} {{sb}}{{v}}/nodes | (jq . 2>/dev/null || cat)
     @echo "== controller {{v}}/status =="
@@ -151,16 +154,22 @@ stream-rm name:
 
 # Pass a stream name; the ingress address is resolved via the controller's
 # discovery API. Verification endpoint only — not part of the system under test.
+#
+# A socket on node 3 can only be dialled from inside net_node3, so the endpoint
+# is picked from the address: 172.29.x means the `-3` container, anything else
+# the net_core one. The recipe obeys the same reachability the planner does.
 [doc("Start the external ffmpeg producer (SRT caller into a source ingress).")]
 producer-up stream="basic":
     #!/usr/bin/env bash
     set -euo pipefail
     target="$(WEAVE_NORTHBOUND_TOKEN={{nb_token}} bash {{scripts}}/endpoints.sh {{stream}} ingress)"
-    PRODUCER_TARGET="$target" {{compose}} --profile producer up -d producer
+    svc="producer$(bash {{scripts}}/inside.sh "$target")"
+    echo "producer: dialling $target from $svc"
+    PRODUCER_TARGET="$target" {{compose}} --profile producer up -d "$svc"
 
-# Stop and remove the external producer.
+# Stop and remove the external producer, whichever subnet it was started in.
 producer-down:
-    {{compose}} --profile producer rm -sf producer
+    -@{{compose}} --profile producer rm -sf producer producer-3
 
 # Pass a stream name; the first output address is resolved via discovery.
 [doc("Start the external ffmpeg consumer (SRT caller pulling a receiver output).")]
@@ -168,11 +177,13 @@ consumer-up stream="basic":
     #!/usr/bin/env bash
     set -euo pipefail
     source="$(WEAVE_NORTHBOUND_TOKEN={{nb_token}} bash {{scripts}}/endpoints.sh {{stream}} output 0)"
-    CONSUMER_SOURCE="$source" {{compose}} --profile consumer up -d consumer
+    svc="consumer$(bash {{scripts}}/inside.sh "$source")"
+    echo "consumer: dialling $source from $svc"
+    CONSUMER_SOURCE="$source" {{compose}} --profile consumer up -d "$svc"
 
-# Stop and remove the external consumer.
+# Stop and remove the external consumer, whichever subnet it was started in.
 consumer-down:
-    {{compose}} --profile consumer rm -sf consumer
+    -@{{compose}} --profile consumer rm -sf consumer consumer-3
 
 # For fan-out: one consumer per receiver output, so every receiver hop can flow.
 # Pass a stream name; the second output address is resolved via discovery.

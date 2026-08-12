@@ -7,7 +7,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<EOF
-usage: netem.sh <node1|node2> <command|netem-spec>
+usage: netem.sh <node1|node2|node3> <command|netem-spec>
   netem.sh node1 delay 200ms 20ms      symmetric delay+jitter on node1's router
   netem.sh node1 loss 5%               packet loss on node1's router
   netem.sh node1 delay 200ms loss 5%   any raw 'tc netem' spec
@@ -21,6 +21,7 @@ node="${1:-}"; shift || usage
 case "$node" in
   node1) router="ow-router-1"; ips="172.26.0.2 172.25.0.11" ;;
   node2) router="ow-router-2"; ips="172.27.0.2 172.25.0.12" ;;
+  node3) router="ow-router-3"; ips="172.29.0.2 172.25.0.13" ;;
   *) usage ;;
 esac
 

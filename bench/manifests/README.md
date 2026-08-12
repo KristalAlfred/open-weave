@@ -44,6 +44,9 @@ not measured.
 | `disabled` | `enabled: false` | `idle` | `idle` | `idle` |
 | `srt-latency` | non-default SRT latency (120ms / 2000ms) | `awaiting_input` | `degraded` | `flowing` |
 | `via` | pinned transit: node-1 → bridge on node-2 → node-1 | `awaiting_input` | — | `flowing` |
+| `nat-egress` | NAT'd node-3 contributes out to node-1 | `awaiting_input` | — | `flowing` |
+| `nat-ingress` | node-1 delivers into NAT'd node-3 (link reverses) | `awaiting_input` | — | `flowing` |
+| `nat-relay` | both ends on NAT'd node-3; bridged via node-1 | `awaiting_input` | — | `flowing` |
 
 Notes:
 
@@ -61,6 +64,34 @@ Notes:
   so per-destination health is real.
 - **`disabled`**: listed by northbound but reconciled to `idle`; no hops are
   provisioned.
+- **`nat-*`**: node 3 sits behind a real NAT — router-3 masquerades its outbound
+  traffic and nothing outside net_node3 is given a route back in. Verified
+  directly, not assumed: a TCP connect from the controller and from node 1 to
+  `172.29.0.10:8080` both fail, while node 3 reaches `172.26.0.10:8080` and its
+  adapter registers through the same path.
+  - **`nat-egress`** needs no relay and no reversal: the destination is dialable,
+    so the sender calls out, which is the direction a NAT allows anyway.
+  - **`nat-ingress`** is the reversal. Observed sockets: the sender's egress on
+    node 1 is `listen`, and node 3's receiver ingress is `connect` to
+    `172.26.0.10`. Delivery into a NAT'd site costs a socket role, not a relay.
+  - **`nat-relay`** is the jump node. Observed: `weave-nat-relay-bridge-0-0` on
+    node 1 listens on *both* sockets while both node-3 hops dial out to it.
+    Removing `relay: true` from node 1 makes the stream unplaceable with
+    `no route from strom-node-3 to strom-node-3: neither can be dialled and no
+    relay node is available`, so the bridge is doing the work rather than
+    decorating a path that would have worked anyway.
+
+  Source and destination are the same node in `nat-relay` because the bench has
+  one NAT'd site. The media still crosses the NAT twice, outbound each time,
+  which is the mechanism two separate NAT'd sites would rely on — but two sites
+  genuinely unable to reach each other is not what this covers.
+
+  Media endpoints for these live *inside* net_node3 (`producer-3`,
+  `consumer-3`). That is not a bench workaround: a socket on a NAT'd node can
+  only be dialled from inside its network, which is why such a site runs its own
+  encoder and decoder. `producer-up`/`consumer-up` pick the right container from
+  the resolved address via `scripts/inside.sh`.
+
 - **`via`**: three hops — `weave-via-sender` on node-1, `weave-via-bridge-0-0`
   on node-2, `weave-via-receiver-0` back on node-1 — so the media crosses both
   routers twice. Observed with every hop `flowing` on both sockets. The bridge is

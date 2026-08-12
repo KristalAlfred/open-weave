@@ -1,0 +1,13 @@
+# NAT'd source: node 3 sits behind a NAT and contributes out to node 1.
+# The destination is dialable, so the sender calls out — the direction a NAT
+# permits anyway — and no relay is needed.
+name: nat-egress
+enabled: true
+source:
+  srt:
+    node: strom-node-3
+    latency: 200
+destinations:
+  - srt:
+      node: strom-node-1
+      latency: 1000

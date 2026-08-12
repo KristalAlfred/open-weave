@@ -1,0 +1,25 @@
+# Node 3 Strom adapter config. Mounted read-only and passed via --config.
+#
+# This node sits behind the NAT that router-3 enforces: it can open connections
+# outward, and nothing outside net_node3 has a route back in. The config says so
+# rather than the controller having to discover it, so planning can pick a
+# direction each link can actually carry.
+node:
+  id: strom-node-3
+  southbound_url: http://172.25.0.21:8081
+  listen: 0.0.0.0:8091
+  # Reachable only from inside net_node3, which is the point of this node. The
+  # controller never dials it — adapters poll southbound — so an address nobody
+  # outside can route is not a problem here.
+  public_endpoint: http://172.29.0.11:8091
+  data_plane:
+    default:
+      host: 172.29.0.10
+      reachability: outbound_only
+  port_range:
+    start: 20000
+    end: 20999
+  transports: [srt]
+strom:
+  url: http://172.29.0.10:8080
+  poll_interval_secs: 5
