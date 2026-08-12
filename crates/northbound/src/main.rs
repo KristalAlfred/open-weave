@@ -14,7 +14,7 @@ use axum::{
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Guard, Token, require_bearer};
-use weave_core::{API_V1, SrtEndpoint, StreamDefinition, StreamTransport};
+use weave_core::{API_V1, FormatConstraint, SrtEndpoint, StreamDefinition, StreamTransport};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:9080";
 const DEFAULT_CONTROLLER_URL: &str = "http://127.0.0.1:8082";
@@ -150,6 +150,7 @@ fn error(status: StatusCode, message: &str) -> Response {
 /// source may not pin it and its entries must be usable node ids.
 fn validate_endpoint(endpoint: &SrtEndpoint, is_source: bool) -> Result<(), &'static str> {
     validate_via(endpoint, is_source)?;
+    validate_format(endpoint, is_source)?;
     match (&endpoint.node, &endpoint.remote) {
         (Some(_), Some(_)) => Err("endpoint must set either node or remote, not both"),
         (None, None) => Err("endpoint must set either node or remote"),
@@ -180,6 +181,44 @@ fn validate_via(endpoint: &SrtEndpoint, is_source: bool) -> Result<(), &'static 
         return Err("via must not repeat a node");
     }
     Ok(())
+}
+
+/// `format` describes what arrives, so it belongs to the source; `accepts`
+/// describes what an endpoint tolerates, so it belongs to a destination. An
+/// empty accepted list would reject every format, which is never what an
+/// operator means to write, so it is refused rather than left to surface later
+/// as an unexplainable mismatch.
+fn validate_format(endpoint: &SrtEndpoint, is_source: bool) -> Result<(), &'static str> {
+    if is_source && endpoint.accepts.is_some() {
+        return Err("accepts belongs on a destination, not the source");
+    }
+    if !is_source && endpoint.format.is_some() {
+        return Err("format belongs on the source, not a destination");
+    }
+    match &endpoint.accepts {
+        Some(accepts) if has_empty_value_set(accepts) => {
+            Err("accepts must not contain an empty list of values")
+        }
+        _ => Ok(()),
+    }
+}
+
+fn has_empty_value_set(accepts: &FormatConstraint) -> bool {
+    fn empty<T>(values: &Option<Vec<T>>) -> bool {
+        values.as_ref().is_some_and(Vec::is_empty)
+    }
+
+    let video = accepts.video.clone().unwrap_or_default();
+    let audio = accepts.audio.clone().unwrap_or_default();
+
+    empty(&accepts.container)
+        || empty(&video.codec)
+        || empty(&video.width)
+        || empty(&video.height)
+        || empty(&video.framerate)
+        || empty(&audio.codec)
+        || empty(&audio.sample_rate)
+        || empty(&audio.channels)
 }
 
 /// Forward a request to the controller, passing its status and body back
@@ -316,6 +355,8 @@ mod tests {
             node: Some(id.to_string()),
             remote: None,
             via: Vec::new(),
+            format: None,
+            accepts: None,
             network: None,
             latency: None,
         }
@@ -446,6 +487,47 @@ mod tests {
         assert_eq!(
             validate_endpoint(&dest, true),
             Err("via belongs on a destination, not the source")
+        );
+    }
+
+    #[test]
+    fn format_belongs_to_the_source_and_accepts_to_a_destination() {
+        let mut source = node_ref("strom-node-1");
+        source.format = Some(weave_core::MediaFormat {
+            container: weave_core::Container::MpegTs,
+            video: None,
+            audio: None,
+        });
+        assert_eq!(validate_endpoint(&source, true), Ok(()));
+        assert_eq!(
+            validate_endpoint(&source, false),
+            Err("format belongs on the source, not a destination")
+        );
+
+        let mut dest = node_ref("strom-node-2");
+        dest.accepts = Some(FormatConstraint::default());
+        assert_eq!(validate_endpoint(&dest, false), Ok(()));
+        assert_eq!(
+            validate_endpoint(&dest, true),
+            Err("accepts belongs on a destination, not the source")
+        );
+    }
+
+    #[test]
+    fn an_empty_accepted_list_is_rejected() {
+        // `sample_rate: []` accepts nothing at all, so every stream into this
+        // destination would conflict for a reason the operator never intended.
+        let mut dest = node_ref("strom-node-2");
+        dest.accepts = Some(FormatConstraint {
+            audio: Some(weave_core::AudioConstraint {
+                sample_rate: Some(Vec::new()),
+                ..weave_core::AudioConstraint::default()
+            }),
+            ..FormatConstraint::default()
+        });
+        assert_eq!(
+            validate_endpoint(&dest, false),
+            Err("accepts must not contain an empty list of values")
         );
     }
 

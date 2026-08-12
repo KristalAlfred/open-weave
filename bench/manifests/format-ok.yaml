@@ -1,0 +1,30 @@
+# Declared format the destination accepts: no conflict, so the stream reports
+# exactly as it would with nothing declared. The format is what the bench
+# producer actually sends, read off ffprobe rather than assumed — note the audio
+# is mono, which `-i sine=...` gives you unless you ask otherwise.
+name: format-ok
+enabled: true
+source:
+  srt:
+    node: strom-node-1
+    latency: 200
+    format:
+      container: mpeg_ts
+      video:
+        codec: h264
+        width: 1280
+        height: 720
+        framerate: { numerator: 30, denominator: 1 }
+      audio:
+        codec: aac
+        sample_rate: 48000
+        channels: 1
+destinations:
+  - srt:
+      node: strom-node-2
+      latency: 1000
+      accepts:
+        container: [mpeg_ts]
+        audio:
+          codec: [aac]
+          sample_rate: [44100, 48000]

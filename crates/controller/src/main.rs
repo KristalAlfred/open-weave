@@ -663,6 +663,26 @@ fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
 }
 
+/// One line naming every destination that cannot accept the declared source
+/// format, or `None` when the manifest declares nothing to check.
+///
+/// Reported, never acted on. The hops are placed and the media flows either way;
+/// what this says is that it will arrive somewhere it cannot be decoded, which is
+/// worth knowing long before anything can convert it.
+fn format_conflict_reason(stream: &StreamDefinition) -> Option<String> {
+    let conflicts = weave_core::stream_format_conflicts(stream);
+    if conflicts.is_empty() {
+        return None;
+    }
+    Some(
+        conflicts
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
 /// Compute per-node desired hops, endpoints, and an aggregate report from the
 /// current stream and node state. Pure: no IO, deterministic for a given input.
 fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> ReconcileOutcome {
@@ -718,9 +738,16 @@ fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> Re
                         .or_default()
                         .push(hop.clone());
                 }
+                // A lost node outranks a format conflict: the path carries nothing
+                // at all, whereas a conflicted path still delivers — just media
+                // the endpoint cannot use. Both are reported as Degraded, so the
+                // reason is what tells them apart.
                 let (status, reason) = match nodes.iter().find(|id| offline.contains(id.as_str())) {
                     Some(id) => (PathStatus::Degraded, Some(format!("node {id} lost"))),
-                    None => (path_status(&path, &observed.hops), None),
+                    None => match format_conflict_reason(stream) {
+                        Some(reason) => (PathStatus::Degraded, Some(reason)),
+                        None => (path_status(&path, &observed.hops), None),
+                    },
                 };
                 let endpoints = match stream_endpoints(stream, &path, &observed.nodes) {
                     Ok(endpoints) => {
@@ -864,6 +891,8 @@ mod tests {
                 node: Some("strom-node-1".to_string()),
                 remote: None,
                 via: Vec::new(),
+                format: None,
+                accepts: None,
                 network: None,
                 latency: Some(200),
             }),
@@ -871,6 +900,8 @@ mod tests {
                 node: Some("strom-node-2".to_string()),
                 remote: None,
                 via: Vec::new(),
+                format: None,
+                accepts: None,
                 network: None,
                 latency: Some(1000),
             })],

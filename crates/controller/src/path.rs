@@ -743,6 +743,8 @@ mod tests {
             node: Some(id.to_string()),
             remote: None,
             via: Vec::new(),
+            format: None,
+            accepts: None,
             network: None,
             latency: Some(latency),
         }
@@ -756,6 +758,8 @@ mod tests {
                 port: 9000,
             }),
             via: Vec::new(),
+            format: None,
+            accepts: None,
             network: None,
             latency: Some(800),
         }
@@ -1154,6 +1158,8 @@ mod tests {
             node: None,
             remote: None,
             via: Vec::new(),
+            format: None,
+            accepts: None,
             network: None,
             latency: None,
         })];

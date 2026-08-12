@@ -47,6 +47,8 @@ not measured.
 | `nat-egress` | NAT'd node-3 contributes out to node-1 | `awaiting_input` | — | `flowing` |
 | `nat-ingress` | node-1 delivers into NAT'd node-3 (link reverses) | `awaiting_input` | — | `flowing` |
 | `nat-relay` | both ends on NAT'd node-3; bridged via node-1 | `awaiting_input` | — | `flowing` |
+| `format-ok` | declared source format the destination accepts | `awaiting_input` | — | `flowing` |
+| `format-mismatch` | 48 kHz source into a 44.1 kHz-only destination | `degraded` | — | `degraded` |
 
 Notes:
 
@@ -64,6 +66,16 @@ Notes:
   so per-destination health is real.
 - **`disabled`**: listed by northbound but reconciled to `idle`; no hops are
   provisioned.
+- **`format-*`**: the declared format in both is what the bench producer actually
+  sends, read off `ffprobe` against a receiver output rather than assumed — the
+  audio is **mono**, which `-i sine=...` gives you unless told otherwise.
+  `format-mismatch` is degraded from the moment it is applied, before any media
+  exists, with `destination 0 cannot accept the source format: audio.sample_rate
+  is 48000 but accepts 44100`. Driving it changes the reason not at all: every
+  hop reports `flowing` on both sockets, because the bytes do arrive — at an
+  endpoint that cannot use them. Nothing converts anything yet; the diagnosis is
+  the feature.
+
 - **`nat-*`**: node 3 sits behind a real NAT — router-3 masquerades its outbound
   traffic and nothing outside net_node3 is given a route back in. Verified
   directly, not assumed: a TCP connect from the controller and from node 1 to

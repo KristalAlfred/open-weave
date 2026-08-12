@@ -28,3 +28,12 @@ destinations:
   # - srt:
   #     node: strom-node-2
   #     via: [edge-relay]
+  # A destination may declare what it accepts. Each field lists tolerated values
+  # and an absent field constrains nothing, so this cares about sample rate and
+  # nothing else. Pair it with `format` on the source (what the producer sends)
+  # and a mismatch is reported on the stream — it is not converted.
+  # - srt:
+  #     node: strom-node-2
+  #     accepts:
+  #       audio:
+  #         sample_rate: [44100]

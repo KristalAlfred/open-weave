@@ -213,6 +213,59 @@ One consequence worth stating: a consumer output on an `outbound_only` node is
 only dialable from inside that node's network, because that is what the node
 declared about itself.
 
+## Media formats
+
+A source may declare what its producer sends, and a destination what it accepts:
+
+```yaml
+source:
+  srt:
+    node: strom-node-1
+    format:
+      container: mpeg_ts
+      audio: { codec: aac, sample_rate: 48000, channels: 1 }
+destinations:
+  - srt:
+      node: studio-node
+      accepts:
+        audio: { sample_rate: [44100] }
+```
+
+The two shapes are deliberately different. A `format` is fixated — every field
+has one value and it describes media that exists. An `accepts` is partially
+specified — each field lists the values the endpoint tolerates, and an absent
+field constrains nothing, so an empty `accepts` accepts everything.
+
+That split is borrowed from GStreamer caps, and **only the algebra transfers**.
+GStreamer negotiates at runtime, in one process, downstream-first over a shared
+bus; none of that exists across a control plane. What does carry over is caps as
+constraint sets that a concrete format is checked against.
+
+Formats are **declared, not discovered**. An SRT flow that only moves bytes never
+parses its payload, so nothing in the path knows what is inside it — a Strom
+endpoint reporting negotiated pad caps would faithfully report "some bytes".
+Learning the real format means putting a parsing element in the pipeline, which
+is a separate piece of work. Until then an absent `format` means unknown, not
+wrong, and nothing is inferred from it.
+
+When a declared source format does not satisfy a destination's `accepts`, the
+stream places and the media flows — it just arrives somewhere it cannot be
+decoded. That is reported rather than acted on:
+
+```
+degraded — destination 0 cannot accept the source format:
+           audio.sample_rate is 48000 but accepts 44100
+```
+
+The mismatch is known at plan time, so it is reported before any media exists.
+A lost node outranks it: both read `Degraded`, and the reason distinguishes them.
+
+**Nothing converts anything yet.** Placing a resampler needs nodes to advertise
+which transforms they can perform, and a cost model so the planner does not
+silently insert a transcode farm to rescue a mistyped manifest. Naming the
+problem precisely is what comes first, and it is what a conversion planner will
+read when it arrives.
+
 ## Strom adapter and drift policy
 
 Strom is the first media runtime target. `weave-adapter-strom` runs beside one

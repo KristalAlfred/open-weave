@@ -202,6 +202,8 @@ destinations:
                 node: Some("strom-node-1".to_string()),
                 remote: None,
                 via: Vec::new(),
+                format: None,
+                accepts: None,
                 network: None,
                 latency: Some(200),
             })
@@ -213,6 +215,8 @@ destinations:
                 node: Some("strom-node-2".to_string()),
                 remote: None,
                 via: Vec::new(),
+                format: None,
+                accepts: None,
                 network: Some("wan".to_string()),
                 latency: None,
             })

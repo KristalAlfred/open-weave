@@ -1,10 +1,16 @@
 //! Shared domain types for open-weave.
 
 pub mod auth;
+pub mod media;
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+
+pub use media::{
+    AudioCodec, AudioConstraint, AudioFormat, Container, FormatConstraint, Framerate, MediaFormat,
+    Mismatch, VideoCodec, VideoConstraint, VideoFormat,
+};
 
 /// Conventional data-plane alias resolved when a manifest pins no network.
 pub const DEFAULT_DATA_PLANE_ALIAS: &str = "default";
@@ -83,6 +89,17 @@ pub struct SrtEndpoint {
     pub network: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency: Option<u32>,
+    /// What the producer feeding this endpoint sends. Sources only.
+    ///
+    /// Declared, not discovered: an SRT flow that only moves bytes never parses
+    /// its payload, so nothing downstream knows what is inside it. Absent means
+    /// the format is unknown and nothing is checked against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<MediaFormat>,
+    /// What this endpoint will accept. Destinations only. Absent accepts
+    /// anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepts: Option<FormatConstraint>,
 }
 
 /// An external SRT listener a stream dials out to. Placed by no node: the sender
@@ -92,6 +109,37 @@ pub struct SrtEndpoint {
 pub struct RemoteAddr {
     pub host: String,
     pub port: u16,
+}
+
+/// Destinations whose declared `accepts` the stream's source format does not
+/// satisfy, in manifest order.
+///
+/// Empty whenever the source declares no format or no destination declares a
+/// constraint — an undeclared format is unknown, not wrong, so nothing is
+/// inferred from its absence.
+///
+/// This only reports. Nothing here places a conversion: a mismatch is a fact
+/// about the manifest, and saying so is useful well before anything can fix it.
+#[must_use]
+pub fn stream_format_conflicts(stream: &StreamDefinition) -> Vec<media::FormatConflict> {
+    let StreamTransport::Srt(source) = &stream.source;
+    let Some(format) = &source.format else {
+        return Vec::new();
+    };
+
+    stream
+        .destinations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, destination)| {
+            let StreamTransport::Srt(destination) = destination;
+            let mismatches = destination.accepts.as_ref()?.mismatches(format);
+            (!mismatches.is_empty()).then_some(media::FormatConflict {
+                destination: index,
+                mismatches,
+            })
+        })
+        .collect()
 }
 
 /// Prefix marking a hop id (and thus its provisioned flow) as owned by open-weave.
@@ -666,6 +714,8 @@ mod tests {
                 node: Some("strom-node-1".to_string()),
                 remote: None,
                 via: Vec::new(),
+                format: None,
+                accepts: None,
                 network: None,
                 latency: Some(200),
             })
@@ -676,6 +726,8 @@ mod tests {
                 node: Some("strom-node-2".to_string()),
                 remote: None,
                 via: Vec::new(),
+                format: None,
+                accepts: None,
                 network: Some("wan".to_string()),
                 latency: None,
             })
@@ -1091,6 +1143,99 @@ mod tests {
                 end: 20000,
             })
         );
+    }
+
+    fn stream_with_formats(
+        format: Option<MediaFormat>,
+        accepts: Option<FormatConstraint>,
+    ) -> StreamDefinition {
+        let mut source = SrtEndpoint {
+            node: Some("strom-node-1".to_string()),
+            remote: None,
+            via: Vec::new(),
+            network: None,
+            latency: None,
+            format: None,
+            accepts: None,
+        };
+        let mut destination = source.clone();
+        source.format = format;
+        destination.node = Some("strom-node-2".to_string());
+        destination.accepts = accepts;
+
+        StreamDefinition {
+            name: "formats".to_string(),
+            enabled: true,
+            source: StreamTransport::Srt(source),
+            destinations: vec![StreamTransport::Srt(destination)],
+        }
+    }
+
+    fn aac_48k() -> MediaFormat {
+        MediaFormat {
+            container: Container::MpegTs,
+            video: None,
+            audio: Some(AudioFormat {
+                codec: AudioCodec::Aac,
+                sample_rate: 48_000,
+                channels: 2,
+            }),
+        }
+    }
+
+    fn wants_44k() -> FormatConstraint {
+        FormatConstraint {
+            audio: Some(AudioConstraint {
+                sample_rate: Some(vec![44_100]),
+                ..AudioConstraint::default()
+            }),
+            ..FormatConstraint::default()
+        }
+    }
+
+    #[test]
+    fn a_destination_that_cannot_accept_the_source_format_is_reported() {
+        let stream = stream_with_formats(Some(aac_48k()), Some(wants_44k()));
+        let conflicts = stream_format_conflicts(&stream);
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].destination, 0);
+        assert_eq!(
+            conflicts[0].to_string(),
+            "destination 0 cannot accept the source format: \
+             audio.sample_rate is 48000 but accepts 44100"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_format_or_constraint_conflicts_with_nothing() {
+        // Absence means unknown, not wrong: nothing is inferred either way.
+        assert!(stream_format_conflicts(&stream_with_formats(None, Some(wants_44k()))).is_empty());
+        assert!(stream_format_conflicts(&stream_with_formats(Some(aac_48k()), None)).is_empty());
+        assert!(stream_format_conflicts(&stream_with_formats(None, None)).is_empty());
+    }
+
+    #[test]
+    fn only_the_destinations_that_conflict_are_reported() {
+        let mut stream = stream_with_formats(Some(aac_48k()), None);
+        let StreamTransport::Srt(base) = &stream.destinations[0];
+
+        let mut fussy = base.clone();
+        fussy.accepts = Some(wants_44k());
+        let mut relaxed = base.clone();
+        relaxed.accepts = Some(FormatConstraint::default());
+
+        stream.destinations = vec![
+            StreamTransport::Srt(relaxed),
+            StreamTransport::Srt(fussy.clone()),
+            StreamTransport::Srt(fussy),
+        ];
+
+        let offenders: Vec<usize> = stream_format_conflicts(&stream)
+            .iter()
+            .map(|c| c.destination)
+            .collect();
+        assert_eq!(offenders, vec![1, 2], "indices match manifest order");
     }
 
     #[test]
