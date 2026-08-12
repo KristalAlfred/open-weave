@@ -43,6 +43,7 @@ not measured.
 | `unplaceable` | `source.node: strom-node-404` (never registers) | `pending` | `pending` | `pending` |
 | `disabled` | `enabled: false` | `idle` | `idle` | `idle` |
 | `srt-latency` | non-default SRT latency (120ms / 2000ms) | `awaiting_input` | `degraded` | `flowing` |
+| `via` | pinned transit: node-1 → bridge on node-2 → node-1 | `awaiting_input` | — | `flowing` |
 
 Notes:
 
@@ -60,3 +61,11 @@ Notes:
   so per-destination health is real.
 - **`disabled`**: listed by northbound but reconciled to `idle`; no hops are
   provisioned.
+- **`via`**: three hops — `weave-via-sender` on node-1, `weave-via-bridge-0-0`
+  on node-2, `weave-via-receiver-0` back on node-1 — so the media crosses both
+  routers twice. Observed with every hop `flowing` on both sockets. The bridge is
+  an ordinary Strom flow (`srtsrc` listener → `srtsink` caller); relaying needed
+  no adapter change. Both nodes here are dialable, so this covers a `via` pin
+  rather than the NAT case that makes the controller insert a relay by itself —
+  that one needs a node the bench cannot dial, which the topology does not yet
+  have.

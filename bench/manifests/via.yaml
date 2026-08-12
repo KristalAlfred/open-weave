@@ -1,0 +1,14 @@
+# Pinned transit: source on node-1 relayed through node-2 before landing back on
+# node-1. Both node subnets are dialable here, so nothing forces a relay — the
+# `via` pin is honoured on its own, and the media crosses the routers twice.
+name: via
+enabled: true
+source:
+  srt:
+    node: strom-node-1
+    latency: 200
+destinations:
+  - srt:
+      node: strom-node-1
+      via: [strom-node-2]
+      latency: 1000
