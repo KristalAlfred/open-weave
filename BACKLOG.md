@@ -4,28 +4,6 @@ Ordered work items. Each states the evidence, what done looks like, and any
 constraint that is easy to break while fixing it. Items are independent unless
 stated otherwise; take them in order when there is no reason not to.
 
-## 1. Northbound is missing two routes the README documents
-
-`README.md:60` lists the operator contract as `/v1/streams`,
-`/v1/streams/{name}`, `/v1/streams/{name}/endpoints`, and `/v1/status`, served
-by both northbound and the controller. `crates/northbound/src/main.rs:78-88`
-serves only `GET/POST /streams`, `DELETE /streams/{name}`, and `/health`.
-
-Endpoints (`crates/controller/src/main.rs:330`) and status
-(`crates/controller/src/main.rs:345`) exist on the controller alone, and
-`README.md` says the controller port must not be publicly exposed. Any operator
-client that needs a stream's resolved address therefore has nowhere to call.
-
-Open question to settle first: northbound's stream routes sit behind the
-northbound bearer, while `/status` on the controller is unauthenticated because
-the dashboard polls it. Northbound serves no dashboard. Putting both new routes
-behind the bearer is the consistent choice for that surface; it diverges from
-the controller, so `README.md` needs to say which surface authenticates what.
-
-Done when: both routes proxy to the controller the same way the existing
-northbound routes do, the auth decision is applied and written into the README
-table, and the proxy paths have tests.
-
 ## 2. Planning ignores node status, so a dead relay is never replaced
 
 `pick_relay` (`crates/controller/src/path.rs:374`) filters on
@@ -112,5 +90,5 @@ Listed so they are not picked up by accident.
   above.
 - Keep `cargo test --workspace` and `cargo clippy --workspace --all-targets`
   clean; both pass as of this file being written.
-- Items 1 and 3 change contracts. Update `README.md` in the same change rather
+- Item 3 changes a contract. Update `README.md` in the same change rather
   than leaving the documentation to a follow-up.

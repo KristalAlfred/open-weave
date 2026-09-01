@@ -74,17 +74,20 @@ async fn main() -> Result<()> {
 }
 
 /// The operator contract is served under [`API_V1`]; `/health` stays unversioned
-/// and open for compose healthchecks and load balancers. Every stream route
-/// requires the northbound bearer token.
+/// and open for compose healthchecks and load balancers. Every contract route
+/// requires the northbound bearer token, `/status` included — unlike on the
+/// controller, where the embedded dashboard reads the same rollup.
 fn router(state: AppState, guard: Guard) -> Router {
-    let streams = Router::new()
+    let operator = Router::new()
         .route("/streams", get(list_streams).post(submit_stream))
         .route("/streams/{name}", axum::routing::delete(delete_stream))
+        .route("/streams/{name}/endpoints", get(get_endpoints))
+        .route("/status", get(get_status))
         .layer(axum::middleware::from_fn_with_state(guard, require_bearer));
 
     Router::new()
         .route("/health", get(health))
-        .nest(API_V1, streams)
+        .nest(API_V1, operator)
         .with_state(state)
 }
 
@@ -138,6 +141,20 @@ async fn delete_stream(State(state): State<AppState>, Path(name): Path<String>) 
         None,
     )
     .await
+}
+
+async fn get_endpoints(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    proxy(
+        &state,
+        reqwest::Method::GET,
+        &format!("/streams/{name}/endpoints"),
+        None,
+    )
+    .await
+}
+
+async fn get_status(State(state): State<AppState>) -> Response {
+    proxy(&state, reqwest::Method::GET, "/status", None).await
 }
 
 fn error(status: StatusCode, message: &str) -> Response {
@@ -433,6 +450,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn endpoints_forwards_path_and_passes_status_through() {
+        let (url, captured) = stub_controller(StatusCode::SERVICE_UNAVAILABLE).await;
+        let app = open_app(url);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/streams/basic/endpoints")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_json(response).await["ok"], true);
+
+        let seen = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("controller saw a request");
+        assert_eq!(seen.method, "GET");
+        assert_eq!(seen.path, "/v1/streams/basic/endpoints");
+    }
+
+    #[tokio::test]
+    async fn status_forwards_method_and_path() {
+        let (url, captured) = stub_controller(StatusCode::OK).await;
+        let app = open_app(url);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let seen = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("controller saw a request");
+        assert_eq!(seen.method, "GET");
+        assert_eq!(seen.path, "/v1/status");
+    }
+
+    #[tokio::test]
     async fn get_passes_controller_status_through() {
         let (url, _captured) = stub_controller(StatusCode::OK).await;
         let app = open_app(url);
@@ -548,10 +616,11 @@ mod tests {
         );
     }
 
-    /// The paths this service served before the `/v1` prefix are gone, and nothing
-    /// is forwarded on their behalf.
+    /// No operator route answers without the `/v1` prefix — including the paths
+    /// this service served before the prefix existed — and nothing is forwarded on
+    /// their behalf.
     #[tokio::test]
-    async fn unversioned_stream_paths_are_not_served() {
+    async fn unversioned_contract_paths_are_not_served() {
         let (url, captured) = stub_controller(StatusCode::OK).await;
         let app = open_app(url);
 
@@ -559,6 +628,8 @@ mod tests {
             ("GET", "/streams"),
             ("POST", "/streams"),
             ("DELETE", "/streams/basic"),
+            ("GET", "/streams/basic/endpoints"),
+            ("GET", "/status"),
         ] {
             let response = app
                 .clone()
@@ -598,7 +669,7 @@ mod tests {
     /// Missing and wrong tokens are both rejected, on read and write, with a
     /// `Bearer` challenge — and nothing reaches the controller.
     #[tokio::test]
-    async fn stream_routes_reject_missing_and_wrong_tokens() {
+    async fn contract_routes_reject_missing_and_wrong_tokens() {
         for header in [None, Some("Bearer wrong-token"), Some("Basic ignored")] {
             let (url, captured) = stub_controller(StatusCode::ACCEPTED).await;
             let app = guarded_app(url);
@@ -611,6 +682,8 @@ mod tests {
                     Body::from(serde_json::to_vec(&sample_stream()).unwrap()),
                 ),
                 ("DELETE", "/v1/streams/basic", Body::empty()),
+                ("GET", "/v1/streams/basic/endpoints", Body::empty()),
+                ("GET", "/v1/status", Body::empty()),
             ] {
                 let mut request = Request::builder()
                     .method(method)
