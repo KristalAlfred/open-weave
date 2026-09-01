@@ -4,15 +4,6 @@ Ordered work items. Each states the evidence, what done looks like, and any
 constraint that is easy to break while fixing it. Items are independent unless
 stated otherwise; take them in order when there is no reason not to.
 
-## 4. The CLI cannot delete a stream
-
-`Command` (`crates/cli/src/main.rs:39`) offers `apply`, `get streams`, and
-`nodes`. Northbound has `DELETE /streams/{name}`. Removing a stream currently
-needs a hand-rolled HTTP call.
-
-Done when: `weave delete stream <name>` calls the existing route and reports
-what happened.
-
 ## 5. The Quickstart references a recipe that does not exist
 
 `README.md:296` lists `just run-node`. The justfile has no such recipe; the
