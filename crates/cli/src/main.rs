@@ -48,6 +48,11 @@ enum Command {
         #[command(subcommand)]
         resource: GetResource,
     },
+    /// Delete resources through the northbound API.
+    Delete {
+        #[command(subcommand)]
+        resource: DeleteResource,
+    },
     /// List registered nodes.
     Nodes,
 }
@@ -56,6 +61,15 @@ enum Command {
 enum GetResource {
     /// List desired streams.
     Streams,
+}
+
+#[derive(Subcommand)]
+enum DeleteResource {
+    /// Delete a desired stream.
+    Stream {
+        /// Name of the stream to delete.
+        name: String,
+    },
 }
 
 #[tokio::main]
@@ -77,6 +91,9 @@ async fn main() -> Result<()> {
         Command::Apply { file } => apply(&url, token.as_ref(), &file).await,
         Command::Get { resource } => match resource {
             GetResource::Streams => get_streams(&url, token.as_ref()).await,
+        },
+        Command::Delete { resource } => match resource {
+            DeleteResource::Stream { name } => delete_stream(&url, token.as_ref(), &name).await,
         },
         Command::Nodes => nodes(),
     }
@@ -160,6 +177,39 @@ async fn get_streams(url: &str, token: Option<&Token>) -> Result<()> {
     Ok(())
 }
 
+async fn delete_stream(url: &str, token: Option<&Token>, name: &str) -> Result<()> {
+    let response = authorized(
+        reqwest::Client::new().delete(api_url(url, &format!("/streams/{name}"))),
+        token,
+    )
+    .send()
+    .await
+    .context("deleting stream on northbound")?;
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        let detail = if body.trim().is_empty() {
+            String::new()
+        } else {
+            format!(": {body}")
+        };
+        bail!("no stream named {name}{detail}");
+    }
+    if !status.is_success() {
+        let hint = if status == reqwest::StatusCode::UNAUTHORIZED {
+            unauthorized_hint(token)
+        } else {
+            ""
+        };
+        bail!("northbound rejected delete: {status}: {body}{hint}");
+    }
+
+    tracing::info!(%name, %status, "stream deleted");
+    println!("deleted stream {name}");
+    Ok(())
+}
+
 fn nodes() -> Result<()> {
     tracing::info!("nodes: not implemented");
     Ok(())
@@ -174,6 +224,11 @@ fn api_url(base: &str, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{Request, StatusCode};
+    use std::sync::{Arc, Mutex};
     use weave_core::{SrtEndpoint, StreamTransport};
 
     #[test]
@@ -255,5 +310,56 @@ destinations:
         let json = serde_json::to_value(&stream).unwrap();
         assert_eq!(json["source"]["srt"]["node"], "strom-node-1");
         assert_eq!(json["destinations"][0]["srt"]["node"], "strom-node-2");
+    }
+
+    /// A stub northbound on a real socket, recording the request line and
+    /// authorization of the last request and answering with a canned status.
+    async fn stub_northbound(status: StatusCode) -> (String, Arc<Mutex<Option<String>>>) {
+        async fn record(
+            State((seen, status)): State<(Arc<Mutex<Option<String>>>, StatusCode)>,
+            request: Request<Body>,
+        ) -> StatusCode {
+            let authorization = request
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            *seen.lock().unwrap() = Some(format!(
+                "{} {} {authorization}",
+                request.method(),
+                request.uri().path()
+            ));
+            status
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .fallback(record)
+            .with_state((Arc::clone(&seen), status));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    #[tokio::test]
+    async fn delete_calls_the_versioned_route_and_reports_an_unknown_stream() {
+        let token = Token::new("cli-test-token").unwrap();
+
+        let (url, seen) = stub_northbound(StatusCode::NO_CONTENT).await;
+        delete_stream(&url, Some(&token), "cam1-to-studio")
+            .await
+            .expect("204 deletes the stream");
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some("DELETE /v1/streams/cam1-to-studio Bearer cli-test-token")
+        );
+
+        let (url, _seen) = stub_northbound(StatusCode::NOT_FOUND).await;
+        let err = delete_stream(&url, Some(&token), "missing")
+            .await
+            .expect_err("404 is an error");
+        assert!(err.to_string().contains("missing"), "{err}");
     }
 }

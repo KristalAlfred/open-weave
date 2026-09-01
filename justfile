@@ -39,3 +39,6 @@ apply FILE="examples/stream.yaml":
 
 get-streams:
     cargo run -p weave-cli -- get streams
+
+delete-stream NAME:
+    cargo run -p weave-cli -- delete stream {{NAME}}
