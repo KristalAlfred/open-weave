@@ -236,6 +236,12 @@ source:
     node: strom-node-1
     format:
       container: mpeg_ts
+      video:
+        codec: h264
+        width: 1920
+        height: 1080
+        framerate: { numerator: 25, denominator: 1 }
+        chroma_subsampling: yuv422
       audio: { codec: aac, sample_rate: 48000, channels: 1 }
 destinations:
   - srt:
@@ -243,6 +249,9 @@ destinations:
       accepts:
         audio: { sample_rate: [44100] }
 ```
+
+Chroma subsampling is declared because it decides whether a receiving node
+decodes on its GPU or falls back to CPU.
 
 The two shapes are deliberately different. A `format` is fixated — every field
 has one value and it describes media that exists. An `accepts` is partially

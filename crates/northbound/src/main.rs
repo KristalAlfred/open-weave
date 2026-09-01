@@ -233,6 +233,7 @@ fn has_empty_value_set(accepts: &FormatConstraint) -> bool {
         || empty(&video.width)
         || empty(&video.height)
         || empty(&video.framerate)
+        || empty(&video.chroma_subsampling)
         || empty(&audio.codec)
         || empty(&audio.sample_rate)
         || empty(&audio.channels)
