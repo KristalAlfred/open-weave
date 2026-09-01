@@ -15,6 +15,7 @@ source:
         width: 1280
         height: 720
         framerate: { numerator: 30, denominator: 1 }
+        chroma_subsampling: yuv420
       audio:
         codec: aac
         sample_rate: 48000

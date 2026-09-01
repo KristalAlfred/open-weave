@@ -1,18 +1,7 @@
 # Backlog
 
-Ordered work items. Each states the evidence, what done looks like, and any
-constraint that is easy to break while fixing it. Items are independent unless
-stated otherwise; take them in order when there is no reason not to.
-
-## 6. `VideoFormat` cannot express chroma subsampling
-
-`crates/core/src/media.rs:39` carries codec, width, height, and framerate.
-Whether a feed is 4:2:0 or 4:2:2 decides whether a receiving node decodes on the
-GPU or falls back to CPU, which makes it the field most worth checking before a
-feed is placed, and the model cannot say it.
-
-Done when: `VideoFormat` and `VideoConstraint` carry chroma subsampling, the
-mismatch report names it like any other field, and the manifest examples show it.
+No open items. A new item should state the evidence, what done looks like,
+and any constraint that is easy to break while fixing it.
 
 ## Not scheduled
 

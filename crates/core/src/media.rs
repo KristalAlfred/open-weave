@@ -41,6 +41,7 @@ pub struct VideoFormat {
     pub width: u32,
     pub height: u32,
     pub framerate: Framerate,
+    pub chroma_subsampling: ChromaSubsampling,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +51,14 @@ pub enum VideoCodec {
     H265,
     Av1,
     Vp9,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChromaSubsampling {
+    Yuv420,
+    Yuv422,
+    Yuv444,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +129,8 @@ pub struct VideoConstraint {
     pub height: Option<Vec<u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub framerate: Option<Vec<Framerate>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chroma_subsampling: Option<Vec<ChromaSubsampling>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -229,6 +240,12 @@ impl FormatConstraint {
                         video.framerate.as_deref(),
                         &mut out,
                     );
+                    check(
+                        "video.chroma_subsampling",
+                        &actual.chroma_subsampling,
+                        video.chroma_subsampling.as_deref(),
+                        &mut out,
+                    );
                 }
             }
         }
@@ -330,6 +347,7 @@ mod tests {
                 width: 1280,
                 height: 720,
                 framerate: Framerate::new(30, 1),
+                chroma_subsampling: ChromaSubsampling::Yuv420,
             }),
             audio: Some(AudioFormat {
                 codec: AudioCodec::Aac,
@@ -390,6 +408,7 @@ mod tests {
             }),
             video: Some(VideoConstraint {
                 codec: Some(vec![VideoCodec::H265]),
+                chroma_subsampling: Some(vec![ChromaSubsampling::Yuv444]),
                 ..VideoConstraint::default()
             }),
         };
@@ -404,6 +423,7 @@ mod tests {
             vec![
                 "container",
                 "video.codec",
+                "video.chroma_subsampling",
                 "audio.codec",
                 "audio.sample_rate"
             ]
@@ -473,6 +493,24 @@ mod tests {
         let mismatches = constraint.mismatches(&ntsc);
         assert_eq!(mismatches.len(), 1, "29.97 is not 30");
         assert_eq!(mismatches[0].field, "video.framerate");
+    }
+
+    #[test]
+    fn a_rejected_chroma_subsampling_is_reported_like_any_other_field() {
+        let constraint = FormatConstraint {
+            video: Some(VideoConstraint {
+                chroma_subsampling: Some(vec![ChromaSubsampling::Yuv422]),
+                ..VideoConstraint::default()
+            }),
+            ..FormatConstraint::default()
+        };
+
+        let mismatches = constraint.mismatches(&source_format());
+        assert_eq!(mismatches.len(), 1);
+        assert_eq!(
+            mismatches[0].to_string(),
+            "video.chroma_subsampling is yuv420 but accepts yuv422"
+        );
     }
 
     #[test]

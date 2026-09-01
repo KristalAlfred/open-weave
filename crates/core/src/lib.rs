@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 pub use media::{
-    AudioCodec, AudioConstraint, AudioFormat, Container, FormatConstraint, Framerate, MediaFormat,
-    Mismatch, VideoCodec, VideoConstraint, VideoFormat,
+    AudioCodec, AudioConstraint, AudioFormat, ChromaSubsampling, Container, FormatConstraint,
+    Framerate, MediaFormat, Mismatch, VideoCodec, VideoConstraint, VideoFormat,
 };
 
 /// Conventional data-plane alias resolved when a manifest pins no network.
