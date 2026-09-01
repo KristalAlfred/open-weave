@@ -4,14 +4,6 @@ Ordered work items. Each states the evidence, what done looks like, and any
 constraint that is easy to break while fixing it. Items are independent unless
 stated otherwise; take them in order when there is no reason not to.
 
-## 5. The Quickstart references a recipe that does not exist
-
-`README.md:296` lists `just run-node`. The justfile has no such recipe; the
-crate it ran was removed in f904e37.
-
-Done when: the line is gone, and the rest of the Quickstart has been run once to
-confirm it works as written.
-
 ## 6. `VideoFormat` cannot express chroma subsampling
 
 `crates/core/src/media.rs:39` carries codec, width, height, and framerate.
