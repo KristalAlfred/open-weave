@@ -4,17 +4,6 @@ Ordered work items. Each states the evidence, what done looks like, and any
 constraint that is easy to break while fixing it. Items are independent unless
 stated otherwise; take them in order when there is no reason not to.
 
-## 3. The Strom client sends no credentials
-
-`crates/strom/src/client.rs` builds requests with no `Authorization` header; the
-crate contains no token handling at all. A Strom instance behind a bearer token
-or an OSC service token cannot be driven by `weave-adapter-strom`.
-
-Done when: the client can present a bearer token, the adapter takes it from
-config and environment the way `node.southbound_token` already works
-(`crates/core/src/lib.rs:535`), and it is absent by default so an unauthenticated
-local Strom keeps working.
-
 ## 4. The CLI cannot delete a stream
 
 `Command` (`crates/cli/src/main.rs:39`) offers `apply`, `get streams`, and
@@ -68,5 +57,3 @@ Listed so they are not picked up by accident.
   above.
 - Keep `cargo test --workspace` and `cargo clippy --workspace --all-targets`
   clean; both pass as of this file being written.
-- Item 3 changes a contract. Update `README.md` in the same change rather
-  than leaving the documentation to a follow-up.

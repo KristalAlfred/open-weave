@@ -38,5 +38,9 @@ node:
 strom:
   # Base URL of the Strom instance this adapter drives.
   url: http://172.26.0.10:8080
+  # Optional; bearer token presented to Strom, only needed when Strom itself
+  # requires one. Takes precedence over WEAVE_STROM_TOKEN. Nothing is sent when
+  # neither is set.
+  # token: <token>
   # Optional; seconds between Strom observation polls. Defaults to 5.
   poll_interval_secs: 5

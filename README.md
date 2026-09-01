@@ -136,6 +136,12 @@ surface token on the hop to the controller, so one secret covers a surface end t
 end. Nodes may instead carry the token in their config file as
 `node.southbound_token`, which takes precedence over the environment.
 
+The Strom adapter also presents a token that open-weave never accepts, so it
+is not in the table. When Strom requires a bearer token, the adapter presents
+`WEAVE_STROM_TOKEN`, or `strom.token` from its config, which takes precedence.
+With neither set no `Authorization` header is sent, so an unauthenticated Strom
+keeps working.
+
 **Services fail closed.** A service whose token variable is unset or empty
 refuses to start rather than serve unauthenticated traffic. For local development
 set `WEAVE_AUTH_DISABLED=1` to opt out explicitly; only `1` or `true` disable it,
