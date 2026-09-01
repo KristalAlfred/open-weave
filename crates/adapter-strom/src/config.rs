@@ -5,6 +5,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use weave_core::NodeConfig;
+use weave_core::auth::Token;
+
+/// Environment variable holding the bearer token presented to Strom.
+pub const STROM_TOKEN_VAR: &str = "WEAVE_STROM_TOKEN";
 
 /// Strom adapter configuration: a shared node section plus the Strom endpoint.
 #[derive(Debug, Clone, Deserialize)]
@@ -18,12 +22,34 @@ pub struct AdapterConfig {
 #[serde(deny_unknown_fields)]
 pub struct StromSection {
     pub url: String,
+    #[serde(default)]
+    pub token: Option<String>,
     #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,
 }
 
 fn default_poll_interval_secs() -> u64 {
     5
+}
+
+impl StromSection {
+    /// Resolve the bearer token presented to Strom: the config value when set,
+    /// otherwise [`STROM_TOKEN_VAR`] from the environment. `None` presents no
+    /// credential and is not an error — Strom authenticates on its own terms, so
+    /// [`weave_core::auth::AUTH_DISABLED_VAR`] does not apply.
+    #[must_use]
+    pub fn resolve_token(&self) -> Option<Token> {
+        pick_token(
+            self.token.as_deref(),
+            std::env::var(STROM_TOKEN_VAR).ok().as_deref(),
+        )
+    }
+}
+
+fn pick_token(config: Option<&str>, env: Option<&str>) -> Option<Token> {
+    config
+        .and_then(Token::new)
+        .or_else(|| env.and_then(Token::new))
 }
 
 impl AdapterConfig {
@@ -99,6 +125,40 @@ strom:
         );
         let config: AdapterConfig = serde_norway::from_str(&yaml).expect("parse");
         assert_eq!(config.node.southbound_token.as_deref(), Some("from-yaml"));
+    }
+
+    #[test]
+    fn strom_token_is_optional_and_parses_when_present() {
+        let config: AdapterConfig = serde_norway::from_str(VALID).expect("parse");
+        assert_eq!(
+            config.strom.token, None,
+            "an unauthenticated Strom needs no token"
+        );
+
+        let yaml = VALID.replace(
+            "url: http://172.26.0.10:8080",
+            "url: http://172.26.0.10:8080\n  token: from-yaml",
+        );
+        let config: AdapterConfig = serde_norway::from_str(&yaml).expect("parse");
+        assert_eq!(config.strom.token.as_deref(), Some("from-yaml"));
+    }
+
+    /// Precedence without mutating process env, which parallel tests share.
+    /// [`StromSection::resolve_token`] adds only the [`STROM_TOKEN_VAR`] lookup.
+    #[test]
+    fn config_token_wins_over_the_environment() {
+        assert_eq!(
+            pick_token(Some("from-yaml"), Some("from-env")),
+            Token::new("from-yaml")
+        );
+        assert_eq!(pick_token(None, Some("from-env")), Token::new("from-env"));
+        assert_eq!(pick_token(None, None), None);
+        assert_eq!(
+            pick_token(Some("  "), Some("from-env")),
+            Token::new("from-env"),
+            "a blank config value counts as absent"
+        );
+        assert_eq!(pick_token(Some("  "), Some("")), None);
     }
 
     #[test]

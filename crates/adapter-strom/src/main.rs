@@ -61,7 +61,9 @@ async fn main() -> Result<()> {
         );
     }
     let southbound = Southbound::new(config.node.southbound_url.clone(), token);
-    let strom = StromClient::new(&config.strom.url);
+    let strom_token = config.strom.resolve_token();
+    let strom_auth = strom_token.is_some();
+    let strom = StromClient::new(&config.strom.url).with_token(strom_token);
     let health_server = spawn_health_server(config.node.listen.clone());
 
     tracing::info!(
@@ -69,6 +71,7 @@ async fn main() -> Result<()> {
         strom_url = %config.strom.url,
         southbound_url = %config.node.southbound_url,
         poll_interval_secs = config.strom.poll_interval_secs,
+        strom_auth,
         data_plane = ?config.node.data_plane,
         port_range = ?config.node.port_range,
         "Strom adapter starting"
