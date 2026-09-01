@@ -193,9 +193,10 @@ relay is dialable, so the two halves of the split link resolve under the same
 rule as everything else.
 
 A node offers itself as transit with `relay: true`; the controller draws the
-lowest-id eligible relay so the choice stays stable across ticks. A stream that
-needs transit and finds none stays `pending` and reports why, the same as any
-other unplaceable stream.
+lowest-id eligible relay so the choice stays stable across ticks. A node that has
+gone offline is not eligible, so a stream moves to the next relay that is up. A
+stream that needs transit and finds none stays `pending` and reports why, the same
+as any other unplaceable stream.
 
 Destinations may also pin transit themselves, upstream-first:
 
@@ -209,7 +210,9 @@ destinations:
 A pin is policy — forcing traffic through a site or region — so it is honoured
 even when the link would have resolved directly, and it does not consult
 `relay: true`. Pins and automatic insertion compose: if a pinned relay cannot be
-dialled from the hop before it, the controller relays into it as well.
+dialled from the hop before it, the controller relays into it as well. A pinned
+node that goes offline is reported `degraded`, not swapped out: the manifest named
+it, so no other node stands in for it.
 
 A relay carries bytes and terminates nothing. Consumers still attach at the
 destination node, and `GET /v1/streams/{name}/endpoints` is unchanged by transit.
