@@ -4,28 +4,6 @@ Ordered work items. Each states the evidence, what done looks like, and any
 constraint that is easy to break while fixing it. Items are independent unless
 stated otherwise; take them in order when there is no reason not to.
 
-## 2. Planning ignores node status, so a dead relay is never replaced
-
-`pick_relay` (`crates/controller/src/path.rs:374`) filters on
-`capabilities.relay`, on the node not being either endpoint, and on the default
-alias being dialable. `NodeStatus` does not appear anywhere in `path.rs`.
-`reconcile` (`crates/controller/src/main.rs:704`) checks `Offline` only after
-planning, to label the stream `Degraded`.
-
-So when the lowest-id relay goes offline the planner keeps selecting it, and the
-stream stays down even when another eligible relay is registered and healthy.
-This is a bug, not a limitation of the model: the status is already on
-`NodeDescriptor` and already reaches `derive_path`.
-
-Two things to preserve. The comment at `path.rs:371` says sorting by id keeps the
-choice stable so a stream does not migrate between equally eligible relays —
-that property should still hold among online nodes. And the filter belongs only
-in relay selection: source and destination nodes are named in the manifest and
-cannot be substituted, so an offline endpoint stays a `Degraded` report.
-
-Done when: an offline node is excluded from relay selection, a test covers
-failover to a second relay, and a test covers the existing stability property.
-
 ## 3. The Strom client sends no credentials
 
 `crates/strom/src/client.rs` builds requests with no `Authorization` header; the

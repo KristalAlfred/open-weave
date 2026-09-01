@@ -883,6 +883,24 @@ mod tests {
         }
     }
 
+    fn nat_registration(id: &str, host: &str) -> NodeRegistration {
+        let mut registration = node_registration(id, host);
+        registration.node.capabilities.data_plane.insert(
+            weave_core::DEFAULT_DATA_PLANE_ALIAS.to_string(),
+            weave_core::DataPlaneAddr {
+                host: host.to_string(),
+                reachability: weave_core::Reachability::OutboundOnly,
+            },
+        );
+        registration
+    }
+
+    fn relay_registration(id: &str, host: &str) -> NodeRegistration {
+        let mut registration = node_registration(id, host);
+        registration.node.capabilities.relay = true;
+        registration
+    }
+
     fn stream(name: &str) -> StreamDefinition {
         StreamDefinition {
             name: name.to_string(),
@@ -1283,6 +1301,38 @@ mod tests {
             !outcome.desired_by_node["strom-node-1"].is_empty(),
             "desired hops for the offline node are still computed"
         );
+    }
+
+    #[test]
+    fn reconcile_replans_a_stream_off_an_offline_relay() {
+        let mut nodes = BTreeMap::from([
+            (
+                "strom-node-1".to_string(),
+                nat_registration("strom-node-1", "172.26.0.10"),
+            ),
+            (
+                "strom-node-2".to_string(),
+                nat_registration("strom-node-2", "172.27.0.10"),
+            ),
+            (
+                "relay-a".to_string(),
+                relay_registration("relay-a", "198.51.100.10"),
+            ),
+            (
+                "relay-b".to_string(),
+                relay_registration("relay-b", "198.51.100.20"),
+            ),
+        ]);
+        nodes.get_mut("relay-a").unwrap().node.status = NodeStatus::Offline;
+        let observed = observed_state(&nodes);
+
+        let outcome = reconcile(vec![stream("basic")], &observed);
+
+        let basic = outcome.streams.iter().find(|s| s.name == "basic").unwrap();
+        assert!(basic.nodes.contains(&"relay-b".to_string()));
+        assert!(!basic.nodes.contains(&"relay-a".to_string()));
+        assert_ne!(basic.status, PathStatus::Degraded);
+        assert_eq!(basic.reason, None);
     }
 
     #[tokio::test]

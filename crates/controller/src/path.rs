@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 use weave_core::{
     DEFAULT_DATA_PLANE_ALIAS, DataPlaneAddr, DesiredHop, HOP_ID_PREFIX, HopConditions, HopRole,
-    HopStatus, NodeDescriptor, Path, PathStatus, PortRange, RemoteAddr, SocketRole, SocketSpec,
-    SrtEndpoint, SrtParams, StreamDefinition, StreamTransport, Transport, roll_up_path,
+    HopStatus, NodeDescriptor, NodeStatus, Path, PathStatus, PortRange, RemoteAddr, SocketRole,
+    SocketSpec, SrtEndpoint, SrtParams, StreamDefinition, StreamTransport, Transport, roll_up_path,
 };
 
 const DEFAULT_SRC_LATENCY: u32 = 200;
@@ -368,9 +368,9 @@ fn link_dialable(
     Ok(station_addr(upstream, nodes)?.is_dialable())
 }
 
-/// The lowest-id relay node both ends of an undialable link can call. Sorting
-/// keeps the choice stable across ticks, so a stream does not migrate between
-/// equally eligible relays.
+/// The lowest-id online relay node both ends of an undialable link can call.
+/// Sorting keeps the choice stable across ticks, so a stream does not migrate
+/// between equally eligible relays.
 fn pick_relay(
     nodes: &[NodeDescriptor],
     upstream: &Station,
@@ -379,6 +379,7 @@ fn pick_relay(
     nodes
         .iter()
         .filter(|node| node.capabilities.relay)
+        .filter(|node| node.status != NodeStatus::Offline)
         .filter(|node| node.id != upstream.node_id && node.id != downstream.node_id)
         .filter(|node| {
             node.capabilities
@@ -1381,6 +1382,64 @@ mod tests {
         let second = derive(&contribution(), &nodes).expect("derive");
         assert_eq!(first.hops[1].node_id, "relay-a");
         assert_eq!(first, second, "re-derivation is stable");
+    }
+
+    #[test]
+    fn an_offline_relay_is_passed_over_for_a_healthy_one() {
+        let mut lost = relay_node("relay-a", "198.51.100.10");
+        lost.status = NodeStatus::Offline;
+        let nodes = vec![
+            nat_node("strom-node-1", "172.26.0.10"),
+            nat_node("strom-node-2", "172.27.0.10"),
+            lost,
+            relay_node("relay-b", "198.51.100.20"),
+        ];
+
+        let path = derive(&contribution(), &nodes).expect("derive");
+        assert_eq!(path.hops.len(), 3, "sender, bridge, receiver");
+        assert_eq!(path.hops[1].node_id, "relay-b");
+        assert_eq!(
+            path.hops[0].egresses[0].host.as_deref(),
+            Some("198.51.100.20"),
+            "the source calls the relay that is up"
+        );
+    }
+
+    #[test]
+    fn relay_choice_is_the_lowest_online_id_and_stable_across_ticks() {
+        let mut lost = relay_node("relay-a", "198.51.100.10");
+        lost.status = NodeStatus::Offline;
+        let nodes = vec![
+            nat_node("strom-node-1", "172.26.0.10"),
+            nat_node("strom-node-2", "172.27.0.10"),
+            relay_node("relay-c", "198.51.100.30"),
+            lost,
+            relay_node("relay-b", "198.51.100.20"),
+        ];
+
+        let first = derive(&contribution(), &nodes).expect("derive");
+        let second = derive(&contribution(), &nodes).expect("derive");
+        assert_eq!(first.hops[1].node_id, "relay-b");
+        assert_eq!(first, second, "re-derivation is stable");
+    }
+
+    #[test]
+    fn an_offline_relay_alone_leaves_the_pair_unplaceable() {
+        let mut lost = relay_node("edge-relay", "198.51.100.9");
+        lost.status = NodeStatus::Offline;
+        let nodes = vec![
+            nat_node("strom-node-1", "172.26.0.10"),
+            nat_node("strom-node-2", "172.27.0.10"),
+            lost,
+        ];
+
+        assert_eq!(
+            derive(&contribution(), &nodes),
+            Err(PlacementError::NoRelayAvailable {
+                upstream: "strom-node-1".to_string(),
+                downstream: "strom-node-2".to_string(),
+            })
+        );
     }
 
     #[test]
