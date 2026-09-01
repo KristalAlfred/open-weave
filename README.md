@@ -305,10 +305,19 @@ just build
 just run-north           # 127.0.0.1:9080
 just run-south           # 127.0.0.1:8081
 just run-controller      # 127.0.0.1:8082 health endpoint
-just run-strom-adapter   # registers Strom via southbound http://127.0.0.1:8081
-just run-node            # future first-party edge node stub
-just cli -- --help
+just run-strom-adapter --config examples/node.yaml
+just cli --help
+just apply               # examples/stream.yaml through northbound
+just get-streams
 ```
+
+The adapter needs a node config, from `--config` or `WEAVE_NODE_CONFIG`; it will
+not start without one. `examples/node.yaml` names the bench's southbound and
+Strom addresses, so point them at your own before running it anywhere else —
+until they answer, the adapter serves `/health` and keeps retrying.
+
+`just apply` and `just get-streams` call northbound, so it has to be up. The
+applied stream stays `Pending` until the nodes it names register.
 
 The CLI picks `WEAVE_NORTHBOUND_TOKEN` up from the environment; `--token`
 overrides it.
