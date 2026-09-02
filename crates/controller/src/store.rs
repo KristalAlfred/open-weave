@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use weave_core::{NodeRegistration, StreamDefinition};
+use weave_core::{NodeRegistration, StreamDefinition, protocol_compatible};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -26,6 +26,39 @@ pub trait StateStore: Send + Sync {
     async fn delete_stream(&self, name: &str) -> Result<(), StoreError>;
     async fn load_nodes(&self) -> Result<Vec<NodeRegistration>, StoreError>;
     async fn upsert_node(&self, registration: &NodeRegistration) -> Result<(), StoreError>;
+}
+
+/// Decode stored registrations, dropping any a running node will send again.
+///
+/// A registration is a cache of what a node reported: every node implementation
+/// re-registers when a heartbeat is answered `404`, so a row this build cannot
+/// read, or one hydrating a protocol version this build no longer serves,
+/// costs one heartbeat interval. A stream definition has no such second copy,
+/// which is why [`PgStore::load_streams`] still fails the boot.
+fn decode_registrations(rows: Vec<(String, serde_json::Value)>) -> Vec<NodeRegistration> {
+    rows.into_iter()
+        .filter_map(
+            |(id, value)| match serde_json::from_value::<NodeRegistration>(value) {
+                Ok(registration) if !protocol_compatible(registration.protocol_version) => {
+                    tracing::warn!(
+                        node_id = %id,
+                        protocol_version = registration.protocol_version,
+                        "dropping a stored registration speaking a protocol version this build no longer serves; the node re-registers on its next heartbeat"
+                    );
+                    None
+                }
+                Ok(registration) => Some(registration),
+                Err(error) => {
+                    tracing::warn!(
+                        node_id = %id,
+                        %error,
+                        "dropping a stored registration this build cannot read; the node re-registers on its next heartbeat"
+                    );
+                    None
+                }
+            },
+        )
+        .collect()
 }
 
 /// Postgres-backed store. Two JSONB tables, created idempotently on connect.
@@ -125,17 +158,22 @@ impl StateStore for PgStore {
 
     async fn load_nodes(&self) -> Result<Vec<NodeRegistration>, StoreError> {
         use sqlx::Row;
-        let rows = sqlx::query("SELECT registration FROM nodes")
+        let rows = sqlx::query("SELECT id, registration FROM nodes")
             .fetch_all(&self.pool)
             .await
             .map_err(StoreError::Query)?;
-        rows.into_iter()
+        let rows = rows
+            .into_iter()
             .map(|row| {
-                row.try_get::<sqlx::types::Json<NodeRegistration>, _>("registration")
-                    .map(|json| json.0)
-                    .map_err(StoreError::Decode)
+                Ok((
+                    row.try_get::<String, _>("id").map_err(StoreError::Decode)?,
+                    row.try_get::<sqlx::types::Json<serde_json::Value>, _>("registration")
+                        .map_err(StoreError::Decode)?
+                        .0,
+                ))
             })
-            .collect()
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        Ok(decode_registrations(rows))
     }
 
     async fn upsert_node(&self, registration: &NodeRegistration) -> Result<(), StoreError> {
@@ -284,6 +322,88 @@ mod tests {
             endpoints: Vec::new(),
             hop_status: Vec::new(),
         }
+    }
+
+    /// Rows written before node capabilities changed shape, taken from a bench
+    /// Postgres: node 1 carries the retired `webrtc_base_url`, the page carries
+    /// `device` as a transport. Both were fatal at boot.
+    #[test]
+    fn stored_registrations_this_build_cannot_read_are_dropped() {
+        let old_strom = serde_json::json!({
+            "protocol_version": 1,
+            "node": {
+                "id": "strom-node-1",
+                "endpoint": "http://172.26.0.11:8091",
+                "status": "ready",
+                "capabilities": {
+                    "data_plane": {"default": {
+                        "host": "172.26.0.10",
+                        "reachability": "dialable",
+                        "webrtc_base_url": "http://172.26.0.10:8080"
+                    }}
+                }
+            }
+        });
+        let old_page = serde_json::json!({
+            "protocol_version": 1,
+            "node": {
+                "id": "browser-8dc516f4",
+                "endpoint": "browser://browser-8dc516f4",
+                "status": "ready",
+                "capabilities": {
+                    "transports": [{"name": "device", "roles": ["listen", "connect"]}]
+                }
+            }
+        });
+        let current = serde_json::to_value(registration("strom-node-2")).unwrap();
+
+        let loaded = decode_registrations(vec![
+            ("strom-node-1".to_string(), old_strom),
+            ("browser-8dc516f4".to_string(), old_page),
+            ("strom-node-2".to_string(), current),
+        ]);
+
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|r| r.node.id.as_str())
+                .collect::<Vec<_>>(),
+            ["strom-node-2"],
+            "the readable row survives and the boot continues"
+        );
+    }
+
+    /// A row shaped exactly as a v1 adapter wrote it: it deserializes cleanly,
+    /// so only the protocol-version check drops it. Left hydrated, its
+    /// heartbeats are answered `202` instead of `404` and it never re-registers.
+    #[test]
+    fn stored_registrations_from_a_retired_protocol_version_are_dropped() {
+        let v1_but_readable = serde_json::json!({
+            "protocol_version": 1,
+            "node": {
+                "id": "strom-node-1",
+                "endpoint": "http://172.26.0.11:8091",
+                "status": "ready",
+                "capabilities": {
+                    "transports": [{"name": "srt"}]
+                }
+            }
+        });
+        let current = serde_json::to_value(registration("strom-node-2")).unwrap();
+
+        let loaded = decode_registrations(vec![
+            ("strom-node-1".to_string(), v1_but_readable),
+            ("strom-node-2".to_string(), current),
+        ]);
+
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|r| r.node.id.as_str())
+                .collect::<Vec<_>>(),
+            ["strom-node-2"],
+            "the v1 row is dropped even though this build can still parse its shape"
+        );
     }
 
     #[tokio::test]

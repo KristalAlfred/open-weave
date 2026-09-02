@@ -112,13 +112,11 @@ async fn submit_stream(
             "stream must have at least one destination",
         );
     }
-    let StreamTransport::Srt(source) = &stream.source;
-    if let Err(message) = validate_endpoint(source, true) {
+    if let Err(message) = validate_transport(&stream.source, true) {
         return error(StatusCode::BAD_REQUEST, message);
     }
     for dest in &stream.destinations {
-        let StreamTransport::Srt(dest) = dest;
-        if let Err(message) = validate_endpoint(dest, false) {
+        if let Err(message) = validate_transport(dest, false) {
             return error(StatusCode::BAD_REQUEST, message);
         }
     }
@@ -159,6 +157,18 @@ async fn get_status(State(state): State<AppState>) -> Response {
 
 fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
+}
+
+/// A `device` endpoint is a node and nothing else, so its only invariant is a
+/// usable node id; the fields an SRT endpoint carries are rejected by serde.
+fn validate_transport(endpoint: &StreamTransport, is_source: bool) -> Result<(), &'static str> {
+    match endpoint {
+        StreamTransport::Srt(endpoint) => validate_endpoint(endpoint, is_source),
+        StreamTransport::Device(endpoint) if endpoint.node.trim().is_empty() => {
+            Err("device node must not be empty")
+        }
+        StreamTransport::Device(_) => Ok(()),
+    }
 }
 
 /// Enforce node-XOR-remote on an endpoint: exactly one of `node`/`remote` must be
@@ -395,6 +405,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn device_endpoints_are_accepted_and_forwarded() {
+        let (url, captured) = stub_controller(StatusCode::ACCEPTED).await;
+        let app = open_app(url);
+
+        let payload = json!({
+            "name": "alice-cam",
+            "source": { "device": { "node": "browser-a1b2" } },
+            "destinations": [ { "srt": { "node": "strom-node-2" } } ]
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/streams")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let seen = captured.lock().unwrap().clone().expect("forwarded");
+        let forwarded: Value = serde_json::from_slice(&seen.body).unwrap();
+        assert_eq!(forwarded["source"]["device"]["node"], "browser-a1b2");
+    }
+
+    #[tokio::test]
+    async fn device_endpoint_with_an_empty_node_is_rejected() {
+        let (url, captured) = stub_controller(StatusCode::ACCEPTED).await;
+        let app = open_app(url);
+
+        let payload = json!({
+            "name": "alice-return",
+            "source": { "srt": { "node": "strom-node-2" } },
+            "destinations": [ { "device": { "node": "  " } } ]
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/streams")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await["error"],
+            "device node must not be empty"
+        );
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "rejected at the boundary"
+        );
+    }
+
+    #[tokio::test]
     async fn post_forwards_body_and_passes_status_through() {
         let (url, captured) = stub_controller(StatusCode::ACCEPTED).await;
         let app = open_app(url);
@@ -524,7 +594,9 @@ mod tests {
         let app = open_app(url);
 
         let mut stream = sample_stream();
-        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0] else {
+            unreachable!("fixture endpoint is srt");
+        };
         dest.remote = Some(RemoteAddr {
             host: "198.51.100.5".to_string(),
             port: 9000,

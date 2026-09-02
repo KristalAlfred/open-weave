@@ -15,10 +15,9 @@ use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Token};
 use weave_core::{
-    API_V1, AdapterDescriptor, AdapterKind, DEFAULT_DATA_PLANE_ALIAS, DesiredHop,
+    API_V1, AdapterDescriptor, AdapterKind, DEFAULT_DATA_PLANE_ALIAS, DesiredHop, DeviceSet,
     EndpointDescriptor, EndpointKind, HopStatus, LinkCondition, LinkStats, NodeCapabilities,
     NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus, PROTOCOL_VERSION,
-    TransportDescriptor,
 };
 use weave_strom::{
     FlowSpec, FlowStats, StromClient, StromError, StromFlow, flow_spec_from_hop, parse_flow_stats,
@@ -27,6 +26,7 @@ use weave_strom::{
 use config::AdapterConfig;
 use provision::{
     IngressObservation, StallTracker, diff_hops, hop_state, resolved_addr, socket_condition,
+    srt_role,
 };
 
 #[derive(Debug, Parser)]
@@ -392,15 +392,14 @@ async fn hop_statuses(
             id: hop.id.clone(),
             node_id: hop.node_id.clone(),
             state: hop_state(flow, failed.contains(&hop.id)),
-            ingress: socket_condition(
-                hop.ingress.role,
-                ingress_connected,
-                ingress_rate,
-                ingress_stalled,
-            ),
-            egress: egress.map_or(LinkCondition::Idle, |e| {
-                socket_condition(e.role, egress_connected, egress_rate, false)
+            ingress: srt_role(&hop.ingress).map_or(LinkCondition::Idle, |role| {
+                socket_condition(role, ingress_connected, ingress_rate, ingress_stalled)
             }),
+            egress: egress
+                .and_then(srt_role)
+                .map_or(LinkCondition::Idle, |role| {
+                    socket_condition(role, egress_connected, egress_rate, false)
+                }),
             resolved_ingress: resolved_addr(&hop.ingress, data_plane_host),
             resolved_egress: egress.and_then(|e| resolved_addr(e, data_plane_host)),
             stats: stats.map(LinkStats::from),
@@ -454,12 +453,8 @@ fn registration(
                     name: "strom".to_string(),
                     kind: AdapterKind::Strom,
                 }],
-                transports: config
-                    .node
-                    .transports
-                    .iter()
-                    .map(|name| TransportDescriptor { name: name.clone() })
-                    .collect(),
+                transports: config.node.transports.clone(),
+                devices: DeviceSet::default(),
                 data_plane: config.node.data_plane.clone(),
                 port_range: Some(config.node.port_range),
                 relay: config.node.relay,
@@ -548,10 +543,7 @@ fn strom_endpoints(node_id: &str, flows: &[StromFlow]) -> Vec<EndpointDescriptor
             label: flow.name.clone(),
             node_id: Some(node_id.to_string()),
             kind: EndpointKind::Flow,
-            transports: flow_transports(flow)
-                .into_iter()
-                .map(|name| TransportDescriptor { name })
-                .collect(),
+            transports: flow_transports(flow),
             metadata: json!({
                 "source": "strom",
                 "strom_flow_id": flow.id,
@@ -636,7 +628,7 @@ async fn health() -> Json<Value> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    use weave_core::{HopRole, SocketRole, SocketSpec, SrtParams, Transport};
+    use weave_core::{HopRole, SocketSpec};
 
     #[derive(Debug, Clone, PartialEq)]
     enum Op {
@@ -705,20 +697,8 @@ mod tests {
             id: id.to_string(),
             node_id: "strom-node-1".to_string(),
             role: HopRole::Sender,
-            ingress: SocketSpec {
-                transport: Transport::Srt,
-                role: SocketRole::Listen,
-                host: None,
-                port: Some(port),
-                params: SrtParams::default(),
-            },
-            egresses: vec![SocketSpec {
-                transport: Transport::Srt,
-                role: SocketRole::Connect,
-                host: Some("10.0.0.2".to_string()),
-                port: Some(port + 1),
-                params: SrtParams::default(),
-            }],
+            ingress: SocketSpec::srt_listen(port, 200),
+            egresses: vec![SocketSpec::srt_connect("10.0.0.2", port + 1, 1000)],
         }
     }
 

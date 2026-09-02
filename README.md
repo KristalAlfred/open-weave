@@ -93,7 +93,7 @@ notice a stale adapter. So `POST /v1/nodes/register` also carries a
 `protocol_version` field, which adapters set from `weave_core::PROTOCOL_VERSION`:
 
 ```json
-{ "protocol_version": 1, "node": { "id": "strom-node-1", "...": "..." } }
+{ "protocol_version": 2, "node": { "id": "strom-node-1", "...": "..." } }
 ```
 
 The controller accepts only the version it speaks. Anything else — including an
@@ -105,8 +105,8 @@ naming the node id:
 {
   "error": "incompatible southbound protocol version",
   "node_id": "strom-node-1",
-  "reported_protocol_version": 2,
-  "supported_protocol_version": 1
+  "reported_protocol_version": 1,
+  "supported_protocol_version": 2
 }
 ```
 
@@ -114,8 +114,10 @@ Nothing about a rejected node is recorded: a registration the controller cannot
 serve correctly is worse than none. `weave-adapter-strom` treats the `409` as
 fatal and exits — retrying never converges — so a version mismatch surfaces as a
 stopped container with a clear reason instead of a node that looks alive.
-`PROTOCOL_VERSION` and `API_V1` move together: a breaking southbound change bumps
-both.
+`API_V1` moves when the routes change; `PROTOCOL_VERSION` moves when the payloads
+behind them do. It is `2`: node capabilities changed shape when WebRTC transports
+arrived, so an adapter built against `1` is refused rather than served hops whose
+sockets it cannot read.
 
 ## Authentication
 

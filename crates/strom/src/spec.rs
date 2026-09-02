@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use weave_core::{DesiredHop, SocketRole, SocketSpec, Transport};
+use weave_core::{DesiredHop, SocketSpec, SrtSocket};
 
 const PLACEHOLDER_ID: &str = "00000000-0000-0000-0000-000000000000";
 const DEFAULT_SRC_LATENCY: u32 = 200;
@@ -32,10 +32,10 @@ pub struct Link {
 
 #[derive(Debug, thiserror::Error)]
 pub enum MappingError {
-    #[error("incomplete socket spec: missing {0}")]
-    IncompleteSocket(&'static str),
     #[error("hop has no egress socket")]
     NoEgress,
+    #[error("no Strom flow shape carries a {0} socket")]
+    UnsupportedSocket(String),
 }
 
 /// Map a desired hop to a Strom flow.
@@ -44,12 +44,12 @@ pub enum MappingError {
 /// yield a fan-out srtsrc→tee→N×(queue→srtsink). The flow name is the hop id, so
 /// flows are adopted by name.
 pub fn flow_spec_from_hop(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
-    let src_props = src_props(&hop.ingress)?;
+    let src_props = src_props(srt_socket(&hop.ingress)?);
 
     let sinks = hop
         .egresses
         .iter()
-        .map(sink_props)
+        .map(|egress| srt_socket(egress).map(sink_props))
         .collect::<Result<Vec<_>, _>>()?;
 
     match sinks.len() {
@@ -63,30 +63,39 @@ pub fn flow_spec_from_hop(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
     }
 }
 
-fn src_props(spec: &SocketSpec) -> Result<Map<String, Value>, MappingError> {
+/// The SRT socket a Strom flow is built from. No flow shape carries a WebRTC
+/// or device socket yet.
+fn srt_socket(spec: &SocketSpec) -> Result<&SrtSocket, MappingError> {
+    match spec {
+        SocketSpec::Srt(socket) => Ok(socket),
+        other => Err(MappingError::UnsupportedSocket(other.to_string())),
+    }
+}
+
+fn src_props(socket: &SrtSocket) -> Map<String, Value> {
     let mut props = Map::new();
-    props.insert("uri".to_string(), Value::String(socket_uri(spec)?));
+    props.insert("uri".to_string(), Value::String(socket_uri(socket)));
     props.insert(
         "latency".to_string(),
-        Value::from(spec.params.latency.unwrap_or(DEFAULT_SRC_LATENCY)),
+        Value::from(socket.params().latency.unwrap_or(DEFAULT_SRC_LATENCY)),
     );
     // A listener srtsrc otherwise EOSes and never re-binds once its peer
     // disconnects or an idle socket errors; keep-listening reuses the socket.
-    if matches!(spec.role, SocketRole::Listen) {
+    if matches!(socket, SrtSocket::Listen { .. }) {
         props.insert("keep-listening".to_string(), Value::Bool(true));
     }
-    Ok(props)
+    props
 }
 
-fn sink_props(spec: &SocketSpec) -> Result<Map<String, Value>, MappingError> {
+fn sink_props(socket: &SrtSocket) -> Map<String, Value> {
     let mut props = Map::new();
-    props.insert("uri".to_string(), Value::String(socket_uri(spec)?));
+    props.insert("uri".to_string(), Value::String(socket_uri(socket)));
     props.insert(
         "latency".to_string(),
-        Value::from(spec.params.latency.unwrap_or(DEFAULT_SINK_LATENCY)),
+        Value::from(socket.params().latency.unwrap_or(DEFAULT_SINK_LATENCY)),
     );
     props.insert("wait-for-connection".to_string(), Value::Bool(false));
-    Ok(props)
+    props
 }
 
 /// Parse `(host, port)` from an `srt://host:port?...` URI. A listener URI
@@ -99,19 +108,11 @@ pub fn parse_srt_endpoint(uri: &str) -> Option<(String, u16)> {
     Some((host.to_string(), port.parse().ok()?))
 }
 
-fn socket_uri(spec: &SocketSpec) -> Result<String, MappingError> {
-    let Transport::Srt = spec.transport;
-    let port = spec.port.ok_or(MappingError::IncompleteSocket("port"))?;
-    Ok(match spec.role {
-        SocketRole::Listen => format!("srt://:{port}?mode=listener"),
-        SocketRole::Connect => {
-            let host = spec
-                .host
-                .as_deref()
-                .ok_or(MappingError::IncompleteSocket("host"))?;
-            format!("srt://{host}:{port}?mode=caller")
-        }
-    })
+fn socket_uri(socket: &SrtSocket) -> String {
+    match socket {
+        SrtSocket::Listen { port, .. } => format!("srt://:{port}?mode=listener"),
+        SrtSocket::Connect { host, port, .. } => format!("srt://{host}:{port}?mode=caller"),
+    }
 }
 
 fn linear_srt_flow(
@@ -218,29 +219,15 @@ fn tee_srt_flow(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weave_core::{HopRole, SrtParams};
+    use weave_core::{DeviceKind, HopRole, SignallingTransport, SocketRole, SrtParams};
 
     fn demo_ingress_hop(id: &str) -> DesiredHop {
         DesiredHop {
             id: id.to_string(),
             node_id: "strom-node-1".to_string(),
             role: HopRole::Sender,
-            ingress: SocketSpec {
-                transport: Transport::Srt,
-                role: SocketRole::Listen,
-                host: None,
-                port: Some(7001),
-                params: SrtParams { latency: Some(200) },
-            },
-            egresses: vec![SocketSpec {
-                transport: Transport::Srt,
-                role: SocketRole::Connect,
-                host: Some("172.31.0.10".to_string()),
-                port: Some(7002),
-                params: SrtParams {
-                    latency: Some(1000),
-                },
-            }],
+            ingress: SocketSpec::srt_listen(7001, 200),
+            egresses: vec![SocketSpec::srt_connect("172.31.0.10", 7002, 1000)],
         }
     }
 
@@ -249,22 +236,8 @@ mod tests {
             id: id.to_string(),
             node_id: "strom-node-2".to_string(),
             role: HopRole::Receiver,
-            ingress: SocketSpec {
-                transport: Transport::Srt,
-                role: SocketRole::Listen,
-                host: None,
-                port: Some(7002),
-                params: SrtParams {
-                    latency: Some(1000),
-                },
-            },
-            egresses: vec![SocketSpec {
-                transport: Transport::Srt,
-                role: SocketRole::Listen,
-                host: None,
-                port: Some(7003),
-                params: SrtParams { latency: Some(200) },
-            }],
+            ingress: SocketSpec::srt_listen(7002, 1000),
+            egresses: vec![SocketSpec::srt_listen(7003, 200)],
         }
     }
 
@@ -292,9 +265,8 @@ mod tests {
 
     fn demo_tee_hop(id: &str) -> DesiredHop {
         let mut hop = demo_ingress_hop(id);
-        let mut second = hop.egresses[0].clone();
-        second.host = Some("172.31.0.20".to_string());
-        hop.egresses.push(second);
+        hop.egresses
+            .push(SocketSpec::srt_connect("172.31.0.20", 7002, 1000));
         hop
     }
 
@@ -320,23 +292,27 @@ mod tests {
     }
 
     #[test]
-    fn connect_socket_without_host_is_an_error() {
-        let mut hop = demo_ingress_hop("x");
-        hop.egresses[0].host = None;
-        assert!(matches!(
-            flow_spec_from_hop(&hop),
-            Err(MappingError::IncompleteSocket("host"))
-        ));
-    }
+    fn a_socket_no_flow_shape_carries_is_an_error() {
+        let mut webrtc = demo_ingress_hop("x");
+        webrtc.ingress = SocketSpec::signalling(
+            SignallingTransport::Whip,
+            SocketRole::Listen,
+            "http://172.26.0.10:8080/whip",
+            "x",
+        );
+        let error = flow_spec_from_hop(&webrtc).expect_err("whip has no flow shape");
+        assert_eq!(
+            error.to_string(),
+            "no Strom flow shape carries a whip socket"
+        );
 
-    #[test]
-    fn socket_without_port_is_an_error() {
-        let mut hop = demo_ingress_hop("x");
-        hop.ingress.port = None;
-        assert!(matches!(
-            flow_spec_from_hop(&hop),
-            Err(MappingError::IncompleteSocket("port"))
-        ));
+        let mut device = demo_ingress_hop("x");
+        device.ingress = SocketSpec::Device(DeviceKind::Capture);
+        let error = flow_spec_from_hop(&device).expect_err("a device has no flow shape");
+        assert_eq!(
+            error.to_string(),
+            "no Strom flow shape carries a capture device socket"
+        );
     }
 
     #[test]
@@ -348,8 +324,7 @@ mod tests {
         );
 
         let mut caller = demo_ingress_hop("x");
-        caller.ingress.role = SocketRole::Connect;
-        caller.ingress.host = Some("172.31.0.99".to_string());
+        caller.ingress = SocketSpec::srt_connect("172.31.0.99", 7001, 200);
         let caller = flow_spec_from_hop(&caller).expect("map");
         assert!(!caller.elements[0].properties.contains_key("keep-listening"));
     }
@@ -371,8 +346,15 @@ mod tests {
     #[test]
     fn default_latencies_applied_when_hop_latency_absent() {
         let mut hop = demo_ingress_hop("x");
-        hop.ingress.params.latency = None;
-        hop.egresses[0].params.latency = None;
+        hop.ingress = SocketSpec::Srt(SrtSocket::Listen {
+            port: 7001,
+            params: SrtParams::default(),
+        });
+        hop.egresses[0] = SocketSpec::Srt(SrtSocket::Connect {
+            host: "172.31.0.10".to_string(),
+            port: 7002,
+            params: SrtParams::default(),
+        });
         let spec = flow_spec_from_hop(&hop).expect("map");
         assert_eq!(spec.elements[0].properties["latency"], Value::from(200));
         assert_eq!(spec.elements[2].properties["latency"], Value::from(1000));
