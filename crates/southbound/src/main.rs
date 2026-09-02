@@ -7,17 +7,23 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::{Value, json};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing_subscriber::EnvFilter;
 use weave_core::API_V1;
 use weave_core::auth::{self, Guard, Token, require_bearer};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8081";
 const DEFAULT_CONTROLLER_URL: &str = "http://127.0.0.1:8082";
+
+/// Origin a browser-hosted node may call the adapter contract from. Unset means
+/// no CORS headers at all, which is right for every adapter that is not a web
+/// page. `*` allows any origin, for development.
+const CORS_ORIGIN_VAR: &str = "WEAVE_SOUTHBOUND_CORS_ORIGIN";
 
 #[derive(Clone)]
 struct AppState {
@@ -57,9 +63,17 @@ async fn main() -> Result<()> {
             auth::AUTH_DISABLED_VAR
         );
     }
+    let cors = match std::env::var(CORS_ORIGIN_VAR) {
+        Ok(origin) if !origin.trim().is_empty() => {
+            tracing::info!(origin = %origin, "allowing browser nodes from this origin");
+            Some(cors_layer(origin.trim())?)
+        }
+        _ => None,
+    };
     let app = router(
         AppState::new(controller_url.clone(), guard.token().cloned()),
         guard,
+        cors,
     );
 
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -78,8 +92,13 @@ async fn main() -> Result<()> {
 /// stays unversioned and open for compose healthchecks and load balancers.
 /// Everything else — registration, heartbeats, and the desired-state and topology
 /// reads — requires the southbound bearer token.
-fn router(state: AppState, guard: Guard) -> Router {
-    let nodes = Router::new()
+///
+/// A browser-hosted node calls this contract from a web page, so the `/v1`
+/// routes optionally carry CORS headers. The layer sits outside the bearer
+/// check: a preflight carries no `Authorization` header and must be answered
+/// before it, not refused by it.
+fn router(state: AppState, guard: Guard, cors: Option<CorsLayer>) -> Router {
+    let mut nodes = Router::new()
         .route("/nodes", get(list_nodes))
         .route("/nodes/register", post(register_node))
         .route("/nodes/{node_id}/heartbeat", post(node_heartbeat))
@@ -87,11 +106,31 @@ fn router(state: AppState, guard: Guard) -> Router {
         .route("/endpoints", get(list_endpoints))
         .route("/state", get(get_state))
         .layer(axum::middleware::from_fn_with_state(guard, require_bearer));
+    if let Some(cors) = cors {
+        nodes = nodes.layer(cors);
+    }
 
     Router::new()
         .route("/health", get(health))
         .nest(API_V1, nodes)
         .with_state(state)
+}
+
+/// CORS for the adapter contract: `origin` is an exact origin or `*`. The page
+/// sends `Authorization` and `Content-Type`, so the preflight must allow both.
+fn cors_layer(origin: &str) -> Result<CorsLayer> {
+    let allow_origin = if origin == "*" {
+        AllowOrigin::any()
+    } else {
+        AllowOrigin::exact(
+            HeaderValue::from_str(origin)
+                .with_context(|| format!("{CORS_ORIGIN_VAR} is not a valid origin: {origin}"))?,
+        )
+    };
+    Ok(CorsLayer::new()
+        .allow_origin(allow_origin)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]))
 }
 
 async fn health() -> Json<Value> {
@@ -257,7 +296,7 @@ mod tests {
 
     /// A router with authentication switched off, for the proxy-fidelity tests.
     fn open_app(controller_url: String) -> Router {
-        router(AppState::new(controller_url, None), Guard::Disabled)
+        router(AppState::new(controller_url, None), Guard::Disabled, None)
     }
 
     /// A router requiring [`TOKEN`], which it also re-presents to the controller.
@@ -265,7 +304,183 @@ mod tests {
         router(
             AppState::new(controller_url, Some(token())),
             Guard::Required(token()),
+            None,
         )
+    }
+
+    /// [`guarded_app`] that also admits a browser page served from `origin`.
+    fn cors_app(controller_url: String, origin: &str) -> Router {
+        router(
+            AppState::new(controller_url, Some(token())),
+            Guard::Required(token()),
+            Some(cors_layer(origin).unwrap()),
+        )
+    }
+
+    const PAGE: &str = "http://172.25.0.40:8000";
+
+    /// A browser's preflight for an authenticated `POST` carries no bearer token;
+    /// it must be answered with the allowed headers, not refused with `401`, and
+    /// it never reaches the controller.
+    #[tokio::test]
+    async fn preflight_is_answered_before_the_bearer_check() {
+        let (url, captured) = stub_controller(StatusCode::ACCEPTED).await;
+        let app = cors_app(url, PAGE);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/v1/nodes/register")
+                    .header("origin", PAGE)
+                    .header("access-control-request-method", "POST")
+                    .header(
+                        "access-control-request-headers",
+                        "authorization, content-type",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers();
+        assert_eq!(headers["access-control-allow-origin"], PAGE);
+        let allowed = headers["access-control-allow-headers"]
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(allowed.contains("authorization"), "{allowed}");
+        assert!(allowed.contains("content-type"), "{allowed}");
+        assert!(
+            headers["access-control-allow-methods"]
+                .to_str()
+                .unwrap()
+                .contains("POST")
+        );
+        assert!(captured.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cors_headers_accompany_an_authenticated_response() {
+        let (url, _captured) = stub_controller(StatusCode::OK).await;
+        let app = cors_app(url, PAGE);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/nodes/browser-a1b2/desired")
+                    .header("origin", PAGE)
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["access-control-allow-origin"], PAGE);
+    }
+
+    #[tokio::test]
+    async fn a_foreign_origin_is_not_allowed() {
+        let (url, _captured) = stub_controller(StatusCode::OK).await;
+        let app = cors_app(url, PAGE);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/nodes/browser-a1b2/desired")
+                    .header("origin", "http://evil.example")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            PAGE,
+            "the allowed origin is stated, never the requester's, so the browser refuses"
+        );
+    }
+
+    #[tokio::test]
+    async fn wildcard_origin_allows_any_page() {
+        let (url, _captured) = stub_controller(StatusCode::OK).await;
+        let app = cors_app(url, "*");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/nodes")
+                    .header("origin", "http://localhost:3000")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.headers()["access-control-allow-origin"], "*");
+    }
+
+    /// Without the variable the adapter contract carries no CORS headers at all,
+    /// and a preflight is just an unauthenticated request.
+    #[tokio::test]
+    async fn without_a_configured_origin_there_is_no_cors() {
+        let (url, captured) = stub_controller(StatusCode::OK).await;
+        let app = guarded_app(url);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/v1/nodes/register")
+                    .header("origin", PAGE)
+                    .header("access-control-request-method", "POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/nodes")
+                    .header("origin", PAGE)
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
+        assert!(captured.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn cors_origin_must_be_a_header_value() {
+        assert!(cors_layer("http://172.25.0.40:8000").is_ok());
+        assert!(cors_layer("*").is_ok());
+        assert!(cors_layer("not a\nheader").is_err());
     }
 
     #[tokio::test]

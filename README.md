@@ -138,6 +138,18 @@ surface token on the hop to the controller, so one secret covers a surface end t
 end. Nodes may instead carry the token in their config file as
 `node.southbound_token`, which takes precedence over the environment.
 
+A browser node (`nodes/browser/`) is a media node too: the page presents
+`WEAVE_SOUTHBOUND_TOKEN` on every southbound call, passed in through the URL
+fragment so it never reaches a server log. Because the page runs on a different
+origin from southbound, southbound sends CORS headers on its `/v1` routes when
+`WEAVE_SOUTHBOUND_CORS_ORIGIN` is set — an exact origin such as
+`http://172.25.0.40:8000`, or `*` for development. Unset, no CORS headers are
+sent and only non-browser adapters can register. The preflight is answered
+before the bearer check and allows `Authorization` and `Content-Type`. Per-node
+tokens issued at registration remain a follow-up; today a page holds the shared
+southbound secret. A browser node registers with a `browser://<id>` endpoint,
+which is a placeholder: the controller never dials any node's endpoint.
+
 The Strom adapter also presents a token that open-weave never accepts, so it
 is not in the table. When Strom requires a bearer token, the adapter presents
 `WEAVE_STROM_TOKEN`, or `strom.token` from its config, which takes precedence.

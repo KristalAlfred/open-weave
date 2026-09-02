@@ -1114,6 +1114,108 @@ mod tests {
         assert_eq!(body, json!([]), "a rejected node is never registered");
     }
 
+    /// A browser node registers with a `browser://<id>` endpoint. The field is
+    /// opaque here: the controller stores it, makes no outbound call to any node
+    /// (it has no HTTP client at all), and serves the node's desired hops for the
+    /// page to pull like any adapter.
+    #[tokio::test]
+    async fn a_browser_endpoint_is_stored_verbatim_and_never_dialled() {
+        let (state, _mem) = mem_state();
+        let app = open_router(state.clone());
+
+        let mut browser = node_registration("browser-a1b2", "browser");
+        browser.node.endpoint = "browser://browser-a1b2".to_string();
+        browser.node.capabilities.port_range = None;
+        browser.node.capabilities.transports = vec![
+            weave_core::TransportOffer::with_roles(
+                weave_core::Transport::Whip,
+                weave_core::RoleSet::only(weave_core::SocketRole::Connect),
+            ),
+            weave_core::TransportOffer::with_roles(
+                weave_core::Transport::Whep,
+                weave_core::RoleSet::only(weave_core::SocketRole::Connect),
+            ),
+        ];
+        browser.node.capabilities.devices = [
+            weave_core::DeviceKind::Capture,
+            weave_core::DeviceKind::Display,
+        ]
+        .into_iter()
+        .collect();
+        browser.node.capabilities.data_plane.insert(
+            weave_core::DEFAULT_DATA_PLANE_ALIAS.to_string(),
+            weave_core::DataPlaneAddr {
+                host: "browser".to_string(),
+                reachability: weave_core::Reachability::OutboundOnly,
+                signalling: weave_core::Signalling::default(),
+            },
+        );
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/v1/nodes/register",
+            Some(serde_json::to_value(&browser).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let mut strom = node_registration("strom-node-2", "172.27.0.10");
+        strom.node.capabilities.transports = vec![
+            weave_core::TransportOffer::new(weave_core::Transport::Srt),
+            weave_core::TransportOffer::with_roles(
+                weave_core::Transport::Whip,
+                weave_core::RoleSet::only(weave_core::SocketRole::Listen),
+            ),
+        ];
+        strom
+            .node
+            .capabilities
+            .data_plane
+            .get_mut(weave_core::DEFAULT_DATA_PLANE_ALIAS)
+            .unwrap()
+            .signalling
+            .whip = Some("http://172.27.0.10:8080/whip".to_string());
+        send(
+            &app,
+            "POST",
+            "/v1/nodes/register",
+            Some(serde_json::to_value(&strom).unwrap()),
+        )
+        .await;
+
+        let mut cam = stream("alice-cam");
+        cam.source = StreamTransport::Device(weave_core::NodeEndpoint {
+            node: "browser-a1b2".to_string(),
+            network: None,
+        });
+        state.streams.write().await.insert(cam.name.clone(), cam);
+
+        reconcile_tick(&state).await;
+
+        let (_, body) = send(&app, "GET", "/v1/nodes", None).await;
+        let nodes: Vec<NodeDescriptor> = serde_json::from_value(body).unwrap();
+        let page = nodes.iter().find(|n| n.id == "browser-a1b2").unwrap();
+        assert_eq!(page.endpoint, "browser://browser-a1b2");
+
+        let (status, body) = send(&app, "GET", "/v1/nodes/browser-a1b2/desired", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
+        assert_eq!(hops.len(), 1);
+        assert!(
+            matches!(
+                hops[0].ingress,
+                weave_core::SocketSpec::Device(weave_core::DeviceKind::Capture)
+            ),
+            "the page's own camera feeds the hop: {:?}",
+            hops[0].ingress
+        );
+        assert!(
+            matches!(hops[0].egresses[0], weave_core::SocketSpec::Whip(_)),
+            "the page pushes to the Strom's ingest: {:?}",
+            hops[0].egresses[0]
+        );
+    }
+
     #[tokio::test]
     async fn desired_reflects_computed_hops_after_a_reconcile_tick() {
         let (state, _mem) = mem_state();
