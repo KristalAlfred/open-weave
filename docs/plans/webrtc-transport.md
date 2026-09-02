@@ -39,6 +39,24 @@ external peers, WebRTC between Strom nodes, TLS, per-node tokens, weave
 pushing WHIP into open-live. WHIP and WHEP exist only as link transports the
 planner chooses; operators never write them.
 
+## Who decides what
+
+- **Manifests name nodes.** `device: { node: X }` means the media starts or
+  ends at X's own capture or display device. No manifest ever names WHIP,
+  WHEP, or a browser.
+- **Nodes declare capabilities at registration.** The page registers
+  `whip [connect]`, `whep [connect]`, `device [listen, connect]`. The Strom
+  adapter registers `srt [listen, connect]`, `whip [listen]`, `whep [listen]`
+  from its config. This is today's `transports` list with roles added.
+- **The controller chooses the transport per link** from both ends'
+  capabilities and writes concrete sockets (`transport`, `role`, `url` or
+  `host`/`port`) into each desired hop. Only it decides.
+- **Adapters map the sockets they are given.** The Strom adapter has one
+  flow shape per (ingress transport, egress transport) pair. It receives
+  `whip → srt` and builds a gateway flow the same way it receives
+  `srt → srt` and builds a relay flow today. The page likewise realises
+  `device → whip` and `whep → device` and nothing else.
+
 ## How it works, end to end
 
 1. The page loads, generates `browser-<8 hex>` (sessionStorage), and
