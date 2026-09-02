@@ -548,7 +548,8 @@ async fn delete_stream(State(state): State<AppState>, Path(name): Path<String>) 
 }
 
 /// Concrete `srt://` endpoints for a placed stream: `200` when placed, `503` when
-/// the stream is known but not yet placed, `404` when unknown.
+/// the stream is known but not yet placed, `404` when unknown. A `device` end
+/// has nothing to dial and reads `null` in its place.
 async fn get_endpoints(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     let view = state.view.read().await;
     if let Some(endpoints) = view.endpoints.get(&name) {
@@ -811,7 +812,7 @@ fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> Re
                     name: stream.name.clone(),
                     status: PathStatus::Pending,
                     nodes: Vec::new(),
-                    reason: None,
+                    reason: Some(error.to_string()),
                     endpoints: None,
                 });
                 PathStatus::Pending
@@ -1338,6 +1339,24 @@ mod tests {
         assert!(
             !outcome.desired_by_node["strom-node-1"].is_empty(),
             "desired hops for the offline node are still computed"
+        );
+    }
+
+    #[test]
+    fn reconcile_reports_why_a_stream_is_pending() {
+        let nodes = BTreeMap::from([(
+            "strom-node-1".to_string(),
+            node_registration("strom-node-1", "172.26.0.10"),
+        )]);
+        let observed = observed_state(&nodes);
+
+        let outcome = reconcile(vec![stream("basic")], &observed);
+
+        let basic = outcome.streams.iter().find(|s| s.name == "basic").unwrap();
+        assert_eq!(basic.status, PathStatus::Pending);
+        assert_eq!(
+            basic.reason.as_deref(),
+            Some("node strom-node-2 is not registered")
         );
     }
 
