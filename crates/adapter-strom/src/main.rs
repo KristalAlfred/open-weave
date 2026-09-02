@@ -3,6 +3,7 @@
 mod config;
 mod provision;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -15,9 +16,10 @@ use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Token};
 use weave_core::{
-    API_V1, AdapterDescriptor, AdapterKind, DEFAULT_DATA_PLANE_ALIAS, DesiredHop, DeviceSet,
-    EndpointDescriptor, EndpointKind, HopStatus, LinkCondition, LinkStats, NodeCapabilities,
-    NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus, PROTOCOL_VERSION,
+    API_V1, AdapterDescriptor, AdapterKind, DEFAULT_DATA_PLANE_ALIAS, DataPlaneAddr, DesiredHop,
+    DeviceSet, EndpointDescriptor, EndpointKind, HopStatus, LinkCondition, LinkStats,
+    NodeCapabilities, NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus,
+    PROTOCOL_VERSION, SignallingTransport, SocketRole, SocketSpec, Transport,
 };
 use weave_strom::{
     FlowSpec, FlowStats, StromClient, StromError, StromFlow, flow_spec_from_hop, parse_flow_stats,
@@ -25,9 +27,14 @@ use weave_strom::{
 
 use config::AdapterConfig;
 use provision::{
-    IngressObservation, StallTracker, diff_hops, hop_state, resolved_addr, socket_condition,
-    srt_role,
+    Side, SideObservation, StallTracker, diff_hops, hop_state, resolved_addr, socket_condition,
+    webrtc_condition,
 };
+
+/// Routes this Strom serves WHIP ingest and WHEP playback at, appended to a
+/// configured signalling base. Both sit at the root, not under `/api`.
+const WHIP_ROUTE: &str = "/whip";
+const WHEP_ROUTE: &str = "/whep";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -72,7 +79,7 @@ async fn main() -> Result<()> {
         southbound_url = %config.node.southbound_url,
         poll_interval_secs = config.strom.poll_interval_secs,
         strom_auth,
-        data_plane = ?config.node.data_plane,
+        data_plane = ?advertised_data_plane(&config),
         port_range = ?config.node.port_range,
         "Strom adapter starting"
     );
@@ -373,33 +380,66 @@ async fn hop_statuses(
         let ingress = stats.as_ref().and_then(FlowStats::ingress);
         let (ingress_connected, ingress_rate) =
             ingress.map_or((false, 0.0), |e| (e.connected, e.rate_mbps));
-        let (egress_connected, egress_rate) = stats
-            .as_ref()
-            .and_then(FlowStats::egress)
-            .map_or((false, 0.0), |e| (e.connected, e.rate_mbps));
+        let egress_stats = stats.as_ref().and_then(FlowStats::egress);
+        let (egress_connected, egress_rate) =
+            egress_stats.map_or((false, 0.0), |e| (e.connected, e.rate_mbps));
 
+        let running = flow.is_some_and(|f| f.running);
+        let gst_paused = flow.and_then(|f| f.gst_state.as_deref()) == Some("Paused");
         let ingress_stalled = tracker.observe(
             &hop.id,
-            IngressObservation {
-                bytes_received: ingress.map(|e| e.bytes_received),
-                running: flow.is_some_and(|f| f.running),
-                gst_paused: flow.and_then(|f| f.gst_state.as_deref()) == Some("Paused"),
+            Side::Ingress,
+            SideObservation {
+                bytes: ingress.map(|e| e.bytes_received),
+                running,
+                gst_paused,
             },
         );
+        let egress_stalled = tracker.observe(
+            &hop.id,
+            Side::Egress,
+            SideObservation {
+                bytes: egress_stats.map(|e| e.bytes_sent),
+                running,
+                gst_paused,
+            },
+        );
+        let playing = running && !gst_paused;
+        let webrtc = |role, srt_side: Side, srt_side_stalled| {
+            webrtc_condition(
+                role,
+                playing,
+                tracker.advanced(&hop.id, srt_side),
+                srt_side_stalled,
+            )
+        };
 
         let egress = hop.egresses.first();
         statuses.push(HopStatus {
             id: hop.id.clone(),
             node_id: hop.node_id.clone(),
             state: hop_state(flow, failed.contains(&hop.id)),
-            ingress: srt_role(&hop.ingress).map_or(LinkCondition::Idle, |role| {
-                socket_condition(role, ingress_connected, ingress_rate, ingress_stalled)
-            }),
-            egress: egress
-                .and_then(srt_role)
-                .map_or(LinkCondition::Idle, |role| {
-                    socket_condition(role, egress_connected, egress_rate, false)
-                }),
+            ingress: match &hop.ingress {
+                SocketSpec::Srt(socket) => socket_condition(
+                    socket.role(),
+                    ingress_connected,
+                    ingress_rate,
+                    ingress_stalled,
+                ),
+                SocketSpec::Whip(socket) | SocketSpec::Whep(socket) => {
+                    webrtc(socket.role, Side::Egress, egress_stalled)
+                }
+                SocketSpec::Device(_) => LinkCondition::Idle,
+            },
+            egress: match egress {
+                Some(SocketSpec::Srt(socket)) => {
+                    socket_condition(socket.role(), egress_connected, egress_rate, false)
+                }
+                Some(SocketSpec::Whip(socket) | SocketSpec::Whep(socket)) => {
+                    webrtc(socket.role, Side::Ingress, ingress_stalled)
+                }
+                Some(SocketSpec::Device(_)) | None => LinkCondition::Idle,
+            },
             resolved_ingress: resolved_addr(&hop.ingress, data_plane_host),
             resolved_egress: egress.and_then(|e| resolved_addr(e, data_plane_host)),
             stats: stats.map(LinkStats::from),
@@ -455,7 +495,7 @@ fn registration(
                 }],
                 transports: config.node.transports.clone(),
                 devices: DeviceSet::default(),
-                data_plane: config.node.data_plane.clone(),
+                data_plane: advertised_data_plane(config),
                 port_range: Some(config.node.port_range),
                 relay: config.node.relay,
             },
@@ -463,6 +503,39 @@ fn registration(
         endpoints,
         hop_status,
     }
+}
+
+/// The node's data-plane addresses with each configured signalling base expanded
+/// into the WHIP and WHEP routes Strom serves under it, for whichever of those
+/// transports `config.node.transports` offers in the `Listen` role Strom hosts
+/// them in. An alias with no entry, or a transport the node does not host,
+/// advertises no signalling for it, and the controller then hosts no WebRTC
+/// link there.
+fn advertised_data_plane(config: &AdapterConfig) -> BTreeMap<String, DataPlaneAddr> {
+    let hosts = |transport: Transport| {
+        config
+            .node
+            .transports
+            .iter()
+            .any(|offer| offer.name == transport && offer.offers(SocketRole::Listen))
+    };
+
+    let mut data_plane = config.node.data_plane.clone();
+    for (alias, base) in &config.strom.signalling_base {
+        let Some(addr) = data_plane.get_mut(alias) else {
+            continue;
+        };
+        let base = base.trim_end_matches('/');
+        if hosts(Transport::Whip) {
+            addr.signalling
+                .set(SignallingTransport::Whip, format!("{base}{WHIP_ROUTE}"));
+        }
+        if hosts(Transport::Whep) {
+            addr.signalling
+                .set(SignallingTransport::Whep, format!("{base}{WHEP_ROUTE}"));
+        }
+    }
+    data_plane
 }
 
 /// Registration the control plane will never accept, however long this adapter
@@ -628,7 +701,7 @@ async fn health() -> Json<Value> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    use weave_core::{HopRole, SocketSpec};
+    use weave_core::{HopRole, Signalling};
 
     #[derive(Debug, Clone, PartialEq)]
     enum Op {
@@ -705,6 +778,97 @@ mod tests {
     fn flow(name: &str, id: &str, running: bool) -> StromFlow {
         serde_json::from_value(json!({ "id": id, "name": name, "running": running }))
             .expect("flow fixture")
+    }
+
+    const WEBRTC_CONFIG: &str = r"
+node:
+  id: strom-node-2
+  southbound_url: http://127.0.0.1:8081
+  listen: 0.0.0.0:8091
+  data_plane:
+    default: 172.27.0.10
+    wan: 203.0.113.7
+  port_range:
+    start: 20000
+    end: 20999
+  transports: [srt, whip, whep]
+strom:
+  url: http://172.27.0.10:8080
+  signalling_base:
+    default: http://172.27.0.10:8080/
+";
+
+    #[test]
+    fn registration_expands_a_signalling_base_into_stroms_own_routes() {
+        let config: AdapterConfig = serde_norway::from_str(WEBRTC_CONFIG).expect("parse config");
+        let registration = registration(
+            &config,
+            "http://172.27.0.10:8091",
+            NodeStatus::Ready,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let data_plane = &registration.node.capabilities.data_plane;
+        assert_eq!(
+            data_plane["default"].signalling,
+            Signalling {
+                whip: Some("http://172.27.0.10:8080/whip".to_string()),
+                whep: Some("http://172.27.0.10:8080/whep".to_string()),
+            },
+            "a trailing slash on the base does not double up"
+        );
+        assert!(
+            data_plane["wan"].signalling.is_empty(),
+            "an alias with no base advertises no signalling"
+        );
+    }
+
+    #[test]
+    fn a_signalling_base_advertises_nothing_without_a_webrtc_transport() {
+        let config: AdapterConfig = serde_norway::from_str(
+            &WEBRTC_CONFIG.replace("transports: [srt, whip, whep]", "transports: [srt]"),
+        )
+        .expect("parse config");
+        let registration = registration(
+            &config,
+            "http://172.27.0.10:8091",
+            NodeStatus::Ready,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert!(
+            registration.node.capabilities.data_plane["default"]
+                .signalling
+                .is_empty(),
+            "a signalling_base with no matching transport offer advertises nothing"
+        );
+    }
+
+    #[test]
+    fn a_signalling_base_advertises_only_the_offered_webrtc_transport() {
+        let config: AdapterConfig = serde_norway::from_str(&WEBRTC_CONFIG.replace(
+            "transports: [srt, whip, whep]",
+            "transports: [srt, { name: whip, roles: [listen] }]",
+        ))
+        .expect("parse config");
+        let registration = registration(
+            &config,
+            "http://172.27.0.10:8091",
+            NodeStatus::Ready,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            registration.node.capabilities.data_plane["default"].signalling,
+            Signalling {
+                whip: Some("http://172.27.0.10:8080/whip".to_string()),
+                whep: None,
+            },
+            "WHIP is offered but WHEP is not"
+        );
     }
 
     #[tokio::test]

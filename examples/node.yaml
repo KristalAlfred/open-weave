@@ -51,3 +51,9 @@ strom:
   # token: <token>
   # Optional; seconds between Strom observation polls. Defaults to 5.
   poll_interval_secs: 5
+  # Optional; base URL peers reach this Strom's WebRTC signalling at, keyed by
+  # data-plane alias. The adapter appends the routes Strom serves (/whip, /whep)
+  # and advertises the result. An alias with no entry advertises no signalling,
+  # and the controller then hosts no WebRTC link on that address.
+  # signalling_base:
+  #   default: http://172.26.0.10:8080
