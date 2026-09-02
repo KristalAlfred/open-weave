@@ -32,8 +32,9 @@ pub const API_V1: &str = "/v1";
 /// [`API_V1`] tells an adapter *where* to send a request; this tells the
 /// controller *what* the adapter on the other end speaks, so a stale adapter is
 /// rejected at registration instead of being served desired state it cannot
-/// realise. The two move together — a breaking southbound change bumps both.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// realise. The prefix moves when the routes change; this moves when the
+/// payloads behind them do.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Whether the controller can serve an adapter declaring protocol `version`.
 ///
@@ -59,11 +60,60 @@ fn default_enabled() -> bool {
     true
 }
 
+/// Wire tag for a device end: the node's own capture or display device.
+pub const DEVICE_TRANSPORT: &str = "device";
+
 /// Transport carrying a stream endpoint. Externally tagged by transport name.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum StreamTransport {
     Srt(SrtEndpoint),
+    /// The media starts or ends at a node's own capture or display device: a
+    /// camera when this is the source, a screen when it is a destination. The
+    /// controller chooses the transport that carries it to or from the node.
+    Device(NodeEndpoint),
+}
+
+impl StreamTransport {
+    /// The registered node this endpoint is placed on, when it names one.
+    #[must_use]
+    pub fn node(&self) -> Option<&str> {
+        match self {
+            Self::Srt(endpoint) => endpoint.node.as_deref(),
+            Self::Device(endpoint) => Some(&endpoint.node),
+        }
+    }
+
+    /// The data-plane alias this endpoint is addressed on, when pinned.
+    #[must_use]
+    pub fn network(&self) -> Option<&str> {
+        match self {
+            Self::Srt(endpoint) => endpoint.network.as_deref(),
+            Self::Device(endpoint) => endpoint.network.as_deref(),
+        }
+    }
+
+    /// The manifest tag of this variant.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Srt(_) => "srt",
+            Self::Device(_) => DEVICE_TRANSPORT,
+        }
+    }
+}
+
+/// An endpoint that is nothing but a node: the node itself produces or consumes
+/// the media, so there is no address, latency, or format to declare.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeEndpoint {
+    pub node: String,
+    /// Data-plane alias resolved against the node's declared address map.
+    /// Absent means [`DEFAULT_DATA_PLANE_ALIAS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -122,7 +172,9 @@ pub struct RemoteAddr {
 /// about the manifest, and saying so is useful well before anything can fix it.
 #[must_use]
 pub fn stream_format_conflicts(stream: &StreamDefinition) -> Vec<media::FormatConflict> {
-    let StreamTransport::Srt(source) = &stream.source;
+    let StreamTransport::Srt(source) = &stream.source else {
+        return Vec::new();
+    };
     let Some(format) = &source.format else {
         return Vec::new();
     };
@@ -132,7 +184,9 @@ pub fn stream_format_conflicts(stream: &StreamDefinition) -> Vec<media::FormatCo
         .iter()
         .enumerate()
         .filter_map(|(index, destination)| {
-            let StreamTransport::Srt(destination) = destination;
+            let StreamTransport::Srt(destination) = destination else {
+                return None;
+            };
             let mismatches = destination.accepts.as_ref()?.mismatches(format);
             (!mismatches.is_empty()).then_some(media::FormatConflict {
                 destination: index,
@@ -181,18 +235,380 @@ pub enum HopRole {
     Receiver,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SocketSpec {
-    pub transport: Transport,
-    pub role: SocketRole,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub port: Option<u16>,
-    #[serde(default)]
-    pub params: SrtParams,
+/// One socket on a hop: where media enters or leaves it, in the terms of the
+/// transport carrying it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SocketSpec {
+    Srt(SrtSocket),
+    /// WebRTC ingest: the `Connect` end pushes media to the `Listen` end's URL.
+    Whip(SignallingSocket),
+    /// WebRTC playback: the `Connect` end pulls media from the `Listen` end's URL.
+    Whep(SignallingSocket),
+    /// The node's own device, where the media starts or ends.
+    Device(DeviceKind),
 }
 
+impl SocketSpec {
+    /// An SRT listener bound to `port`.
+    #[must_use]
+    pub fn srt_listen(port: u16, latency: u32) -> Self {
+        Self::Srt(SrtSocket::Listen {
+            port,
+            params: SrtParams {
+                latency: Some(latency),
+            },
+        })
+    }
+
+    /// An SRT caller dialling `host:port`.
+    #[must_use]
+    pub fn srt_connect(host: impl Into<String>, port: u16, latency: u32) -> Self {
+        Self::Srt(SrtSocket::Connect {
+            host: host.into(),
+            port,
+            params: SrtParams {
+                latency: Some(latency),
+            },
+        })
+    }
+
+    /// One end of a `transport`-signalled WebRTC link, addressed at
+    /// `{base}/{endpoint_id}` — see [`SignallingSocket::new`].
+    #[must_use]
+    pub fn signalling(
+        transport: SignallingTransport,
+        role: SocketRole,
+        base: &str,
+        endpoint_id: &str,
+    ) -> Self {
+        let socket = SignallingSocket::new(role, base, endpoint_id);
+        match transport {
+            SignallingTransport::Whip => Self::Whip(socket),
+            SignallingTransport::Whep => Self::Whep(socket),
+        }
+    }
+
+    /// The wire name of this socket's end: its [`SocketRole`] for a link
+    /// transport, its [`DeviceKind`] for a device.
+    #[must_use]
+    pub fn end_name(&self) -> &'static str {
+        match self {
+            Self::Srt(socket) => socket.role().name(),
+            Self::Whip(socket) | Self::Whep(socket) => socket.role.name(),
+            Self::Device(kind) => kind.name(),
+        }
+    }
+}
+
+impl std::fmt::Display for SocketSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Srt(_) => f.write_str(Transport::Srt.name()),
+            Self::Whip(_) => f.write_str(Transport::Whip.name()),
+            Self::Whep(_) => f.write_str(Transport::Whep.name()),
+            Self::Device(kind) => write!(f, "{kind} device"),
+        }
+    }
+}
+
+/// One end of an SRT link: a listener binds a port, a caller dials one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SrtSocket {
+    Listen {
+        port: u16,
+        params: SrtParams,
+    },
+    Connect {
+        host: String,
+        port: u16,
+        params: SrtParams,
+    },
+}
+
+impl SrtSocket {
+    #[must_use]
+    pub fn role(&self) -> SocketRole {
+        match self {
+            Self::Listen { .. } => SocketRole::Listen,
+            Self::Connect { .. } => SocketRole::Connect,
+        }
+    }
+
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        match self {
+            Self::Listen { port, .. } | Self::Connect { port, .. } => *port,
+        }
+    }
+
+    #[must_use]
+    pub fn params(&self) -> SrtParams {
+        match self {
+            Self::Listen { params, .. } | Self::Connect { params, .. } => *params,
+        }
+    }
+}
+
+/// One end of a WebRTC link, addressed by the signalling URL the `Connect` end
+/// calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignallingSocket {
+    pub role: SocketRole,
+    pub url: String,
+    /// Id the URL was built from — carried alongside `url` rather than
+    /// re-derived by callers.
+    pub endpoint_id: String,
+}
+
+impl SignallingSocket {
+    /// Builds the signalling URL from `base` (trailing `/` trimmed) and
+    /// `endpoint_id`, joined `{base}/{endpoint_id}` — the one place that joins
+    /// a signalling URL from its parts.
+    #[must_use]
+    pub fn new(role: SocketRole, base: &str, endpoint_id: impl Into<String>) -> Self {
+        let endpoint_id = endpoint_id.into();
+        let url = format!("{}/{endpoint_id}", base.trim_end_matches('/'));
+        Self {
+            role,
+            url,
+            endpoint_id,
+        }
+    }
+}
+
+/// Flat wire form of a [`SocketSpec`]: a `transport` and `role` naming the
+/// variant, plus the fields that variant carries.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SocketRepr {
+    transport: SocketTransport,
+    role: SocketEnd,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    params: Option<SrtParams>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SocketTransport {
+    Srt,
+    Whip,
+    Whep,
+    Device,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SocketEnd {
+    Listen,
+    Connect,
+    Capture,
+    Display,
+}
+
+impl SocketEnd {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Listen => SocketRole::Listen.name(),
+            Self::Connect => SocketRole::Connect.name(),
+            Self::Capture => DeviceKind::Capture.name(),
+            Self::Display => DeviceKind::Display.name(),
+        }
+    }
+
+    fn link_role(self) -> Result<SocketRole, String> {
+        match self {
+            Self::Listen => Ok(SocketRole::Listen),
+            Self::Connect => Ok(SocketRole::Connect),
+            Self::Capture | Self::Display => Err(format!("{} is not a socket role", self.name())),
+        }
+    }
+
+    fn device_kind(self) -> Result<DeviceKind, String> {
+        match self {
+            Self::Capture => Ok(DeviceKind::Capture),
+            Self::Display => Ok(DeviceKind::Display),
+            Self::Listen | Self::Connect => Err(format!("{} is not a device role", self.name())),
+        }
+    }
+}
+
+impl From<SocketRole> for SocketEnd {
+    fn from(role: SocketRole) -> Self {
+        match role {
+            SocketRole::Listen => Self::Listen,
+            SocketRole::Connect => Self::Connect,
+        }
+    }
+}
+
+impl From<DeviceKind> for SocketEnd {
+    fn from(kind: DeviceKind) -> Self {
+        match kind {
+            DeviceKind::Capture => Self::Capture,
+            DeviceKind::Display => Self::Display,
+        }
+    }
+}
+
+/// Reject a socket that carries a field its transport has no use for, naming
+/// the first such field.
+fn reject_extra_fields<const N: usize>(
+    socket: &str,
+    fields: [(&str, bool); N],
+) -> Result<(), String> {
+    match fields.into_iter().find(|(_, present)| *present) {
+        Some((field, _)) => Err(format!("a {socket} socket carries no {field}")),
+        None => Ok(()),
+    }
+}
+
+impl From<&SocketSpec> for SocketRepr {
+    fn from(spec: &SocketSpec) -> Self {
+        let bare = |transport, role| Self {
+            transport,
+            role,
+            host: None,
+            port: None,
+            url: None,
+            endpoint_id: None,
+            params: None,
+        };
+        match spec {
+            SocketSpec::Srt(SrtSocket::Listen { port, params }) => Self {
+                port: Some(*port),
+                params: Some(*params),
+                ..bare(SocketTransport::Srt, SocketEnd::Listen)
+            },
+            SocketSpec::Srt(SrtSocket::Connect { host, port, params }) => Self {
+                host: Some(host.clone()),
+                port: Some(*port),
+                params: Some(*params),
+                ..bare(SocketTransport::Srt, SocketEnd::Connect)
+            },
+            SocketSpec::Whip(socket) => Self {
+                url: Some(socket.url.clone()),
+                endpoint_id: Some(socket.endpoint_id.clone()),
+                ..bare(SocketTransport::Whip, socket.role.into())
+            },
+            SocketSpec::Whep(socket) => Self {
+                url: Some(socket.url.clone()),
+                endpoint_id: Some(socket.endpoint_id.clone()),
+                ..bare(SocketTransport::Whep, socket.role.into())
+            },
+            SocketSpec::Device(kind) => bare(SocketTransport::Device, (*kind).into()),
+        }
+    }
+}
+
+impl TryFrom<SocketRepr> for SocketSpec {
+    type Error = String;
+
+    fn try_from(repr: SocketRepr) -> Result<Self, Self::Error> {
+        let SocketRepr {
+            transport,
+            role,
+            host,
+            port,
+            url,
+            endpoint_id,
+            params,
+        } = repr;
+
+        match transport {
+            SocketTransport::Srt => {
+                reject_extra_fields(
+                    "srt",
+                    [
+                        ("url", url.is_some()),
+                        ("endpoint_id", endpoint_id.is_some()),
+                    ],
+                )?;
+                let port = port.ok_or_else(|| "an srt socket needs a port".to_string())?;
+                let params = params.unwrap_or_default();
+                match role.link_role()? {
+                    SocketRole::Listen => {
+                        reject_extra_fields("listening srt", [("host", host.is_some())])?;
+                        Ok(Self::Srt(SrtSocket::Listen { port, params }))
+                    }
+                    SocketRole::Connect => {
+                        let host =
+                            host.ok_or_else(|| "a calling srt socket needs a host".to_string())?;
+                        Ok(Self::Srt(SrtSocket::Connect { host, port, params }))
+                    }
+                }
+            }
+            SocketTransport::Whip | SocketTransport::Whep => {
+                let whip = matches!(transport, SocketTransport::Whip);
+                let name = if whip {
+                    Transport::Whip
+                } else {
+                    Transport::Whep
+                }
+                .name();
+                reject_extra_fields(
+                    name,
+                    [
+                        ("host", host.is_some()),
+                        ("port", port.is_some()),
+                        ("params", params.is_some()),
+                    ],
+                )?;
+                let socket = SignallingSocket {
+                    role: role.link_role()?,
+                    url: url.ok_or_else(|| format!("a {name} socket needs a url"))?,
+                    endpoint_id: endpoint_id
+                        .ok_or_else(|| format!("a {name} socket needs an endpoint_id"))?,
+                };
+                Ok(if whip {
+                    Self::Whip(socket)
+                } else {
+                    Self::Whep(socket)
+                })
+            }
+            SocketTransport::Device => {
+                reject_extra_fields(
+                    DEVICE_TRANSPORT,
+                    [
+                        ("host", host.is_some()),
+                        ("port", port.is_some()),
+                        ("url", url.is_some()),
+                        ("endpoint_id", endpoint_id.is_some()),
+                        ("params", params.is_some()),
+                    ],
+                )?;
+                Ok(Self::Device(role.device_kind()?))
+            }
+        }
+    }
+}
+
+impl Serialize for SocketSpec {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        SocketRepr::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SocketSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::try_from(SocketRepr::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Which end of a link a socket is: `Listen` hosts and `Connect` dials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SocketRole {
@@ -200,10 +616,100 @@ pub enum SocketRole {
     Connect,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+impl SocketRole {
+    /// The wire name, as serialized.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Listen => "listen",
+            Self::Connect => "connect",
+        }
+    }
+}
+
+/// A transport that carries media between two nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
     Srt,
+    /// WebRTC ingest. The `Connect` end pushes media to the `Listen` end's
+    /// signalling URL.
+    Whip,
+    /// WebRTC playback. The `Connect` end pulls media from the `Listen` end's
+    /// signalling URL.
+    Whep,
+}
+
+impl Transport {
+    /// The wire name, as serialized.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Srt => "srt",
+            Self::Whip => "whip",
+            Self::Whep => "whep",
+        }
+    }
+
+    /// This transport's signalling counterpart, when it is signalled at all.
+    #[must_use]
+    pub fn signalling(self) -> Option<SignallingTransport> {
+        match self {
+            Self::Srt => None,
+            Self::Whip => Some(SignallingTransport::Whip),
+            Self::Whep => Some(SignallingTransport::Whep),
+        }
+    }
+}
+
+impl std::fmt::Display for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// A [`Transport`] that is signalled: [`Signalling`] carries a base URL per
+/// variant, and [`SocketSpec::signalling`] builds a socket for one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SignallingTransport {
+    Whip,
+    Whep,
+}
+
+impl SignallingTransport {
+    /// The [`Transport`] this signalling applies to.
+    #[must_use]
+    pub fn transport(self) -> Transport {
+        match self {
+            Self::Whip => Transport::Whip,
+            Self::Whep => Transport::Whep,
+        }
+    }
+}
+
+/// The node's own capture or display device, where media starts or ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceKind {
+    Capture,
+    Display,
+}
+
+impl DeviceKind {
+    /// The wire name, as serialized.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Capture => "capture",
+            Self::Display => "display",
+        }
+    }
+}
+
+impl std::fmt::Display for DeviceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -256,14 +762,14 @@ pub enum HopState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LinkCondition {
-    /// No SRT connection; the socket is a listener patiently waiting. Healthy.
+    /// No connection; the socket is a listener patiently waiting. Healthy.
     #[default]
     Idle,
-    /// No SRT connection; the socket is a caller still retrying. Ambiguous, not degraded.
+    /// No connection; the socket is a caller still retrying. Ambiguous, not degraded.
     Connecting,
-    /// SRT connection up but rate ~0 — fine on our end, nothing coming through yet.
+    /// Connection up but rate ~0 — fine on our end, nothing coming through yet.
     Connected,
-    /// SRT connection up and media flowing.
+    /// Connection up and media flowing.
     Flowing,
     /// Ingress once carried media but byte progress has frozen while the flow still
     /// claims to run — detected across polls, not from any instantaneous field.
@@ -383,8 +889,12 @@ pub struct NodeDescriptor {
 pub struct NodeCapabilities {
     #[serde(default)]
     pub adapters: Vec<AdapterDescriptor>,
+    /// Link transports this node offers, with the roles it can take.
     #[serde(default)]
-    pub transports: Vec<TransportDescriptor>,
+    pub transports: Vec<TransportOffer>,
+    /// Devices the node can capture from or display on.
+    #[serde(default, skip_serializing_if = "DeviceSet::is_empty")]
+    pub devices: DeviceSet,
     /// Data-plane addresses this node advertises, keyed by alias. The
     /// [`DEFAULT_DATA_PLANE_ALIAS`] entry serves node-referenced endpoints
     /// that pin no network.
@@ -401,6 +911,30 @@ pub struct NodeCapabilities {
     pub relay: bool,
 }
 
+impl NodeCapabilities {
+    /// Whether this node can take `role` over `transport`.
+    ///
+    /// A node that declares no transports at all is read as SRT in both roles:
+    /// `transports` is an optional config field, so a node config that omits it
+    /// still reaches this.
+    #[must_use]
+    pub fn offers(&self, transport: Transport, role: SocketRole) -> bool {
+        if self.transports.is_empty() {
+            return transport == Transport::Srt;
+        }
+        self.transports
+            .iter()
+            .any(|offer| offer.name == transport && offer.roles.contains(role))
+    }
+
+    /// Whether this node offers a `kind` device. Unlike [`Self::offers`] there
+    /// is no fallback: a node that declares no devices has none.
+    #[must_use]
+    pub fn offers_device(&self, kind: DeviceKind) -> bool {
+        self.devices.contains(kind)
+    }
+}
+
 /// One data-plane address a node advertises, plus whether peers can open
 /// connections to it.
 ///
@@ -411,6 +945,11 @@ pub struct NodeCapabilities {
 pub struct DataPlaneAddr {
     pub host: String,
     pub reachability: Reachability,
+    /// Signalling bases for WebRTC links hosted at this address, declared by
+    /// the node. A caller builds the full URL via [`SocketSpec::signalling`],
+    /// which owns the join with the endpoint id.
+    #[serde(default, skip_serializing_if = "Signalling::is_empty")]
+    pub signalling: Signalling,
 }
 
 impl DataPlaneAddr {
@@ -420,6 +959,7 @@ impl DataPlaneAddr {
         Self {
             host: host.into(),
             reachability: Reachability::Dialable,
+            signalling: Signalling::default(),
         }
     }
 
@@ -440,6 +980,8 @@ impl<'de> Deserialize<'de> for DataPlaneAddr {
             host: String,
             #[serde(default)]
             reachability: Reachability,
+            #[serde(default)]
+            signalling: Signalling,
         }
 
         #[derive(Deserialize)]
@@ -451,8 +993,51 @@ impl<'de> Deserialize<'de> for DataPlaneAddr {
 
         Ok(match Repr::deserialize(deserializer)? {
             Repr::Host(host) => Self::dialable(host),
-            Repr::Full(Full { host, reachability }) => Self { host, reachability },
+            Repr::Full(Full {
+                host,
+                reachability,
+                signalling,
+            }) => Self {
+                host,
+                reachability,
+                signalling,
+            },
         })
+    }
+}
+
+/// Base URLs a node serves WHIP and WHEP signalling at, per WebRTC transport.
+/// A transport with no base is not offered for hosting at that address.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Signalling {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whep: Option<String>,
+}
+
+impl Signalling {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.whip.is_none() && self.whep.is_none()
+    }
+
+    /// The base URL hosted for `transport`, when this address offers one.
+    #[must_use]
+    pub fn base(&self, transport: SignallingTransport) -> Option<&str> {
+        match transport {
+            SignallingTransport::Whip => self.whip.as_deref(),
+            SignallingTransport::Whep => self.whep.as_deref(),
+        }
+    }
+
+    /// Declare the base URL this address hosts `transport` signalling at.
+    pub fn set(&mut self, transport: SignallingTransport, base: String) {
+        match transport {
+            SignallingTransport::Whip => self.whip = Some(base),
+            SignallingTransport::Whep => self.whep = Some(base),
+        }
     }
 }
 
@@ -508,8 +1093,10 @@ pub struct NodeConfig {
     pub data_plane: BTreeMap<String, DataPlaneAddr>,
     /// Inclusive port range the controller may assign from for this node.
     pub port_range: PortRange,
+    /// Link transports this node advertises, each a bare name (both roles) or
+    /// `{ name, roles }`.
     #[serde(default)]
-    pub transports: Vec<String>,
+    pub transports: Vec<TransportOffer>,
     /// Whether this node offers itself as transit for other nodes' streams.
     #[serde(default)]
     pub relay: bool,
@@ -605,9 +1192,200 @@ pub enum AdapterKind {
     Custom,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TransportDescriptor {
-    pub name: String,
+/// One transport a node offers, with the socket roles it can take over it.
+///
+/// Deserializes from a bare name or a full mapping, so `transports: [srt]` and
+/// `transports: [{ name: whip, roles: [listen] }]` are both valid. A bare name,
+/// or a mapping without `roles`, offers both roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TransportOffer {
+    pub name: Transport,
+    pub roles: RoleSet,
+}
+
+impl TransportOffer {
+    /// A transport offered in both roles.
+    #[must_use]
+    pub fn new(name: Transport) -> Self {
+        Self {
+            name,
+            roles: RoleSet::both(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_roles(name: Transport, roles: RoleSet) -> Self {
+        Self { name, roles }
+    }
+
+    #[must_use]
+    pub fn offers(&self, role: SocketRole) -> bool {
+        self.roles.contains(role)
+    }
+}
+
+impl<'de> Deserialize<'de> for TransportOffer {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Full {
+            name: Transport,
+            #[serde(default = "RoleSet::both")]
+            roles: RoleSet,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Name(Transport),
+            Full(Full),
+        }
+
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Name(name) => Self::new(name),
+            Repr::Full(Full { name, roles }) => Self::with_roles(name, roles),
+        })
+    }
+}
+
+/// A non-empty set of the socket roles a node can take over one transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoleSet {
+    listen: bool,
+    connect: bool,
+}
+
+impl RoleSet {
+    #[must_use]
+    pub fn both() -> Self {
+        Self {
+            listen: true,
+            connect: true,
+        }
+    }
+
+    #[must_use]
+    pub fn only(role: SocketRole) -> Self {
+        Self {
+            listen: matches!(role, SocketRole::Listen),
+            connect: matches!(role, SocketRole::Connect),
+        }
+    }
+
+    #[must_use]
+    pub fn contains(self, role: SocketRole) -> bool {
+        match role {
+            SocketRole::Listen => self.listen,
+            SocketRole::Connect => self.connect,
+        }
+    }
+
+    fn roles(self) -> impl Iterator<Item = SocketRole> {
+        [
+            self.listen.then_some(SocketRole::Listen),
+            self.connect.then_some(SocketRole::Connect),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+impl Serialize for RoleSet {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_seq(self.roles())
+    }
+}
+
+impl<'de> Deserialize<'de> for RoleSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut set = Self {
+            listen: false,
+            connect: false,
+        };
+        for role in Vec::<SocketRole>::deserialize(deserializer)? {
+            match role {
+                SocketRole::Listen => set.listen = true,
+                SocketRole::Connect => set.connect = true,
+            }
+        }
+        if !set.listen && !set.connect {
+            return Err(serde::de::Error::custom("a transport offered in no role"));
+        }
+        Ok(set)
+    }
+}
+
+/// The devices a node offers, listed by [`DeviceKind`] name on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeviceSet {
+    capture: bool,
+    display: bool,
+}
+
+impl DeviceSet {
+    #[must_use]
+    pub fn contains(self, kind: DeviceKind) -> bool {
+        match kind {
+            DeviceKind::Capture => self.capture,
+            DeviceKind::Display => self.display,
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.capture && !self.display
+    }
+
+    fn kinds(self) -> impl Iterator<Item = DeviceKind> {
+        [
+            self.capture.then_some(DeviceKind::Capture),
+            self.display.then_some(DeviceKind::Display),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+impl FromIterator<DeviceKind> for DeviceSet {
+    fn from_iter<I: IntoIterator<Item = DeviceKind>>(kinds: I) -> Self {
+        let mut set = Self::default();
+        for kind in kinds {
+            match kind {
+                DeviceKind::Capture => set.capture = true,
+                DeviceKind::Display => set.display = true,
+            }
+        }
+        set
+    }
+}
+
+impl Serialize for DeviceSet {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_seq(self.kinds())
+    }
+}
+
+impl<'de> Deserialize<'de> for DeviceSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Vec::<DeviceKind>::deserialize(deserializer)?
+            .into_iter()
+            .collect())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -616,8 +1394,10 @@ pub struct EndpointDescriptor {
     pub label: String,
     pub node_id: Option<String>,
     pub kind: EndpointKind,
+    /// Transport labels an adapter recognised on this endpoint, such as
+    /// `webrtc` or `ndi`. Guesses read off the underlying system, not offers.
     #[serde(default)]
-    pub transports: Vec<TransportDescriptor>,
+    pub transports: Vec<String>,
     #[serde(default)]
     pub metadata: serde_json::Value,
 }
@@ -752,22 +1532,8 @@ mod tests {
             id: "weave-contribution-sender".to_string(),
             node_id: "strom-node-1".to_string(),
             role: HopRole::Sender,
-            ingress: SocketSpec {
-                transport: Transport::Srt,
-                role: SocketRole::Listen,
-                host: None,
-                port: Some(7001),
-                params: SrtParams { latency: Some(200) },
-            },
-            egresses: vec![SocketSpec {
-                transport: Transport::Srt,
-                role: SocketRole::Connect,
-                host: Some("172.31.0.10".to_string()),
-                port: Some(7002),
-                params: SrtParams {
-                    latency: Some(1000),
-                },
-            }],
+            ingress: SocketSpec::srt_listen(7001, 200),
+            egresses: vec![SocketSpec::srt_connect("172.31.0.10", 7002, 1000)],
         }
     }
 
@@ -793,9 +1559,8 @@ mod tests {
     #[test]
     fn hop_with_multiple_egresses_round_trips() {
         let mut hop = sample_hop();
-        let mut second = hop.egresses[0].clone();
-        second.port = Some(7003);
-        hop.egresses.push(second);
+        hop.egresses
+            .push(SocketSpec::srt_connect("172.31.0.10", 7003, 1000));
         assert_eq!(hop.egresses.len(), 2);
 
         let round_trip: DesiredHop =
@@ -804,16 +1569,9 @@ mod tests {
     }
 
     #[test]
-    fn socket_spec_omits_absent_host_and_port() {
-        let listen = SocketSpec {
-            transport: Transport::Srt,
-            role: SocketRole::Listen,
-            host: None,
-            port: Some(7001),
-            params: SrtParams::default(),
-        };
-        let value = serde_json::to_value(&listen).unwrap();
-        assert!(value.get("host").is_none(), "absent host is not serialized");
+    fn a_listening_srt_socket_carries_no_host() {
+        let value = serde_json::to_value(SocketSpec::srt_listen(7001, 200)).unwrap();
+        assert!(value.get("host").is_none(), "a listener has no host");
         assert_eq!(value["role"], "listen");
         assert_eq!(value["transport"], "srt");
     }
@@ -1094,7 +1852,7 @@ mod tests {
                 start: 20000,
                 end: 20999,
             },
-            transports: vec!["srt".to_string()],
+            transports: vec![TransportOffer::new(Transport::Srt)],
             relay: false,
         }
     }
@@ -1218,7 +1976,9 @@ mod tests {
     #[test]
     fn only_the_destinations_that_conflict_are_reported() {
         let mut stream = stream_with_formats(Some(aac_48k()), None);
-        let StreamTransport::Srt(base) = &stream.destinations[0];
+        let StreamTransport::Srt(base) = &stream.destinations[0] else {
+            unreachable!("fixture destination is srt");
+        };
 
         let mut fussy = base.clone();
         fussy.accepts = Some(wants_44k());
@@ -1313,5 +2073,413 @@ mod tests {
             "bogus": true
         }));
         assert!(result.is_err(), "deny_unknown_fields rejects typos");
+    }
+
+    #[test]
+    fn device_endpoint_round_trips_and_denies_unknown_fields() {
+        let json = serde_json::json!({
+            "name": "alice-cam",
+            "source": { "device": { "node": "browser-a1b2" } },
+            "destinations": [ { "srt": { "node": "strom-node-2" } } ]
+        });
+        let stream: StreamDefinition = serde_json::from_value(json).expect("parse stream");
+        assert_eq!(
+            stream.source,
+            StreamTransport::Device(NodeEndpoint {
+                node: "browser-a1b2".to_string(),
+                network: None,
+            })
+        );
+        assert_eq!(stream.source.node(), Some("browser-a1b2"));
+        assert_eq!(stream.source.kind(), "device");
+
+        let round_trip: StreamDefinition =
+            serde_json::from_str(&serde_json::to_string(&stream).unwrap()).unwrap();
+        assert_eq!(stream, round_trip);
+        let value = serde_json::to_value(&stream).unwrap();
+        assert_eq!(
+            value["source"]["device"],
+            serde_json::json!({ "node": "browser-a1b2" })
+        );
+
+        let with_latency: Result<StreamTransport, _> = serde_json::from_value(serde_json::json!({
+            "device": { "node": "browser-a1b2", "latency": 200 }
+        }));
+        assert!(with_latency.is_err(), "a device endpoint has no SRT fields");
+    }
+
+    #[test]
+    fn device_source_declares_no_format_so_nothing_conflicts() {
+        let stream = StreamDefinition {
+            name: "alice-cam".to_string(),
+            enabled: true,
+            source: StreamTransport::Device(NodeEndpoint {
+                node: "browser-a1b2".to_string(),
+                network: None,
+            }),
+            destinations: vec![StreamTransport::Srt(SrtEndpoint {
+                node: Some("strom-node-2".to_string()),
+                remote: None,
+                via: Vec::new(),
+                network: None,
+                latency: None,
+                format: None,
+                accepts: Some(wants_44k()),
+            })],
+        };
+        assert!(stream_format_conflicts(&stream).is_empty());
+    }
+
+    #[test]
+    fn every_socket_variant_round_trips_through_its_flat_wire_form() {
+        let cases = [
+            (
+                SocketSpec::srt_listen(7001, 200),
+                serde_json::json!({
+                    "transport": "srt", "role": "listen", "port": 7001,
+                    "params": { "latency": 200 }
+                }),
+            ),
+            (
+                SocketSpec::srt_connect("10.0.0.2", 7002, 1000),
+                serde_json::json!({
+                    "transport": "srt", "role": "connect", "host": "10.0.0.2", "port": 7002,
+                    "params": { "latency": 1000 }
+                }),
+            ),
+            (
+                SocketSpec::signalling(
+                    SignallingTransport::Whip,
+                    SocketRole::Listen,
+                    "http://172.26.0.10:8080/whip",
+                    "weave-x",
+                ),
+                serde_json::json!({
+                    "transport": "whip", "role": "listen",
+                    "url": "http://172.26.0.10:8080/whip/weave-x", "endpoint_id": "weave-x"
+                }),
+            ),
+            (
+                SocketSpec::signalling(
+                    SignallingTransport::Whep,
+                    SocketRole::Connect,
+                    "http://172.26.0.10:8080/whep",
+                    "weave-x",
+                ),
+                serde_json::json!({
+                    "transport": "whep", "role": "connect",
+                    "url": "http://172.26.0.10:8080/whep/weave-x", "endpoint_id": "weave-x"
+                }),
+            ),
+            (
+                SocketSpec::Device(DeviceKind::Capture),
+                serde_json::json!({ "transport": "device", "role": "capture" }),
+            ),
+            (
+                SocketSpec::Device(DeviceKind::Display),
+                serde_json::json!({ "transport": "device", "role": "display" }),
+            ),
+        ];
+
+        for (socket, wire) in cases {
+            assert_eq!(serde_json::to_value(&socket).unwrap(), wire);
+            let parsed: SocketSpec = serde_json::from_value(wire).unwrap();
+            assert_eq!(parsed, socket);
+        }
+    }
+
+    /// A socket stored before `params` was optional on the wire.
+    #[test]
+    fn an_srt_socket_parses_with_empty_params() {
+        let stored: SocketSpec = serde_json::from_value(serde_json::json!({
+            "transport": "srt", "role": "listen", "port": 7001, "params": {}
+        }))
+        .expect("hydrate");
+        assert_eq!(
+            stored,
+            SocketSpec::Srt(SrtSocket::Listen {
+                port: 7001,
+                params: SrtParams::default(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_socket_that_mixes_up_its_transport_is_rejected() {
+        let rejected = [
+            serde_json::json!({ "transport": "srt", "role": "listen", "params": {} }),
+            serde_json::json!({ "transport": "srt", "role": "connect", "port": 7002 }),
+            serde_json::json!({
+                "transport": "srt", "role": "listen", "port": 7001, "host": "10.0.0.2"
+            }),
+            serde_json::json!({
+                "transport": "srt", "role": "listen", "port": 7001, "url": "http://x/whip/y"
+            }),
+            serde_json::json!({ "transport": "whip", "role": "listen" }),
+            serde_json::json!({
+                "transport": "whip", "role": "listen", "url": "http://x/whip/y"
+            }),
+            serde_json::json!({
+                "transport": "whip", "role": "listen", "url": "http://x/whip/y", "port": 7001,
+                "endpoint_id": "y"
+            }),
+            serde_json::json!({
+                "transport": "whep", "role": "connect", "url": "http://x/whep/y",
+                "endpoint_id": "y", "params": {}
+            }),
+            serde_json::json!({ "transport": "device", "role": "connect" }),
+            serde_json::json!({ "transport": "srt", "role": "capture", "port": 7001 }),
+            serde_json::json!({ "transport": "device", "role": "capture", "port": 7001 }),
+            serde_json::json!({ "transport": "srt", "role": "listen", "port": 7001, "bogus": 1 }),
+            serde_json::json!({
+                "transport": "srt", "role": "listen", "port": 7001, "endpoint_id": "y"
+            }),
+            serde_json::json!({ "transport": "device", "role": "capture", "endpoint_id": "y" }),
+        ];
+
+        for wire in rejected {
+            let result: Result<SocketSpec, _> = serde_json::from_value(wire.clone());
+            assert!(result.is_err(), "{wire} must not parse");
+        }
+    }
+
+    #[test]
+    fn socket_display_names_the_transport_or_the_device() {
+        assert_eq!(SocketSpec::srt_listen(7001, 200).to_string(), "srt");
+        assert_eq!(
+            SocketSpec::signalling(
+                SignallingTransport::Whip,
+                SocketRole::Listen,
+                "http://x/whip",
+                "y"
+            )
+            .to_string(),
+            "whip"
+        );
+        assert_eq!(
+            SocketSpec::signalling(
+                SignallingTransport::Whep,
+                SocketRole::Connect,
+                "http://x/whep",
+                "y"
+            )
+            .to_string(),
+            "whep"
+        );
+        assert_eq!(
+            SocketSpec::Device(DeviceKind::Capture).to_string(),
+            "capture device"
+        );
+        assert_eq!(
+            SocketSpec::Device(DeviceKind::Display).to_string(),
+            "display device"
+        );
+    }
+
+    #[test]
+    fn transport_offer_reads_a_bare_name_as_both_roles() {
+        let capabilities: NodeCapabilities = serde_json::from_value(serde_json::json!({
+            "transports": [
+                "srt",
+                { "name": "whip", "roles": ["listen"] },
+                { "name": "whep" }
+            ]
+        }))
+        .expect("parse capabilities");
+
+        assert_eq!(
+            capabilities.transports[0],
+            TransportOffer::new(Transport::Srt)
+        );
+        assert!(capabilities.transports[0].offers(SocketRole::Listen));
+        assert!(capabilities.transports[0].offers(SocketRole::Connect));
+        assert_eq!(
+            capabilities.transports[1],
+            TransportOffer::with_roles(Transport::Whip, RoleSet::only(SocketRole::Listen))
+        );
+        assert!(!capabilities.transports[1].offers(SocketRole::Connect));
+        assert_eq!(
+            capabilities.transports[2],
+            TransportOffer::new(Transport::Whep)
+        );
+
+        let round_trip: NodeCapabilities =
+            serde_json::from_str(&serde_json::to_string(&capabilities).unwrap()).unwrap();
+        assert_eq!(capabilities, round_trip);
+        assert_eq!(
+            serde_json::to_value(capabilities.transports[0]).unwrap(),
+            serde_json::json!({ "name": "srt", "roles": ["listen", "connect"] })
+        );
+
+        let bogus: Result<TransportOffer, _> =
+            serde_json::from_value(serde_json::json!({ "name": "srt", "role": "listen" }));
+        assert!(bogus.is_err(), "deny_unknown_fields rejects typos");
+    }
+
+    #[test]
+    fn a_transport_offered_in_no_role_or_under_no_known_name_is_rejected() {
+        let no_role: Result<TransportOffer, _> =
+            serde_json::from_value(serde_json::json!({ "name": "whip", "roles": [] }));
+        assert!(no_role.is_err(), "a transport offered in no role");
+
+        let unknown: Result<TransportOffer, _> = serde_json::from_value(serde_json::json!("rist"));
+        assert!(unknown.is_err(), "an unknown transport name is an error");
+    }
+
+    /// Registrations persisted before roles existed carry `{ "name": "srt" }`.
+    #[test]
+    fn a_transport_stored_before_roles_offers_both() {
+        let stored: TransportOffer =
+            serde_json::from_value(serde_json::json!({ "name": "srt" })).expect("hydrate");
+        assert_eq!(stored, TransportOffer::new(Transport::Srt));
+    }
+
+    #[test]
+    fn capabilities_without_transports_read_as_srt_in_both_roles() {
+        let bare = NodeCapabilities::default();
+        assert!(bare.offers(Transport::Srt, SocketRole::Listen));
+        assert!(bare.offers(Transport::Srt, SocketRole::Connect));
+        assert!(!bare.offers(Transport::Whip, SocketRole::Listen));
+
+        let declared = NodeCapabilities {
+            transports: vec![TransportOffer::with_roles(
+                Transport::Whip,
+                RoleSet::only(SocketRole::Connect),
+            )],
+            ..NodeCapabilities::default()
+        };
+        assert!(declared.offers(Transport::Whip, SocketRole::Connect));
+        assert!(!declared.offers(Transport::Whip, SocketRole::Listen));
+        assert!(
+            !declared.offers(Transport::Srt, SocketRole::Listen),
+            "declaring any transport withdraws the SRT fallback"
+        );
+    }
+
+    #[test]
+    fn devices_parse_from_a_list_and_are_omitted_when_empty() {
+        let capabilities: NodeCapabilities = serde_json::from_value(serde_json::json!({
+            "devices": ["capture", "display"]
+        }))
+        .expect("parse capabilities");
+        assert!(capabilities.offers_device(DeviceKind::Capture));
+        assert!(capabilities.offers_device(DeviceKind::Display));
+        assert_eq!(
+            serde_json::to_value(&capabilities).unwrap()["devices"],
+            serde_json::json!(["capture", "display"])
+        );
+
+        let capture: DeviceSet = [DeviceKind::Capture].into_iter().collect();
+        assert!(capture.contains(DeviceKind::Capture));
+        assert!(!capture.contains(DeviceKind::Display));
+
+        let bare = NodeCapabilities::default();
+        assert!(bare.devices.is_empty());
+        assert!(!bare.offers_device(DeviceKind::Capture), "no fallback");
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("devices")
+                .is_none(),
+            "an empty device set is not serialized"
+        );
+    }
+
+    #[test]
+    fn data_plane_addr_carries_signalling_bases_per_webrtc_transport() {
+        let addr: DataPlaneAddr = serde_json::from_value(serde_json::json!({
+            "host": "172.26.0.10",
+            "signalling": {
+                "whip": "http://172.26.0.10:8080/whip",
+                "whep": "http://172.26.0.10:8080/whep"
+            }
+        }))
+        .expect("parse");
+        assert!(addr.is_dialable());
+        assert_eq!(
+            addr.signalling.whip.as_deref(),
+            Some("http://172.26.0.10:8080/whip")
+        );
+        assert_eq!(
+            addr.signalling.whep.as_deref(),
+            Some("http://172.26.0.10:8080/whep")
+        );
+        assert_eq!(
+            addr.signalling.base(SignallingTransport::Whip),
+            Some("http://172.26.0.10:8080/whip")
+        );
+        assert_eq!(
+            addr.signalling.base(SignallingTransport::Whep),
+            Some("http://172.26.0.10:8080/whep")
+        );
+        let round_trip: DataPlaneAddr =
+            serde_json::from_str(&serde_json::to_string(&addr).unwrap()).unwrap();
+        assert_eq!(addr, round_trip);
+
+        let shorthand: DataPlaneAddr =
+            serde_json::from_value(serde_json::json!("172.26.0.10")).expect("parse shorthand");
+        assert_eq!(shorthand, DataPlaneAddr::dialable("172.26.0.10"));
+        assert!(shorthand.signalling.is_empty());
+        assert_eq!(
+            serde_json::to_value(&shorthand).unwrap(),
+            serde_json::json!({ "host": "172.26.0.10", "reachability": "dialable" }),
+            "an address hosting no signalling serializes none"
+        );
+    }
+
+    #[test]
+    fn signalling_socket_joins_base_and_endpoint_id() {
+        let trimmed = SignallingSocket::new(SocketRole::Listen, "http://x:8080/whip/", "weave-a");
+        let bare = SignallingSocket::new(SocketRole::Listen, "http://x:8080/whip", "weave-a");
+        assert_eq!(trimmed.url, "http://x:8080/whip/weave-a");
+        assert_eq!(trimmed.endpoint_id, "weave-a");
+        assert_eq!(
+            trimmed, bare,
+            "a trailing slash on the base changes nothing"
+        );
+    }
+
+    #[test]
+    fn signalling_transport_maps_both_ways_with_transport() {
+        assert_eq!(Transport::Srt.signalling(), None);
+        assert_eq!(
+            Transport::Whip.signalling(),
+            Some(SignallingTransport::Whip)
+        );
+        assert_eq!(
+            Transport::Whep.signalling(),
+            Some(SignallingTransport::Whep)
+        );
+        assert_eq!(SignallingTransport::Whip.transport(), Transport::Whip);
+        assert_eq!(SignallingTransport::Whep.transport(), Transport::Whep);
+    }
+
+    #[test]
+    fn signalling_set_is_read_back_by_transport() {
+        let mut signalling = Signalling::default();
+        signalling.set(SignallingTransport::Whip, "http://x/whip".to_string());
+        assert_eq!(
+            signalling.base(SignallingTransport::Whip),
+            Some("http://x/whip")
+        );
+        assert_eq!(signalling.base(SignallingTransport::Whep), None);
+    }
+
+    #[test]
+    fn transport_and_device_names_match_their_wire_form() {
+        for transport in [Transport::Srt, Transport::Whip, Transport::Whep] {
+            assert_eq!(
+                serde_json::to_value(transport).unwrap(),
+                serde_json::json!(transport.name())
+            );
+            assert_eq!(transport.to_string(), transport.name());
+        }
+        for kind in [DeviceKind::Capture, DeviceKind::Display] {
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::json!(kind.name())
+            );
+            assert_eq!(kind.to_string(), kind.name());
+        }
     }
 }

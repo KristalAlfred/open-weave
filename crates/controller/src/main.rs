@@ -169,21 +169,58 @@ struct HopView {
     stats: Option<weave_core::LinkStats>,
 }
 
+/// One socket as the dashboard reads it: every transport's fields flattened
+/// into one object, with the ones this socket does not carry left out.
 #[derive(Debug, Serialize)]
 struct SocketView {
-    mode: weave_core::SocketRole,
+    transport: &'static str,
+    mode: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
 }
 
 impl From<&weave_core::SocketSpec> for SocketView {
     fn from(spec: &weave_core::SocketSpec) -> Self {
+        use weave_core::{DEVICE_TRANSPORT, SocketSpec, SrtSocket, Transport};
+
+        let (transport, mode, host, port, url) = match spec {
+            SocketSpec::Srt(socket) => (
+                Transport::Srt.name(),
+                socket.role().name(),
+                match socket {
+                    SrtSocket::Connect { host, .. } => Some(host.clone()),
+                    SrtSocket::Listen { .. } => None,
+                },
+                Some(socket.port()),
+                None,
+            ),
+            SocketSpec::Whip(socket) => (
+                Transport::Whip.name(),
+                socket.role.name(),
+                None,
+                None,
+                Some(socket.url.clone()),
+            ),
+            SocketSpec::Whep(socket) => (
+                Transport::Whep.name(),
+                socket.role.name(),
+                None,
+                None,
+                Some(socket.url.clone()),
+            ),
+            SocketSpec::Device(kind) => (DEVICE_TRANSPORT, kind.name(), None, None, None),
+        };
+
         Self {
-            mode: spec.role,
-            host: spec.host.clone(),
-            port: spec.port,
+            transport,
+            mode,
+            host,
+            port,
+            url,
         }
     }
 }
@@ -890,6 +927,7 @@ mod tests {
             weave_core::DataPlaneAddr {
                 host: host.to_string(),
                 reachability: weave_core::Reachability::OutboundOnly,
+                signalling: weave_core::Signalling::default(),
             },
         );
         registration

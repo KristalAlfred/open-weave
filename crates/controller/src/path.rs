@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 use weave_core::{
     DEFAULT_DATA_PLANE_ALIAS, DataPlaneAddr, DesiredHop, HOP_ID_PREFIX, HopConditions, HopRole,
-    HopStatus, NodeDescriptor, NodeStatus, Path, PathStatus, PortRange, RemoteAddr, SocketRole,
-    SocketSpec, SrtEndpoint, SrtParams, StreamDefinition, StreamTransport, Transport, roll_up_path,
+    HopStatus, NodeDescriptor, NodeStatus, Path, PathStatus, PortRange, RemoteAddr, SocketSpec,
+    SrtEndpoint, StreamDefinition, StreamTransport, roll_up_path,
 };
 
 const DEFAULT_SRC_LATENCY: u32 = 200;
@@ -40,6 +40,15 @@ pub enum PlacementError {
     },
     #[error("a source endpoint must not pin via")]
     SourceVia,
+    #[error("{0} endpoints cannot be placed yet")]
+    UnsupportedEndpoint(&'static str),
+}
+
+fn srt_endpoint(endpoint: &StreamTransport) -> Result<&SrtEndpoint, PlacementError> {
+    match endpoint {
+        StreamTransport::Srt(endpoint) => Ok(endpoint),
+        other => Err(PlacementError::UnsupportedEndpoint(other.kind())),
+    }
 }
 
 #[must_use]
@@ -135,7 +144,7 @@ pub fn derive_path(
     _observed: &[HopStatus],
     ports: &mut PortAllocator,
 ) -> Result<Path, PlacementError> {
-    let StreamTransport::Srt(source) = &stream.source;
+    let source = srt_endpoint(&stream.source)?;
     if stream.destinations.is_empty() {
         return Err(PlacementError::NoDestination);
     }
@@ -154,7 +163,7 @@ pub fn derive_path(
     let mut downstream = Vec::new();
 
     for (index, dest) in stream.destinations.iter().enumerate() {
-        let StreamTransport::Srt(dest) = dest;
+        let dest = srt_endpoint(dest)?;
         let latency = dest.latency.unwrap_or(DEFAULT_SINK_LATENCY);
         let placement = endpoint_placement(dest)?;
 
@@ -204,7 +213,7 @@ pub fn derive_path(
             // An external listener terminates the chain: the last hop dials it
             // and no hop is placed for it.
             Placement::Remote(remote) => {
-                let socket = connect_socket(remote.host.clone(), remote.port, latency);
+                let socket = SocketSpec::srt_connect(remote.host.clone(), remote.port, latency);
                 push_egress(&mut sender_egresses, &mut hops, socket);
             }
             // The last hop is the receiver; its remaining egress is the socket
@@ -217,7 +226,7 @@ pub fn derive_path(
                     claim_port(&receiver.node_id, &consumer_key(&receiver.id), nodes, ports)?;
                 receiver
                     .egresses
-                    .push(listen_socket(port, RECV_CONSUMER_LATENCY));
+                    .push(SocketSpec::srt_listen(port, RECV_CONSUMER_LATENCY));
             }
         }
 
@@ -413,8 +422,8 @@ fn plan_link(
     if down_addr.is_dialable() {
         let port = claim_port(&downstream.station.node_id, downstream.hop_id, nodes, ports)?;
         return Ok((
-            connect_socket(down_addr.host, port, latency),
-            listen_socket(port, latency),
+            SocketSpec::srt_connect(down_addr.host, port, latency),
+            SocketSpec::srt_listen(port, latency),
         ));
     }
 
@@ -422,8 +431,8 @@ fn plan_link(
     if up_addr.is_dialable() {
         let port = claim_port(&upstream.station.node_id, downstream.hop_id, nodes, ports)?;
         return Ok((
-            listen_socket(port, latency),
-            connect_socket(up_addr.host, port, latency),
+            SocketSpec::srt_listen(port, latency),
+            SocketSpec::srt_connect(up_addr.host, port, latency),
         ));
     }
 
@@ -485,7 +494,7 @@ fn source_socket(
 ) -> Result<SocketSpec, PlacementError> {
     let latency = source.latency.unwrap_or(DEFAULT_SRC_LATENCY);
     let port = claim_port(node_id, hop_id, nodes, ports)?;
-    Ok(listen_socket(port, latency))
+    Ok(SocketSpec::srt_listen(port, latency))
 }
 
 fn claim_port(
@@ -542,30 +551,6 @@ fn find_node<'a>(nodes: &'a [NodeDescriptor], id: &str) -> Option<&'a NodeDescri
     nodes.iter().find(|node| node.id == id)
 }
 
-fn connect_socket(host: String, port: u16, latency: u32) -> SocketSpec {
-    SocketSpec {
-        transport: Transport::Srt,
-        role: SocketRole::Connect,
-        host: Some(host),
-        port: Some(port),
-        params: SrtParams {
-            latency: Some(latency),
-        },
-    }
-}
-
-fn listen_socket(port: u16, latency: u32) -> SocketSpec {
-    SocketSpec {
-        transport: Transport::Srt,
-        role: SocketRole::Listen,
-        host: None,
-        port: Some(port),
-        params: SrtParams {
-            latency: Some(latency),
-        },
-    }
-}
-
 /// Concrete `srt://` addresses a producer and consumers use to reach a placed
 /// stream, resolved against the same node data-plane aliases planning used.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -601,7 +586,7 @@ pub fn stream_endpoints(
     path: &Path,
     nodes: &[NodeDescriptor],
 ) -> Result<StreamEndpoints, PlacementError> {
-    let StreamTransport::Srt(source) = &stream.source;
+    let source = srt_endpoint(&stream.source)?;
     let source_node = source_node(source)?;
     let sender = path
         .hops
@@ -612,7 +597,7 @@ pub fn stream_endpoints(
 
     let mut outputs = Vec::with_capacity(stream.destinations.len());
     for (index, dest) in stream.destinations.iter().enumerate() {
-        let StreamTransport::Srt(dest) = dest;
+        let dest = srt_endpoint(dest)?;
         match endpoint_placement(dest)? {
             Placement::Remote(remote) => outputs.push(remote_endpoint_addr(&remote)),
             Placement::Node(node_id) => {
@@ -669,8 +654,12 @@ fn remote_endpoint_addr(remote: &RemoteAddr) -> EndpointAddr {
 }
 
 fn hop_port(spec: &SocketSpec, hop_id: &str) -> Result<u16, PlacementError> {
-    spec.port
-        .ok_or_else(|| PlacementError::UnassignedPort(hop_id.to_string()))
+    match spec {
+        SocketSpec::Srt(socket) => Ok(socket.port()),
+        SocketSpec::Whip(_) | SocketSpec::Whep(_) | SocketSpec::Device(_) => {
+            Err(PlacementError::UnassignedPort(hop_id.to_string()))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -679,8 +668,24 @@ mod tests {
     use std::collections::BTreeMap;
     use weave_core::{
         HopState, LinkCondition, NodeCapabilities, NodeStatus, PortRange, Reachability,
-        ResolvedAddr,
+        ResolvedAddr, Signalling, SocketRole, SrtSocket,
     };
+
+    /// Every socket this planner places is SRT, so a test asserting on an
+    /// address can insist on that.
+    fn srt(spec: &SocketSpec) -> &SrtSocket {
+        match spec {
+            SocketSpec::Srt(socket) => socket,
+            other => panic!("planned a {other} socket"),
+        }
+    }
+
+    fn host(spec: &SocketSpec) -> Option<&str> {
+        match srt(spec) {
+            SrtSocket::Connect { host, .. } => Some(host),
+            SrtSocket::Listen { .. } => None,
+        }
+    }
 
     fn node(id: &str, host: &str) -> NodeDescriptor {
         node_with_aliases(id, &[(DEFAULT_DATA_PLANE_ALIAS, host)])
@@ -706,6 +711,7 @@ mod tests {
                 DataPlaneAddr {
                     host: host.to_string(),
                     reachability: Reachability::OutboundOnly,
+                    signalling: Signalling::default(),
                 },
             )]),
         )
@@ -794,25 +800,27 @@ mod tests {
         let sender = &path.hops[0];
         assert_eq!(sender.role, HopRole::Sender);
         assert_eq!(sender.node_id, "strom-node-1");
-        assert_eq!(sender.ingress.role, SocketRole::Listen);
-        let ingress_port = sender.ingress.port.expect("ingress port");
+        assert_eq!(srt(&sender.ingress).role(), SocketRole::Listen);
+        let ingress_port = srt(&sender.ingress).port();
         assert!((7000..=7999).contains(&ingress_port));
         assert_eq!(sender.egresses.len(), 1);
-        assert_eq!(sender.egresses[0].role, SocketRole::Connect);
-        assert_eq!(sender.egresses[0].host.as_deref(), Some("172.27.0.10"));
+        assert_eq!(srt(&sender.egresses[0]).role(), SocketRole::Connect);
+        assert_eq!(host(&sender.egresses[0]), Some("172.27.0.10"));
 
         let receiver = &path.hops[1];
         assert_eq!(receiver.role, HopRole::Receiver);
         assert_eq!(receiver.node_id, "strom-node-2");
-        let dest_port = receiver.ingress.port.expect("dest port");
-        assert_eq!(sender.egresses[0].port, Some(dest_port));
-        assert!((7000..=7999).contains(&receiver.egresses[0].port.expect("consumer port")));
+        let dest_port = srt(&receiver.ingress).port();
+        assert_eq!(srt(&sender.egresses[0]).port(), dest_port);
+        assert!((7000..=7999).contains(&srt(&receiver.egresses[0]).port()));
     }
 
     #[test]
     fn receiver_is_placed_on_its_declared_node() {
         let mut stream = contribution();
-        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0] else {
+            unreachable!("fixture endpoint is srt");
+        };
         dest.node = Some("strom-node-1".to_string());
 
         let path = derive(&stream, &nodes()).expect("derive");
@@ -822,7 +830,9 @@ mod tests {
     #[test]
     fn source_on_unregistered_node_is_not_registered() {
         let mut stream = contribution();
-        let StreamTransport::Srt(source) = &mut stream.source;
+        let StreamTransport::Srt(source) = &mut stream.source else {
+            unreachable!("fixture endpoint is srt");
+        };
         source.node = Some("ghost".to_string());
 
         assert_eq!(
@@ -839,12 +849,12 @@ mod tests {
 
         let path = derive(&stream, &nodes()).expect("derive");
         let egress = &path.hops[0].egresses[0];
-        assert_eq!(egress.host.as_deref(), Some("172.27.0.10"));
-        let port = egress.port.expect("assigned port");
+        assert_eq!(host(egress), Some("172.27.0.10"));
+        let port = srt(egress).port();
         assert!((7000..=7999).contains(&port), "port {port} within range");
         assert_eq!(
-            path.hops[1].ingress.port,
-            Some(port),
+            srt(&path.hops[1].ingress).port(),
+            port,
             "receiver listens on it"
         );
     }
@@ -852,7 +862,9 @@ mod tests {
     #[test]
     fn node_ref_destination_resolves_named_alias() {
         let mut stream = contribution();
-        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0] else {
+            unreachable!("fixture endpoint is srt");
+        };
         dest.network = Some("wan".to_string());
 
         let mut nodes = nodes();
@@ -862,16 +874,15 @@ mod tests {
         );
 
         let path = derive(&stream, &nodes).expect("derive");
-        assert_eq!(
-            path.hops[0].egresses[0].host.as_deref(),
-            Some("203.0.113.7")
-        );
+        assert_eq!(host(&path.hops[0].egresses[0]), Some("203.0.113.7"));
     }
 
     #[test]
     fn node_ref_destination_with_unknown_alias_is_rejected() {
         let mut stream = contribution();
-        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0] else {
+            unreachable!("fixture endpoint is srt");
+        };
         dest.network = Some("mgmt".to_string());
 
         assert_eq!(
@@ -886,7 +897,9 @@ mod tests {
     #[test]
     fn node_ref_destination_on_unregistered_node_is_not_registered() {
         let mut stream = contribution();
-        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0] else {
+            unreachable!("fixture endpoint is srt");
+        };
         dest.node = Some("strom-node-404".to_string());
 
         assert_eq!(
@@ -932,8 +945,8 @@ mod tests {
         let first = derive(&stream, &nodes()).expect("derive");
         let second = derive(&stream, &nodes()).expect("derive");
         assert_eq!(
-            first.hops[0].egresses[0].port,
-            second.hops[0].egresses[0].port
+            srt(&first.hops[0].egresses[0]).port(),
+            srt(&second.hops[0].egresses[0]).port()
         );
     }
 
@@ -998,8 +1011,8 @@ mod tests {
     fn consumer_port_is_within_range_and_distinct_from_ingress() {
         let path = derive(&contribution(), &nodes()).expect("derive");
         let receiver = &path.hops[1];
-        let ingress = receiver.ingress.port.expect("ingress port");
-        let consumer = receiver.egresses[0].port.expect("consumer port");
+        let ingress = srt(&receiver.ingress).port();
+        let consumer = srt(&receiver.egresses[0]).port();
         assert!((7000..=7999).contains(&consumer));
         assert_ne!(ingress, consumer, "consumer never collides with ingress");
     }
@@ -1013,36 +1026,32 @@ mod tests {
             node("strom-node-2", "172.27.0.10"),
         ];
         let path = derive(&stream, &before).expect("derive");
-        assert_eq!(
-            path.hops[0].egresses[0].host.as_deref(),
-            Some("172.27.0.10")
-        );
+        assert_eq!(host(&path.hops[0].egresses[0]), Some("172.27.0.10"));
 
         let after = vec![
             node("strom-node-1", "172.26.0.10"),
             node("strom-node-2", "172.27.0.55"),
         ];
         let path = derive(&stream, &after).expect("derive");
-        assert_eq!(
-            path.hops[0].egresses[0].host.as_deref(),
-            Some("172.27.0.55")
-        );
+        assert_eq!(host(&path.hops[0].egresses[0]), Some("172.27.0.55"));
     }
 
     #[test]
     fn sender_egress_uses_planned_delivery_when_no_resolved_ingress() {
         let path = derive(&contribution(), &nodes()).expect("derive");
+        assert_eq!(host(&path.hops[0].egresses[0]), Some("172.27.0.10"));
         assert_eq!(
-            path.hops[0].egresses[0].host.as_deref(),
-            Some("172.27.0.10")
+            srt(&path.hops[0].egresses[0]).port(),
+            srt(&path.hops[1].ingress).port()
         );
-        assert_eq!(path.hops[0].egresses[0].port, path.hops[1].ingress.port);
     }
 
     #[test]
     fn sender_egress_ignores_reported_resolved_ingress_even_for_wan() {
         let mut stream = contribution();
-        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0] else {
+            unreachable!("fixture endpoint is srt");
+        };
         dest.network = Some("wan".to_string());
 
         let mut nodes = nodes();
@@ -1070,12 +1079,13 @@ mod tests {
         let path =
             derive_path(&stream, &nodes, &observed, &mut PortAllocator::new()).expect("derive");
         assert_eq!(
-            path.hops[0].egresses[0].host.as_deref(),
+            host(&path.hops[0].egresses[0]),
             Some("203.0.113.7"),
             "keeps the wan host"
         );
         assert_eq!(
-            path.hops[0].egresses[0].port, path.hops[1].ingress.port,
+            srt(&path.hops[0].egresses[0]).port(),
+            srt(&path.hops[1].ingress).port(),
             "keeps the planned port"
         );
     }
@@ -1110,9 +1120,9 @@ mod tests {
         assert_eq!(path.hops.len(), 1, "only the sender hop is placed");
         let sender = &path.hops[0];
         assert_eq!(sender.egresses.len(), 1);
-        assert_eq!(sender.egresses[0].role, SocketRole::Connect);
-        assert_eq!(sender.egresses[0].host.as_deref(), Some("198.51.100.5"));
-        assert_eq!(sender.egresses[0].port, Some(9000));
+        assert_eq!(srt(&sender.egresses[0]).role(), SocketRole::Connect);
+        assert_eq!(host(&sender.egresses[0]), Some("198.51.100.5"));
+        assert_eq!(srt(&sender.egresses[0]).port(), 9000);
 
         let endpoints = stream_endpoints(&stream, &path, &nodes()).expect("endpoints");
         assert_eq!(endpoints.outputs.len(), 1);
@@ -1136,7 +1146,7 @@ mod tests {
         );
         let sender = &path.hops[0];
         assert_eq!(sender.egresses.len(), 2, "one egress per destination");
-        assert_eq!(sender.egresses[1].host.as_deref(), Some("198.51.100.5"));
+        assert_eq!(host(&sender.egresses[1]), Some("198.51.100.5"));
         assert_eq!(path.hops[1].id, receiver_hop_id("contribution", 0));
 
         let endpoints = stream_endpoints(&stream, &path, &nodes()).expect("endpoints");
@@ -1190,8 +1200,8 @@ mod tests {
         assert_eq!(sender.role, HopRole::Sender);
         assert_eq!(sender.node_id, "strom-node-1");
         assert_eq!(sender.egresses.len(), 2, "one egress per destination");
-        assert_eq!(sender.egresses[0].host.as_deref(), Some("172.27.0.10"));
-        assert_eq!(sender.egresses[1].host.as_deref(), Some("172.26.0.10"));
+        assert_eq!(host(&sender.egresses[0]), Some("172.27.0.10"));
+        assert_eq!(host(&sender.egresses[1]), Some("172.26.0.10"));
 
         let receiver0 = &path.hops[1];
         assert_eq!(receiver0.id, "weave-fanout-receiver-0");
@@ -1210,7 +1220,9 @@ mod tests {
     #[test]
     fn fanout_is_all_or_nothing_when_a_destination_is_unplaceable() {
         let mut stream = fanout();
-        let StreamTransport::Srt(dest) = &mut stream.destinations[1];
+        let StreamTransport::Srt(dest) = &mut stream.destinations[1] else {
+            unreachable!("fixture endpoint is srt");
+        };
         dest.node = Some("ghost".to_string());
         assert_eq!(
             derive(&stream, &nodes()),
@@ -1225,8 +1237,8 @@ mod tests {
     #[test]
     fn dialable_destination_keeps_the_sender_calling() {
         let path = derive(&contribution(), &nodes()).expect("derive");
-        assert_eq!(path.hops[0].egresses[0].role, SocketRole::Connect);
-        assert_eq!(path.hops[1].ingress.role, SocketRole::Listen);
+        assert_eq!(srt(&path.hops[0].egresses[0]).role(), SocketRole::Connect);
+        assert_eq!(srt(&path.hops[1].ingress).role(), SocketRole::Listen);
     }
 
     #[test]
@@ -1242,21 +1254,21 @@ mod tests {
         let sender_egress = &path.hops[0].egresses[0];
         let receiver = &path.hops[1];
         assert_eq!(
-            sender_egress.role,
+            srt(sender_egress).role(),
             SocketRole::Listen,
             "the dialable end listens"
         );
         assert_eq!(
-            receiver.ingress.role,
+            srt(&receiver.ingress).role(),
             SocketRole::Connect,
             "the NAT'd end dials out"
         );
         assert_eq!(
-            receiver.ingress.host.as_deref(),
+            host(&receiver.ingress),
             Some("172.26.0.10"),
             "it dials the source node's data-plane address"
         );
-        assert_eq!(receiver.ingress.port, sender_egress.port);
+        assert_eq!(srt(&receiver.ingress).port(), srt(sender_egress).port());
     }
 
     #[test]
@@ -1274,14 +1286,14 @@ mod tests {
         let sender = &path.hops[0];
         let receiver = &path.hops[1];
 
-        let egress_port = sender.egresses[0].port.expect("egress port");
+        let egress_port = srt(&sender.egresses[0]).port();
         assert!(
             (7000..=7999).contains(&egress_port),
             "the reversed link listens on node-1, so its port comes from node-1's range"
         );
-        assert_ne!(sender.ingress.port, sender.egresses[0].port);
+        assert_ne!(srt(&sender.ingress).port(), srt(&sender.egresses[0]).port());
         assert!(
-            (8000..=8999).contains(&receiver.egresses[0].port.expect("consumer port")),
+            (8000..=8999).contains(&srt(&receiver.egresses[0]).port()),
             "the consumer socket still belongs to the destination node"
         );
     }
@@ -1306,28 +1318,32 @@ mod tests {
         assert_eq!(bridge.id, "weave-contribution-bridge-0-0");
 
         assert_eq!(
-            sender.egresses[0].role,
+            srt(&sender.egresses[0]).role(),
             SocketRole::Connect,
             "the NAT'd source calls out"
         );
-        assert_eq!(sender.egresses[0].host.as_deref(), Some("198.51.100.9"));
+        assert_eq!(host(&sender.egresses[0]), Some("198.51.100.9"));
         assert_eq!(
-            receiver.ingress.role,
+            srt(&receiver.ingress).role(),
             SocketRole::Connect,
             "the NAT'd destination calls out too"
         );
-        assert_eq!(receiver.ingress.host.as_deref(), Some("198.51.100.9"));
+        assert_eq!(host(&receiver.ingress), Some("198.51.100.9"));
 
         assert_eq!(
-            bridge.ingress.role,
+            srt(&bridge.ingress).role(),
             SocketRole::Listen,
             "the relay listens on both sides"
         );
-        assert_eq!(bridge.egresses[0].role, SocketRole::Listen);
-        assert_eq!(bridge.ingress.port, sender.egresses[0].port);
-        assert_eq!(bridge.egresses[0].port, receiver.ingress.port);
+        assert_eq!(srt(&bridge.egresses[0]).role(), SocketRole::Listen);
+        assert_eq!(srt(&bridge.ingress).port(), srt(&sender.egresses[0]).port());
+        assert_eq!(
+            srt(&bridge.egresses[0]).port(),
+            srt(&receiver.ingress).port()
+        );
         assert_ne!(
-            bridge.ingress.port, bridge.egresses[0].port,
+            srt(&bridge.ingress).port(),
+            srt(&bridge.egresses[0]).port(),
             "the relay's two sockets are distinct"
         );
     }
@@ -1399,7 +1415,7 @@ mod tests {
         assert_eq!(path.hops.len(), 3, "sender, bridge, receiver");
         assert_eq!(path.hops[1].node_id, "relay-b");
         assert_eq!(
-            path.hops[0].egresses[0].host.as_deref(),
+            host(&path.hops[0].egresses[0]),
             Some("198.51.100.20"),
             "the source calls the relay that is up"
         );
@@ -1445,7 +1461,9 @@ mod tests {
     #[test]
     fn via_pins_a_bridge_on_an_otherwise_direct_link() {
         let mut stream = contribution();
-        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0] else {
+            unreachable!("fixture endpoint is srt");
+        };
         dest.via = vec!["edge-relay".to_string()];
 
         let mut nodes = nodes();
@@ -1460,11 +1478,11 @@ mod tests {
         assert_eq!(path.hops[1].node_id, "edge-relay");
         assert_eq!(path.hops[1].role, HopRole::Bridge);
         assert_eq!(
-            path.hops[2].ingress.role,
+            srt(&path.hops[2].ingress).role(),
             SocketRole::Listen,
             "both ends are dialable, so the relay calls the receiver"
         );
-        assert_eq!(path.hops[1].egresses[0].role, SocketRole::Connect);
+        assert_eq!(srt(&path.hops[1].egresses[0]).role(), SocketRole::Connect);
     }
 
     #[test]
@@ -1472,7 +1490,9 @@ mod tests {
         // `relay: true` gates automatic selection. An explicit pin is operator
         // intent and does not consult it.
         let mut stream = contribution();
-        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0] else {
+            unreachable!("fixture endpoint is srt");
+        };
         dest.via = vec!["transit".to_string()];
 
         let mut nodes = nodes();
@@ -1485,7 +1505,9 @@ mod tests {
     #[test]
     fn via_chains_multiple_relays_in_order() {
         let mut stream = contribution();
-        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0] else {
+            unreachable!("fixture endpoint is srt");
+        };
         dest.via = vec!["relay-first".to_string(), "relay-second".to_string()];
 
         let mut nodes = nodes();
@@ -1500,7 +1522,7 @@ mod tests {
         assert_eq!(path.hops[1].id, "weave-contribution-bridge-0-0");
         assert_eq!(path.hops[2].id, "weave-contribution-bridge-0-1");
         assert_eq!(
-            path.hops[1].egresses[0].host.as_deref(),
+            host(&path.hops[1].egresses[0]),
             Some("198.51.100.20"),
             "each bridge dials the next"
         );
@@ -1521,11 +1543,11 @@ mod tests {
         let bridge = &path.hops[1];
         assert_eq!(bridge.role, HopRole::Bridge);
         assert_eq!(
-            bridge.egresses[0].host.as_deref(),
+            host(&bridge.egresses[0]),
             Some("198.51.100.5"),
             "the bridge dials the external listener"
         );
-        assert_eq!(bridge.egresses[0].port, Some(9000));
+        assert_eq!(srt(&bridge.egresses[0]).port(), 9000);
 
         let endpoints = stream_endpoints(&stream, &path, &nodes).expect("endpoints");
         assert_eq!(endpoints.outputs[0].url, "srt://198.51.100.5:9000");
@@ -1536,7 +1558,9 @@ mod tests {
         // node-1 and the pinned transit node are both outbound-only, so the link
         // between them needs a relay of its own on top of the pin.
         let mut stream = contribution();
-        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0] else {
+            unreachable!("fixture endpoint is srt");
+        };
         dest.via = vec!["transit".to_string()];
 
         let nodes = vec![
@@ -1591,7 +1615,9 @@ mod tests {
     #[test]
     fn source_via_is_rejected() {
         let mut stream = contribution();
-        let StreamTransport::Srt(source) = &mut stream.source;
+        let StreamTransport::Srt(source) = &mut stream.source else {
+            unreachable!("fixture endpoint is srt");
+        };
         source.via = vec!["edge-relay".to_string()];
         assert_eq!(derive(&stream, &nodes()), Err(PlacementError::SourceVia));
     }
@@ -1599,7 +1625,9 @@ mod tests {
     #[test]
     fn via_to_an_unregistered_node_is_not_registered() {
         let mut stream = contribution();
-        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0] else {
+            unreachable!("fixture endpoint is srt");
+        };
         dest.via = vec!["ghost".to_string()];
 
         assert_eq!(
@@ -1613,7 +1641,9 @@ mod tests {
     #[test]
     fn bridge_hops_are_managed_and_deterministic() {
         let mut stream = contribution();
-        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0] else {
+            unreachable!("fixture endpoint is srt");
+        };
         dest.via = vec!["edge-relay".to_string()];
 
         let mut nodes = nodes();
@@ -1628,7 +1658,9 @@ mod tests {
     #[test]
     fn stream_endpoints_are_unchanged_by_an_intervening_bridge() {
         let mut stream = contribution();
-        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0] else {
+            unreachable!("fixture endpoint is srt");
+        };
         dest.via = vec!["edge-relay".to_string()];
 
         let mut nodes = nodes();
@@ -1638,13 +1670,13 @@ mod tests {
         let endpoints = stream_endpoints(&stream, &path, &nodes).expect("endpoints");
 
         assert_eq!(endpoints.ingress.node, "strom-node-1");
-        assert_eq!(endpoints.ingress.port, path.hops[0].ingress.port.unwrap());
+        assert_eq!(endpoints.ingress.port, srt(&path.hops[0].ingress).port());
         assert_eq!(endpoints.outputs.len(), 1);
         assert_eq!(
             endpoints.outputs[0].node, "strom-node-2",
             "the consumer still attaches at the destination, not the relay"
         );
-        let consumer_port = path.hops[2].egresses[0].port.expect("consumer port");
+        let consumer_port = srt(&path.hops[2].egresses[0]).port();
         assert_eq!(endpoints.outputs[0].port, consumer_port);
     }
 
@@ -1655,7 +1687,7 @@ mod tests {
         let path = derive(&stream, &nodes).expect("derive");
         let endpoints = stream_endpoints(&stream, &path, &nodes).expect("endpoints");
 
-        let ingress_port = path.hops[0].ingress.port.expect("ingress port");
+        let ingress_port = srt(&path.hops[0].ingress).port();
         assert_eq!(endpoints.ingress.node, "strom-node-1");
         assert_eq!(endpoints.ingress.host, "172.26.0.10");
         assert_eq!(endpoints.ingress.port, ingress_port);
@@ -1666,7 +1698,7 @@ mod tests {
 
         assert_eq!(endpoints.outputs.len(), 1);
         let output = &endpoints.outputs[0];
-        let consumer_port = path.hops[1].egresses[0].port.expect("consumer port");
+        let consumer_port = srt(&path.hops[1].egresses[0]).port();
         assert_eq!(output.node, "strom-node-2");
         assert_eq!(output.host, "172.27.0.10");
         assert_eq!(output.port, consumer_port);
@@ -1676,7 +1708,9 @@ mod tests {
     #[test]
     fn stream_endpoints_follow_named_alias() {
         let mut stream = contribution();
-        let StreamTransport::Srt(dest) = &mut stream.destinations[0];
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0] else {
+            unreachable!("fixture endpoint is srt");
+        };
         dest.network = Some("wan".to_string());
 
         let mut nodes = nodes();

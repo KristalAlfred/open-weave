@@ -4,7 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 use weave_core::{
-    DesiredHop, HopState, LinkCondition, ResolvedAddr, SocketRole, SocketSpec, is_managed_hop_id,
+    DesiredHop, HopState, LinkCondition, ResolvedAddr, SocketRole, SocketSpec, SrtSocket,
+    is_managed_hop_id,
 };
 use weave_strom::{StromFlow, parse_srt_endpoint};
 
@@ -158,7 +159,11 @@ fn hop_srt_endpoints(hop: &DesiredHop) -> Vec<(String, u16)> {
 }
 
 fn socket_endpoint(spec: &SocketSpec) -> Option<(String, u16)> {
-    Some((spec.host.clone().unwrap_or_default(), spec.port?))
+    match spec {
+        SocketSpec::Srt(SrtSocket::Listen { port, .. }) => Some((String::new(), *port)),
+        SocketSpec::Srt(SrtSocket::Connect { host, port, .. }) => Some((host.clone(), *port)),
+        SocketSpec::Whip(_) | SocketSpec::Whep(_) | SocketSpec::Device(_) => None,
+    }
 }
 
 /// Derive a hop's control-plane lifecycle state from its flow presence.
@@ -201,47 +206,44 @@ pub fn socket_condition(
     }
 }
 
-/// Best-effort resolved address for a socket spec. A listener with no explicit
-/// host resolves to the node's advertised data-plane host so peers connect to a
-/// concrete address, falling back to the wildcard when the node declares none; a
-/// connector with no host cannot be resolved.
+/// Best-effort resolved address for a socket spec. A listener resolves to the
+/// node's advertised data-plane host so peers connect to a concrete address,
+/// falling back to the wildcard when the node declares none; a socket carrying
+/// no address of its own cannot be resolved.
 #[must_use]
 pub fn resolved_addr(spec: &SocketSpec, data_plane_host: Option<&str>) -> Option<ResolvedAddr> {
-    let port = spec.port?;
-    let host = match spec.role {
-        SocketRole::Listen => spec
-            .host
-            .clone()
-            .unwrap_or_else(|| data_plane_host.unwrap_or("0.0.0.0").to_string()),
-        SocketRole::Connect => spec.host.clone()?,
+    let (host, port) = match spec {
+        SocketSpec::Srt(SrtSocket::Listen { port, .. }) => {
+            (data_plane_host.unwrap_or("0.0.0.0").to_string(), *port)
+        }
+        SocketSpec::Srt(SrtSocket::Connect { host, port, .. }) => (host.clone(), *port),
+        SocketSpec::Whip(_) | SocketSpec::Whep(_) | SocketSpec::Device(_) => return None,
     };
     Some(ResolvedAddr { host, port })
+}
+
+/// The SRT role a socket's link condition is read from. A socket this adapter
+/// does not realise has none.
+#[must_use]
+pub fn srt_role(spec: &SocketSpec) -> Option<SocketRole> {
+    match spec {
+        SocketSpec::Srt(socket) => Some(socket.role()),
+        SocketSpec::Whip(_) | SocketSpec::Whep(_) | SocketSpec::Device(_) => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weave_core::{HopRole, SrtParams, Transport};
+    use weave_core::{HopRole, SignallingTransport};
 
     fn hop(id: &str) -> DesiredHop {
         DesiredHop {
             id: id.to_string(),
             node_id: "strom-node-1".to_string(),
             role: HopRole::Sender,
-            ingress: SocketSpec {
-                transport: Transport::Srt,
-                role: SocketRole::Listen,
-                host: None,
-                port: Some(7001),
-                params: SrtParams::default(),
-            },
-            egresses: vec![SocketSpec {
-                transport: Transport::Srt,
-                role: SocketRole::Connect,
-                host: Some("10.0.0.2".to_string()),
-                port: Some(7002),
-                params: SrtParams::default(),
-            }],
+            ingress: SocketSpec::srt_listen(7001, 200),
+            egresses: vec![SocketSpec::srt_connect("10.0.0.2", 7002, 1000)],
         }
     }
 
@@ -533,13 +535,7 @@ mod tests {
 
     #[test]
     fn resolved_addr_uses_data_plane_host_for_listener_else_wildcard() {
-        let listen = SocketSpec {
-            transport: Transport::Srt,
-            role: SocketRole::Listen,
-            host: None,
-            port: Some(7001),
-            params: SrtParams::default(),
-        };
+        let listen = SocketSpec::srt_listen(7001, 200);
         assert_eq!(
             resolved_addr(&listen, Some("172.26.0.10")),
             Some(ResolvedAddr {
@@ -555,13 +551,18 @@ mod tests {
             })
         );
 
-        let connect_no_host = SocketSpec {
-            transport: Transport::Srt,
-            role: SocketRole::Connect,
-            host: None,
-            port: Some(7002),
-            params: SrtParams::default(),
-        };
-        assert_eq!(resolved_addr(&connect_no_host, Some("172.26.0.10")), None);
+        let signalling = SocketSpec::signalling(
+            SignallingTransport::Whip,
+            SocketRole::Listen,
+            "http://172.26.0.10:8080/whip",
+            "x",
+        );
+        assert_eq!(
+            resolved_addr(&signalling, Some("172.26.0.10")),
+            None,
+            "a socket with no address of its own resolves to nothing"
+        );
+        assert_eq!(srt_role(&signalling), None);
+        assert_eq!(srt_role(&listen), Some(SocketRole::Listen));
     }
 }

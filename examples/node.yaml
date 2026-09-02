@@ -29,8 +29,15 @@ node:
   port_range:
     start: 20000
     end: 20999
-  # Optional transports advertised to the controller.
+  # Optional link transports advertised to the controller: srt, whip or whep.
+  # Any other name is a config error. A bare name offers both socket roles;
+  # spell an entry out to offer only one — Strom hosts WHIP ingest and WHEP
+  # playback for browser nodes but never dials them.
   transports: [srt]
+  # transports:
+  #   - srt
+  #   - { name: whip, roles: [listen] }
+  #   - { name: whep, roles: [listen] }
   # Optional; offer this node as transit for streams that neither start nor end
   # on it. The controller draws relays from nodes that set this and whose default
   # alias is dialable. A `via` pin in a manifest does not consult it.
