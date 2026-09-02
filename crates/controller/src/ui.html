@@ -172,6 +172,7 @@ const COLORS = {
   connecting: "var(--amber)", connected: "var(--blue)", stalled: "var(--red)",
 };
 const HOLLOW = new Set(["idle", "pending", "connecting", "starting", "unreported"]);
+const DEVICE_TRANSPORT = "device";
 
 function h(tag, cls, ...children) {
   const el = document.createElement(tag);
@@ -263,7 +264,21 @@ function addrChip(tag, text, title) {
   return el;
 }
 
-const arrow = () => h("span", "arrow", "→");
+// SRT and a device end are the unremarkable cases and draw a bare arrow; a
+// WebRTC transport is named on the arrow.
+function arrow(socket) {
+  const transport = socket && socket.transport;
+  const bare = !transport || transport === "srt" || transport === DEVICE_TRANSPORT;
+  const el = h("span", "arrow", bare ? "→" : `→ ${transport} →`);
+  if (socket && socket.url) el.title = socket.url;
+  return el;
+}
+
+// The chip standing in for a device end: the media starts at the node's own
+// camera or ends on its own screen, so there is no address to show.
+function deviceChip(tag, socket) {
+  return addrChip(tag, socket.mode === "capture" ? "camera" : "screen", "the node's own device");
+}
 
 // Bridges on destination `i`'s chain, upstream-first. A bridge id carries both
 // the destination it serves and its position along that destination's chain.
@@ -284,7 +299,8 @@ function renderPath(stream) {
   const endpoints = stream.endpoints;
 
   const trunk = h("div", "trunk");
-  if (endpoints) trunk.append(addrChip("in", endpoints.ingress.url, "producers dial this ingress"), arrow());
+  if (sender && sender.ingress.transport === DEVICE_TRANSPORT) trunk.append(deviceChip("in", sender.ingress), arrow(sender.ingress));
+  else if (endpoints && endpoints.ingress) trunk.append(addrChip("in", endpoints.ingress.url, "producers dial this ingress"), arrow(sender && sender.ingress));
   if (sender) trunk.append(hopChip(sender));
   if (trunk.childNodes.length) path.append(trunk);
 
@@ -293,13 +309,22 @@ function renderPath(stream) {
   for (let i = 0; i < count; i++) {
     const branch = h("div", "branch", h("span", "fork", "↳"));
     const output = outputs[i];
-    for (const bridge of bridgesFor(downstream, i)) branch.append(hopChip(bridge), arrow());
+    let link = sender ? sender.egresses[i] : null;
+    for (const bridge of bridgesFor(downstream, i)) {
+      branch.append(arrow(link), hopChip(bridge));
+      link = bridge.egresses[0];
+    }
     const receiver = output && output.node === ""
       ? null // remote destination: the chain dials out, no receiver hop
       : downstream.find(r => r.id.endsWith(`-receiver-${i}`));
-    if (receiver) branch.append(hopChip(receiver), arrow());
-    if (output) {
-      branch.append(receiver
+    if (receiver) {
+      branch.append(arrow(link), hopChip(receiver));
+      link = receiver.egresses[0];
+    }
+    if (receiver && link && link.transport === DEVICE_TRANSPORT) {
+      branch.append(arrow(link), deviceChip("out", link));
+    } else if (output) {
+      branch.append(arrow(link), receiver
         ? addrChip("out", output.url, "consumers dial this output")
         : addrChip("remote", output.url, "remote listener the chain dials"));
     }

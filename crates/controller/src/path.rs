@@ -4,14 +4,17 @@ use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 use weave_core::{
-    DEFAULT_DATA_PLANE_ALIAS, DataPlaneAddr, DesiredHop, HOP_ID_PREFIX, HopConditions, HopRole,
-    HopStatus, NodeDescriptor, NodeStatus, Path, PathStatus, PortRange, RemoteAddr, SocketSpec,
-    SrtEndpoint, StreamDefinition, StreamTransport, roll_up_path,
+    DEFAULT_DATA_PLANE_ALIAS, DataPlaneAddr, DesiredHop, DeviceKind, HOP_ID_PREFIX, HopConditions,
+    HopRole, HopStatus, NodeDescriptor, NodeStatus, Path, PathStatus, PortRange, RemoteAddr,
+    SocketRole, SocketSpec, SrtSocket, StreamDefinition, StreamTransport, Transport, roll_up_path,
 };
 
 const DEFAULT_SRC_LATENCY: u32 = 200;
 const DEFAULT_SINK_LATENCY: u32 = 1000;
 const RECV_CONSUMER_LATENCY: u32 = 200;
+
+/// Link transports in the order the planner prefers them.
+const TRANSPORT_PREFERENCE: [Transport; 3] = [Transport::Srt, Transport::Whip, Transport::Whep];
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PlacementError {
@@ -25,8 +28,15 @@ pub enum PlacementError {
     NoPortRange { node: String },
     #[error("node {node} has no free port left in its range")]
     PortRangeExhausted { node: String },
-    #[error("hop {0} has no assigned port")]
-    UnassignedPort(String),
+    #[error("path for stream {stream} has no hop {hop}")]
+    MissingHop { stream: String, hop: String },
+    #[error("hop {hop} has no socket for consumers to dial")]
+    NoConsumerSocket { hop: String },
+    #[error(
+        "hop {hop} carries a {} socket where an SRT listener is needed",
+        socket_end_description(.socket)
+    )]
+    NotAnSrtListener { hop: String, socket: SocketSpec },
     #[error("stream source must be a node, not a remote endpoint")]
     RemoteSource,
     #[error("endpoint must set exactly one of node or remote")]
@@ -38,16 +48,28 @@ pub enum PlacementError {
         upstream: String,
         downstream: String,
     },
+    #[error(
+        "no transport connects {upstream} to {downstream}: they offer none in complementary roles and no relay node bridges them"
+    )]
+    NoCommonTransport {
+        upstream: String,
+        downstream: String,
+    },
+    #[error("node {node} hosts a {transport} link but declares no signalling base for it")]
+    NoSignalling { node: String, transport: Transport },
+    #[error("node {node} offers no {kind} device")]
+    NoDevice { node: String, kind: DeviceKind },
     #[error("a source endpoint must not pin via")]
     SourceVia,
-    #[error("{0} endpoints cannot be placed yet")]
-    UnsupportedEndpoint(&'static str),
 }
 
-fn srt_endpoint(endpoint: &StreamTransport) -> Result<&SrtEndpoint, PlacementError> {
-    match endpoint {
-        StreamTransport::Srt(endpoint) => Ok(endpoint),
-        other => Err(PlacementError::UnsupportedEndpoint(other.kind())),
+/// Names `socket` for [`PlacementError::NotAnSrtListener`]. A device's `Display`
+/// already names which one it is; a link transport's does not say which end, so
+/// its role is prefixed on.
+fn socket_end_description(socket: &SocketSpec) -> String {
+    match socket {
+        SocketSpec::Device(_) => socket.to_string(),
+        _ => format!("{socket} {}", socket.end_name()),
     }
 }
 
@@ -71,9 +93,50 @@ pub fn bridge_hop_id(stream: &str, dest: usize, position: usize) -> String {
 
 /// Where a stream endpoint is placed: on a registered node, or dialed out to an
 /// external SRT listener.
-enum Placement {
-    Node(String),
-    Remote(RemoteAddr),
+enum Placement<'a> {
+    Node(&'a str),
+    Remote(&'a RemoteAddr),
+}
+
+/// How the media enters or leaves the stream at a manifest endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Terminal {
+    /// An SRT socket a producer or consumer dials.
+    Srt,
+    /// The node's own capture or display device; nothing external attaches.
+    Device,
+}
+
+/// A manifest endpoint as the planner reads it, whichever variant wrote it.
+struct Endpoint<'a> {
+    placement: Placement<'a>,
+    network: Option<&'a str>,
+    via: &'a [String],
+    latency: Option<u32>,
+    terminal: Terminal,
+}
+
+fn read_endpoint(endpoint: &StreamTransport) -> Result<Endpoint<'_>, PlacementError> {
+    match endpoint {
+        StreamTransport::Srt(endpoint) => Ok(Endpoint {
+            placement: match (&endpoint.node, &endpoint.remote) {
+                (Some(node), None) => Placement::Node(node),
+                (None, Some(remote)) => Placement::Remote(remote),
+                _ => return Err(PlacementError::EndpointPlacement),
+            },
+            network: endpoint.network.as_deref(),
+            via: &endpoint.via,
+            latency: endpoint.latency,
+            terminal: Terminal::Srt,
+        }),
+        StreamTransport::Device(endpoint) => Ok(Endpoint {
+            placement: Placement::Node(&endpoint.node),
+            network: endpoint.network.as_deref(),
+            via: &[],
+            latency: None,
+            terminal: Terminal::Device,
+        }),
+    }
 }
 
 /// Per-tick, per-node port occupancy. Assigns every port a path needs from the
@@ -124,16 +187,21 @@ impl PortAllocator {
 /// per-tick collision-aware allocator. A hop's reported `resolved_ingress` is
 /// observability only and never rewrites a planned socket.
 ///
-/// Which end of a link listens follows [`Reachability`](weave_core::Reachability)
-/// rather than a fixed template: the downstream listens when it can be dialled,
-/// otherwise the upstream listens and the downstream calls it. When neither end
-/// can be dialled the link needs transit, and [`splice_relays`] inserts a relay
-/// node both ends can call — the NAT-to-NAT case, which resolves into two links
-/// under the same rule rather than a special path.
+/// Each link's transport and direction come from both ends' declared
+/// capabilities, see [`link_transport`]: SRT when both ends offer it, with the
+/// downstream listening whenever it can be dialled and the direction reversing
+/// otherwise; WHIP when a node that can only push media meets one hosting an
+/// ingest; WHEP when a node hosting playback meets one that pulls it. When no
+/// transport connects the two ends directly, [`chain_hops`] inserts a relay node
+/// compatible with both halves — the NAT-to-NAT case and the browser-to-browser
+/// case resolve into two links under the same rule rather than a special path.
 ///
 /// A `remote` destination places no receiver hop and claims no port for its
 /// terminal link: whichever hop precedes it gains one caller egress to the
-/// external listener. The source must be a node; a remote source is rejected.
+/// external listener. A `device` endpoint claims no port either: the media
+/// starts at the node's camera or ends at its screen, so its terminal socket is
+/// a [`SocketSpec::Device`] with no address. The source must be a node; a remote
+/// source is rejected.
 ///
 /// Fan-out is one sender hop teeing to one egress per destination, each with its
 /// own chain. Placement is all-or-nothing: if any destination is unplaceable the
@@ -144,7 +212,7 @@ pub fn derive_path(
     _observed: &[HopStatus],
     ports: &mut PortAllocator,
 ) -> Result<Path, PlacementError> {
-    let source = srt_endpoint(&stream.source)?;
+    let source = read_endpoint(&stream.source)?;
     if stream.destinations.is_empty() {
         return Err(PlacementError::NoDestination);
     }
@@ -152,81 +220,61 @@ pub fn derive_path(
         return Err(PlacementError::SourceVia);
     }
 
-    let sender_node = source_node(source)?;
+    let sender_node = source_node(&source)?;
     let sender_id = sender_hop_id(&stream.name);
     let source_station = Station {
-        node_id: sender_node.clone(),
-        network: source.network.clone(),
+        node_id: sender_node.to_string(),
+        network: source.network.map(str::to_string),
     };
 
     let mut sender_egresses = Vec::with_capacity(stream.destinations.len());
     let mut downstream = Vec::new();
 
     for (index, dest) in stream.destinations.iter().enumerate() {
-        let dest = srt_endpoint(dest)?;
+        let dest = read_endpoint(dest)?;
         let latency = dest.latency.unwrap_or(DEFAULT_SINK_LATENCY);
-        let placement = endpoint_placement(dest)?;
 
-        let chain = chain_hops(
-            &stream.name,
-            index,
-            &source_station,
-            dest,
-            &placement,
-            nodes,
-        )?;
+        let chain = chain_hops(&stream.name, index, &source_station, &dest, nodes)?;
 
         // Each link attaches its upstream socket to the hop before it, which is
         // the sender for the first link and the previous chain hop after that.
-        let mut hops: Vec<DesiredHop> = Vec::with_capacity(chain.len());
+        let mut hops: Vec<DesiredHop> = Vec::with_capacity(chain.bridges.len() + 1);
         let mut upstream = LinkEnd {
             station: &source_station,
             hop_id: &sender_id,
         };
 
-        for entry in &chain {
-            let (up_socket, down_socket) = plan_link(
-                &upstream,
-                &LinkEnd {
-                    station: &entry.station,
-                    hop_id: &entry.id,
-                },
-                latency,
-                nodes,
-                ports,
-            )?;
+        for bridge in &chain.bridges {
+            let (up_socket, hop) = plan_hop(&upstream, bridge, latency, nodes, ports)?;
             push_egress(&mut sender_egresses, &mut hops, up_socket);
-            hops.push(DesiredHop {
-                id: entry.id.clone(),
-                node_id: entry.station.node_id.clone(),
-                role: entry.role,
-                ingress: down_socket,
-                egresses: Vec::new(),
-            });
+            hops.push(hop);
             upstream = LinkEnd {
-                station: &entry.station,
-                hop_id: &entry.id,
+                station: &bridge.station,
+                hop_id: &bridge.id,
             };
         }
 
-        match &placement {
+        match &chain.terminal {
             // An external listener terminates the chain: the last hop dials it
             // and no hop is placed for it.
-            Placement::Remote(remote) => {
+            ChainTerminal::Remote(remote) => {
                 let socket = SocketSpec::srt_connect(remote.host.clone(), remote.port, latency);
                 push_egress(&mut sender_egresses, &mut hops, socket);
             }
-            // The last hop is the receiver; its remaining egress is the socket
-            // the consumer dials.
-            Placement::Node(_) => {
-                let receiver = hops
-                    .last_mut()
-                    .ok_or_else(|| PlacementError::UnassignedPort(stream.name.clone()))?;
-                let port =
-                    claim_port(&receiver.node_id, &consumer_key(&receiver.id), nodes, ports)?;
-                receiver
-                    .egresses
-                    .push(SocketSpec::srt_listen(port, RECV_CONSUMER_LATENCY));
+            // The chain ends on a receiver hop, whose remaining egress is the
+            // socket the consumer dials or the device the media ends on.
+            ChainTerminal::Receiver(receiver) => {
+                let (up_socket, mut hop) = plan_hop(&upstream, receiver, latency, nodes, ports)?;
+                push_egress(&mut sender_egresses, &mut hops, up_socket);
+                hop.egresses.push(match dest.terminal {
+                    Terminal::Srt => {
+                        let key = consumer_key(&receiver.id);
+                        let port = claim_port(&hop.node_id, &key, nodes, ports)?;
+                        SocketSpec::srt_listen(port, RECV_CONSUMER_LATENCY)
+                    }
+                    Terminal::Device => device_socket(&hop.node_id, DeviceKind::Display, nodes)?,
+                });
+                hops.push(hop);
             }
         }
 
@@ -235,9 +283,9 @@ pub fn derive_path(
 
     let sender = DesiredHop {
         id: sender_id.clone(),
-        node_id: sender_node.clone(),
+        node_id: sender_node.to_string(),
         role: HopRole::Sender,
-        ingress: source_socket(source, &sender_node, &sender_id, nodes, ports)?,
+        ingress: source_socket(&source, sender_node, &sender_id, nodes, ports)?,
         egresses: sender_egresses,
     };
 
@@ -250,6 +298,32 @@ pub fn derive_path(
         enabled: stream.enabled,
         hops,
     })
+}
+
+/// Plan the link that feeds `hop` and place it: the socket the upstream end of
+/// that link owns, and the hop itself, its ingress the downstream socket.
+fn plan_hop(
+    upstream: &LinkEnd,
+    hop: &ChainHop,
+    latency: u32,
+    nodes: &[NodeDescriptor],
+    ports: &mut PortAllocator,
+) -> Result<(SocketSpec, DesiredHop), PlacementError> {
+    let downstream = LinkEnd {
+        station: &hop.station,
+        hop_id: &hop.id,
+    };
+    let (up_socket, down_socket) = plan_link(upstream, &downstream, latency, nodes, ports)?;
+    Ok((
+        up_socket,
+        DesiredHop {
+            id: hop.id.clone(),
+            node_id: hop.station.node_id.clone(),
+            role: hop.role,
+            ingress: down_socket,
+            egresses: Vec::new(),
+        },
+    ))
 }
 
 /// Attach a link's upstream socket to the hop it leaves from: the sender when the
@@ -290,100 +364,104 @@ struct ChainHop {
     role: HopRole,
 }
 
+/// The hops between the sender and one destination, and how the chain ends.
+struct Chain<'a> {
+    bridges: Vec<ChainHop>,
+    terminal: ChainTerminal<'a>,
+}
+
+/// Where a destination's chain ends.
+enum ChainTerminal<'a> {
+    /// A hop placed on the destination node.
+    Receiver(ChainHop),
+    /// An external listener the hop before it dials; no hop is placed for it.
+    Remote(&'a RemoteAddr),
+}
+
 /// One end of a link: where it sits and which hop owns the socket.
 struct LinkEnd<'a> {
     station: &'a Station,
     hop_id: &'a str,
 }
 
-/// Build the hops between the sender and one destination's terminal: a bridge per
-/// relayed node, then the receiver when the destination is a node.
-fn chain_hops(
+/// Build one destination's chain: a bridge per relayed node, a relay wherever no
+/// transport carries a link directly, and the terminal the last link runs into.
+fn chain_hops<'a>(
     stream: &str,
     dest_index: usize,
     source: &Station,
-    dest: &SrtEndpoint,
-    placement: &Placement,
+    dest: &Endpoint<'a>,
     nodes: &[NodeDescriptor],
-) -> Result<Vec<ChainHop>, PlacementError> {
-    let mut stations: Vec<Station> = dest.via.iter().map(|id| Station::relay(id)).collect();
-    if let Placement::Node(node_id) = placement {
-        stations.push(Station {
-            node_id: node_id.clone(),
-            network: dest.network.clone(),
-        });
+) -> Result<Chain<'a>, PlacementError> {
+    let mut stations: Vec<Station> = Vec::with_capacity(dest.via.len());
+    for station in dest.via.iter().map(|id| Station::relay(id)) {
+        relay_before(&mut stations, source, &station, nodes)?;
+        stations.push(station);
     }
 
-    let stations = splice_relays(source, stations, nodes)?;
-    let terminal_is_node = matches!(placement, Placement::Node(_));
-    let last = stations.len().saturating_sub(1);
+    let terminal = match dest.placement {
+        Placement::Remote(remote) => ChainTerminal::Remote(remote),
+        Placement::Node(node_id) => {
+            let station = Station {
+                node_id: node_id.to_string(),
+                network: dest.network.map(str::to_string),
+            };
+            relay_before(&mut stations, source, &station, nodes)?;
+            ChainTerminal::Receiver(ChainHop {
+                station,
+                id: receiver_hop_id(stream, dest_index),
+                role: HopRole::Receiver,
+            })
+        }
+    };
 
-    Ok(stations
+    let bridges = stations
         .into_iter()
         .enumerate()
-        .map(|(position, station)| {
-            if terminal_is_node && position == last {
-                ChainHop {
-                    station,
-                    id: receiver_hop_id(stream, dest_index),
-                    role: HopRole::Receiver,
-                }
-            } else {
-                ChainHop {
-                    station,
-                    id: bridge_hop_id(stream, dest_index, position),
-                    role: HopRole::Bridge,
-                }
-            }
+        .map(|(position, station)| ChainHop {
+            station,
+            id: bridge_hop_id(stream, dest_index, position),
+            role: HopRole::Bridge,
         })
-        .collect())
+        .collect();
+
+    Ok(Chain { bridges, terminal })
 }
 
-/// Insert a relay ahead of any link whose ends cannot dial each other.
+/// Extend `chain` with a relay when no transport carries the link into `next`
+/// from the station before it — the source's own station when the chain is
+/// still empty.
 ///
-/// A spliced relay is dialable by construction, so both halves of the split link
-/// resolve under the ordinary rule — the upstream calls the relay, and the
-/// downstream calls it too. One pass is enough; no inserted link can itself need
-/// a relay.
-fn splice_relays(
+/// A spliced relay is compatible with both halves by construction, so each
+/// resolves under the ordinary rule — the upstream reaches the relay, and the
+/// relay reaches the downstream. One pass is enough; no inserted link can itself
+/// need a relay.
+fn relay_before(
+    chain: &mut Vec<Station>,
     source: &Station,
-    stations: Vec<Station>,
+    next: &Station,
     nodes: &[NodeDescriptor],
-) -> Result<Vec<Station>, PlacementError> {
-    let mut resolved = Vec::with_capacity(stations.len());
-    let mut upstream = source.clone();
-
-    for station in stations {
-        if !link_dialable(&upstream, &station, nodes)? {
-            let relay = pick_relay(nodes, &upstream, &station)?;
-            resolved.push(relay);
-        }
-        upstream = station.clone();
-        resolved.push(station);
+) -> Result<(), PlacementError> {
+    let upstream = chain.last().unwrap_or(source);
+    if let Err(failure) = station_link(upstream, next, nodes) {
+        let relay = pick_relay(nodes, upstream, next, failure)?;
+        chain.push(relay);
     }
-
-    Ok(resolved)
+    Ok(())
 }
 
-/// Whether either end of a link can be dialled by the other.
-fn link_dialable(
-    upstream: &Station,
-    downstream: &Station,
-    nodes: &[NodeDescriptor],
-) -> Result<bool, PlacementError> {
-    if station_addr(downstream, nodes)?.is_dialable() {
-        return Ok(true);
-    }
-    Ok(station_addr(upstream, nodes)?.is_dialable())
-}
-
-/// The lowest-id online relay node both ends of an undialable link can call.
-/// Sorting keeps the choice stable across ticks, so a stream does not migrate
-/// between equally eligible relays.
+/// The lowest-id online relay node that can carry both halves of a link no
+/// transport connects directly. Sorting keeps the choice stable across ticks, so
+/// a stream does not migrate between equally eligible relays.
+///
+/// When none qualifies the error names why the direct link failed: two ends that
+/// do share a transport but cannot dial each other read as a routing problem,
+/// two that share none as a capability problem.
 fn pick_relay(
     nodes: &[NodeDescriptor],
     upstream: &Station,
     downstream: &Station,
+    failure: LinkFailure,
 ) -> Result<Station, PlacementError> {
     nodes
         .iter()
@@ -396,21 +474,133 @@ fn pick_relay(
                 .get(DEFAULT_DATA_PLANE_ALIAS)
                 .is_some_and(DataPlaneAddr::is_dialable)
         })
+        .filter(|node| {
+            let relay = Station::relay(&node.id);
+            station_link(upstream, &relay, nodes).is_ok()
+                && station_link(&relay, downstream, nodes).is_ok()
+        })
         .min_by(|a, b| a.id.cmp(&b.id))
         .map(|node| Station::relay(&node.id))
-        .ok_or_else(|| PlacementError::NoRelayAvailable {
-            upstream: upstream.node_id.clone(),
-            downstream: downstream.node_id.clone(),
-        })
+        .ok_or_else(|| failure.into_error(&upstream.node_id, &downstream.node_id))
+}
+
+/// Which end of a link hosts the socket the other dials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Listener {
+    Upstream,
+    Downstream,
+}
+
+/// Why no transport connects two ends directly.
+#[derive(Debug, PartialEq, Eq)]
+enum LinkFailure {
+    /// They share a transport in complementary roles, but the end that would
+    /// have to listen cannot be dialled.
+    Undialable,
+    /// They offer no transport in complementary roles at all.
+    NoCommonTransport,
+    /// A node or alias in the link does not resolve.
+    Placement(PlacementError),
+}
+
+impl LinkFailure {
+    /// The placement error a failed link reports, named for the two ends.
+    fn into_error(self, upstream: &str, downstream: &str) -> PlacementError {
+        match self {
+            Self::Undialable => PlacementError::NoRelayAvailable {
+                upstream: upstream.to_string(),
+                downstream: downstream.to_string(),
+            },
+            Self::NoCommonTransport => PlacementError::NoCommonTransport {
+                upstream: upstream.to_string(),
+                downstream: downstream.to_string(),
+            },
+            Self::Placement(error) => error,
+        }
+    }
+}
+
+impl From<PlacementError> for LinkFailure {
+    fn from(error: PlacementError) -> Self {
+        Self::Placement(error)
+    }
+}
+
+/// One end of a link resolved to its node and the address it is reached at.
+struct ResolvedEnd<'a> {
+    node: &'a NodeDescriptor,
+    addr: &'a DataPlaneAddr,
+}
+
+impl ResolvedEnd<'_> {
+    fn offers(&self, transport: Transport, role: SocketRole) -> bool {
+        self.node.capabilities.offers(transport, role)
+    }
+}
+
+/// The transport and direction of a link between two resolved ends, or why none
+/// fits.
+///
+/// Candidates are taken in [`TRANSPORT_PREFERENCE`] order. SRT works in either
+/// direction, so the downstream listens when it can be dialled and the upstream
+/// otherwise. WHIP carries media from the connecting end to the listening one,
+/// so only the downstream may host it; WHEP carries media from the listening end
+/// to the connecting one, so only the upstream may. In every case the end that
+/// listens must offer that role and be dialable, and the other end must offer
+/// the complementary role.
+fn link_transport(
+    upstream: &ResolvedEnd,
+    downstream: &ResolvedEnd,
+) -> Result<(Transport, Listener), LinkFailure> {
+    let mut complementary = false;
+    for transport in TRANSPORT_PREFERENCE {
+        let listeners: &[Listener] = match transport {
+            Transport::Srt => &[Listener::Downstream, Listener::Upstream],
+            Transport::Whip => &[Listener::Downstream],
+            Transport::Whep => &[Listener::Upstream],
+        };
+        for &listener in listeners {
+            let (host, dialer) = match listener {
+                Listener::Downstream => (downstream, upstream),
+                Listener::Upstream => (upstream, downstream),
+            };
+            if !(host.offers(transport, SocketRole::Listen)
+                && dialer.offers(transport, SocketRole::Connect))
+            {
+                continue;
+            }
+            complementary = true;
+            if host.addr.is_dialable() {
+                return Ok((transport, listener));
+            }
+        }
+    }
+    Err(if complementary {
+        LinkFailure::Undialable
+    } else {
+        LinkFailure::NoCommonTransport
+    })
+}
+
+/// [`link_transport`] between two stations, resolving both first.
+fn station_link(
+    upstream: &Station,
+    downstream: &Station,
+    nodes: &[NodeDescriptor],
+) -> Result<(Transport, Listener), LinkFailure> {
+    let up = resolve_station(upstream, nodes)?;
+    let down = resolve_station(downstream, nodes)?;
+    link_transport(&up, &down)
 }
 
 /// Plan one link's socket pair: `(upstream egress, downstream ingress)`.
 ///
-/// The downstream listens whenever it can be dialled, which keeps the common case
-/// identical to a fixed sender-calls-receiver template. Otherwise the direction
-/// reverses and the downstream dials the upstream. The port is claimed on
-/// whichever node listens, always keyed by the downstream hop id so an assignment
-/// stays stable when a link's direction is the same across ticks.
+/// The transport and which end listens come from [`link_transport`]. An SRT
+/// listener claims its port on the listening node, always keyed by the
+/// downstream hop id so an assignment stays stable when a link's direction is
+/// the same across ticks. A WebRTC listener claims no port: its socket is
+/// signalled at the base its node declares, addressed by the downstream hop id
+/// so every link is a distinct endpoint.
 fn plan_link(
     upstream: &LinkEnd,
     downstream: &LinkEnd,
@@ -418,40 +608,54 @@ fn plan_link(
     nodes: &[NodeDescriptor],
     ports: &mut PortAllocator,
 ) -> Result<(SocketSpec, SocketSpec), PlacementError> {
-    let down_addr = station_addr(downstream.station, nodes)?.clone();
-    if down_addr.is_dialable() {
-        let port = claim_port(&downstream.station.node_id, downstream.hop_id, nodes, ports)?;
-        return Ok((
-            SocketSpec::srt_connect(down_addr.host, port, latency),
-            SocketSpec::srt_listen(port, latency),
-        ));
-    }
+    let up = resolve_station(upstream.station, nodes)?;
+    let down = resolve_station(downstream.station, nodes)?;
+    let (transport, listener) = link_transport(&up, &down).map_err(|failure| {
+        failure.into_error(&upstream.station.node_id, &downstream.station.node_id)
+    })?;
 
-    let up_addr = station_addr(upstream.station, nodes)?.clone();
-    if up_addr.is_dialable() {
-        let port = claim_port(&upstream.station.node_id, downstream.hop_id, nodes, ports)?;
-        return Ok((
-            SocketSpec::srt_listen(port, latency),
-            SocketSpec::srt_connect(up_addr.host, port, latency),
-        ));
-    }
-
-    Err(PlacementError::NoRelayAvailable {
-        upstream: upstream.station.node_id.clone(),
-        downstream: downstream.station.node_id.clone(),
+    let host = match listener {
+        Listener::Downstream => &down,
+        Listener::Upstream => &up,
+    };
+    let (listen, connect) = match transport.signalling() {
+        None => {
+            let port = ports.claim(host.node, downstream.hop_id)?;
+            (
+                SocketSpec::srt_listen(port, latency),
+                SocketSpec::srt_connect(host.addr.host.clone(), port, latency),
+            )
+        }
+        Some(signalling) => {
+            let base = host.addr.signalling.base(signalling).ok_or_else(|| {
+                PlacementError::NoSignalling {
+                    node: host.node.id.clone(),
+                    transport,
+                }
+            })?;
+            (
+                SocketSpec::signalling(signalling, SocketRole::Listen, base, downstream.hop_id),
+                SocketSpec::signalling(signalling, SocketRole::Connect, base, downstream.hop_id),
+            )
+        }
+    };
+    Ok(match listener {
+        Listener::Downstream => (connect, listen),
+        Listener::Upstream => (listen, connect),
     })
 }
 
-/// The data-plane address a station is reached at, via its node's alias map.
-fn station_addr<'a>(
+/// The node and data-plane address a station is reached at, via its alias map.
+fn resolve_station<'a>(
     station: &Station,
     nodes: &'a [NodeDescriptor],
-) -> Result<&'a DataPlaneAddr, PlacementError> {
+) -> Result<ResolvedEnd<'a>, PlacementError> {
     let node =
         find_node(nodes, &station.node_id).ok_or_else(|| PlacementError::NodeNotRegistered {
             node: station.node_id.clone(),
         })?;
-    resolve_addr(node, station.network.as_deref())
+    let addr = resolve_addr(node, station.network.as_deref())?;
+    Ok(ResolvedEnd { node, addr })
 }
 
 /// Roll the path's hops up into one end-to-end status via observed hop conditions.
@@ -470,31 +674,48 @@ pub fn path_status(path: &Path, observed: &[HopStatus]) -> PathStatus {
     roll_up_path(path.enabled, &conditions)
 }
 
-fn endpoint_placement(endpoint: &SrtEndpoint) -> Result<Placement, PlacementError> {
-    match (&endpoint.node, &endpoint.remote) {
-        (Some(node), None) => Ok(Placement::Node(node.clone())),
-        (None, Some(remote)) => Ok(Placement::Remote(remote.clone())),
-        _ => Err(PlacementError::EndpointPlacement),
-    }
-}
-
-fn source_node(source: &SrtEndpoint) -> Result<String, PlacementError> {
-    match endpoint_placement(source)? {
+fn source_node<'a>(source: &Endpoint<'a>) -> Result<&'a str, PlacementError> {
+    match source.placement {
         Placement::Node(node) => Ok(node),
         Placement::Remote(_) => Err(PlacementError::RemoteSource),
     }
 }
 
+/// The sender's ingress: an SRT listener a producer dials, or the node's own
+/// camera when the source is a `device`.
 fn source_socket(
-    source: &SrtEndpoint,
+    source: &Endpoint,
     node_id: &str,
     hop_id: &str,
     nodes: &[NodeDescriptor],
     ports: &mut PortAllocator,
 ) -> Result<SocketSpec, PlacementError> {
-    let latency = source.latency.unwrap_or(DEFAULT_SRC_LATENCY);
-    let port = claim_port(node_id, hop_id, nodes, ports)?;
-    Ok(SocketSpec::srt_listen(port, latency))
+    match source.terminal {
+        Terminal::Srt => {
+            let latency = source.latency.unwrap_or(DEFAULT_SRC_LATENCY);
+            let port = claim_port(node_id, hop_id, nodes, ports)?;
+            Ok(SocketSpec::srt_listen(port, latency))
+        }
+        Terminal::Device => device_socket(node_id, DeviceKind::Capture, nodes),
+    }
+}
+
+/// A socket on the node's own `kind` device, which the node must advertise.
+fn device_socket(
+    node_id: &str,
+    kind: DeviceKind,
+    nodes: &[NodeDescriptor],
+) -> Result<SocketSpec, PlacementError> {
+    let node = find_node(nodes, node_id).ok_or_else(|| PlacementError::NodeNotRegistered {
+        node: node_id.to_string(),
+    })?;
+    if !node.capabilities.offers_device(kind) {
+        return Err(PlacementError::NoDevice {
+            node: node_id.to_string(),
+            kind,
+        });
+    }
+    Ok(SocketSpec::Device(kind))
 }
 
 fn claim_port(
@@ -553,10 +774,14 @@ fn find_node<'a>(nodes: &'a [NodeDescriptor], id: &str) -> Option<&'a NodeDescri
 
 /// Concrete `srt://` addresses a producer and consumers use to reach a placed
 /// stream, resolved against the same node data-plane aliases planning used.
+///
+/// A `device` end has nothing to dial, so it reads `null`: the ingress when the
+/// source is a device, and the output at that destination's index otherwise.
+/// Outputs keep manifest order, so index `i` is always destination `i`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StreamEndpoints {
-    pub ingress: EndpointAddr,
-    pub outputs: Vec<EndpointAddr>,
+    pub ingress: Option<EndpointAddr>,
+    pub outputs: Vec<Option<EndpointAddr>>,
 }
 
 /// One resolved data-plane socket: the node hosting it plus its dialable address.
@@ -575,49 +800,64 @@ pub struct EndpointAddr {
 /// Hosts follow the manifest `network` alias per endpoint; the ingress port is the
 /// sender hop's listen port and each node output is its receiver's assigned
 /// consumer port. A remote destination reports the external listener URL the
-/// sender dials out to.
+/// sender dials out to. A `device` end reports `None`.
 ///
 /// # Errors
 /// Returns [`PlacementError`] if a referenced node is unregistered, declares no
-/// address for the requested alias, the source is remote, or the path carries an
-/// unassigned port.
+/// address for the requested alias, the source is remote, or the path does not
+/// carry the hops and SRT listeners the stream's shape calls for.
 pub fn stream_endpoints(
     stream: &StreamDefinition,
     path: &Path,
     nodes: &[NodeDescriptor],
 ) -> Result<StreamEndpoints, PlacementError> {
-    let source = srt_endpoint(&stream.source)?;
-    let source_node = source_node(source)?;
+    let source = read_endpoint(&stream.source)?;
+    let source_node = source_node(&source)?;
     let sender = path
         .hops
         .first()
-        .ok_or_else(|| PlacementError::UnassignedPort(path.stream.clone()))?;
-    let ingress_port = hop_port(&sender.ingress, &sender.id)?;
-    let ingress = endpoint_addr(&source_node, source.network.as_deref(), ingress_port, nodes)?;
+        .ok_or_else(|| PlacementError::MissingHop {
+            stream: path.stream.clone(),
+            hop: sender_hop_id(&path.stream),
+        })?;
+    let ingress = match source.terminal {
+        Terminal::Device => None,
+        Terminal::Srt => {
+            let port = listener_port(&sender.ingress, &sender.id)?;
+            Some(endpoint_addr(source_node, source.network, port, nodes)?)
+        }
+    };
 
     let mut outputs = Vec::with_capacity(stream.destinations.len());
     for (index, dest) in stream.destinations.iter().enumerate() {
-        let dest = srt_endpoint(dest)?;
-        match endpoint_placement(dest)? {
-            Placement::Remote(remote) => outputs.push(remote_endpoint_addr(&remote)),
-            Placement::Node(node_id) => {
+        let dest = read_endpoint(dest)?;
+        match (&dest.placement, dest.terminal) {
+            (Placement::Remote(remote), _) => outputs.push(Some(remote_endpoint_addr(remote))),
+            (Placement::Node(_), Terminal::Device) => outputs.push(None),
+            (Placement::Node(node_id), Terminal::Srt) => {
                 let receiver_id = receiver_hop_id(&stream.name, index);
                 let receiver = path
                     .hops
                     .iter()
                     .find(|hop| hop.id == receiver_id)
-                    .ok_or_else(|| PlacementError::UnassignedPort(receiver_id.clone()))?;
-                let consumer = receiver
-                    .egresses
-                    .first()
-                    .ok_or_else(|| PlacementError::UnassignedPort(receiver.id.clone()))?;
-                let consumer_port = hop_port(consumer, &receiver.id)?;
-                outputs.push(endpoint_addr(
-                    &node_id,
-                    dest.network.as_deref(),
+                    .ok_or_else(|| PlacementError::MissingHop {
+                        stream: path.stream.clone(),
+                        hop: receiver_id.clone(),
+                    })?;
+                let consumer =
+                    receiver
+                        .egresses
+                        .first()
+                        .ok_or_else(|| PlacementError::NoConsumerSocket {
+                            hop: receiver.id.clone(),
+                        })?;
+                let consumer_port = listener_port(consumer, &receiver.id)?;
+                outputs.push(Some(endpoint_addr(
+                    node_id,
+                    dest.network,
                     consumer_port,
                     nodes,
-                )?);
+                )?));
             }
         }
     }
@@ -653,12 +893,15 @@ fn remote_endpoint_addr(remote: &RemoteAddr) -> EndpointAddr {
     }
 }
 
-fn hop_port(spec: &SocketSpec, hop_id: &str) -> Result<u16, PlacementError> {
+/// The port an SRT listener publishes, for the addresses producers and consumers
+/// dial.
+fn listener_port(spec: &SocketSpec, hop_id: &str) -> Result<u16, PlacementError> {
     match spec {
-        SocketSpec::Srt(socket) => Ok(socket.port()),
-        SocketSpec::Whip(_) | SocketSpec::Whep(_) | SocketSpec::Device(_) => {
-            Err(PlacementError::UnassignedPort(hop_id.to_string()))
-        }
+        SocketSpec::Srt(SrtSocket::Listen { port, .. }) => Ok(*port),
+        other => Err(PlacementError::NotAnSrtListener {
+            hop: hop_id.to_string(),
+            socket: other.clone(),
+        }),
     }
 }
 
@@ -667,12 +910,12 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use weave_core::{
-        HopState, LinkCondition, NodeCapabilities, NodeStatus, PortRange, Reachability,
-        ResolvedAddr, Signalling, SocketRole, SrtSocket,
+        HopState, LinkCondition, NodeCapabilities, NodeEndpoint, NodeStatus, PortRange,
+        Reachability, ResolvedAddr, RoleSet, Signalling, SignallingTransport, SocketRole,
+        SrtEndpoint, SrtSocket, TransportOffer,
     };
 
-    /// Every socket this planner places is SRT, so a test asserting on an
-    /// address can insist on that.
+    /// The SRT socket a spec carries, for tests asserting on an address.
     fn srt(spec: &SocketSpec) -> &SrtSocket {
         match spec {
             SocketSpec::Srt(socket) => socket,
@@ -685,6 +928,11 @@ mod tests {
             SrtSocket::Connect { host, .. } => Some(host),
             SrtSocket::Listen { .. } => None,
         }
+    }
+
+    /// The address behind an end that has one; a device end reads `None`.
+    fn addr(end: &Option<EndpointAddr>) -> &EndpointAddr {
+        end.as_ref().expect("a dialable endpoint")
     }
 
     fn node(id: &str, host: &str) -> NodeDescriptor {
@@ -1126,8 +1374,8 @@ mod tests {
 
         let endpoints = stream_endpoints(&stream, &path, &nodes()).expect("endpoints");
         assert_eq!(endpoints.outputs.len(), 1);
-        assert_eq!(endpoints.outputs[0].url, "srt://198.51.100.5:9000");
-        assert!(endpoints.outputs[0].node.is_empty());
+        assert_eq!(addr(&endpoints.outputs[0]).url, "srt://198.51.100.5:9000");
+        assert!(addr(&endpoints.outputs[0]).node.is_empty());
     }
 
     #[test]
@@ -1151,8 +1399,8 @@ mod tests {
 
         let endpoints = stream_endpoints(&stream, &path, &nodes()).expect("endpoints");
         assert_eq!(endpoints.outputs.len(), 2);
-        assert_eq!(endpoints.outputs[0].node, "strom-node-2");
-        assert_eq!(endpoints.outputs[1].url, "srt://198.51.100.5:9000");
+        assert_eq!(addr(&endpoints.outputs[0]).node, "strom-node-2");
+        assert_eq!(addr(&endpoints.outputs[1]).url, "srt://198.51.100.5:9000");
     }
 
     #[test]
@@ -1550,7 +1798,7 @@ mod tests {
         assert_eq!(srt(&bridge.egresses[0]).port(), 9000);
 
         let endpoints = stream_endpoints(&stream, &path, &nodes).expect("endpoints");
-        assert_eq!(endpoints.outputs[0].url, "srt://198.51.100.5:9000");
+        assert_eq!(addr(&endpoints.outputs[0]).url, "srt://198.51.100.5:9000");
     }
 
     #[test]
@@ -1669,15 +1917,19 @@ mod tests {
         let path = derive(&stream, &nodes).expect("derive");
         let endpoints = stream_endpoints(&stream, &path, &nodes).expect("endpoints");
 
-        assert_eq!(endpoints.ingress.node, "strom-node-1");
-        assert_eq!(endpoints.ingress.port, srt(&path.hops[0].ingress).port());
+        assert_eq!(addr(&endpoints.ingress).node, "strom-node-1");
+        assert_eq!(
+            addr(&endpoints.ingress).port,
+            srt(&path.hops[0].ingress).port()
+        );
         assert_eq!(endpoints.outputs.len(), 1);
         assert_eq!(
-            endpoints.outputs[0].node, "strom-node-2",
+            addr(&endpoints.outputs[0]).node,
+            "strom-node-2",
             "the consumer still attaches at the destination, not the relay"
         );
         let consumer_port = srt(&path.hops[2].egresses[0]).port();
-        assert_eq!(endpoints.outputs[0].port, consumer_port);
+        assert_eq!(addr(&endpoints.outputs[0]).port, consumer_port);
     }
 
     #[test]
@@ -1688,16 +1940,14 @@ mod tests {
         let endpoints = stream_endpoints(&stream, &path, &nodes).expect("endpoints");
 
         let ingress_port = srt(&path.hops[0].ingress).port();
-        assert_eq!(endpoints.ingress.node, "strom-node-1");
-        assert_eq!(endpoints.ingress.host, "172.26.0.10");
-        assert_eq!(endpoints.ingress.port, ingress_port);
-        assert_eq!(
-            endpoints.ingress.url,
-            format!("srt://172.26.0.10:{ingress_port}")
-        );
+        let ingress = addr(&endpoints.ingress);
+        assert_eq!(ingress.node, "strom-node-1");
+        assert_eq!(ingress.host, "172.26.0.10");
+        assert_eq!(ingress.port, ingress_port);
+        assert_eq!(ingress.url, format!("srt://172.26.0.10:{ingress_port}"));
 
         assert_eq!(endpoints.outputs.len(), 1);
-        let output = &endpoints.outputs[0];
+        let output = addr(&endpoints.outputs[0]);
         let consumer_port = srt(&path.hops[1].egresses[0]).port();
         assert_eq!(output.node, "strom-node-2");
         assert_eq!(output.host, "172.27.0.10");
@@ -1721,7 +1971,7 @@ mod tests {
 
         let path = derive(&stream, &nodes).expect("derive");
         let endpoints = stream_endpoints(&stream, &path, &nodes).expect("endpoints");
-        assert_eq!(endpoints.outputs[0].host, "203.0.113.7");
+        assert_eq!(addr(&endpoints.outputs[0]).host, "203.0.113.7");
     }
 
     #[test]
@@ -1733,6 +1983,482 @@ mod tests {
             Err(PlacementError::NodeNotRegistered {
                 node: "strom-node-1".to_string()
             })
+        );
+    }
+
+    /// A web page: pushes WHIP, pulls WHEP, owns a camera and a screen, sits
+    /// behind whatever network it is on, and has no ports to assign.
+    fn browser_node(id: &str) -> NodeDescriptor {
+        NodeDescriptor {
+            id: id.to_string(),
+            endpoint: format!("browser://{id}"),
+            status: NodeStatus::Ready,
+            capabilities: NodeCapabilities {
+                transports: vec![
+                    TransportOffer::with_roles(Transport::Whip, RoleSet::only(SocketRole::Connect)),
+                    TransportOffer::with_roles(Transport::Whep, RoleSet::only(SocketRole::Connect)),
+                ],
+                devices: [DeviceKind::Capture, DeviceKind::Display]
+                    .into_iter()
+                    .collect(),
+                data_plane: BTreeMap::from([(
+                    DEFAULT_DATA_PLANE_ALIAS.to_string(),
+                    DataPlaneAddr {
+                        host: "browser".to_string(),
+                        reachability: Reachability::OutboundOnly,
+                        signalling: Signalling::default(),
+                    },
+                )]),
+                port_range: None,
+                ..NodeCapabilities::default()
+            },
+        }
+    }
+
+    /// A Strom node that also hosts WHIP ingest and WHEP playback. The bases it
+    /// declares are its own to choose, so they are nothing the planner could
+    /// have guessed.
+    fn webrtc_node(id: &str, host: &str) -> NodeDescriptor {
+        let mut node = node(id, host);
+        node.capabilities.transports = vec![
+            TransportOffer::new(Transport::Srt),
+            TransportOffer::with_roles(Transport::Whip, RoleSet::only(SocketRole::Listen)),
+            TransportOffer::with_roles(Transport::Whep, RoleSet::only(SocketRole::Listen)),
+        ];
+        *signalling_of(&mut node) = Signalling {
+            whip: Some(format!("http://{host}:8080/ingest")),
+            whep: Some(format!("http://{host}:8080/playback")),
+        };
+        node
+    }
+
+    fn signalling_of(node: &mut NodeDescriptor) -> &mut Signalling {
+        &mut node
+            .capabilities
+            .data_plane
+            .get_mut(DEFAULT_DATA_PLANE_ALIAS)
+            .expect("the default alias")
+            .signalling
+    }
+
+    fn device_ref(id: &str) -> StreamTransport {
+        StreamTransport::Device(NodeEndpoint {
+            node: id.to_string(),
+            network: None,
+        })
+    }
+
+    fn alice_cam() -> StreamDefinition {
+        StreamDefinition {
+            name: "alice-cam".to_string(),
+            enabled: true,
+            source: device_ref("browser-a1b2"),
+            destinations: vec![StreamTransport::Srt(node_ref("strom-node-2", 1000))],
+        }
+    }
+
+    fn alice_return() -> StreamDefinition {
+        StreamDefinition {
+            name: "alice-return".to_string(),
+            enabled: true,
+            source: StreamTransport::Srt(node_ref("strom-node-2", 200)),
+            destinations: vec![device_ref("browser-a1b2")],
+        }
+    }
+
+    fn webrtc_nodes() -> Vec<NodeDescriptor> {
+        vec![
+            browser_node("browser-a1b2"),
+            webrtc_node("strom-node-2", "172.27.0.10"),
+        ]
+    }
+
+    #[test]
+    fn device_sender_to_strom_is_whip_hosted_on_strom() {
+        let path = derive(&alice_cam(), &webrtc_nodes()).expect("derive");
+        assert_eq!(path.hops.len(), 2);
+        let signalled = SocketSpec::signalling(
+            SignallingTransport::Whip,
+            SocketRole::Listen,
+            "http://172.27.0.10:8080/ingest",
+            "weave-alice-cam-receiver-0",
+        );
+
+        let sender = &path.hops[0];
+        assert_eq!(sender.node_id, "browser-a1b2");
+        assert_eq!(
+            sender.ingress,
+            SocketSpec::Device(DeviceKind::Capture),
+            "the media starts at the camera"
+        );
+        assert_eq!(
+            sender.egresses,
+            vec![SocketSpec::signalling(
+                SignallingTransport::Whip,
+                SocketRole::Connect,
+                "http://172.27.0.10:8080/ingest",
+                "weave-alice-cam-receiver-0",
+            )]
+        );
+
+        let receiver = &path.hops[1];
+        assert_eq!(receiver.node_id, "strom-node-2");
+        assert_eq!(receiver.ingress, signalled, "Strom hosts the ingest");
+        assert_eq!(srt(&receiver.egresses[0]).role(), SocketRole::Listen);
+        assert!((7000..=7999).contains(&srt(&receiver.egresses[0]).port()));
+
+        let endpoints = stream_endpoints(&alice_cam(), &path, &webrtc_nodes()).expect("endpoints");
+        assert_eq!(endpoints.ingress, None, "a camera has nothing to dial");
+        assert_eq!(endpoints.outputs.len(), 1);
+        assert_eq!(addr(&endpoints.outputs[0]).node, "strom-node-2");
+    }
+
+    #[test]
+    fn strom_to_device_receiver_is_whep_hosted_on_strom() {
+        let path = derive(&alice_return(), &webrtc_nodes()).expect("derive");
+        assert_eq!(path.hops.len(), 2);
+        let signalled = SocketSpec::signalling(
+            SignallingTransport::Whep,
+            SocketRole::Listen,
+            "http://172.27.0.10:8080/playback",
+            "weave-alice-return-receiver-0",
+        );
+
+        let sender = &path.hops[0];
+        assert_eq!(sender.node_id, "strom-node-2");
+        assert_eq!(srt(&sender.ingress).role(), SocketRole::Listen);
+        assert_eq!(
+            sender.egresses,
+            vec![signalled],
+            "Strom hosts the playback the browser pulls"
+        );
+
+        let receiver = &path.hops[1];
+        assert_eq!(receiver.node_id, "browser-a1b2");
+        assert_eq!(
+            receiver.ingress,
+            SocketSpec::signalling(
+                SignallingTransport::Whep,
+                SocketRole::Connect,
+                "http://172.27.0.10:8080/playback",
+                "weave-alice-return-receiver-0",
+            )
+        );
+        assert_eq!(
+            receiver.egresses,
+            vec![SocketSpec::Device(DeviceKind::Display)],
+            "the media ends on the screen"
+        );
+
+        let endpoints =
+            stream_endpoints(&alice_return(), &path, &webrtc_nodes()).expect("endpoints");
+        assert_eq!(addr(&endpoints.ingress).node, "strom-node-2");
+        assert_eq!(
+            endpoints.outputs,
+            vec![None],
+            "a screen has nothing to dial"
+        );
+    }
+
+    #[test]
+    fn a_hosting_nodes_declared_base_takes_the_hop_id_and_nothing_else() {
+        let mut strom = webrtc_node("strom-node-2", "172.27.0.10");
+        signalling_of(&mut strom).whip = Some("https://edge.example/sessions/".to_string());
+        let nodes = vec![browser_node("browser-a1b2"), strom];
+
+        let path = derive(&alice_cam(), &nodes).expect("derive");
+        assert_eq!(
+            path.hops[1].ingress,
+            SocketSpec::signalling(
+                SignallingTransport::Whip,
+                SocketRole::Listen,
+                "https://edge.example/sessions",
+                "weave-alice-cam-receiver-0",
+            )
+        );
+    }
+
+    #[test]
+    fn hosting_webrtc_without_a_signalling_base_is_rejected() {
+        let mut strom = webrtc_node("strom-node-2", "172.27.0.10");
+        *signalling_of(&mut strom) = Signalling::default();
+        let nodes = vec![browser_node("browser-a1b2"), strom];
+        assert_eq!(
+            derive(&alice_cam(), &nodes),
+            Err(PlacementError::NoSignalling {
+                node: "strom-node-2".to_string(),
+                transport: Transport::Whip,
+            })
+        );
+    }
+
+    #[test]
+    fn a_base_for_one_webrtc_transport_does_not_serve_the_other() {
+        let mut strom = webrtc_node("strom-node-2", "172.27.0.10");
+        signalling_of(&mut strom).whep = None;
+        let nodes = vec![browser_node("browser-a1b2"), strom];
+
+        derive(&alice_cam(), &nodes).expect("the whip base still hosts the camera's link");
+        assert_eq!(
+            derive(&alice_return(), &nodes),
+            Err(PlacementError::NoSignalling {
+                node: "strom-node-2".to_string(),
+                transport: Transport::Whep,
+            })
+        );
+    }
+
+    #[test]
+    fn endpoints_serialize_device_ends_as_null() {
+        let nodes = webrtc_nodes();
+        let cam = derive(&alice_cam(), &nodes).expect("derive");
+        let value =
+            serde_json::to_value(stream_endpoints(&alice_cam(), &cam, &nodes).unwrap()).unwrap();
+        assert!(value["ingress"].is_null());
+        assert_eq!(value["outputs"][0]["node"], "strom-node-2");
+        assert!(
+            value["outputs"][0]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("srt://172.27.0.10:")
+        );
+
+        let ret = derive(&alice_return(), &nodes).expect("derive");
+        let value =
+            serde_json::to_value(stream_endpoints(&alice_return(), &ret, &nodes).unwrap()).unwrap();
+        assert_eq!(value["ingress"]["node"], "strom-node-2");
+        assert_eq!(value["outputs"], serde_json::json!([null]));
+    }
+
+    #[test]
+    fn srt_only_endpoints_json_shape_is_unchanged() {
+        let path = derive(&contribution(), &nodes()).expect("derive");
+        let value =
+            serde_json::to_value(stream_endpoints(&contribution(), &path, &nodes()).unwrap())
+                .unwrap();
+        let ingress = value["ingress"].as_object().unwrap();
+        let mut keys: Vec<&str> = ingress.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["host", "node", "port", "url"]);
+        assert_eq!(value["outputs"].as_array().unwrap().len(), 1);
+        assert!(value["outputs"][0].is_object());
+    }
+
+    #[test]
+    fn srt_is_preferred_when_both_ends_offer_it() {
+        let pair = vec![
+            webrtc_node("strom-node-1", "172.26.0.10"),
+            webrtc_node("strom-node-2", "172.27.0.10"),
+        ];
+        let path = derive(&contribution(), &pair).expect("derive");
+        assert!(matches!(path.hops[0].egresses[0], SocketSpec::Srt(_)));
+        assert!(matches!(path.hops[1].ingress, SocketSpec::Srt(_)));
+        assert_eq!(
+            path,
+            derive(&contribution(), &nodes()).expect("derive"),
+            "declaring srt explicitly plans the same as declaring nothing"
+        );
+    }
+
+    #[test]
+    fn two_browsers_without_a_relay_share_no_transport() {
+        let mut stream = alice_cam();
+        stream.destinations = vec![device_ref("browser-c3d4")];
+        let nodes = vec![browser_node("browser-a1b2"), browser_node("browser-c3d4")];
+
+        assert_eq!(
+            derive(&stream, &nodes),
+            Err(PlacementError::NoCommonTransport {
+                upstream: "browser-a1b2".to_string(),
+                downstream: "browser-c3d4".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn two_browsers_bridge_through_a_strom_relay() {
+        let mut stream = alice_cam();
+        stream.destinations = vec![device_ref("browser-c3d4")];
+        let mut relay = webrtc_node("strom-node-1", "172.26.0.10");
+        relay.capabilities.relay = true;
+        let nodes = vec![
+            browser_node("browser-a1b2"),
+            browser_node("browser-c3d4"),
+            relay,
+        ];
+
+        let path = derive(&stream, &nodes).expect("derive");
+        let placed: Vec<(&str, &str)> = path
+            .hops
+            .iter()
+            .map(|h| (h.id.as_str(), h.node_id.as_str()))
+            .collect();
+        assert_eq!(
+            placed,
+            vec![
+                ("weave-alice-cam-sender", "browser-a1b2"),
+                ("weave-alice-cam-bridge-0-0", "strom-node-1"),
+                ("weave-alice-cam-receiver-0", "browser-c3d4"),
+            ]
+        );
+        let bridge = &path.hops[1];
+        assert_eq!(
+            bridge.ingress,
+            SocketSpec::signalling(
+                SignallingTransport::Whip,
+                SocketRole::Listen,
+                "http://172.26.0.10:8080/ingest",
+                "weave-alice-cam-bridge-0-0",
+            )
+        );
+        assert_eq!(
+            bridge.egresses,
+            vec![SocketSpec::signalling(
+                SignallingTransport::Whep,
+                SocketRole::Listen,
+                "http://172.26.0.10:8080/playback",
+                "weave-alice-cam-receiver-0",
+            )]
+        );
+        assert_eq!(
+            path.hops[0].egresses,
+            vec![SocketSpec::signalling(
+                SignallingTransport::Whip,
+                SocketRole::Connect,
+                "http://172.26.0.10:8080/ingest",
+                "weave-alice-cam-bridge-0-0",
+            )],
+            "the camera pushes into the relay's ingest"
+        );
+        assert_eq!(
+            path.hops[2].ingress,
+            SocketSpec::signalling(
+                SignallingTransport::Whep,
+                SocketRole::Connect,
+                "http://172.26.0.10:8080/playback",
+                "weave-alice-cam-receiver-0",
+            ),
+            "the far browser pulls it back out"
+        );
+        assert_eq!(
+            path.hops[2].egresses,
+            vec![SocketSpec::Device(DeviceKind::Display)]
+        );
+    }
+
+    #[test]
+    fn a_relay_that_cannot_carry_both_halves_is_passed_over() {
+        let mut stream = alice_cam();
+        stream.destinations = vec![device_ref("browser-c3d4")];
+        // SRT-only relay: dialable and offered, but a browser speaks no SRT.
+        let nodes = vec![
+            browser_node("browser-a1b2"),
+            browser_node("browser-c3d4"),
+            relay_node("srt-relay", "198.51.100.9"),
+        ];
+        assert!(matches!(
+            derive(&stream, &nodes),
+            Err(PlacementError::NoCommonTransport { .. })
+        ));
+    }
+
+    #[test]
+    fn a_device_endpoint_needs_a_node_that_offers_one() {
+        let mut stream = alice_cam();
+        let StreamTransport::Device(source) = &mut stream.source else {
+            unreachable!()
+        };
+        source.node = "strom-node-2".to_string();
+        assert_eq!(
+            derive(&stream, &webrtc_nodes()),
+            Err(PlacementError::NoDevice {
+                node: "strom-node-2".to_string(),
+                kind: DeviceKind::Capture,
+            })
+        );
+
+        let mut stream = alice_return();
+        stream.destinations = vec![device_ref("strom-node-2")];
+        assert_eq!(
+            derive(&stream, &webrtc_nodes()),
+            Err(PlacementError::NoDevice {
+                node: "strom-node-2".to_string(),
+                kind: DeviceKind::Display,
+            })
+        );
+    }
+
+    #[test]
+    fn a_strom_node_that_only_speaks_srt_is_never_handed_a_webrtc_socket() {
+        // node-2 declares srt only; the browser cannot reach it, and there is
+        // no relay, so the stream stays unplaced rather than misplanned.
+        let mut srt_only = node("strom-node-2", "172.27.0.10");
+        srt_only.capabilities.transports = vec![TransportOffer::new(Transport::Srt)];
+        let nodes = vec![browser_node("browser-a1b2"), srt_only];
+        assert!(matches!(
+            derive(&alice_cam(), &nodes),
+            Err(PlacementError::NoCommonTransport { .. })
+        ));
+    }
+
+    #[test]
+    fn webrtc_plans_are_deterministic() {
+        let a = derive(&alice_cam(), &webrtc_nodes()).expect("derive");
+        let b = derive(&alice_cam(), &webrtc_nodes()).expect("derive");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn endpoints_name_a_hop_the_path_is_missing() {
+        let stream = contribution();
+        let mut path = derive(&stream, &nodes()).expect("derive");
+        path.hops.retain(|hop| hop.role != HopRole::Receiver);
+        assert_eq!(
+            stream_endpoints(&stream, &path, &nodes()),
+            Err(PlacementError::MissingHop {
+                stream: "contribution".to_string(),
+                hop: "weave-contribution-receiver-0".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn endpoints_name_a_receiver_with_no_consumer_socket() {
+        let stream = contribution();
+        let mut path = derive(&stream, &nodes()).expect("derive");
+        path.hops[1].egresses.clear();
+        assert_eq!(
+            stream_endpoints(&stream, &path, &nodes()),
+            Err(PlacementError::NoConsumerSocket {
+                hop: "weave-contribution-receiver-0".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn endpoints_name_a_consumer_socket_that_is_not_an_srt_listener() {
+        let stream = contribution();
+        let mut path = derive(&stream, &nodes()).expect("derive");
+        path.hops[1].egresses[0] = SocketSpec::Device(DeviceKind::Display);
+        let error = stream_endpoints(&stream, &path, &nodes()).unwrap_err();
+        assert_eq!(
+            error,
+            PlacementError::NotAnSrtListener {
+                hop: "weave-contribution-receiver-0".to_string(),
+                socket: SocketSpec::Device(DeviceKind::Display),
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "hop weave-contribution-receiver-0 carries a display device socket where an SRT listener is needed"
+        );
+
+        path.hops[1].egresses[0] = SocketSpec::srt_connect("198.51.100.5", 9000, 200);
+        let error = stream_endpoints(&stream, &path, &nodes()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "hop weave-contribution-receiver-0 carries a srt connect socket where an SRT listener is needed",
+            "names the caller, not just the transport"
         );
     }
 }
