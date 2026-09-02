@@ -81,7 +81,8 @@ Deliberately **not** versioned:
 
 `/status` *is* versioned: it is a scriptable rollup that people automate against
 (the bench justfile does), so it belongs to the operator contract rather than to
-the dashboard — even though, like the dashboard, it is unauthenticated.
+the dashboard. The unauthenticated copy is the controller's, which the dashboard
+shares; northbound's copy sits behind the bearer.
 
 There are no back-compat aliases: the previously unprefixed paths now `404`.
 
@@ -125,7 +126,7 @@ constant time and never logged.
 
 | Variable | Presented by | Accepted by |
 |---|---|---|
-| `WEAVE_NORTHBOUND_TOKEN` | operators, the `weave` CLI (`--token`), northbound → controller | northbound, controller |
+| `WEAVE_NORTHBOUND_TOKEN` | operators, the `weave` CLI (`--token`), northbound → controller | northbound (every operator route), controller (every operator route but `/v1/status`) |
 | `WEAVE_SOUTHBOUND_TOKEN` | adapters and media nodes, southbound → controller | southbound, controller |
 
 The controller backs both surfaces, so it needs both variables and requires the
@@ -144,13 +145,16 @@ Left unauthenticated on purpose:
 
 - **`/health`** on every service — compose healthchecks and load balancers need it.
 - **The controller dashboard** (`/`, `/ui`, `/view`) and the `/v1/status` rollup
-  it shares its data with. The dashboard is browser-loaded and polls `/view`,
-  which a bearer token cannot carry without a cookie/session mechanism or a
-  reverse proxy. `/view` exposes topology and allocated ports, so **do not expose
-  the controller port publicly** — keep it on a private network or put a reverse
-  proxy in front of it. The controller's `/v1/streams` and `/v1/nodes` API routes
-  *are* authenticated, so an exposed port leaks read-only dashboard data rather
-  than write access.
+  it shares its data with — on the controller only. Northbound's `/v1/status` and
+  `/v1/streams/{name}/endpoints` require the northbound token, so an operator can
+  read a stream's resolved address through northbound with the controller port
+  unexposed. The dashboard is browser-loaded and polls `/view`, which a bearer
+  token cannot carry without a cookie/session mechanism or a reverse proxy.
+  `/view` exposes topology and allocated ports, so **do not expose the controller
+  port publicly** — keep it on a private network or put a reverse proxy in front
+  of it. The controller's `/v1/streams` and `/v1/nodes` API routes *are*
+  authenticated, so an exposed port leaks read-only dashboard data rather than
+  write access.
 
 There is no TLS: terminate it at a reverse proxy. Per-node tokens issued at
 registration and mTLS are follow-ups, not implemented here.
