@@ -38,6 +38,8 @@ pub struct StromElement {
 #[derive(Debug, Deserialize)]
 pub struct StromBlock {
     #[serde(default)]
+    pub id: String,
+    #[serde(default)]
     pub block_definition_id: String,
     #[serde(default)]
     pub properties: BTreeMap<String, Value>,

@@ -1,5 +1,6 @@
 //! Adapter configuration loaded from a YAML file at startup.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -26,6 +27,11 @@ pub struct StromSection {
     pub token: Option<String>,
     #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,
+    /// Base URL peers reach this Strom's WebRTC signalling at, keyed by
+    /// data-plane alias. The adapter appends the routes Strom serves and
+    /// advertises the result; an alias with no entry advertises no signalling.
+    #[serde(default)]
+    pub signalling_base: BTreeMap<String, String>,
 }
 
 fn default_poll_interval_secs() -> u64 {
@@ -57,7 +63,8 @@ impl AdapterConfig {
     ///
     /// # Errors
     /// Returns an error if the file cannot be read, the YAML is malformed or
-    /// carries unknown fields, or the node config fails validation.
+    /// carries unknown fields, the node config fails validation, or a
+    /// `signalling_base` names an alias the node does not advertise.
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
@@ -67,13 +74,27 @@ impl AdapterConfig {
             .node
             .validate()
             .with_context(|| format!("validating node config {}", path.display()))?;
+        config
+            .validate_signalling_aliases()
+            .with_context(|| format!("validating config {}", path.display()))?;
         Ok(config)
+    }
+
+    fn validate_signalling_aliases(&self) -> Result<()> {
+        for alias in self.strom.signalling_base.keys() {
+            anyhow::ensure!(
+                self.node.data_plane.contains_key(alias),
+                "signalling_base names alias {alias}, which data_plane does not declare"
+            );
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weave_core::{RoleSet, SocketRole, Transport, TransportOffer};
 
     const VALID: &str = r"
 node:
@@ -159,6 +180,66 @@ strom:
             "a blank config value counts as absent"
         );
         assert_eq!(pick_token(Some("  "), Some("")), None);
+    }
+
+    #[test]
+    fn parses_transports_and_signalling_bases() {
+        let yaml = VALID
+            .replace(
+                "transports: [srt]",
+                "transports: [srt, {name: whip, roles: [listen]}]",
+            )
+            .replace(
+                "  url: http://172.26.0.10:8080",
+                "  url: http://172.26.0.10:8080\n  signalling_base:\n    default: http://172.26.0.10:8080",
+            );
+        let config: AdapterConfig = serde_norway::from_str(&yaml).expect("parse");
+        assert_eq!(
+            config.node.transports,
+            vec![
+                TransportOffer::new(Transport::Srt),
+                TransportOffer::with_roles(Transport::Whip, RoleSet::only(SocketRole::Listen)),
+            ],
+            "a bare name offers both roles; a mapping offers only what it lists"
+        );
+        assert_eq!(
+            config
+                .strom
+                .signalling_base
+                .get("default")
+                .map(String::as_str),
+            Some("http://172.26.0.10:8080")
+        );
+        assert!(
+            config.node.data_plane["default"].signalling.is_empty(),
+            "the adapter fills signalling in at registration, not the node config"
+        );
+        assert_eq!(config.node.validate(), Ok(()));
+    }
+
+    #[test]
+    fn signalling_base_for_an_unknown_alias_is_rejected() {
+        let yaml = VALID.replace(
+            "  url: http://172.26.0.10:8080",
+            "  url: http://172.26.0.10:8080\n  signalling_base:\n    wan: http://203.0.113.7:8080",
+        );
+        let config: AdapterConfig = serde_norway::from_str(&yaml).expect("parse");
+        let error = config
+            .validate_signalling_aliases()
+            .expect_err("wan is not declared in data_plane");
+        assert!(
+            error.to_string().contains("wan"),
+            "the message names the alias: {error}"
+        );
+    }
+
+    #[test]
+    fn signalling_base_is_absent_by_default() {
+        let config: AdapterConfig = serde_norway::from_str(VALID).expect("parse");
+        assert!(
+            config.strom.signalling_base.is_empty(),
+            "an SRT-only Strom declares no signalling"
+        );
     }
 
     #[test]

@@ -15,6 +15,9 @@ pub struct ElementStats {
     /// Cumulative bytes received across this element's callers. Byte progress over
     /// time is the only reliable signal that a connected socket is truly flowing.
     pub bytes_received: i64,
+    /// Cumulative bytes sent across this element's callers; the sink-side
+    /// counterpart of `bytes_received`.
+    pub bytes_sent: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -27,21 +30,30 @@ pub struct FlowStats {
 }
 
 impl FlowStats {
-    /// The first element whose id starts with `srtsrc` (a hop's ingress socket).
+    /// The first `srtsrc` element: `srtsrc_0` in an element flow, `<block>:srtsrc`
+    /// inside a block. A hop's SRT ingress socket.
     #[must_use]
     pub fn ingress(&self) -> Option<&ElementStats> {
-        self.element_with_prefix("srtsrc")
+        self.element_named("srtsrc")
     }
 
-    /// The first element whose id starts with `srtsink` (a hop's egress socket).
+    /// The first `srtsink` element, likewise. A hop's SRT egress socket.
     #[must_use]
     pub fn egress(&self) -> Option<&ElementStats> {
-        self.element_with_prefix("srtsink")
+        self.element_named("srtsink")
     }
 
-    fn element_with_prefix(&self, prefix: &str) -> Option<&ElementStats> {
-        self.elements.iter().find(|e| e.id.starts_with(prefix))
+    fn element_named(&self, element: &str) -> Option<&ElementStats> {
+        self.elements
+            .iter()
+            .find(|e| is_srt_element(&e.id, element))
     }
+}
+
+/// Whether a `connections` key names `element` (`srtsrc`/`srtsink`), either as a
+/// bare element id such as `srtsrc_0` or inside a block as `<block>:srtsrc`.
+fn is_srt_element(id: &str, element: &str) -> bool {
+    id.starts_with(element) || id.rsplit(':').next() == Some(element)
 }
 
 impl From<FlowStats> for weave_core::LinkStats {
@@ -78,7 +90,7 @@ pub fn parse_flow_stats(value: &Value) -> FlowStats {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        let rate_keys = if id.starts_with("srtsink") {
+        let rate_keys = if is_srt_element(id, "srtsink") {
             SEND_RATE_KEYS
         } else {
             RECV_RATE_KEYS
@@ -86,6 +98,7 @@ pub fn parse_flow_stats(value: &Value) -> FlowStats {
 
         let mut rate_mbps = 0.0;
         let mut bytes_received = 0;
+        let mut bytes_sent = 0;
         if let Some(callers) = connection.get("callers").and_then(Value::as_array) {
             for caller in callers {
                 stats.packets_sent_lost += field_i64(caller, "packets_sent_lost");
@@ -95,6 +108,7 @@ pub fn parse_flow_stats(value: &Value) -> FlowStats {
                     field_i64(caller, "packets_received_retransmitted");
                 rate_mbps += rate_field(caller, rate_keys);
                 bytes_received += field_i64(caller, "bytes_received");
+                bytes_sent += field_i64(caller, "bytes_sent");
             }
         }
 
@@ -103,6 +117,7 @@ pub fn parse_flow_stats(value: &Value) -> FlowStats {
             connected,
             rate_mbps,
             bytes_received,
+            bytes_sent,
         });
     }
 
@@ -164,6 +179,37 @@ mod tests {
         let stats = parse_flow_stats(&value);
         assert_eq!(stats.ingress().map(|e| e.bytes_received), Some(721_519_840));
         assert_eq!(stats.egress().map(|e| e.bytes_received), Some(0));
+    }
+
+    /// A block's SRT element is keyed `<block>:srtsink`, as the bench Strom
+    /// (0.6.6) reports it for a `mpegtssrt_output` block.
+    #[test]
+    fn finds_srt_elements_inside_blocks() {
+        let value = serde_json::json!({
+            "stats": { "connections": {
+                "srt_out:srtsink": { "role": "sink", "mode": "listener", "connected": true, "callers": [
+                    { "bytes_sent": 4096, "send_rate_mbps": 1.5, "bytes_received": null }
+                ]}
+            }}
+        });
+        let stats = parse_flow_stats(&value);
+        assert!(stats.ingress().is_none());
+        let egress = stats.egress().expect("block srtsink");
+        assert_eq!(egress.id, "srt_out:srtsink");
+        assert_eq!(egress.rate_mbps, 1.5, "a sink reads the send rate");
+        assert_eq!(egress.bytes_sent, 4096);
+        assert_eq!(egress.bytes_received, 0);
+
+        let value = serde_json::json!({
+            "stats": { "connections": {
+                "srt_in:srtsrc": { "role": "source", "connected": true, "callers": [
+                    { "bytes_received": 512, "recv_rate_mbps": 0.7 }
+                ]}
+            }}
+        });
+        let stats = parse_flow_stats(&value);
+        assert_eq!(stats.ingress().map(|e| e.bytes_received), Some(512));
+        assert!(stats.egress().is_none());
     }
 
     #[test]

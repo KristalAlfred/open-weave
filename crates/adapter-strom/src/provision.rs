@@ -9,15 +9,17 @@ use weave_core::{
 };
 use weave_strom::{StromFlow, parse_srt_endpoint};
 
-/// Consecutive polls without ingress byte progress before a running, ever-flowed
-/// hop is judged stalled. At the default 5s poll this is ~15s of frozen bytes.
+/// Consecutive polls without byte progress on one side before a running,
+/// ever-flowed hop is judged stalled there. At the default 5s poll this is ~15s
+/// of frozen bytes.
 const STALL_POLLS: u32 = 3;
 
-/// Per-poll ingress observation fed to the [`StallTracker`].
+/// Per-poll observation of one side of a hop, fed to the [`StallTracker`].
 #[derive(Debug, Clone, Copy)]
-pub struct IngressObservation {
-    /// Cumulative ingress bytes, or `None` when stats are unavailable this cycle.
-    pub bytes_received: Option<i64>,
+pub struct SideObservation {
+    /// Cumulative bytes through that side, or `None` when stats are unavailable
+    /// this cycle.
+    pub bytes: Option<i64>,
     /// Whether the flow still claims to be running.
     pub running: bool,
     /// Whether the flow's GStreamer state is `Paused` (healthy-idle listener).
@@ -31,23 +33,30 @@ struct HopProgress {
     ever_flowed: bool,
 }
 
-/// In-memory byte-progress tracker keyed by hop id. Byte progress across polls is
-/// the only reliable signal that a connected ingress is truly flowing; no single
-/// instantaneous field separates a dead flow from a live one.
+/// Which side of a hop a byte counter belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Side {
+    Ingress,
+    Egress,
+}
+
+/// In-memory byte-progress tracker keyed by hop id and side. Byte progress
+/// across polls is the only reliable signal that a connected socket is truly
+/// flowing; no single instantaneous field separates a dead flow from a live one.
 #[derive(Debug, Default)]
 pub struct StallTracker {
-    hops: HashMap<String, HopProgress>,
+    hops: HashMap<(String, Side), HopProgress>,
 }
 
 impl StallTracker {
-    /// Fold one poll's ingress observation for `hop_id` and report whether the
-    /// ingress is stalled: it has flowed since we began watching, its bytes have
+    /// Fold one poll's observation of `side` of `hop_id` and report whether that
+    /// side is stalled: it has flowed since we began watching, its bytes have
     /// been frozen for at least [`STALL_POLLS`] polls, and the flow still runs and
     /// is not a paused idle listener.
-    pub fn observe(&mut self, hop_id: &str, obs: IngressObservation) -> bool {
-        let progress = self.hops.entry(hop_id.to_string()).or_default();
+    pub fn observe(&mut self, hop_id: &str, side: Side, obs: SideObservation) -> bool {
+        let progress = self.hops.entry((hop_id.to_string(), side)).or_default();
 
-        if let Some(bytes) = obs.bytes_received {
+        if let Some(bytes) = obs.bytes {
             match progress.last_bytes {
                 // First sighting only establishes a baseline, so a counter that is
                 // already frozen reads never-flowed until it is seen to advance.
@@ -69,9 +78,17 @@ impl StallTracker {
             && progress.stale_polls >= STALL_POLLS
     }
 
+    /// Whether `side` of `hop_id` advanced on its most recent observation.
+    #[must_use]
+    pub fn advanced(&self, hop_id: &str, side: Side) -> bool {
+        self.hops
+            .get(&(hop_id.to_string(), side))
+            .is_some_and(|progress| progress.ever_flowed && progress.stale_polls == 0)
+    }
+
     /// Drop tracked hops no longer desired so state cannot grow without bound.
     pub fn retain(&mut self, desired: &HashSet<&str>) {
-        self.hops.retain(|id, _| desired.contains(id.as_str()));
+        self.hops.retain(|(id, _), _| desired.contains(id.as_str()));
     }
 }
 
@@ -94,11 +111,12 @@ impl HopPlan {
 
 /// Reconcile desired hops against observed Strom flows.
 ///
-/// Flows are adopted by name. A flow whose SRT socket URIs no longer match the
-/// desired hop (host or port changed) is treated as drifted: it is deleted and
-/// recreated rather than adopted, so a re-addressed stream actually reaches the
-/// node. Only flows carrying the managed hop-id prefix are ever deleted, so flows
-/// created outside open-weave are left untouched.
+/// Flows are adopted by name. A flow whose sockets no longer match the desired
+/// hop (an SRT host or port changed, or a WHIP/WHEP endpoint id) is treated as
+/// drifted: it is deleted and recreated rather than adopted, so a re-addressed
+/// stream actually reaches the node. Only flows carrying the managed hop-id
+/// prefix are ever deleted, so flows created outside open-weave are left
+/// untouched.
 #[must_use]
 pub fn diff_hops(desired: &[DesiredHop], flows: &[StromFlow]) -> HopPlan {
     let desired_by_id: HashMap<&str, &DesiredHop> =
@@ -134,27 +152,63 @@ pub fn diff_hops(desired: &[DesiredHop], flows: &[StromFlow]) -> HopPlan {
     }
 }
 
-/// Whether an adopted flow's SRT sockets diverge from the desired hop. A flow
-/// exposing no parseable `srt://` URI cannot be compared, so it is adopted rather
-/// than recreated.
+/// Whether an adopted flow's sockets diverge from the desired hop: its SRT
+/// addresses (element `uri`s and block `srt_uri`s) or its WHIP/WHEP endpoint ids
+/// (block `endpoint_id`s). A flow exposing neither cannot be compared, so it is
+/// adopted rather than recreated.
 fn flow_drifted(flow: &StromFlow, hop: &DesiredHop) -> bool {
-    let actual = flow_srt_endpoints(flow);
-    !actual.is_empty() && actual != hop_srt_endpoints(hop)
+    let actual_srt = sorted(flow_srt_endpoints(flow));
+    let actual_ids = sorted(flow_endpoint_ids(flow));
+    if actual_srt.is_empty() && actual_ids.is_empty() {
+        return false;
+    }
+    actual_srt != sorted(hop_srt_endpoints(hop)) || actual_ids != sorted(hop_endpoint_ids(hop))
+}
+
+fn sorted<T: Ord>(mut values: Vec<T>) -> Vec<T> {
+    values.sort();
+    values
 }
 
 fn flow_srt_endpoints(flow: &StromFlow) -> Vec<(String, u16)> {
-    flow.elements
+    let element_uris = flow
+        .elements
         .iter()
-        .filter_map(|element| element.properties.get("uri"))
+        .filter_map(|element| element.properties.get("uri"));
+    let block_uris = flow
+        .blocks
+        .iter()
+        .filter_map(|block| block.properties.get("srt_uri"));
+    element_uris
+        .chain(block_uris)
         .filter_map(Value::as_str)
         .filter_map(parse_srt_endpoint)
         .collect()
 }
 
+fn flow_endpoint_ids(flow: &StromFlow) -> Vec<String> {
+    flow.blocks
+        .iter()
+        .filter_map(|block| block.properties.get("endpoint_id"))
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn hop_sockets(hop: &DesiredHop) -> impl Iterator<Item = &SocketSpec> {
+    std::iter::once(&hop.ingress).chain(hop.egresses.iter())
+}
+
 fn hop_srt_endpoints(hop: &DesiredHop) -> Vec<(String, u16)> {
-    std::iter::once(&hop.ingress)
-        .chain(hop.egresses.iter())
-        .filter_map(socket_endpoint)
+    hop_sockets(hop).filter_map(socket_endpoint).collect()
+}
+
+fn hop_endpoint_ids(hop: &DesiredHop) -> Vec<String> {
+    hop_sockets(hop)
+        .filter_map(|spec| match spec {
+            SocketSpec::Whip(socket) | SocketSpec::Whep(socket) => Some(socket.endpoint_id.clone()),
+            SocketSpec::Srt(_) | SocketSpec::Device(_) => None,
+        })
         .collect()
 }
 
@@ -206,6 +260,34 @@ pub fn socket_condition(
     }
 }
 
+/// Map a WebRTC socket to its link condition.
+///
+/// Strom exposes no per-session stats for WHIP/WHEP: sessions run in their own
+/// pipelines, outside the flow that `srt-stats` and `webrtc-stats` inspect. So
+/// the condition is read off the flow and the SRT side of the same hop. A
+/// `stalled` SRT side overrides all else, as in [`socket_condition`]. Otherwise
+/// a flow that is not playing has no session: the socket waits, `Idle` when it
+/// hosts and `Connecting` when it dials. A playing flow whose SRT side advanced
+/// this poll is carrying media through, so the WebRTC side is `Flowing`; a
+/// playing flow with frozen SRT bytes is `Connected`.
+#[must_use]
+pub fn webrtc_condition(
+    role: SocketRole,
+    playing: bool,
+    srt_side_advanced: bool,
+    srt_side_stalled: bool,
+) -> LinkCondition {
+    if srt_side_stalled {
+        return LinkCondition::Stalled;
+    }
+    match (playing, role) {
+        (false, SocketRole::Listen) => LinkCondition::Idle,
+        (false, SocketRole::Connect) => LinkCondition::Connecting,
+        (true, _) if srt_side_advanced => LinkCondition::Flowing,
+        (true, _) => LinkCondition::Connected,
+    }
+}
+
 /// Best-effort resolved address for a socket spec. A listener resolves to the
 /// node's advertised data-plane host so peers connect to a concrete address,
 /// falling back to the wildcard when the node declares none; a socket carrying
@@ -220,16 +302,6 @@ pub fn resolved_addr(spec: &SocketSpec, data_plane_host: Option<&str>) -> Option
         SocketSpec::Whip(_) | SocketSpec::Whep(_) | SocketSpec::Device(_) => return None,
     };
     Some(ResolvedAddr { host, port })
-}
-
-/// The SRT role a socket's link condition is read from. A socket this adapter
-/// does not realise has none.
-#[must_use]
-pub fn srt_role(spec: &SocketSpec) -> Option<SocketRole> {
-    match spec {
-        SocketSpec::Srt(socket) => Some(socket.role()),
-        SocketSpec::Whip(_) | SocketSpec::Whep(_) | SocketSpec::Device(_) => None,
-    }
 }
 
 #[cfg(test)]
@@ -409,9 +481,9 @@ mod tests {
         );
     }
 
-    fn flowing(bytes: i64) -> IngressObservation {
-        IngressObservation {
-            bytes_received: Some(bytes),
+    fn flowing(bytes: i64) -> SideObservation {
+        SideObservation {
+            bytes: Some(bytes),
             running: true,
             gst_paused: false,
         }
@@ -421,30 +493,42 @@ mod tests {
     fn never_flowed_hop_never_stalls() {
         let mut tracker = StallTracker::default();
         for _ in 0..6 {
-            assert!(!tracker.observe("weave-a", flowing(0)));
+            assert!(!tracker.observe("weave-a", Side::Ingress, flowing(0)));
         }
     }
 
     #[test]
     fn flowed_then_frozen_stalls_after_three_polls() {
         let mut tracker = StallTracker::default();
-        assert!(!tracker.observe("weave-a", flowing(1000)));
-        assert!(!tracker.observe("weave-a", flowing(2000)));
-        assert!(!tracker.observe("weave-a", flowing(2000)), "1 frozen poll");
-        assert!(!tracker.observe("weave-a", flowing(2000)), "2 frozen polls");
-        assert!(tracker.observe("weave-a", flowing(2000)), "3 frozen polls");
+        assert!(!tracker.observe("weave-a", Side::Ingress, flowing(1000)));
+        assert!(!tracker.observe("weave-a", Side::Ingress, flowing(2000)));
+        assert!(
+            !tracker.observe("weave-a", Side::Ingress, flowing(2000)),
+            "1 frozen poll"
+        );
+        assert!(
+            !tracker.observe("weave-a", Side::Ingress, flowing(2000)),
+            "2 frozen polls"
+        );
+        assert!(
+            tracker.observe("weave-a", Side::Ingress, flowing(2000)),
+            "3 frozen polls"
+        );
     }
 
     #[test]
     fn byte_progress_clears_a_stall() {
         let mut tracker = StallTracker::default();
-        tracker.observe("weave-a", flowing(1000));
+        tracker.observe("weave-a", Side::Ingress, flowing(1000));
         for _ in 0..3 {
-            tracker.observe("weave-a", flowing(2000));
+            tracker.observe("weave-a", Side::Ingress, flowing(2000));
         }
-        assert!(tracker.observe("weave-a", flowing(2000)), "stalled");
         assert!(
-            !tracker.observe("weave-a", flowing(3000)),
+            tracker.observe("weave-a", Side::Ingress, flowing(2000)),
+            "stalled"
+        );
+        assert!(
+            !tracker.observe("weave-a", Side::Ingress, flowing(3000)),
             "recovers when bytes advance"
         );
     }
@@ -452,30 +536,30 @@ mod tests {
     #[test]
     fn paused_flow_is_never_stalled() {
         let mut tracker = StallTracker::default();
-        tracker.observe("weave-a", flowing(1000));
-        tracker.observe("weave-a", flowing(2000));
+        tracker.observe("weave-a", Side::Ingress, flowing(1000));
+        tracker.observe("weave-a", Side::Ingress, flowing(2000));
         for _ in 0..4 {
-            let obs = IngressObservation {
-                bytes_received: Some(2000),
+            let obs = SideObservation {
+                bytes: Some(2000),
                 running: true,
                 gst_paused: true,
             };
-            assert!(!tracker.observe("weave-a", obs));
+            assert!(!tracker.observe("weave-a", Side::Ingress, obs));
         }
     }
 
     #[test]
     fn stopped_flow_is_never_stalled() {
         let mut tracker = StallTracker::default();
-        tracker.observe("weave-a", flowing(1000));
-        tracker.observe("weave-a", flowing(2000));
+        tracker.observe("weave-a", Side::Ingress, flowing(1000));
+        tracker.observe("weave-a", Side::Ingress, flowing(2000));
         for _ in 0..4 {
-            let obs = IngressObservation {
-                bytes_received: Some(2000),
+            let obs = SideObservation {
+                bytes: Some(2000),
                 running: false,
                 gst_paused: false,
             };
-            assert!(!tracker.observe("weave-a", obs));
+            assert!(!tracker.observe("weave-a", Side::Ingress, obs));
         }
     }
 
@@ -484,15 +568,15 @@ mod tests {
         // SRT settles bytes_received down at caller disconnect before freezing; a
         // hop that has flowed is still judged stalled, not treated as fresh.
         let mut tracker = StallTracker::default();
-        tracker.observe("weave-a", flowing(71_416_276));
-        tracker.observe("weave-a", flowing(72_000_000));
+        tracker.observe("weave-a", Side::Ingress, flowing(71_416_276));
+        tracker.observe("weave-a", Side::Ingress, flowing(72_000_000));
         assert!(
-            !tracker.observe("weave-a", flowing(68_958_964)),
+            !tracker.observe("weave-a", Side::Ingress, flowing(68_958_964)),
             "settle-down poll"
         );
-        assert!(!tracker.observe("weave-a", flowing(68_958_964)));
+        assert!(!tracker.observe("weave-a", Side::Ingress, flowing(68_958_964)));
         assert!(
-            tracker.observe("weave-a", flowing(68_958_964)),
+            tracker.observe("weave-a", Side::Ingress, flowing(68_958_964)),
             "frozen after settle -> stalled"
         );
     }
@@ -503,34 +587,166 @@ mod tests {
         // observed advance it reads never-flowed rather than stalled.
         let mut tracker = StallTracker::default();
         for _ in 0..6 {
-            assert!(!tracker.observe("weave-a", flowing(9_299_932)));
+            assert!(!tracker.observe("weave-a", Side::Ingress, flowing(9_299_932)));
         }
     }
 
     #[test]
     fn missing_stats_do_not_advance_a_stall() {
         let mut tracker = StallTracker::default();
-        tracker.observe("weave-a", flowing(1000));
-        tracker.observe("weave-a", flowing(2000));
-        let missing = IngressObservation {
-            bytes_received: None,
+        tracker.observe("weave-a", Side::Ingress, flowing(1000));
+        tracker.observe("weave-a", Side::Ingress, flowing(2000));
+        let missing = SideObservation {
+            bytes: None,
             running: true,
             gst_paused: false,
         };
         for _ in 0..5 {
-            assert!(!tracker.observe("weave-a", missing));
+            assert!(!tracker.observe("weave-a", Side::Ingress, missing));
         }
     }
 
     #[test]
     fn retain_drops_undesired_hops() {
         let mut tracker = StallTracker::default();
-        tracker.observe("weave-a", flowing(1000));
-        tracker.observe("weave-b", flowing(1000));
+        tracker.observe("weave-a", Side::Ingress, flowing(1000));
+        tracker.observe("weave-a", Side::Egress, flowing(1000));
+        tracker.observe("weave-b", Side::Ingress, flowing(1000));
         let desired: HashSet<&str> = ["weave-a"].into_iter().collect();
         tracker.retain(&desired);
-        assert!(tracker.hops.contains_key("weave-a"));
-        assert!(!tracker.hops.contains_key("weave-b"));
+        assert!(
+            tracker
+                .hops
+                .contains_key(&("weave-a".to_string(), Side::Ingress))
+        );
+        assert!(
+            tracker
+                .hops
+                .contains_key(&("weave-a".to_string(), Side::Egress))
+        );
+        assert!(
+            !tracker
+                .hops
+                .contains_key(&("weave-b".to_string(), Side::Ingress))
+        );
+    }
+
+    #[test]
+    fn advanced_reads_only_the_most_recent_poll() {
+        let mut tracker = StallTracker::default();
+        assert!(!tracker.advanced("weave-a", Side::Egress), "never seen");
+        tracker.observe("weave-a", Side::Egress, flowing(1000));
+        assert!(
+            !tracker.advanced("weave-a", Side::Egress),
+            "a baseline is not progress"
+        );
+        tracker.observe("weave-a", Side::Egress, flowing(2000));
+        assert!(tracker.advanced("weave-a", Side::Egress));
+        tracker.observe("weave-a", Side::Egress, flowing(2000));
+        assert!(
+            !tracker.advanced("weave-a", Side::Egress),
+            "frozen this poll"
+        );
+        assert!(
+            !tracker.advanced("weave-a", Side::Ingress),
+            "sides are independent"
+        );
+    }
+
+    #[test]
+    fn webrtc_condition_is_inferred_from_the_flow_and_the_srt_side() {
+        assert_eq!(
+            webrtc_condition(SocketRole::Listen, false, false, false),
+            LinkCondition::Idle
+        );
+        assert_eq!(
+            webrtc_condition(SocketRole::Connect, false, false, false),
+            LinkCondition::Connecting
+        );
+        assert_eq!(
+            webrtc_condition(SocketRole::Listen, true, false, false),
+            LinkCondition::Connected
+        );
+        assert_eq!(
+            webrtc_condition(SocketRole::Listen, true, true, false),
+            LinkCondition::Flowing
+        );
+    }
+
+    #[test]
+    fn webrtc_condition_reports_a_stalled_srt_side() {
+        assert_eq!(
+            webrtc_condition(SocketRole::Listen, true, false, true),
+            LinkCondition::Stalled
+        );
+        assert_eq!(
+            webrtc_condition(SocketRole::Connect, false, false, true),
+            LinkCondition::Stalled,
+            "a stall outranks the waiting states, as in socket_condition"
+        );
+    }
+
+    fn whip_gateway_hop() -> DesiredHop {
+        DesiredHop {
+            id: "weave-alice-cam-receiver-0".to_string(),
+            node_id: "strom-node-2".to_string(),
+            role: HopRole::Receiver,
+            ingress: SocketSpec::signalling(
+                SignallingTransport::Whip,
+                SocketRole::Listen,
+                "http://172.27.0.10:8080/whip",
+                "weave-alice-cam-receiver-0",
+            ),
+            egresses: vec![SocketSpec::srt_listen(7003, 200)],
+        }
+    }
+
+    fn block_flow(name: &str, endpoint_id: &str, srt_uri: &str) -> StromFlow {
+        serde_json::from_value(serde_json::json!({
+            "id": "id-a",
+            "name": name,
+            "running": true,
+            "blocks": [
+                { "id": "whip_in", "block_definition_id": "builtin.whip_input",
+                  "properties": { "endpoint_id": endpoint_id } },
+                { "id": "srt_out_0", "block_definition_id": "builtin.mpegtssrt_output",
+                  "properties": { "srt_uri": srt_uri } },
+            ],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn block_flow_with_matching_sockets_is_adopted() {
+        let desired = vec![whip_gateway_hop()];
+        let flows = vec![block_flow(
+            "weave-alice-cam-receiver-0",
+            "weave-alice-cam-receiver-0",
+            "srt://:7003?mode=listener",
+        )];
+        assert!(diff_hops(&desired, &flows).is_empty());
+    }
+
+    #[test]
+    fn block_flow_with_a_changed_endpoint_id_or_srt_uri_drifts() {
+        let desired = vec![whip_gateway_hop()];
+        for (endpoint_id, srt_uri) in [
+            ("weave-alice-cam-receiver-1", "srt://:7003?mode=listener"),
+            ("weave-alice-cam-receiver-0", "srt://:7004?mode=listener"),
+        ] {
+            let flows = vec![block_flow(
+                "weave-alice-cam-receiver-0",
+                endpoint_id,
+                srt_uri,
+            )];
+            let plan = diff_hops(&desired, &flows);
+            assert_eq!(
+                plan.delete,
+                vec!["id-a".to_string()],
+                "{endpoint_id} {srt_uri}"
+            );
+            assert_eq!(plan.create.len(), 1);
+        }
     }
 
     #[test]
@@ -562,7 +778,5 @@ mod tests {
             None,
             "a socket with no address of its own resolves to nothing"
         );
-        assert_eq!(srt_role(&signalling), None);
-        assert_eq!(srt_role(&listen), Some(SocketRole::Listen));
     }
 }

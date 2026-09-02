@@ -1,0 +1,42 @@
+{
+  "id": "00000000-0000-0000-0000-000000000000",
+  "name": "weave-alice-cam-receiver-0",
+  "elements": [],
+  "blocks": [
+    {
+      "id": "whip_in",
+      "block_definition_id": "builtin.whip_input",
+      "name": "WHIP ingest",
+      "properties": {
+        "endpoint_id": "weave-alice-cam-receiver-0",
+        "mode": "audio_video",
+        "decode": true,
+        "max_sessions": 1
+      },
+      "position": [100.0, 200.0]
+    },
+    {
+      "id": "venc",
+      "block_definition_id": "builtin.videoenc",
+      "name": "H.264 encoder",
+      "properties": { "codec": "h264" },
+      "position": [300.0, 200.0]
+    },
+    {
+      "id": "srt_out_0",
+      "block_definition_id": "builtin.mpegtssrt_output",
+      "name": "SRT output",
+      "properties": {
+        "srt_uri": "srt://:7003?mode=listener",
+        "latency": 200,
+        "wait_for_connection": false
+      },
+      "position": [800.0, 200.0]
+    }
+  ],
+  "links": [
+    { "from": "whip_in:video_out", "to": "venc:video_in" },
+    { "from": "venc:encoded_out", "to": "srt_out_0:video_in" },
+    { "from": "whip_in:audio_out", "to": "srt_out_0:audio_in_0" }
+  ]
+}
