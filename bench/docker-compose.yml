@@ -108,6 +108,9 @@ services:
       WEAVE_SOUTHBOUND_ADDR: 0.0.0.0:8081
       WEAVE_CONTROLLER_URL: http://172.25.0.22:8082
       WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_SOUTHBOUND_TOKEN:-bench-southbound-token}
+      # The browser node is a web page on another origin. `*` is a development
+      # value like the tokens above; a deployment names the page's origin.
+      WEAVE_SOUTHBOUND_CORS_ORIGIN: ${WEAVE_SOUTHBOUND_CORS_ORIGIN:-*}
     ports:
       - "29081:8081"
     networks:
@@ -375,6 +378,34 @@ services:
       timeout: 3s
       retries: 10
       start_period: 5s
+
+  # --- browser node (net_core, profile) ---
+  # On net_core so its WebRTC media reaches Strom's ICE candidates on the node
+  # subnets; a browser on a macOS host has no route there. See bench/README.md.
+  browser:
+    build:
+      context: ..
+      dockerfile: bench/Dockerfile.browser
+    image: open-weave-bench-browser:local
+    container_name: ow-browser
+    profiles: ["browser"]
+    restart: "no"
+    shm_size: "1gb"
+    environment:
+      WEAVE_SOUTHBOUND_URL: http://172.25.0.21:8081
+      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_SOUTHBOUND_TOKEN:-bench-southbound-token}
+    volumes:
+      - ../nodes/browser:/work:ro
+      # check.mjs compares the page's PROTOCOL_VERSION with the Rust constant and
+      # looks for it two levels above the page, so /work needs this beside it or
+      # the comparison is skipped.
+      - ../crates/core/src/lib.rs:/crates/core/src/lib.rs:ro
+    networks:
+      net_core:
+        ipv4_address: 172.25.0.40
+    # The node id is pinned so the browser manifests keep naming the same node
+    # across restarts; the `browser-id` recipe reads the same default.
+    command: ["node", "/work/check.mjs", "--serve", "8000", "--stay", "--node", "${WEAVE_BROWSER_NODE_ID:-browser-bench}"]
 
   # --- external verification endpoints (NOT part of the system) ---
   # Off by default (profiles). Started explicitly via the bench producer/consumer

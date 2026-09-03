@@ -1,0 +1,11 @@
+# Browser camera into node-1: the planner picks WHIP hosted on Strom; a consumer pulls SRT.
+# Templated: BROWSER_NODE is the page's id, filled in by `just browser-stream`.
+name: browser-cam
+enabled: true
+source:
+  device:
+    node: BROWSER_NODE
+destinations:
+  - srt:
+      node: strom-node-1
+      latency: 1000

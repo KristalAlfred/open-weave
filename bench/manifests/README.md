@@ -49,6 +49,8 @@ not measured.
 | `nat-relay` | both ends on NAT'd node-3; bridged via node-1 | `awaiting_input` | — | `flowing` |
 | `format-ok` | declared source format the destination accepts | `awaiting_input` | — | `flowing` |
 | `format-mismatch` | 48 kHz source into a 44.1 kHz-only destination | `degraded` | — | `degraded` |
+| `browser-cam` | page camera → node-1 over WHIP, consumer pulls SRT | `degraded` (see note) | — | `degraded` (see note) |
+| `browser-return` | producer → node-1 → page screen over WHEP | `awaiting_input` | `flowing` | `flowing` |
 
 Notes:
 
@@ -112,3 +114,13 @@ Notes:
   rather than the NAT case that makes the controller insert a relay by itself —
   that one needs a node the bench cannot dial, which the topology does not yet
   have.
+- **`browser-*`**: templates, `BROWSER_NODE` is the page's node id and
+  `just bench browser-stream` fills it in; applying one directly leaves it
+  `pending` on an unregistered node. The media for `browser-cam` comes from the
+  page itself, so its "No media" column is the page with no consumer attached.
+  It is `degraded` because the page's Chromium sends no H264 and Strom's WHIP
+  input accepts nothing else, so only audio arrives — the page's own hop reads
+  `flowing` on both sockets while node-1's reads `idle → flowing` at a few
+  kb/s. `bench/README.md` has the detail and `BACKLOG.md` the item.
+  `browser-return` is the mirror and flows end to end (VP9 + Opus into the page
+  at ~8 Mb/s).

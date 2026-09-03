@@ -143,7 +143,7 @@ A browser node (`nodes/browser/`) is a media node too: the page presents
 fragment so it never reaches a server log. Because the page runs on a different
 origin from southbound, southbound sends CORS headers on its `/v1` routes when
 `WEAVE_SOUTHBOUND_CORS_ORIGIN` is set — an exact origin such as
-`http://172.25.0.40:8000`, or `*` for development. Unset, no CORS headers are
+`https://studio.example`, or `*` for development. Unset, no CORS headers are
 sent and only non-browser adapters can register. The preflight is answered
 before the bearer check and allows `Authorization` and `Content-Type`. Per-node
 tokens issued at registration remain a follow-up; today a page holds the shared
@@ -239,6 +239,77 @@ destination node, and `GET /v1/streams/{name}/endpoints` is unchanged by transit
 One consequence worth stating: a consumer output on an `outbound_only` node is
 only dialable from inside that node's network, because that is what the node
 declared about itself.
+
+## Transports
+
+Manifests name nodes, never transports between them. `srt: { node: X }` says the
+media enters or leaves X through an SRT socket a producer or consumer dials;
+`device: { node: X }` says it starts at X's own camera or ends on X's own screen:
+
+```yaml
+name: alice-cam
+source:
+  device:
+    node: browser-a1b2          # the node's own camera
+destinations:
+  - srt:
+      node: strom-node-2        # a consumer dials this receiver's output
+```
+
+Nodes declare what they can carry when they register. A `transports` list holds
+the link transports — `srt`, `whip`, `whep` — each with the socket roles the
+node can take over it; a bare name offers both, which is what every Strom node
+has always said. A device is not a transport but a terminal, so it sits in its
+own `devices` list. A browser page offers `whip` and `whep` in the `connect`
+role only, and declares `devices: [capture, display]`. A Strom node hosting
+WebRTC for it offers `whip` and `whep` in the `listen` role:
+
+```yaml
+transports:
+  - srt
+  - { name: whip, roles: [listen] }
+  - { name: whep, roles: [listen] }
+```
+
+A WebRTC link needs a signalling URL, and only the node serving it knows its
+path. So each data-plane address may carry the base URL per transport, and the
+controller appends `/<hop id>` and assumes nothing else:
+
+```yaml
+data_plane:
+  default:
+    host: 172.26.0.10
+    signalling:
+      whip: http://172.26.0.10:8080/whip
+      whep: http://172.26.0.10:8080/whep
+```
+
+A node normally does not write that itself — its adapter fills it in at
+registration. `weave-adapter-strom` builds it from `strom.signalling_base`, a
+data-plane alias to base URL map, plus the routes its own Strom serves.
+
+The controller chooses the transport per link from both ends' capabilities and
+writes the concrete sockets into each desired hop. Preference is `srt`, then
+`whip`, then `whep`; a candidate needs the listening end to offer `listen`, be
+dialable, and the other end to offer `connect`. WHIP is only ever hosted
+downstream (the connecting end pushes media), WHEP only upstream (the
+connecting end pulls). Two ends with no transport in common get a relay that
+can carry both halves, or the stream stays `pending` with the reason. A WebRTC
+socket carries that signalling URL and the endpoint id it was built from
+instead of a host and port, and claims no port.
+
+Adapters map the sockets they are given. The Strom adapter has one flow shape
+per (ingress, egress) transport pair: `srt → srt` is the byte relay it always
+built; `whip → srt` is `whip_input → videoenc → mpegtssrt_output`; `srt → whep`
+is `mpegtssrt_input → whep_output`. A hop with WebRTC on both sides is refused,
+because the adapter reads media progress from a hop's SRT byte counters and
+such a hop has none. The browser node realises `device → whip` and
+`whep → device` and nothing else. Neither adapter ever decides a transport.
+
+`GET /v1/streams/{name}/endpoints` lists only what an external peer can dial,
+so a `device` end reads `null` in its place (`ingress: null` for a camera
+source, a `null` output for a screen destination). See `nodes/browser/README.md`
+for the page and `bench/README.md` for running it against the bench.
 
 ## Media formats
 
