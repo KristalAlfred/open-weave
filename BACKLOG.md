@@ -64,15 +64,19 @@ that is easy to break while fixing it.
   only at `POST /v1/nodes/register` (`crates/controller/src/main.rs`), which is
   southbound. The `srt_only_endpoints_json_shape_is_unchanged` test
   (`crates/controller/src/path.rs`) shows an SRT-only stream still serializes
-  `ingress` and each output as a plain object, so nothing breaks today; the gap
-  is that the northbound contract has no version knob at all, and the README's
+  `ingress` and each output as a plain object, so SRT-only clients see no
+  change. A client reading every output did break: open-live's `weave` provider
+  read `.node` off a `null` entry and threw, so it listed no weave source at all
+  while any device destination existed, until its fork was fixed. The gap is
+  that the northbound contract has no version knob at all, and the README's
   rule — `API_V1` moves when the routes change, `PROTOCOL_VERSION` moves when
   the payloads behind them do — does not say what covers a northbound payload
   shape change. Done: a client can tell this shape apart from the one before it,
   whether by a version on the payload, a bump to `API_V1`, or the README rule
   extended to name what covers it. Easy to break: the only manifests exercising
-  a `device` end today are the bench's `browser-cam` and `browser-return`; a fix
-  checked only against SRT-only manifests would not catch a regression here.
+  a `device` end today are the bench's `browser-cam`, `browser-cam-host` and
+  `browser-return`; a fix checked only against SRT-only manifests would not
+  catch a regression here.
 
 ## Not scheduled
 

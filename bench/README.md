@@ -58,6 +58,7 @@ also picks up the profiled producer/consumer whenever they come up.
 | 28080 | strom-1 API |
 | 28081 | strom-2 API |
 | 28082 | strom-3 API (host→container; grants no route into net_node3) |
+| 28083 | open-live's Strom API (profile `open-live`; not a weave node, see "Feeding open-live") |
 
 Open <http://localhost:29082/ui> to watch the system live: registered nodes,
 every stream's path across them (per-hop link conditions and rates), and the
@@ -228,15 +229,18 @@ waiting on it — that stream does not settle here, see below.
 
 Node 1 offers `whip [listen]` and `whep [listen]` and names the base URL
 browsers reach its signalling at (`strom.signalling_base` in
-`config/adapter-1.yaml`; the adapter appends `/whip` and `/whep` and advertises
-the result on the `default` address). Southbound allows the page's origin with
+`config/adapter-1.yaml`, one entry per data-plane alias; the adapter appends
+`/whip` and `/whep` and advertises the result on that alias). The `default`
+alias signals at `172.26.0.10:8080` for the page inside the bench; the
+`docker-host` alias signals at `localhost:28080` for a page on this machine,
+see "Feeding open-live". Southbound allows the page's origin with
 `WEAVE_SOUTHBOUND_CORS_ORIGIN=*`, a development value like the tokens.
 
 The container serves the page to itself and opens it as `http://127.0.0.1:8000`,
 because `getUserMedia` exists only in a secure context. `just logs browser`
 shows one line per 5 s with every hop's conditions and negotiated codecs.
 
-Observed on this bench (arm64 Docker Desktop):
+Observed on this bench (arm64, Docker via colima):
 
 - `browser-return` reaches `flowing` end to end: producer SRT → node-1
   `mpegtssrt_input → whep_output` → the page plays VP9 + Opus at ~8 Mb/s, and
@@ -257,6 +261,66 @@ Observed on this bench (arm64 Docker Desktop):
 - A page restart is answered with `503` for 10–20 s: `whip_input` allows one
   session and the page cannot release the one it left behind. Also in
   `BACKLOG.md`.
+
+## Feeding open-live
+
+open-live (the fork at `~/git/open-live`, with the `weave` source provider) lists
+every placed weave stream's node-hosted SRT output as a read-only source and
+dials it from its own Strom. The bench carries that Strom as `open-live-strom`
+on net_core (profile `open-live`, host port 28083). It is another system's
+engine, not a weave node: no adapter fronts it, and it reaches node 1's SRT
+sockets through router-1 the way the bundled producer and consumer do. open-live
+itself runs on this machine and only speaks HTTP to it.
+
+The feed is a browser on this machine, which cannot reach `172.26.0.10:8080`:
+colima routes no container IP to the host, and only the published ports are
+reachable. So node 1 advertises a second data-plane alias, `docker-host`, with
+the same SRT address as `default` and signalling at `localhost:28080` instead.
+The `browser-cam-host` manifest selects it with `network: docker-host` on the
+destination; the planner then resolves both the WHIP URL the page dials and the
+SRT host open-live dials from that one alias.
+
+```sh
+just open-live-strom-up            # Strom for open-live, host port 28083
+just page                          # serve nodes/browser; open the printed URL in Chrome
+just host-cam browser-<id>         # apply browser-cam-host for the page's node id
+just host-cam-down                 # delete it again
+```
+
+Then run open-live against the bench; its `weave` provider lists the stream's
+SRT output as a source within one poll:
+
+```sh
+cd ~/git/open-live
+docker compose up -d couchdb       # reads COUCHDB_PASSWORD from .env
+SOURCE_PROVIDERS=weave WEAVE_NORTHBOUND_URL=http://localhost:29080 \
+  WEAVE_NORTHBOUND_TOKEN=bench-northbound-token \
+  STROM_URL=http://localhost:28083 pnpm dev
+curl -s localhost:3000/api/v1/sources | jq
+```
+
+Observed:
+
+- After `adapter-1` restarts with the config, `GET /v1/nodes` shows node 1's
+  `docker-host` alias with `signalling.whip = http://localhost:28080/whip`
+  beside the unchanged `default`.
+- `just host-cam browser-bench` planned the page's hop as `device → whip connect
+  http://localhost:28080/whip/weave-browser-cam-host-receiver-0` and the output
+  as `srt://172.26.0.10:20665`; node 1 ran the receiver as `whip_input →
+  videoenc → mpegtssrt_output`. The in-bench page's hop read `failed · Failed to
+  fetch`, since `localhost` inside its container is itself; the recipe exists
+  for a page on this machine.
+- `ow-open-live-strom` gets its routes from `route-manager` within one interval
+  and opens a TCP connection to `172.26.0.10:8080`.
+- With `browser-cam`, `browser-cam-host` and `browser-return` applied, the fork's
+  provider lists the first two with `?mode=caller` and skips `browser-return`,
+  whose only output is a device end reported as `null`. Before the fork's fix
+  that `null` made the whole listing throw, so no weave source appeared while
+  any device destination existed.
+- Not observed yet: a browser on this machine sending H264 into node 1 through
+  the `docker-host` alias, and open-live activating a weave source through
+  `open-live-strom`. The camera part needs a person at the machine, because a
+  fake microphone never answers `getUserMedia` here.
 
 ## Notes
 

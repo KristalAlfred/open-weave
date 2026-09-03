@@ -37,7 +37,7 @@ sock="${DOCKER_SOCK:-/var/run/docker.sock}"
 # the NAT the bench tests against: adding a 172.29.0.0/24 route to any group
 # below silently removes the boundary and the NAT manifests start passing for the
 # wrong reason.
-core_containers="ow-controller ow-southbound ow-browser ow-producer ow-consumer ow-consumer-2"
+core_containers="ow-controller ow-southbound ow-browser ow-open-live-strom ow-producer ow-consumer ow-consumer-2"
 core_routes="172.26.0.0/24=172.25.0.11 172.27.0.0/24=172.25.0.12"
 
 node1_containers="ow-strom-1 ow-adapter-1"

@@ -50,6 +50,7 @@ not measured.
 | `format-ok` | declared source format the destination accepts | `awaiting_input` | — | `flowing` |
 | `format-mismatch` | 48 kHz source into a 44.1 kHz-only destination | `degraded` | — | `degraded` |
 | `browser-cam` | page camera → node-1 over WHIP, consumer pulls SRT | `degraded` (see note) | — | `degraded` (see note) |
+| `browser-cam-host` | camera of a page on this machine → node-1 via the `docker-host` alias | `pending` (see note) | — | — |
 | `browser-return` | producer → node-1 → page screen over WHEP | `awaiting_input` | `flowing` | `flowing` |
 
 Notes:
@@ -124,3 +125,10 @@ Notes:
   kb/s. `bench/README.md` has the detail and `BACKLOG.md` the item.
   `browser-return` is the mirror and flows end to end (VP9 + Opus into the page
   at ~8 Mb/s).
+- **`browser-cam-host`**: `browser-cam` for a page in a browser on this machine,
+  which `just bench host-cam <node-id>` fills in. Its destination names node 1's
+  `docker-host` alias, so the page is told to signal at `localhost:28080` while
+  the SRT output stays on `172.26.0.10` for open-live's Strom (`bench/README.md`,
+  "Feeding open-live"). Applied for the in-bench page it stays `pending`: that
+  page's hop fails with `Failed to fetch`, because `localhost` in its container
+  is itself. Media from a page on this machine has not been observed yet.

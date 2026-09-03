@@ -7,6 +7,9 @@ ctrl    := "http://localhost:29082"
 strom1  := "http://localhost:28080"
 strom2  := "http://localhost:28081"
 strom3  := "http://localhost:28082"
+# Strom that open-live drives (profile `open-live`); not a weave node.
+strom_ol := "http://localhost:28083"
+page_dir := source_directory() / ".." / "nodes" / "browser"
 
 # Version prefix carrying both control-plane contracts, matching weave_core::API_V1.
 # `/health` and the controller dashboard (`/`, `/ui`, `/view`) sit outside it.
@@ -49,7 +52,7 @@ wait:
 
 # Tear everything down: containers, networks, volumes (incl. profiled endpoints).
 down:
-    {{compose}} --profile producer --profile consumer --profile browser down -v --remove-orphans
+    {{compose}} --profile producer --profile consumer --profile browser --profile open-live down -v --remove-orphans
 
 ps:
     {{compose}} ps
@@ -254,6 +257,54 @@ browser-down:
     -@just stream-rm browser-cam
     -@just stream-rm browser-return
     -@{{compose}} --profile browser rm -sf browser
+
+# Strom for open-live to drive, on net_core behind profile `open-live`. Waits for its API.
+[doc("Start the Strom open-live drives (profile `open-live`, host port 28083).")]
+open-live-strom-up:
+    {{compose}} --profile open-live up -d open-live-strom
+    @for _ in $(seq 1 30); do \
+        curl -sf {{strom_ol}}/api/version >/dev/null 2>&1 && \
+        { echo "open-live strom ready at {{strom_ol}}"; exit 0; }; \
+        sleep 2; \
+    done; echo "timeout waiting for open-live strom" >&2; exit 1
+
+open-live-strom-down:
+    {{compose}} --profile open-live rm -sf open-live-strom
+
+# Serve the page for a browser on this host. It needs a localhost origin for the
+# camera, and southbound's CORS default of `*` lets it register from there.
+[doc("Serve nodes/browser on localhost:<port> for a browser on this host; prints the URL to open.")]
+page port="8000":
+    @echo "open  http://localhost:{{port}}/#southbound={{sb}}&token={{sb_token}}"
+    python3 -m http.server {{port}} -d {{page_dir}} --bind 127.0.0.1
+
+# The stream a page on this host feeds: WHIP signalled at localhost:28080 via node
+# 1's `docker-host` alias, SRT out on the node subnet for open-live's Strom.
+[doc("Apply browser-cam-host for <node-id> (a page on this host); print its WHIP URL and SRT output.")]
+host-cam id:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
+    sed "s/BROWSER_NODE/{{id}}/" {{manifests}}/browser-cam-host.yaml > "$tmp"
+    WEAVE_NORTHBOUND_URL={{nb}} WEAVE_NORTHBOUND_TOKEN={{nb_token}} \
+        cargo run --quiet -p weave-cli -- apply -f "$tmp"
+    url=""
+    for _ in $(seq 1 15); do
+        url="$(curl -sf {{sb_auth}} {{sb}}{{v}}/nodes/{{id}}/desired \
+            | jq -r '.[] | select(.id=="weave-browser-cam-host-sender") | .egresses[0].url' 2>/dev/null || true)"
+        [ -n "$url" ] && break
+        sleep 2
+    done
+    if [ -z "$url" ]; then
+        echo "browser-cam-host has no hop on {{id}} yet — is that page registered? 'just bench status' lists nodes" >&2
+        exit 1
+    fi
+    out="$(WEAVE_NORTHBOUND_TOKEN={{nb_token}} bash {{scripts}}/endpoints.sh browser-cam-host output 0)"
+    echo "page sends WHIP to:     $url"
+    echo "open-live dials:        srt://$out?mode=caller  (listed by its weave provider)"
+
+host-cam-down:
+    @just stream-rm browser-cam-host
 
 # Impair a node's network via its router, e.g. `just netem node1 delay 200ms loss 5%`.
 netem +ARGS:

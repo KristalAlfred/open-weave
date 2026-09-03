@@ -10,6 +10,11 @@ node:
   public_endpoint: http://172.26.0.11:8091
   data_plane:
     default: 172.26.0.10
+    # The same address, for a browser on the Docker host. colima routes no
+    # container IP to the host, so such a page reaches this Strom's signalling
+    # only through the port published on localhost:28080 (signalling_base
+    # below), while its SRT side stays on the node subnet for peers inside.
+    docker-host: 172.26.0.10
   port_range:
     start: 20000
     end: 20999
@@ -24,7 +29,8 @@ node:
 strom:
   url: http://172.26.0.10:8080
   poll_interval_secs: 5
-  # Where browsers reach this Strom's WHIP and WHEP signalling. The adapter
-  # appends /whip and /whep and advertises the result on the `default` alias.
+  # Where browsers reach this Strom's WHIP and WHEP signalling, per alias. The
+  # adapter appends /whip and /whep and advertises the result.
   signalling_base:
     default: http://172.26.0.10:8080
+    docker-host: http://localhost:28080

@@ -407,6 +407,33 @@ services:
     # across restarts; the `browser-id` recipe reads the same default.
     command: ["node", "/work/check.mjs", "--serve", "8000", "--stay", "--node", "${WEAVE_BROWSER_NODE_ID:-browser-bench}"]
 
+  # --- open-live's Strom (net_core, profile) ---
+  # The engine open-live drives when it consumes a weave stream. No weave adapter
+  # sits in front of it: it is another system's Strom that happens to share the
+  # bench networks, reaching node 1's SRT sockets through router-1 like the
+  # producer and consumer do. open-live itself runs on the host against the
+  # published port. See bench/README.md, "Feeding open-live".
+  open-live-strom:
+    image: eyevinntechnology/strom:latest
+    container_name: ow-open-live-strom
+    profiles: ["open-live"]
+    environment:
+      STROM_PORT: "8080"
+      STROM_DATA_DIR: /data
+    volumes:
+      - open-live-strom-data:/data
+    ports:
+      - "28083:8080"
+    networks:
+      net_core:
+        ipv4_address: 172.25.0.50
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
   # --- external verification endpoints (NOT part of the system) ---
   # Off by default (profiles). Started explicitly via the bench producer/consumer
   # recipes so status transitions can be demonstrated.
@@ -477,4 +504,5 @@ volumes:
   strom1-data:
   strom2-data:
   strom3-data:
+  open-live-strom-data:
   pgdata:
