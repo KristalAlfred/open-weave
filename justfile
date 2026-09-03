@@ -9,6 +9,7 @@ build:
 
 test:
     cargo test
+    just browser-check
 
 fmt:
     cargo fmt
@@ -18,6 +19,9 @@ fmt-check:
 
 lint:
     cargo clippy --all-targets --all-features
+
+browser-check:
+    node nodes/browser/check.mjs --check-only
 
 run-north:
     cargo run -p weave-northbound

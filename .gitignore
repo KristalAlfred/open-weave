@@ -4,3 +4,4 @@
 *.pdb
 Cargo.lock.orig
 .DS_Store
+nodes/browser/node_modules/
