@@ -15,7 +15,10 @@ that is easy to break while fixing it.
   `just bench browser-stream` reaches `flowing` on `browser-cam` with video in
   the SRT output. Two routes: a Chromium that encodes H264 (Google Chrome on
   x86_64 — there is no Linux arm64 build), or VP8/VP9 accepted by `whip_input`,
-  which is a change to Strom. Easy to break: `bench/justfile` prints
+  which is a change to Strom. The gateway flow itself is fine: Google Chrome on
+  the macOS host, through the `docker-host` alias and `browser-cam-host`, put
+  H264 640x480 plus AAC on the SRT output with the flow `Playing`
+  (`bench/README.md`, "Feeding open-live"). Easy to break: `bench/justfile` prints
   `browser-cam`'s status instead of waiting on it, and `bench/README.md` records
   the cycling as observed, so both change with the fix.
 - **A video-only WHIP sender leaves the gateway flow paused.**

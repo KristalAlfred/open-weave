@@ -317,10 +317,19 @@ Observed:
   whose only output is a device end reported as `null`. Before the fork's fix
   that `null` made the whole listing throw, so no weave source appeared while
   any device destination existed.
-- Not observed yet: a browser on this machine sending H264 into node 1 through
-  the `docker-host` alias, and open-live activating a weave source through
-  `open-live-strom`. The camera part needs a person at the machine, because a
-  fake microphone never answers `getUserMedia` here.
+- Google Chrome on this machine, registered as its own node and given
+  `browser-cam-host`, sent camera and microphone into node 1 through the
+  `docker-host` alias. Strom's log shows one WHIP session from peer
+  `172.26.0.1` with both `Pad audio_0` and `Pad video_0`, the first video pad
+  seen on this bench; the gateway flow reached `gst_state: Playing`; and
+  `ffprobe` on the SRT output found `h264 (Constrained Baseline) 640x480 30 fps`
+  and `aac 48 kHz stereo`. Strom logged a burst of `mpegtsmux` warnings
+  (`Impossible to configure latency: max 0 < min 40 ms. Add queues`) at
+  session start; the media flowed regardless. With nothing dialling the SRT
+  output the stream reads `degraded`, which is the roll-up for a source that
+  flows and a destination that does not.
+- Not observed yet: open-live activating a weave source through
+  `open-live-strom`.
 
 ## Notes
 
