@@ -1,0 +1,11 @@
+{
+  "name": "open-weave-browser-node",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node check.mjs"
+  },
+  "dependencies": {
+    "playwright": "1.62.1"
+  }
+}
