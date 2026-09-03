@@ -88,7 +88,7 @@ bench defaults to development values so `just up` stays a single command:
 | Variable | Default | Used by |
 |---|---|---|
 | `WEAVE_NORTHBOUND_TOKEN` | `bench-northbound-token` | northbound, controller, CLI, `endpoints.sh` |
-| `WEAVE_SOUTHBOUND_TOKEN` | `bench-southbound-token` | southbound, controller, adapter-1, adapter-2 |
+| `WEAVE_SOUTHBOUND_TOKEN` | `bench-southbound-token` | southbound, controller, the three adapters, the browser page |
 
 Export either variable to override it; `docker-compose.yml` and the recipes read
 the same defaults, so both stay in step. The adapter configs deliberately leave
@@ -203,6 +203,60 @@ Both sit on `net_core` and route to either node subnet through the netem routers
 Addresses come from the controller's discovery API, not hardcoded tables — see the
 `/v1/streams/{name}/endpoints` note above and `manifests/README.md` for the manifest
 library.
+
+## Browser node
+
+A web page can be a node (`nodes/browser/`). The bench runs one as a headless
+Chromium inside `net_core`, because WebRTC media has to reach Strom's ICE
+candidates on the node subnets and a browser on a macOS host generally has no
+route there. The service is off by default (profile `browser`):
+
+```sh
+just browser-up             # build + start the page as node `browser-bench`, print its id
+just browser-stream         # apply browser-cam + browser-return, attach the media endpoints, wait
+just browser-down           # detach, delete both streams, stop the page
+```
+
+`browser-cam` sends the page's camera to node-1 (the planner picks WHIP hosted
+on Strom; the consumer pulls the SRT output). `browser-return` feeds the
+producer into node-1 and plays it on the page (the planner picks WHEP hosted on
+Strom). Both manifests are templates: `browser-stream` fills in the node id,
+which `docker-compose.yml` pins to `browser-bench` so the manifests keep
+pointing at the page across restarts. The recipe then waits for
+`browser-return` to reach `flowing`, then prints `browser-cam`'s status without
+waiting on it — that stream does not settle here, see below.
+
+Node 1 offers `whip [listen]` and `whep [listen]` and names the base URL
+browsers reach its signalling at (`strom.signalling_base` in
+`config/adapter-1.yaml`; the adapter appends `/whip` and `/whep` and advertises
+the result on the `default` address). Southbound allows the page's origin with
+`WEAVE_SOUTHBOUND_CORS_ORIGIN=*`, a development value like the tokens.
+
+The container serves the page to itself and opens it as `http://127.0.0.1:8000`,
+because `getUserMedia` exists only in a secure context. `just logs browser`
+shows one line per 5 s with every hop's conditions and negotiated codecs.
+
+Observed on this bench (arm64 Docker Desktop):
+
+- `browser-return` reaches `flowing` end to end: producer SRT → node-1
+  `mpegtssrt_input → whep_output` → the page plays VP9 + Opus at ~8 Mb/s, and
+  both hops report `flowing` on both sockets.
+- `browser-cam` cycles between `degraded` and `pending` and never reaches
+  `flowing` (8 `degraded`, 16 `pending` in 24 samples over two minutes). The
+  page sends audio + video over WHIP (~0.5 Mb/s) and its hop reads
+  `device flowing → whip flowing`, but Strom's `whip_input` accepts only H264
+  video (`video-codecs = ["H264"]` in `backend/src/blocks/builtin/whip.rs`) and
+  the Playwright image's Chromium (Chromium 151, arm64) has no H264 encoder, so
+  the session carries only the Opus audio. Strom then emits an audio-only
+  trickle on the SRT output (`egress flowing` at ~5 kb/s), the flow never leaves
+  `gst_state: Paused` (its WHIP ingress reads `idle`), and Strom's inactivity
+  monitor tears the session down every ~20 s. The page reconnects, reports
+  `pending` for its first attempts, and the roll-up follows it — which is where
+  the `pending` samples come from. `BACKLOG.md` has the item and what would fix
+  it.
+- A page restart is answered with `503` for 10–20 s: `whip_input` allows one
+  session and the page cannot release the one it left behind. Also in
+  `BACKLOG.md`.
 
 ## Notes
 

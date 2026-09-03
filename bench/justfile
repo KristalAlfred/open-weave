@@ -20,6 +20,10 @@ sb_token := env("WEAVE_SOUTHBOUND_TOKEN", "bench-southbound-token")
 nb_auth  := "-H 'Authorization: Bearer " + nb_token + "'"
 sb_auth  := "-H 'Authorization: Bearer " + sb_token + "'"
 
+# Node id the browser page registers under, pinned on the `browser` service's
+# `command:` in docker-compose.yml so the browser manifests keep naming it.
+browser_node := env("WEAVE_BROWSER_NODE_ID", "browser-bench")
+
 default:
     @just --list
 
@@ -45,7 +49,7 @@ wait:
 
 # Tear everything down: containers, networks, volumes (incl. profiled endpoints).
 down:
-    {{compose}} --profile producer --profile consumer down -v --remove-orphans
+    {{compose}} --profile producer --profile consumer --profile browser down -v --remove-orphans
 
 ps:
     {{compose}} ps
@@ -197,6 +201,59 @@ consumer-2-up stream="fanout":
 # Stop and remove the second external consumer.
 consumer-2-down:
     {{compose}} --profile consumer rm -sf consumer-2
+
+# Build and start the headless browser node inside the bench, then print its id.
+[doc("Start the in-bench browser node (profile `browser`) and print its node id.")]
+browser-up:
+    {{compose}} --profile browser up -d --build browser
+    @just browser-id
+
+# Wait for the pinned browser node to appear in southbound's registry, then echo it.
+browser-id:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for _ in $(seq 1 30); do
+        got="$(curl -sf {{sb_auth}} {{sb}}{{v}}/nodes \
+            | jq -r --arg id '{{browser_node}}' '.[] | select(.id==$id) | .id' 2>/dev/null || true)"
+        if [ -n "$got" ]; then echo "$got"; exit 0; fi
+        sleep 2
+    done
+    echo "{{browser_node}} has not registered with southbound;" \
+         "'just bench logs browser' shows why, 'just bench status' lists the nodes there are" >&2
+    exit 1
+
+# Apply browser-cam and browser-return for the page and drive both: the camera
+# stream's SRT output is pulled by the consumer, the return stream's SRT ingress
+# is fed by the producer and played on the page.
+[doc("Apply both browser manifests for <node-id> (default: the pinned page) and drive them end to end.")]
+browser-stream id="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    id="{{id}}"
+    [ -n "$id" ] || id="$(just browser-id)"
+    tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
+    for m in browser-cam browser-return; do
+        sed "s/BROWSER_NODE/$id/" {{manifests}}/$m.yaml > "$tmp"
+        WEAVE_NORTHBOUND_URL={{nb}} WEAVE_NORTHBOUND_TOKEN={{nb_token}} \
+            cargo run --quiet -p weave-cli -- apply -f "$tmp"
+    done
+    just consumer-up browser-cam
+    just producer-up browser-return
+    just stream-wait browser-return flowing
+    # browser-cam never reaches `flowing` here and is not waited on: the page's
+    # Chromium sends no H264, Strom's whip_input accepts nothing else, and its
+    # inactivity monitor drops the session every ~20 s, so the stream cycles
+    # `degraded` and `pending` (BACKLOG.md).
+    printf 'browser-cam: '
+    curl -sf {{ctrl}}{{v}}/status | jq -r '.streams[] | select(.name=="browser-cam") | .status'
+
+# Detach the media endpoints, delete both browser streams, and stop the page.
+browser-down:
+    -@just consumer-down
+    -@just producer-down
+    -@just stream-rm browser-cam
+    -@just stream-rm browser-return
+    -@{{compose}} --profile browser rm -sf browser
 
 # Impair a node's network via its router, e.g. `just netem node1 delay 200ms loss 5%`.
 netem +ARGS:

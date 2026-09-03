@@ -1,0 +1,14 @@
+# syntax=docker/dockerfile:1
+# The bench's browser node: Playwright's image (Chromium and its fake-device
+# support) plus the `playwright` package from nodes/browser, which the image
+# does not ship.
+#
+# The package installs at / because docker-compose.yml mounts nodes/browser at
+# /work read-only at run time, hiding anything the image writes there, and
+# /node_modules is the next directory Node's resolver looks in for
+# `import("playwright")` from /work/check.mjs. The browsers it would otherwise
+# download are already in the image, so its install script is skipped.
+FROM mcr.microsoft.com/playwright:v1.62.1-noble
+COPY nodes/browser/package.json nodes/browser/pnpm-lock.yaml /
+RUN corepack enable pnpm && pnpm install --dir / --frozen-lockfile --ignore-scripts
+WORKDIR /work

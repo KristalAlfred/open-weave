@@ -1,0 +1,11 @@
+# Producer SRT into node-1, played on the browser's screen: the planner picks WHEP hosted on Strom.
+# Templated: BROWSER_NODE is the page's id, filled in by `just browser-stream`.
+name: browser-return
+enabled: true
+source:
+  srt:
+    node: strom-node-1
+    latency: 200
+destinations:
+  - device:
+      node: BROWSER_NODE
