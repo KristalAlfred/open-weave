@@ -50,7 +50,14 @@ export interface SourceProvider {
 }
 ```
 
-Poll-only. No watch/subscribe API in this iteration.
+Poll-only. No watch/subscribe API in this iteration — a provider learns about a
+source by listing again.
+
+Since `docs/plans/controller-webhooks.md` landed, weave's controller pushes node
+lifecycle events (`node.registered`, `node.online`, `node.offline`) to one
+configured receiver. That is a different seam: it tells an outside service a
+*node* appeared, so the service can declare a stream for it over northbound. The
+`weave` provider still discovers that stream's SRT output by polling.
 
 ### Registry and sync — `src/providers/registry.ts`
 

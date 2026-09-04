@@ -136,6 +136,12 @@ services:
       DATABASE_URL: postgres://weave:weave@172.25.0.23:5432/weave
       WEAVE_NORTHBOUND_TOKEN: ${WEAVE_NORTHBOUND_TOKEN:-bench-northbound-token}
       WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_SOUTHBOUND_TOKEN:-bench-southbound-token}
+      # Node lifecycle webhooks, delivered to `just bench hook-sink` on this
+      # host. Unset WEAVE_WEBHOOK_URL to switch them off.
+      WEAVE_WEBHOOK_URL: ${WEAVE_WEBHOOK_URL-http://host.docker.internal:29099}
+      WEAVE_WEBHOOK_TOKEN: ${WEAVE_WEBHOOK_TOKEN:-bench-webhook-token}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "29082:8082"
     networks:

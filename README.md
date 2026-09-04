@@ -45,7 +45,9 @@ operator/system
 ```
 
 Requests flow left to right: the CLI calls northbound, adapters call southbound,
-and both of those call the controller. The controller never calls back out.
+and both of those call the controller. The controller answers no request by
+calling back out; its one outbound call is the node lifecycle webhook below,
+which is fire-and-forget and off unless configured.
 
 The core rule is: **wide southbound ecosystem, narrow adapter contract**. A
 southbound implementation may only discover, only report health, or fully
@@ -178,6 +180,71 @@ Left unauthenticated on purpose:
 
 There is no TLS: terminate it at a reverse proxy. Per-node tokens issued at
 registration and mTLS are follow-ups, not implemented here.
+
+## Node lifecycle webhooks
+
+The controller POSTs a JSON event to one configured receiver when a node
+registers, goes offline, or comes back. It exists so a service that hosts guest
+pages can declare a stream for a guest's seat on being told the page registered,
+rather than polling `/v1/nodes`.
+
+| Variable | Meaning |
+|---|---|
+| `WEAVE_WEBHOOK_URL` | Absolute URL receiving events. Unset or blank switches webhooks off. |
+| `WEAVE_WEBHOOK_TOKEN` | Presented to the receiver as `Authorization: Bearer <token>`. Optional. |
+| `WEAVE_WEBHOOK_EVENTS` | Comma-separated event types to deliver. Defaults to all of them. |
+
+| Event | When |
+|---|---|
+| `node.registered` | Every accepted registration, including a re-registration of a node already online — a page reload does exactly this. |
+| `node.online` | A node heartbeats after having been marked offline. |
+| `node.offline` | A node crosses `WEAVE_NODE_TTL_SECS` without a heartbeat. |
+
+```json
+{
+  "event_id": "guest-1-3",
+  "event_type": "node.registered",
+  "occurred_at": "2026-09-04T11:22:33.123456789Z",
+  "node": {
+    "id": "guest-1",
+    "status": "ready",
+    "endpoint": "browser://guest-1",
+    "capabilities": {
+      "adapters": [],
+      "transports": [
+        { "name": "whip", "roles": ["connect"] },
+        { "name": "whep", "roles": ["connect"] }
+      ],
+      "devices": ["capture", "display"],
+      "data_plane": { "default": { "host": "browser", "reachability": "outbound_only" } },
+      "relay": false
+    }
+  }
+}
+```
+
+That is a browser node's registration as `nodes/browser/` sends it. `devices`
+and `transports` are what a consumer reads to decide the node is a capture
+device worth declaring a stream for.
+
+`node` is the registering node's descriptor and nothing else: `endpoints` and
+`hop_status` describe hops rather than the node, and are not part of this
+contract. `event_id` is stable across retries of one delivery, so a receiver can
+deduplicate.
+
+Emitting never blocks a registration. Events are queued and delivered by one
+background worker, in order, retried with backoff on a connect error or 5xx and
+abandoned after four attempts; a 4xx is the receiver rejecting the event and is
+not retried. A full queue drops rather than waits, and the queue is in memory, so
+events do not survive a controller restart.
+
+**Delivery is at-least-once and incomplete by design.** A receiver reconciles
+against southbound `GET /v1/nodes` on boot and treats events as hints, not truth.
+
+The bearer token authenticates the controller to the receiver; it does not let
+the receiver tell a genuine event from anyone who has learned the token. A
+receiver outside the trust boundary wants a body signature instead, which is not
+implemented.
 
 ## Reachability, link direction, and jump nodes
 

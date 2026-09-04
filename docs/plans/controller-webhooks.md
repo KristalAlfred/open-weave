@@ -1,5 +1,24 @@
 # Plan: node lifecycle webhooks from the controller
 
+## Status
+
+Implemented. All three events deliver; `crates/core/src/webhook.rs` holds the
+wire contract and `crates/controller/src/webhook.rs` the emitter. Checked
+against a real controller and the `just bench hook-sink` receiver: registration,
+TTL expiry and a heartbeat after expiry each produced one event, and a
+registration with the sink stopped answered `202` in 12 ms while the worker
+retried four times and gave up.
+
+Three departures from what is written below:
+
+- `occurred_at` needs an RFC 3339 clock and the workspace had none, so this adds
+  `time` (`formatting`, `parsing`) rather than hand-rolling civil-date maths.
+- `Emitter::emit` takes `(EventType, NodeSummary)` and builds the `Event`, so the
+  id counter and the clock have one home.
+- Queue size, attempt cap, backoff and HTTP timeout are `Config` fields with
+  defaults rather than constants, so tests do not sleep for seconds. Only the
+  three documented env vars are exposed on the CLI.
+
 ## Goal
 
 Let an outside service learn that a node registered, went offline, or came back,

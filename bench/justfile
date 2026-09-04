@@ -25,6 +25,11 @@ sb_auth  := "-H 'Authorization: Bearer " + sb_token + "'"
 # `command:` in docker-compose.yml so the browser manifests keep naming it.
 browser_node := env("WEAVE_BROWSER_NODE_ID", "browser-bench")
 
+# Port `just hook-sink` listens on. docker-compose.yml points the controller's
+# WEAVE_WEBHOOK_URL at this port on host.docker.internal.
+hook_port := env("WEAVE_WEBHOOK_PORT", "29099")
+hook_token := env("WEAVE_WEBHOOK_TOKEN", "bench-webhook-token")
+
 default:
     @just --list
 
@@ -295,6 +300,37 @@ host-cam seat="guest-1":
 
 host-cam-down:
     @just stream-rm browser-cam-host
+
+# The controller only delivers when WEAVE_WEBHOOK_URL is set on its service, so
+# start this before `just bench up` and expect a connection-refused line in the
+# controller log for anything emitted while it is down.
+[doc("Print node lifecycle webhooks the controller delivers, until interrupted.")]
+hook-sink:
+    #!/usr/bin/env python3
+    import http.server, json, sys
+
+    class Sink(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers.get("content-length", 0)))
+            auth = self.headers.get("authorization", "<none>")
+            try:
+                event = json.loads(body)
+                line = f"{event['event_type']:16} {event['node']['id']:16} {event['occurred_at']}"
+                detail = json.dumps(event, indent=2)
+            except (ValueError, KeyError):
+                line, detail = "<unparsed>", body.decode("utf-8", "replace")
+            print(f"{line}\n  authorization: {auth}\n{detail}", flush=True)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_):
+            pass
+
+    print("webhook sink on http://0.0.0.0:{{hook_port}} — ctrl-c to stop", flush=True)
+    try:
+        http.server.HTTPServer(("0.0.0.0", {{hook_port}}), Sink).serve_forever()
+    except KeyboardInterrupt:
+        sys.exit(0)
 
 # Impair a node's network via its router, e.g. `just netem node1 delay 200ms loss 5%`.
 netem +ARGS:

@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod media;
+pub mod webhook;
 
 use std::collections::BTreeMap;
 

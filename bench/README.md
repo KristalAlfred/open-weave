@@ -59,6 +59,7 @@ also picks up the profiled producer/consumer whenever they come up.
 | 28081 | strom-2 API |
 | 28082 | strom-3 API (host→container; grants no route into net_node3) |
 | 28083 | open-live's Strom API, published by open-live's compose file, not this one (see "Feeding open-live") |
+| 29099 | `just hook-sink` on this host, where the controller delivers node lifecycle webhooks (see "Node lifecycle webhooks") |
 
 Open <http://localhost:29082/ui> to watch the system live: registered nodes,
 every stream's path across them (per-hop link conditions and rates), and the
@@ -129,6 +130,8 @@ just netem node1 delay 200ms loss 5%   # impair node 1's network
 just netem-show node1
 just netem-clear node1
 
+just hook-sink     # print node lifecycle webhooks (run in its own terminal)
+
 just down          # tear down (containers, networks, volumes)
 ```
 
@@ -184,6 +187,33 @@ receiver outputs the stream has, which is how `stream-up` knows how many consume
 to attach. The producer/consumer recipes use it and pass the token in. It reads
 `WEAVE_NORTHBOUND_TOKEN` from its environment and fails fast on `401` rather than
 polling a rejected token.
+
+## Node lifecycle webhooks
+
+The `controller` service sets `WEAVE_WEBHOOK_URL` to
+`http://host.docker.internal:29099` and `WEAVE_WEBHOOK_TOKEN` to
+`bench-webhook-token`, so it delivers `node.registered`, `node.online` and
+`node.offline` to a sink on this host. `just hook-sink` is that sink: a few lines
+of Python that print each event and the `Authorization` header it arrived with.
+Export `WEAVE_WEBHOOK_URL=` (empty) before `just up` to switch webhooks off.
+
+Run the sink in its own terminal *before* `just up` — the controller logs a
+connection-refused line and gives up on anything emitted while it is down.
+
+```sh
+just hook-sink                 # terminal 1
+just up                        # terminal 2
+just page 8000 guest-1         # terminal 3, then open the printed URL
+```
+
+Opening the page gives one `node.registered` for `guest-1`. Reloading the tab
+gives a second `node.registered` for the same id, because `#node=` pins the seat
+and a re-registration is not reported as `node.online`. Closing the tab and
+waiting `WEAVE_NODE_TTL_SECS` (15) gives `node.offline`.
+
+`host.docker.internal` resolves through the `extra_hosts: host-gateway` entry on
+the controller service. See the README's "Node lifecycle webhooks" for the
+payload and the delivery guarantees.
 
 ## External verification endpoints
 

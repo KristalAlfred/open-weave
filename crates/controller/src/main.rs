@@ -5,6 +5,7 @@
 
 mod path;
 mod store;
+mod webhook;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -25,6 +26,7 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Guard, require_bearer};
+use weave_core::webhook::{EventType, NodeSummary};
 use weave_core::{
     API_V1, DesiredHop, EndpointDescriptor, HopStatus, NodeDescriptor, NodeHeartbeat,
     NodeRegistration, NodeStatus, ObservedState, PROTOCOL_VERSION, PathStatus, ReconcileReport,
@@ -50,6 +52,15 @@ struct Args {
     /// in-memory store and does not persist state across restarts.
     #[arg(long, env = "DATABASE_URL")]
     database_url: Option<String>,
+    /// Absolute URL that receives node lifecycle events. Webhooks are off when unset.
+    #[arg(long, env = "WEAVE_WEBHOOK_URL")]
+    webhook_url: Option<String>,
+    /// Presented to the receiver as `Authorization: Bearer <token>`.
+    #[arg(long, env = "WEAVE_WEBHOOK_TOKEN")]
+    webhook_token: Option<String>,
+    /// Event types to deliver, comma-separated. Defaults to all of them.
+    #[arg(long, env = "WEAVE_WEBHOOK_EVENTS", value_delimiter = ',')]
+    webhook_events: Vec<String>,
 }
 
 /// Latest reconcile snapshot served by the read-only status/discovery API.
@@ -72,10 +83,16 @@ struct AppState {
     node_ttl: Duration,
     desired: Arc<RwLock<BTreeMap<String, Vec<DesiredHop>>>>,
     view: Arc<RwLock<ControllerView>>,
+    /// `None` when no receiver is configured; every emit site is then a no-op.
+    webhooks: Option<Arc<webhook::Emitter>>,
 }
 
 impl AppState {
-    async fn hydrate(store: Arc<dyn StateStore>, node_ttl: Duration) -> Result<Self> {
+    async fn hydrate(
+        store: Arc<dyn StateStore>,
+        node_ttl: Duration,
+        webhooks: Option<Arc<webhook::Emitter>>,
+    ) -> Result<Self> {
         let streams = store
             .load_streams()
             .await
@@ -100,7 +117,14 @@ impl AppState {
             node_ttl,
             desired: Arc::new(RwLock::new(BTreeMap::new())),
             view: Arc::new(RwLock::new(ControllerView::default())),
+            webhooks,
         })
+    }
+
+    fn emit(&self, event_type: EventType, node: NodeSummary) {
+        if let Some(emitter) = &self.webhooks {
+            emitter.emit(event_type, node);
+        }
     }
 }
 
@@ -269,7 +293,15 @@ async fn main() -> Result<()> {
         );
     }
 
-    let state = AppState::hydrate(store, node_ttl).await?;
+    let webhooks = webhook::Emitter::new(webhook::Config {
+        url: args.webhook_url.clone(),
+        token: args.webhook_token.clone(),
+        events: args.webhook_events.clone(),
+        ..webhook::Config::default()
+    })
+    .map(Arc::new);
+
+    let state = AppState::hydrate(store, node_ttl, webhooks).await?;
     let api = spawn_api_server(args.listen.clone(), state.clone(), north, south);
 
     tracing::info!(interval_secs = args.interval_secs, "controller starting");
@@ -292,12 +324,20 @@ async fn main() -> Result<()> {
 
 async fn reconcile_tick(state: &AppState) {
     let streams: Vec<StreamDefinition> = state.streams.read().await.values().cloned().collect();
-    let observed = {
+    let (observed, went_offline) = {
         let mut nodes = state.nodes.write().await;
         let last_seen = state.last_seen.read().await;
-        mark_offline(&mut nodes, &last_seen, Instant::now(), state.node_ttl);
-        observed_state(&nodes)
+        let transitioned = mark_offline(&mut nodes, &last_seen, Instant::now(), state.node_ttl);
+        let summaries: Vec<NodeSummary> = transitioned
+            .iter()
+            .filter_map(|id| nodes.get(id))
+            .map(|registration| NodeSummary::from(&registration.node))
+            .collect();
+        (observed_state(&nodes), summaries)
     };
+    for node in went_offline {
+        state.emit(EventType::NodeOffline, node);
+    }
     let outcome = reconcile(streams, &observed);
 
     for stream in &outcome.streams {
@@ -317,22 +357,27 @@ async fn reconcile_tick(state: &AppState) {
     view.hops = outcome.hops_by_stream;
 }
 
-/// Mark nodes whose last heartbeat is older than `ttl` as [`NodeStatus::Offline`].
-/// Nodes seen within the TTL keep their reported status. Pure: the caller supplies
-/// `now`, so the boundary is testable without a clock.
+/// Mark nodes whose last heartbeat is older than `ttl` as [`NodeStatus::Offline`],
+/// returning the ids that changed. Nodes seen within the TTL keep their reported
+/// status. Pure: the caller supplies `now`, so the boundary is testable without a
+/// clock, and the caller — not this — emits for the transitions.
 fn mark_offline(
     nodes: &mut BTreeMap<String, NodeRegistration>,
     last_seen: &BTreeMap<String, Instant>,
     now: Instant,
     ttl: Duration,
-) {
+) -> Vec<String> {
+    let mut transitioned = Vec::new();
     for (id, registration) in nodes.iter_mut() {
-        if let Some(seen) = last_seen.get(id)
+        if registration.node.status != NodeStatus::Offline
+            && let Some(seen) = last_seen.get(id)
             && now.saturating_duration_since(*seen) > ttl
         {
             registration.node.status = NodeStatus::Offline;
+            transitioned.push(id.clone());
         }
     }
+    transitioned
 }
 
 fn observed_state(nodes: &BTreeMap<String, NodeRegistration>) -> ObservedState {
@@ -627,6 +672,7 @@ async fn register_node(
             .into_response();
     }
 
+    let summary = NodeSummary::from(&registration.node);
     {
         let mut nodes = state.nodes.write().await;
         if let Err(err) = state.store.upsert_node(&registration).await {
@@ -644,6 +690,7 @@ async fn register_node(
         .await
         .insert(node_id.clone(), Instant::now());
     tracing::info!(%node_id, endpoint_count, "node registered");
+    state.emit(EventType::NodeRegistered, summary);
     (
         StatusCode::ACCEPTED,
         Json(json!({ "status": "accepted", "node_id": node_id })),
@@ -664,16 +711,24 @@ async fn node_heartbeat(
     let Some(registration) = nodes.get_mut(&node_id) else {
         return error(StatusCode::NOT_FOUND, "unknown node");
     };
+    let was_offline = registration.node.status == NodeStatus::Offline;
     registration.node.status = heartbeat.status;
     registration.endpoints = heartbeat.endpoints;
     registration.hop_status = heartbeat.hop_status;
+    let status = registration.node.status;
+    let recovered = (was_offline && status != NodeStatus::Offline)
+        .then(|| NodeSummary::from(&registration.node));
+    drop(nodes);
     state
         .last_seen
         .write()
         .await
         .insert(node_id.clone(), Instant::now());
+    if let Some(summary) = recovered {
+        state.emit(EventType::NodeOnline, summary);
+    }
 
-    tracing::debug!(%node_id, status = ?registration.node.status, "node heartbeat");
+    tracing::debug!(%node_id, ?status, "node heartbeat");
     (
         StatusCode::ACCEPTED,
         Json(json!({ "status": "accepted", "node_id": node_id })),
@@ -866,6 +921,8 @@ mod tests {
     use tower::ServiceExt;
     use weave_core::{NodeCapabilities, PortRange, SrtEndpoint, StreamTransport};
 
+    use crate::webhook::tests::{Sink, sink};
+
     const NORTH_TOKEN: &str = "controller-north-test-token";
     const SOUTH_TOKEN: &str = "controller-south-test-token";
 
@@ -893,6 +950,7 @@ mod tests {
             node_ttl: Duration::from_secs(15),
             desired: Arc::new(RwLock::new(BTreeMap::new())),
             view: Arc::new(RwLock::new(ControllerView::default())),
+            webhooks: None,
         };
         (state, mem)
     }
@@ -1416,6 +1474,171 @@ mod tests {
             NodeStatus::Ready,
             "age == ttl is not yet offline"
         );
+    }
+
+    #[test]
+    fn mark_offline_reports_only_the_nodes_it_transitioned() {
+        let mut nodes = BTreeMap::from([
+            (
+                "stale".to_string(),
+                node_registration("stale", "172.26.0.10"),
+            ),
+            (
+                "fresh".to_string(),
+                node_registration("fresh", "172.27.0.10"),
+            ),
+        ]);
+
+        let ttl = Duration::from_secs(15);
+        let now = Instant::now();
+        let last_seen = BTreeMap::from([
+            ("stale".to_string(), now - Duration::from_secs(20)),
+            ("fresh".to_string(), now - Duration::from_secs(5)),
+        ]);
+
+        assert_eq!(
+            mark_offline(&mut nodes, &last_seen, now, ttl),
+            vec!["stale".to_string()]
+        );
+        assert!(
+            mark_offline(&mut nodes, &last_seen, now, ttl).is_empty(),
+            "a node already offline does not transition again"
+        );
+    }
+
+    fn webhook_state(sink: &Sink) -> AppState {
+        let (mut state, _mem) = mem_state();
+        state.webhooks = webhook::Emitter::new(webhook::Config {
+            url: Some(sink.url.clone()),
+            ..webhook::Config::default()
+        })
+        .map(Arc::new);
+        state
+    }
+
+    #[tokio::test]
+    async fn registering_a_node_emits_node_registered() {
+        let mut sink = sink(StatusCode::OK).await;
+        let app = open_router(webhook_state(&sink));
+
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/v1/nodes/register",
+            Some(serde_json::to_value(node_registration("guest-1", "172.26.0.10")).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let event = sink.next().await.event;
+        assert_eq!(
+            event.event_type,
+            weave_core::webhook::EventType::NodeRegistered
+        );
+        assert_eq!(event.node.id, "guest-1");
+        assert_eq!(event.node.endpoint, "http://guest-1:8080");
+        assert_eq!(event.node.status, NodeStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn a_node_past_its_ttl_emits_node_offline_once() {
+        let mut sink = sink(StatusCode::OK).await;
+        let state = webhook_state(&sink);
+        state.nodes.write().await.insert(
+            "guest-1".to_string(),
+            node_registration("guest-1", "172.26.0.10"),
+        );
+        state.last_seen.write().await.insert(
+            "guest-1".to_string(),
+            Instant::now() - Duration::from_secs(60),
+        );
+
+        reconcile_tick(&state).await;
+        reconcile_tick(&state).await;
+
+        let event = sink.next().await.event;
+        assert_eq!(
+            event.event_type,
+            weave_core::webhook::EventType::NodeOffline
+        );
+        assert_eq!(event.node.id, "guest-1");
+        assert_eq!(event.node.status, NodeStatus::Offline);
+        sink.expect_idle().await;
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_from_an_offline_node_emits_node_online() {
+        let mut sink = sink(StatusCode::OK).await;
+        let state = webhook_state(&sink);
+        let mut registration = node_registration("guest-1", "172.26.0.10");
+        registration.node.status = NodeStatus::Offline;
+        state
+            .nodes
+            .write()
+            .await
+            .insert("guest-1".to_string(), registration);
+        let app = open_router(state);
+
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/v1/nodes/guest-1/heartbeat",
+            Some(json!({ "node_id": "guest-1", "status": "ready" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let event = sink.next().await.event;
+        assert_eq!(event.event_type, weave_core::webhook::EventType::NodeOnline);
+        assert_eq!(event.node.status, NodeStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_from_a_live_node_emits_nothing() {
+        let mut sink = sink(StatusCode::OK).await;
+        let state = webhook_state(&sink);
+        state.nodes.write().await.insert(
+            "guest-1".to_string(),
+            node_registration("guest-1", "172.26.0.10"),
+        );
+        let app = open_router(state);
+
+        send(
+            &app,
+            "POST",
+            "/v1/nodes/guest-1/heartbeat",
+            Some(json!({ "node_id": "guest-1", "status": "ready" })),
+        )
+        .await;
+
+        sink.expect_idle().await;
+    }
+
+    #[tokio::test]
+    async fn registration_is_accepted_while_the_receiver_refuses_connections() {
+        let (mut state, _mem) = mem_state();
+        state.webhooks = webhook::Emitter::new(webhook::Config {
+            // Reserved for documentation; nothing listens there.
+            url: Some("http://192.0.2.1:1/hook".to_string()),
+            timeout: Duration::from_millis(50),
+            ..webhook::Config::default()
+        })
+        .map(Arc::new);
+        let app = open_router(state);
+
+        let accepted = tokio::time::timeout(
+            Duration::from_secs(2),
+            send(
+                &app,
+                "POST",
+                "/v1/nodes/register",
+                Some(serde_json::to_value(node_registration("guest-1", "172.26.0.10")).unwrap()),
+            ),
+        )
+        .await
+        .expect("registration must not wait on the webhook receiver");
+
+        assert_eq!(accepted.0, StatusCode::ACCEPTED);
     }
 
     #[test]
