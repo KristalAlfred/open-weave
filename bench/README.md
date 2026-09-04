@@ -335,8 +335,26 @@ Observed:
   session start; the media flowed regardless. With nothing dialling the SRT
   output the stream reads `degraded`, which is the roll-up for a source that
   flows and a destination that does not.
-- Not observed yet: open-live activating a weave source through
-  `open-live-strom`.
+- open-live activated a production with `browser-cam-host` assigned:
+  `ow-open-live-strom` dialled node 1's output (a caller from `172.25.0.50` on
+  the SRT sink, 4.3 Mb/s) and the weave stream read `flowing`, the first time a
+  stream on this bench reached that state with another system as the consumer.
+- An assigned open-live input with no media holds its whole production at
+  `gst_state: Paused`. With `browser-cam` (the in-bench page's audio-only
+  trickle) or an unpublished WHIP input beside the camera, the flow stayed
+  `Paused, pending Playing`; with only the camera assigned it reached `Playing`
+  in 2 s.
+- A camera page without a microphone starves node 1's gateway flow: Strom 1 saw
+  `Pad video_0` alone, the hop read `whip stalled → srt idle`, and a 15 s SRT
+  probe of the output returned nothing. That is the backlog item on video-only
+  WHIP senders; the page sends both tracks unless opened with `media=video`.
+- open-live's WHEP previews never connected to a browser on this machine until
+  a TURN relay existed. From the studio's origin, a browser without camera or
+  microphone permission offers only mDNS `.local` host candidates, which Strom
+  cannot resolve, and the browser cannot reach Strom's container addresses, so
+  every candidate pair stayed `in-progress`. open-live's compose now runs
+  `coturn` on TCP 3478 and Strom lists it; the same browser then connected over
+  a relay pair and decoded the PGM at 1280x720.
 
 ## Notes
 
