@@ -258,30 +258,35 @@ browser-down:
 
 # Serve the page for a browser on this host. It needs a localhost origin for the
 # camera, and southbound's CORS default of `*` lets it register from there.
-[doc("Serve nodes/browser on localhost:<port> for a browser on this host; prints the URL to open.")]
-page port="8000":
-    @echo "open  http://localhost:{{port}}/#southbound={{sb}}&token={{sb_token}}"
+# `seat` pins the page's node id via `#node=`, the way the in-bench page is
+# pinned on its `command:`. Without it the page mints a fresh id per tab, so a
+# guest who rejoins leaves the applied stream pointing at a node that is gone —
+# and open-live, which keys its source doc on the stream, loses the mixer input
+# the operator had assigned. Concurrent guests need distinct seats.
+[doc("Serve nodes/browser on localhost:<port> pinned to <seat>, for a browser on this host; prints the URL to open.")]
+page port="8000" seat="guest-1":
+    @echo "open  http://localhost:{{port}}/#southbound={{sb}}&token={{sb_token}}&node={{seat}}"
     python3 -m http.server {{port}} -d {{page_dir}} --bind 127.0.0.1
 
 # The stream a page on this host feeds: WHIP signalled at localhost:28080 via node
 # 1's `docker-host` alias, SRT out on the node subnet for open-live's Strom.
-[doc("Apply browser-cam-host for <node-id> (a page on this host); print its WHIP URL and SRT output.")]
-host-cam id:
+[doc("Apply browser-cam-host for <seat> (the id `just page` pinned); print its WHIP URL and SRT output.")]
+host-cam seat="guest-1":
     #!/usr/bin/env bash
     set -euo pipefail
     tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
-    sed "s/BROWSER_NODE/{{id}}/" {{manifests}}/browser-cam-host.yaml > "$tmp"
+    sed "s/BROWSER_NODE/{{seat}}/" {{manifests}}/browser-cam-host.yaml > "$tmp"
     WEAVE_NORTHBOUND_URL={{nb}} WEAVE_NORTHBOUND_TOKEN={{nb_token}} \
         cargo run --quiet -p weave-cli -- apply -f "$tmp"
     url=""
     for _ in $(seq 1 15); do
-        url="$(curl -sf {{sb_auth}} {{sb}}{{v}}/nodes/{{id}}/desired \
+        url="$(curl -sf {{sb_auth}} {{sb}}{{v}}/nodes/{{seat}}/desired \
             | jq -r '.[] | select(.id=="weave-browser-cam-host-sender") | .egresses[0].url' 2>/dev/null || true)"
         [ -n "$url" ] && break
         sleep 2
     done
     if [ -z "$url" ]; then
-        echo "browser-cam-host has no hop on {{id}} yet — is that page registered? 'just bench status' lists nodes" >&2
+        echo "browser-cam-host has no hop on {{seat}} yet — is that page registered? 'just bench status' lists nodes" >&2
         exit 1
     fi
     out="$(WEAVE_NORTHBOUND_TOKEN={{nb_token}} bash {{scripts}}/endpoints.sh browser-cam-host output 0)"

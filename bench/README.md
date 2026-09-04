@@ -284,14 +284,23 @@ destination; the planner then resolves both the WHIP URL the page dials and the
 SRT host open-live dials from that one alias.
 
 ```sh
-just page                          # serve nodes/browser; open the printed URL in Chrome
-just host-cam browser-<id>         # apply browser-cam-host for the page's node id
+just page                          # serve nodes/browser pinned to seat guest-1; open the printed URL
+just host-cam                      # apply browser-cam-host for that seat
 just host-cam-down                 # delete it again
 ```
 
-Then start open-live's stack. Its compose file passes `SOURCE_PROVIDERS`,
+`just page` pins the page's node id with `#node=<seat>`, the way the in-bench
+page is pinned on its `command:`. The seat is the identity the whole chain hangs
+off: the manifest names it as the source device, and open-live keys its source
+doc on the stream, so a guest who reloads or rejoins that seat comes back on the
+mixer input the operator already assigned. Unpinned, every tab is a new node and
+the applied stream is left pointing at one that is gone. Pass `just page 8000
+guest-2` for a second, concurrent guest.
+
+Then start open-live's stack with `just up-weave`, which layers
+`docker-compose.weave.yml` on and passes `SOURCE_PROVIDERS`,
 `WEAVE_NORTHBOUND_URL` and `WEAVE_NORTHBOUND_TOKEN` through from open-live's
-`.env`; from inside a container the northbound is at `host.docker.internal`,
+`.env` (a plain `docker compose up` leaves the provider off); from inside a container the northbound is at `host.docker.internal`,
 not `localhost`. The `weave` provider then lists the stream's SRT output as a
 source within one poll:
 
