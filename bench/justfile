@@ -7,8 +7,6 @@ ctrl    := "http://localhost:29082"
 strom1  := "http://localhost:28080"
 strom2  := "http://localhost:28081"
 strom3  := "http://localhost:28082"
-# Strom that open-live drives (profile `open-live`); not a weave node.
-strom_ol := "http://localhost:28083"
 page_dir := source_directory() / ".." / "nodes" / "browser"
 
 # Version prefix carrying both control-plane contracts, matching weave_core::API_V1.
@@ -52,7 +50,7 @@ wait:
 
 # Tear everything down: containers, networks, volumes (incl. profiled endpoints).
 down:
-    {{compose}} --profile producer --profile consumer --profile browser --profile open-live down -v --remove-orphans
+    {{compose}} --profile producer --profile consumer --profile browser down -v --remove-orphans
 
 ps:
     {{compose}} ps
@@ -257,19 +255,6 @@ browser-down:
     -@just stream-rm browser-cam
     -@just stream-rm browser-return
     -@{{compose}} --profile browser rm -sf browser
-
-# Strom for open-live to drive, on net_core behind profile `open-live`. Waits for its API.
-[doc("Start the Strom open-live drives (profile `open-live`, host port 28083).")]
-open-live-strom-up:
-    {{compose}} --profile open-live up -d open-live-strom
-    @for _ in $(seq 1 30); do \
-        curl -sf {{strom_ol}}/api/version >/dev/null 2>&1 && \
-        { echo "open-live strom ready at {{strom_ol}}"; exit 0; }; \
-        sleep 2; \
-    done; echo "timeout waiting for open-live strom" >&2; exit 1
-
-open-live-strom-down:
-    {{compose}} --profile open-live rm -sf open-live-strom
 
 # Serve the page for a browser on this host. It needs a localhost origin for the
 # camera, and southbound's CORS default of `*` lets it register from there.

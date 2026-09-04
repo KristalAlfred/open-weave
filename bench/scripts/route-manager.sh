@@ -37,6 +37,9 @@ sock="${DOCKER_SOCK:-/var/run/docker.sock}"
 # the NAT the bench tests against: adding a 172.29.0.0/24 route to any group
 # below silently removes the boundary and the NAT manifests start passing for the
 # wrong reason.
+# ow-open-live-strom is not a service here: open-live's own docker-compose.yml
+# joins its Strom to net_core under that name so it can dial node 1's SRT
+# outputs. Renaming it there silently drops its routes.
 core_containers="ow-controller ow-southbound ow-browser ow-open-live-strom ow-producer ow-consumer ow-consumer-2"
 core_routes="172.26.0.0/24=172.25.0.11 172.27.0.0/24=172.25.0.12"
 

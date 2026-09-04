@@ -58,7 +58,7 @@ also picks up the profiled producer/consumer whenever they come up.
 | 28080 | strom-1 API |
 | 28081 | strom-2 API |
 | 28082 | strom-3 API (host→container; grants no route into net_node3) |
-| 28083 | open-live's Strom API (profile `open-live`; not a weave node, see "Feeding open-live") |
+| 28083 | open-live's Strom API, published by open-live's compose file, not this one (see "Feeding open-live") |
 
 Open <http://localhost:29082/ui> to watch the system live: registered nodes,
 every stream's path across them (per-hop link conditions and rates), and the
@@ -266,11 +266,14 @@ Observed on this bench (arm64, Docker via colima):
 
 open-live (the fork at `~/git/open-live`, with the `weave` source provider) lists
 every placed weave stream's node-hosted SRT output as a read-only source and
-dials it from its own Strom. The bench carries that Strom as `open-live-strom`
-on net_core (profile `open-live`, host port 28083). It is another system's
-engine, not a weave node: no adapter fronts it, and it reaches node 1's SRT
-sockets through router-1 the way the bundled producer and consumer do. open-live
-itself runs on this machine and only speaks HTTP to it.
+dials it from its own Strom. That Strom is the `strom` service in open-live's
+`docker-compose.yml`, not a service here. It joins this bench's net_core as an
+external network (`ow-bench_net_core`, address `172.25.0.50`, host port 28083)
+under the container name `ow-open-live-strom`, and `scripts/route-manager.sh`
+lists that name so it gets the routes into the node subnets the way the bundled
+producer and consumer do. It is another system's engine, not a weave node: no
+adapter fronts it. Two consequences: the bench must be up before open-live's
+stack, and `just down` removes the network from under it.
 
 The feed is a browser on this machine, which cannot reach `172.26.0.10:8080`:
 colima routes no container IP to the host, and only the published ports are
@@ -281,21 +284,25 @@ destination; the planner then resolves both the WHIP URL the page dials and the
 SRT host open-live dials from that one alias.
 
 ```sh
-just open-live-strom-up            # Strom for open-live, host port 28083
 just page                          # serve nodes/browser; open the printed URL in Chrome
 just host-cam browser-<id>         # apply browser-cam-host for the page's node id
 just host-cam-down                 # delete it again
 ```
 
-Then run open-live against the bench; its `weave` provider lists the stream's
-SRT output as a source within one poll:
+Then start open-live's stack. Its compose file passes `SOURCE_PROVIDERS`,
+`WEAVE_NORTHBOUND_URL` and `WEAVE_NORTHBOUND_TOKEN` through from open-live's
+`.env`; from inside a container the northbound is at `host.docker.internal`,
+not `localhost`. The `weave` provider then lists the stream's SRT output as a
+source within one poll:
 
 ```sh
 cd ~/git/open-live
-docker compose up -d couchdb       # reads COUCHDB_PASSWORD from .env
-SOURCE_PROVIDERS=weave WEAVE_NORTHBOUND_URL=http://localhost:29080 \
-  WEAVE_NORTHBOUND_TOKEN=bench-northbound-token \
-  STROM_URL=http://localhost:28083 pnpm dev
+cat >> .env <<'EOF'
+SOURCE_PROVIDERS=weave
+WEAVE_NORTHBOUND_URL=http://host.docker.internal:29080
+WEAVE_NORTHBOUND_TOKEN=bench-northbound-token
+EOF
+docker compose up -d --build
 curl -s localhost:3000/api/v1/sources | jq
 ```
 
