@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
+description = "Operator CLI for open-weave: apply live media stream manifests and inspect control-plane state."
+keywords = ["media", "srt", "webrtc", "streaming", "cli"]
+categories = ["command-line-utilities", "multimedia::video"]
 
 [[bin]]
 name = "weave"

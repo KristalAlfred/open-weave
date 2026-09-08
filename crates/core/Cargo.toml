@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
+description = "Shared domain types for open-weave: stream definitions, nodes, endpoints, capabilities and observed state."
+keywords = ["media", "srt", "webrtc", "streaming", "control-plane"]
+categories = ["multimedia::video", "network-programming"]
 
 [features]
 default = []

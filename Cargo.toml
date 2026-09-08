@@ -14,6 +14,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+readme = "README.md"
 repository = "https://github.com/KristalAlfred/open-weave"
 
 [workspace.dependencies]

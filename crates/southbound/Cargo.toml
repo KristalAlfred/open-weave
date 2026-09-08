@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
+description = "Adapter-facing southbound API for open-weave: node registration, telemetry and endpoint discovery."
+keywords = ["media", "srt", "webrtc", "streaming", "api"]
+categories = ["web-programming::http-server", "multimedia::video"]
 
 [[bin]]
 name = "weave-southbound"
