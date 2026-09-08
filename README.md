@@ -1,14 +1,45 @@
 # open-weave
 
-open-weave is a software-defined media contribution orchestrator — the control-plane
-"brain" that accepts declarative desired state and reconciles it onto a
-southbound ecosystem of media nodes, adapters, and existing transport systems.
+open-weave takes a file describing the live media streams you want and makes them
+happen. It plans the SRT, WHIP and WHEP links between your media nodes, tells
+each node's adapter what to build, and keeps reconciling as nodes come and go. It
+works out which end of a link dials the other, and inserts a relay hop when both
+ends sit behind NAT.
 
-It does **not** define a new media data plane. The northbound side speaks operator
-intent; the southbound side normalizes media runtimes into one observed/control
-model. One runtime is implemented: [Strom](https://github.com/Eyevinn/strom), via
+```yaml
+name: cam1-to-studio
+source:
+  srt: { node: remote-site }
+destinations:
+  - srt: { node: studio }
+```
+
+`weave apply -f` that, and `weave get streams` reports it `flowing` once the
+nodes it names have registered and their hops are up.
+
+It does **not** define a new media data plane, and no media passes through
+open-weave itself. The northbound side speaks operator intent; the southbound
+side normalizes media runtimes into one observed/control model. One runtime is
+implemented: [Strom](https://github.com/Eyevinn/strom), via
 `weave-adapter-strom`. NMOS, MXL and MCM are targets the adapter contract is
 shaped for, not ones it ships with.
+
+## Use it for
+
+- Live contribution feeds over SRT, WHIP or WHEP across more than a couple of
+  sites, declared in a file instead of clicked into each box.
+- Links where one or both ends sit behind NAT and you would rather not work out
+  the relay yourself.
+- Fronting [Strom](https://github.com/Eyevinn/strom) instances, or whatever else
+  you run once it has an adapter.
+
+## Not for
+
+- Moving or converting media. Nothing transcodes, resamples or remuxes; a format
+  mismatch is reported, not fixed.
+- File-based or VOD work. Every contract here describes live links between nodes.
+- Production, yet. No TLS, no controller HA, no per-node tokens — see
+  [Status](#status).
 
 ## Status
 
@@ -467,6 +498,15 @@ objects. The source of truth is open-weave desired state; out-of-band Strom
 changes should be reconciled back or explicitly adopted into desired state.
 
 ## Quickstart
+
+The fastest way to see open-weave work is the bench: a docker-compose stack with
+three Strom nodes behind emulated routers, which starts empty and takes stream
+manifests. `just bench up` then `just bench stream-up basic` drives a stream end
+to end. See [`bench/README.md`](bench/README.md).
+
+To run the services directly instead, note that `run-north`, `run-south`,
+`run-controller` and `run-strom-adapter` are each a long-running server and want
+a terminal of their own.
 
 Every service needs its surface token (see [Authentication](#authentication)), so
 export both first — or set `WEAVE_AUTH_DISABLED=1` to run without any:
