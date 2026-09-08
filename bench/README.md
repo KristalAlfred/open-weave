@@ -294,16 +294,17 @@ Observed on this bench (arm64, Docker via colima):
 
 ## Feeding open-live
 
-open-live (the fork at `~/git/open-live`, with the `weave` source provider) lists
-every placed weave stream's node-hosted SRT output as a read-only source and
-dials it from its own Strom. That Strom is the `strom` service in open-live's
-`docker-compose.yml`, not a service here. It joins this bench's net_core as an
-external network (`ow-bench_net_core`, address `172.25.0.50`, host port 28083)
-under the container name `ow-open-live-strom`, and `scripts/route-manager.sh`
-lists that name so it gets the routes into the node subnets the way the bundled
-producer and consumer do. It is another system's engine, not a weave node: no
-adapter fronts it. Two consequences: the bench must be up before open-live's
-stack, and `just down` removes the network from under it.
+[open-live](https://github.com/Eyevinn/open-live), with a `weave` source
+provider added in a fork, lists every placed weave stream's node-hosted SRT
+output as a read-only source and dials it from its own Strom. That Strom is the
+`strom` service in open-live's `docker-compose.yml`, not a service here. It
+joins this bench's net_core as an external network (`ow-bench_net_core`, address
+`172.25.0.50`, host port 28083) under the container name `ow-open-live-strom`,
+and `scripts/route-manager.sh` lists that name so it gets the routes into the
+node subnets the way the bundled producer and consumer do. It is another
+system's engine, not a weave node: no adapter fronts it. Two consequences: the
+bench must be up before open-live's stack, and `just down` removes the network
+from under it.
 
 The feed is a browser on this machine, which cannot reach `172.26.0.10:8080`:
 colima routes no container IP to the host, and only the published ports are
@@ -330,12 +331,13 @@ guest-2` for a second, concurrent guest.
 Then start open-live's stack with `just up-weave`, which layers
 `docker-compose.weave.yml` on and passes `SOURCE_PROVIDERS`,
 `WEAVE_NORTHBOUND_URL` and `WEAVE_NORTHBOUND_TOKEN` through from open-live's
-`.env` (a plain `docker compose up` leaves the provider off); from inside a container the northbound is at `host.docker.internal`,
-not `localhost`. The `weave` provider then lists the stream's SRT output as a
-source within one poll:
+`.env` (a plain `docker compose up` leaves the provider off); from inside a
+container the northbound is at `host.docker.internal`, not `localhost`. The
+`weave` provider then lists the stream's SRT output as a source within one
+poll:
 
 ```sh
-cd ~/git/open-live
+cd /path/to/open-live
 cat >> .env <<'EOF'
 SOURCE_PROVIDERS=weave
 WEAVE_NORTHBOUND_URL=http://host.docker.internal:29080

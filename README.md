@@ -1,12 +1,30 @@
 # open-weave
 
 open-weave is a software-defined media contribution orchestrator — the control-plane
-"brain" that accepts declarative desired state and reconciles it onto a wide
+"brain" that accepts declarative desired state and reconciles it onto a
 southbound ecosystem of media nodes, adapters, and existing transport systems.
 
 It does **not** define a new media data plane. The northbound side speaks operator
-intent; the southbound side normalizes NMOS, MXL, MCM, managed edge nodes, and
-future vendor adapters into one observed/control model.
+intent; the southbound side normalizes media runtimes into one observed/control
+model. One runtime is implemented: [Strom](https://github.com/Eyevinn/strom), via
+`weave-adapter-strom`. NMOS, MXL and MCM are targets the adapter contract is
+shaped for, not ones it ships with.
+
+## Status
+
+Early, and version `0.1.0` means it. The contracts move without deprecation
+windows — `API_V1` and `PROTOCOL_VERSION` tell a client what it is talking to,
+and a mismatch is refused rather than smoothed over.
+
+Built: the three control-plane services, the `weave` CLI, one southbound adapter
+(`weave-adapter-strom`), and a browser node. Links carry SRT, WHIP or WHEP, and
+the controller plans NAT traversal through relay nodes. All of it is verified on
+the docker-compose bench in `bench/`, which runs real Strom instances behind
+per-node `netem` routers, and nowhere else.
+
+Not built: TLS, controller HA, per-node tokens, format conversion, and any
+adapter other than Strom. `BACKLOG.md` lists the known gaps with the evidence
+behind each one.
 
 ## Crates and binaries
 
@@ -26,12 +44,9 @@ future vendor adapters into one observed/control model.
 - **`weave-adapter-strom`** — southbound adapter for existing
   [Strom](https://github.com/Eyevinn/strom) media runtimes.
 
-Adapter crates can be split out as needed, for example:
-
-- `weave-adapter-nmos`
-- `weave-adapter-mxl-domain`
-- `weave-adapter-mxl-k8s`
-- `weave-adapter-mcm`
+Further adapters get their own crates as they arrive. None exist yet;
+`weave-adapter-nmos`, `weave-adapter-mxl-domain` and `weave-adapter-mcm` are
+names for unstarted work, listed to show where the seam falls.
 
 ## Runtime shape
 
@@ -482,3 +497,7 @@ applied stream stays `Pending` until the nodes it names register.
 
 The CLI picks `WEAVE_NORTHBOUND_TOKEN` up from the environment; `--token`
 overrides it.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).

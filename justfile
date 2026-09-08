@@ -8,17 +8,17 @@ build:
     cargo build
 
 test:
-    cargo test
+    cargo test --workspace
     just browser-check
 
 fmt:
     cargo fmt
 
 fmt-check:
-    cargo fmt --check
+    cargo fmt --all --check
 
 lint:
-    cargo clippy --all-targets --all-features
+    cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 browser-check:
     node nodes/browser/check.mjs --check-only
