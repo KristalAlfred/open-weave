@@ -1,6 +1,6 @@
-# NAT'd destination: node 1 sends to node 3, which nothing can dial. The link
-# reverses — node 1 listens on its egress and node 3's receiver calls in — so
-# delivery into a NAT'd site needs no relay either.
+# NAT'd destination: node 1 sends to node 3, which nothing can dial.
+# The link reverses — node 1 listens on its egress and node 3's receiver calls
+# in — so delivery into a NAT'd site needs no relay either.
 name: nat-ingress
 enabled: true
 source:

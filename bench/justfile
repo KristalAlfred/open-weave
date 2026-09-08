@@ -34,12 +34,14 @@ default:
     @just --list
 
 # Build images and bring the whole stack up, then wait for it to be healthy.
+[group("stack")]
 up:
     {{compose}} build
     {{compose}} up -d
     @just wait
 
 # Poll every service's health endpoint until the stack is ready.
+[group("stack")]
 wait:
     @echo "waiting for stack..."
     @for i in $(seq 1 90); do \
@@ -54,17 +56,22 @@ wait:
     done; echo "timeout waiting for stack" >&2; {{compose}} ps; exit 1
 
 # Tear everything down: containers, networks, volumes (incl. profiled endpoints).
+[group("stack")]
 down:
     {{compose}} --profile producer --profile consumer --profile browser down -v --remove-orphans
 
+# Container states for every bench service.
+[group("stack")]
 ps:
     {{compose}} ps
 
-# Follow logs for a service (e.g. `just logs controller`).
+# Follow logs for a service (e.g. `just bench logs controller`).
+[group("stack")]
 logs svc="controller":
     {{compose}} logs -f --tail=40 {{svc}}
 
 # Health of every service + nodes registered with southbound + controller view.
+[group("stack")]
 status:
     @echo "== health =="
     @printf "northbound:  "; curl -sf {{nb}}/health   >/dev/null && echo ok || echo DOWN
@@ -81,15 +88,17 @@ status:
     @curl -sf {{nb_auth}} {{nb}}{{v}}/streams | (jq . 2>/dev/null || cat)
 
 # List the available stream manifests with their one-line description.
+[group("streams")]
 stream-ls:
     @for f in {{manifests}}/*.yaml; do \
-        printf "%-14s %s\n" "$(basename "$f" .yaml)" "$(head -1 "$f" | sed 's/^# *//')"; \
+        printf "%-16s %s\n" "$(basename "$f" .yaml)" "$(head -1 "$f" | sed 's/^# *//')"; \
     done
 
-# Apply a manifest by name (stem == stream name), e.g. `just stream basic`.
+# Apply a manifest by name (stem == stream name), e.g. `just bench stream basic`.
 # Control plane only: the stream is registered and placed, but nothing feeds it,
-# so it settles at `awaiting_input`. Use `just stream-up` to also drive media.
+# so it settles at `awaiting_input`. Use `just bench stream-up` to also drive media.
 [doc("Apply a manifest by name, control plane only (no media).")]
+[group("streams")]
 stream name:
     @WEAVE_NORTHBOUND_URL={{nb}} WEAVE_NORTHBOUND_TOKEN={{nb_token}} \
         cargo run --quiet -p weave-cli -- apply -f {{manifests}}/{{name}}.yaml
@@ -98,11 +107,12 @@ stream name:
 
 # Attach the external producer to the stream's ingress and one consumer per
 # receiver output, then wait for `flowing`. This is the recipe to reach for;
-# `just stream` alone leaves the path unfed.
+# `just bench stream` alone leaves the path unfed.
 #
 # The producer/consumer containers are singletons, so this re-points them at
 # <name>: a previously driven stream loses its media and falls back to `degraded`.
 [doc("Apply a manifest AND drive it end to end, waiting for `flowing`.")]
+[group("streams")]
 stream-up name="basic":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -138,13 +148,15 @@ stream-up name="basic":
     just stream-wait {{name}} flowing
 
 # Stop driving a stream and remove it: detach the external endpoints, then delete.
+[group("streams")]
 stream-down name="basic":
     -@just producer-down
     -@just consumer-down
     -@just consumer-2-down
     @just stream-rm {{name}}
 
-# Poll the controller until a stream reports `status`, e.g. `just stream-wait basic flowing`.
+# Poll the controller until a stream reports `status`, e.g. `just bench stream-wait basic flowing`.
+[group("streams")]
 stream-wait name status="flowing" attempts="45":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -158,7 +170,8 @@ stream-wait name status="flowing" attempts="45":
     echo "inspect with 'just bench status' or the dashboard at {{ctrl}}/ui" >&2
     exit 1
 
-# Remove a stream by name, e.g. `just stream-rm basic`. Controller tears down its hops next tick.
+# Remove a stream by name, e.g. `just bench stream-rm basic`. Controller tears down its hops next tick.
+[group("streams")]
 stream-rm name:
     @curl -sf {{nb_auth}} -X DELETE {{nb}}{{v}}/streams/{{name}} && echo "deleted {{name}}" || echo "not found: {{name}}"
 
@@ -169,6 +182,7 @@ stream-rm name:
 # is picked from the address: 172.29.x means the `-3` container, anything else
 # the net_core one. The recipe obeys the same reachability the planner does.
 [doc("Start the external ffmpeg producer (SRT caller into a source ingress).")]
+[group("media")]
 producer-up stream="basic":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -178,11 +192,13 @@ producer-up stream="basic":
     PRODUCER_TARGET="$target" {{compose}} --profile producer up -d "$svc"
 
 # Stop and remove the external producer, whichever subnet it was started in.
+[group("media")]
 producer-down:
     -@{{compose}} --profile producer rm -sf producer producer-3
 
 # Pass a stream name; the first output address is resolved via discovery.
 [doc("Start the external ffmpeg consumer (SRT caller pulling a receiver output).")]
+[group("media")]
 consumer-up stream="basic":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -192,12 +208,14 @@ consumer-up stream="basic":
     CONSUMER_SOURCE="$source" {{compose}} --profile consumer up -d "$svc"
 
 # Stop and remove the external consumer, whichever subnet it was started in.
+[group("media")]
 consumer-down:
     -@{{compose}} --profile consumer rm -sf consumer consumer-3
 
 # For fan-out: one consumer per receiver output, so every receiver hop can flow.
 # Pass a stream name; the second output address is resolved via discovery.
 [doc("Start a second external consumer, attached to a stream's output 1.")]
+[group("media")]
 consumer-2-up stream="fanout":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -205,16 +223,19 @@ consumer-2-up stream="fanout":
     CONSUMER_SOURCE_2="$source" {{compose}} --profile consumer up -d consumer-2
 
 # Stop and remove the second external consumer.
+[group("media")]
 consumer-2-down:
     {{compose}} --profile consumer rm -sf consumer-2
 
 # Build and start the headless browser node inside the bench, then print its id.
 [doc("Start the in-bench browser node (profile `browser`) and print its node id.")]
+[group("browser")]
 browser-up:
     {{compose}} --profile browser up -d --build browser
     @just browser-id
 
 # Wait for the pinned browser node to appear in southbound's registry, then echo it.
+[group("browser")]
 browser-id:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -232,6 +253,7 @@ browser-id:
 # stream's SRT output is pulled by the consumer, the return stream's SRT ingress
 # is fed by the producer and played on the page.
 [doc("Apply both browser manifests for <node-id> (default: the pinned page) and drive them end to end.")]
+[group("browser")]
 browser-stream id="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -254,6 +276,7 @@ browser-stream id="":
     curl -sf {{ctrl}}{{v}}/status | jq -r '.streams[] | select(.name=="browser-cam") | .status'
 
 # Detach the media endpoints, delete both browser streams, and stop the page.
+[group("browser")]
 browser-down:
     -@just consumer-down
     -@just producer-down
@@ -269,13 +292,15 @@ browser-down:
 # and open-live, which keys its source doc on the stream, loses the mixer input
 # the operator had assigned. Concurrent guests need distinct seats.
 [doc("Serve nodes/browser on localhost:<port> pinned to <seat>, for a browser on this host; prints the URL to open.")]
+[group("browser")]
 page port="8000" seat="guest-1":
     @echo "open  http://localhost:{{port}}/#southbound={{sb}}&token={{sb_token}}&node={{seat}}"
     python3 -m http.server {{port}} -d {{page_dir}} --bind 127.0.0.1
 
 # The stream a page on this host feeds: WHIP signalled at localhost:28080 via node
 # 1's `docker-host` alias, SRT out on the node subnet for open-live's Strom.
-[doc("Apply browser-cam-host for <seat> (the id `just page` pinned); print its WHIP URL and SRT output.")]
+[doc("Apply browser-cam-host for <seat> (the id `just bench page` pinned); print its WHIP URL and SRT output.")]
+[group("browser")]
 host-cam seat="guest-1":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -298,6 +323,8 @@ host-cam seat="guest-1":
     echo "page sends WHIP to:     $url"
     echo "open-live dials:        srt://$out?mode=caller  (listed by its weave provider)"
 
+# Delete the browser-cam-host stream.
+[group("browser")]
 host-cam-down:
     @just stream-rm browser-cam-host
 
@@ -305,6 +332,7 @@ host-cam-down:
 # start this before `just bench up` and expect a connection-refused line in the
 # controller log for anything emitted while it is down.
 [doc("Print node lifecycle webhooks the controller delivers, until interrupted.")]
+[group("webhooks")]
 hook-sink:
     #!/usr/bin/env python3
     import http.server, json, sys
@@ -332,14 +360,17 @@ hook-sink:
     except KeyboardInterrupt:
         sys.exit(0)
 
-# Impair a node's network via its router, e.g. `just netem node1 delay 200ms loss 5%`.
+# Impair a node's network via its router, e.g. `just bench netem node1 delay 200ms loss 5%`.
+[group("impairment")]
 netem +ARGS:
     bash {{scripts}}/netem.sh {{ARGS}}
 
-# Clear impairment on a node, e.g. `just netem-clear node1`.
+# Clear impairment on a node, e.g. `just bench netem-clear node1`.
+[group("impairment")]
 netem-clear node:
     bash {{scripts}}/netem.sh {{node}} clear
 
-# Show current qdiscs on a node's router, e.g. `just netem-show node1`.
+# Show current qdiscs on a node's router, e.g. `just bench netem-show node1`.
+[group("impairment")]
 netem-show node:
     bash {{scripts}}/netem.sh {{node}} show

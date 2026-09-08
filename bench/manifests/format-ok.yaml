@@ -1,7 +1,7 @@
-# Declared format the destination accepts: no conflict, so the stream reports
-# exactly as it would with nothing declared. The format is what the bench
-# producer actually sends, read off ffprobe rather than assumed — note the audio
-# is mono, which `-i sine=...` gives you unless you ask otherwise.
+# Declared format the destination accepts: no conflict, nothing reported.
+# The stream reports exactly as it would with nothing declared. The format is
+# what the bench producer actually sends, read off ffprobe rather than assumed —
+# note the audio is mono, which `-i sine=...` gives you unless you ask otherwise.
 name: format-ok
 enabled: true
 source:

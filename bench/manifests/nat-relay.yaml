@@ -1,8 +1,9 @@
-# Both ends behind the same NAT, so neither can be dialled and the controller
-# inserts a bridge on node 1 (the bench's only `relay: true` node) that both
-# call out to. Source and destination are the same node because the bench has
-# one NAT'd site; the media still crosses the NAT twice, outbound each time,
-# which is the mechanism two separate NAT'd sites would rely on.
+# Both ends behind the same NAT, bridged through node 1.
+# Neither end can be dialled, so the controller inserts a bridge on node 1 (the
+# bench's only `relay: true` node) that both call out to. Source and destination
+# are the same node because the bench has one NAT'd site; the media still
+# crosses the NAT twice, outbound each time, which is the mechanism two separate
+# NAT'd sites would rely on.
 name: nat-relay
 enabled: true
 source:

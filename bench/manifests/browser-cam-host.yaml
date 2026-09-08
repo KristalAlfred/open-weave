@@ -1,5 +1,6 @@
-# Camera of a browser on the Docker host into node-1 over WHIP signalled at localhost:28080; SRT out for open-live to dial.
-# Templated: BROWSER_NODE is the page's id, filled in by `just host-cam <id>`.
+# Camera of a browser on the Docker host into node-1 over WHIP at localhost:28080.
+# The SRT output stays on the node subnet for an external consumer to dial.
+# Templated: BROWSER_NODE is the page's id, filled in by `just bench host-cam <seat>`.
 name: browser-cam-host
 enabled: true
 source:

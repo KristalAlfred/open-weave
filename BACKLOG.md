@@ -18,9 +18,9 @@ that is easy to break while fixing it.
   which is a change to Strom. The gateway flow itself is fine: Google Chrome on
   the macOS host, through the `docker-host` alias and `browser-cam-host`, put
   H264 640x480 plus AAC on the SRT output with the flow `Playing`
-  (`bench/README.md`, "Feeding open-live"). Easy to break: `bench/justfile` prints
-  `browser-cam`'s status instead of waiting on it, and `bench/README.md` records
-  the cycling as observed, so both change with the fix.
+  (`bench/README.md`, "A page in your own browser"). Easy to break:
+  `bench/justfile` prints `browser-cam`'s status instead of waiting on it, and
+  `bench/README.md` records that it does not settle, so both change with the fix.
 - **A video-only WHIP sender leaves the gateway flow paused.**
   `whip_to_srt_flow` always links `whip_in:audio_out` into
   `mpegtssrt_output`'s `audio_in_0` (`crates/strom/src/spec.rs`). A run with

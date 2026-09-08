@@ -1,7 +1,7 @@
-# A destination that only takes 44.1 kHz, fed a 48 kHz source. The path is
-# placeable and the media flows — it just arrives somewhere it cannot be used —
-# so the stream is reported degraded with the offending field named. Nothing
-# converts it yet; saying so is the point.
+# Format mismatch: a 48 kHz source into a 44.1 kHz-only destination.
+# The path is placeable and the media flows — it just arrives somewhere it
+# cannot be used — so the stream is reported degraded with the offending field
+# named. Nothing converts it yet; saying so is the point.
 name: format-mismatch
 enabled: true
 source:

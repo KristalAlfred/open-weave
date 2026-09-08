@@ -1,6 +1,6 @@
-# Pinned transit: source on node-1 relayed through node-2 before landing back on
-# node-1. Both node subnets are dialable here, so nothing forces a relay — the
-# `via` pin is honoured on its own, and the media crosses the routers twice.
+# Pinned transit: node-1 relayed through node-2 before landing back on node-1.
+# Both node subnets are dialable here, so nothing forces a relay — the `via` pin
+# is honoured on its own, and the media crosses the routers twice.
 name: via
 enabled: true
 source:
