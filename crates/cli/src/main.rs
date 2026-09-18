@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use reqwest::RequestBuilder;
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Token};
-use weave_core::{API_PREFIX, StreamDefinition, validate_resource_id};
+use weave_core::{API_PREFIX, ApiError, StreamDefinition, StreamPlan, validate_resource_id};
 
 #[derive(Parser)]
 #[command(name = "weave", version, about = "open-weave control plane CLI")]
@@ -39,6 +39,12 @@ struct Cli {
 enum Command {
     /// Apply a stream definition (YAML) as desired state.
     Apply {
+        /// Path to the stream YAML file.
+        #[arg(short = 'f', long = "file")]
+        file: PathBuf,
+    },
+    /// Preview validation and placement without changing desired state.
+    Plan {
         /// Path to the stream YAML file.
         #[arg(short = 'f', long = "file")]
         file: PathBuf,
@@ -94,6 +100,7 @@ async fn main() -> Result<()> {
 
     match command {
         Command::Apply { file } => apply(&url, token.as_ref(), &file).await,
+        Command::Plan { file } => plan(&url, token.as_ref(), &file).await,
         Command::Get { resource } => match resource {
             GetResource::Streams => get_streams(&url, token.as_ref()).await,
             GetResource::Stream { name } => get_stream(&url, token.as_ref(), &name).await,
@@ -124,6 +131,20 @@ fn unauthorized_hint(token: Option<&Token>) -> &'static str {
     }
 }
 
+fn error_detail(body: &str) -> String {
+    let Ok(error) = serde_json::from_str::<ApiError>(body) else {
+        return body.to_string();
+    };
+    let mut detail = error.message;
+    for issue in error.details {
+        detail.push_str(&format!(
+            "\n{} [{}]: {}",
+            issue.field, issue.code, issue.message
+        ));
+    }
+    detail
+}
+
 fn parse_stream(yaml: &str) -> Result<StreamDefinition> {
     serde_norway::with::singleton_map_recursive::deserialize(serde_norway::Deserializer::from_str(
         yaml,
@@ -132,10 +153,7 @@ fn parse_stream(yaml: &str) -> Result<StreamDefinition> {
 }
 
 async fn apply(url: &str, token: Option<&Token>, file: &Path) -> Result<()> {
-    let text =
-        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-    let stream =
-        parse_stream(&text).with_context(|| format!("parsing stream from {}", file.display()))?;
+    let stream = read_stream(file)?;
 
     let response = authorized(reqwest::Client::new().post(api_url(url, "/streams")), token)
         .json(&stream)
@@ -151,11 +169,53 @@ async fn apply(url: &str, token: Option<&Token>, file: &Path) -> Result<()> {
         } else {
             ""
         };
-        bail!("northbound rejected stream: {status}: {body}{hint}");
+        bail!(
+            "northbound rejected stream: {status}: {}{hint}",
+            error_detail(&body)
+        );
     }
 
     tracing::info!(name = %stream.name, %status, "stream applied");
     println!("{body}");
+    Ok(())
+}
+
+fn read_stream(file: &Path) -> Result<StreamDefinition> {
+    let text =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    parse_stream(&text).with_context(|| format!("parsing stream from {}", file.display()))
+}
+
+async fn plan(url: &str, token: Option<&Token>, file: &Path) -> Result<()> {
+    let stream = read_stream(file)?;
+    plan_stream(url, token, &stream).await
+}
+
+async fn plan_stream(url: &str, token: Option<&Token>, stream: &StreamDefinition) -> Result<()> {
+    let response = authorized(
+        reqwest::Client::new().post(api_url(url, "/stream-plans")),
+        token,
+    )
+    .json(&stream)
+    .send()
+    .await
+    .context("planning stream through northbound")?;
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let hint = if status == reqwest::StatusCode::UNAUTHORIZED {
+            unauthorized_hint(token)
+        } else {
+            ""
+        };
+        bail!(
+            "northbound rejected stream plan: {status}: {}{hint}",
+            error_detail(&body)
+        );
+    }
+    let plan: StreamPlan = serde_json::from_str(&body).context("decoding stream plan")?;
+    println!("{}", serde_json::to_string_pretty(&plan)?);
     Ok(())
 }
 
@@ -318,6 +378,25 @@ destinations:
     }
 
     #[test]
+    fn structured_errors_show_field_details() {
+        let body = serde_json::json!({
+            "code": "invalid_request",
+            "message": "stream validation failed",
+            "details": [{
+                "field": "name",
+                "code": "invalid_characters",
+                "message": "stream name is invalid"
+            }]
+        })
+        .to_string();
+
+        assert_eq!(
+            error_detail(&body),
+            "stream validation failed\nname [invalid_characters]: stream name is invalid"
+        );
+    }
+
+    #[test]
     fn api_url_inserts_the_version_prefix_once() {
         assert_eq!(
             api_url("http://127.0.0.1:9080", "/streams"),
@@ -409,6 +488,77 @@ destinations:
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{addr}"), seen)
+    }
+
+    async fn stub_plan() -> (String, Arc<Mutex<Option<String>>>) {
+        async fn record(
+            State(seen): State<Arc<Mutex<Option<String>>>>,
+            method: axum::http::Method,
+            uri: axum::http::Uri,
+            headers: axum::http::HeaderMap,
+            axum::Json(stream): axum::Json<StreamDefinition>,
+        ) -> axum::Json<StreamPlan> {
+            let authorization = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            *seen.lock().unwrap() = Some(format!(
+                "{method} {} {authorization} {}",
+                uri.path(),
+                stream.name
+            ));
+            axum::Json(StreamPlan {
+                name: stream.name,
+                status: weave_core::PlanStatus::Unplaced,
+                nodes: Vec::new(),
+                hops: Vec::new(),
+                endpoints: None,
+                reason: Some("node missing is not registered".to_string()),
+            })
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let app = Router::new().fallback(record).with_state(Arc::clone(&seen));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    #[tokio::test]
+    async fn plan_calls_the_versioned_route_with_auth_and_body() {
+        let token = Token::new("cli-test-token").unwrap();
+        let stream = StreamDefinition {
+            name: "preview".to_string(),
+            enabled: true,
+            source: StreamTransport::Srt(SrtEndpoint {
+                node: Some("missing".to_string()),
+                remote: None,
+                via: Vec::new(),
+                network: None,
+                latency: None,
+                format: None,
+                accepts: None,
+            }),
+            destinations: vec![StreamTransport::Srt(SrtEndpoint {
+                node: Some("also-missing".to_string()),
+                remote: None,
+                via: Vec::new(),
+                network: None,
+                latency: None,
+                format: None,
+                accepts: None,
+            })],
+        };
+        let (url, seen) = stub_plan().await;
+
+        plan_stream(&url, Some(&token), &stream).await.unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some("POST /v4/stream-plans Bearer cli-test-token preview")
+        );
     }
 
     #[tokio::test]

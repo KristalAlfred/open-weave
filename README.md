@@ -105,7 +105,7 @@ Both control-plane contracts are served under **`/v4`**:
 
 | Contract | Served by | Routes |
 |---|---|---|
-| operator (northbound) | northbound, controller | `/v4/streams`, `/v4/streams/{name}`, `/v4/streams/{name}/endpoints`, `/v4/status` |
+| operator (northbound) | northbound, controller | `/v4/streams`, `/v4/streams/{name}`, `/v4/streams/{name}/endpoints`, `/v4/stream-plans`, `/v4/status` |
 | adapter (southbound) | southbound, controller | `/v4/nodes/register`, `/v4/nodes/{id}/heartbeat`, `/v4/nodes/{id}/desired`, `/v4/nodes`, `/v4/endpoints`, `/v4/state` |
 
 The controller serves the union of both, because northbound and southbound are
@@ -122,6 +122,14 @@ There is no separate northbound payload version to miss.
 `GET /v4/streams` lists desired streams. `GET /v4/streams/{name}` returns one
 desired stream or `404 stream_not_found`. The same resource path accepts
 `DELETE`; applying remains `POST /v4/streams`.
+
+`POST /v4/stream-plans` accepts the same stream definition as apply and changes
+no state. It validates the definition, plans it alongside the current desired
+streams against the current nodes, and returns `placed`, `unplaced`, or
+`disabled` with the resolved nodes, desired hops, endpoints, and any placement
+reason. Existing hop observations are excluded, so a preview describes
+placement rather than the runtime state of an older stream with the same name.
+Use `weave plan -f examples/stream.yaml` or `just plan`.
 
 The adapter contract is the one that matters most: operators attach their own
 media nodes, including third-party adapters open-weave does not ship, and those

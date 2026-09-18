@@ -103,3 +103,5 @@ Listed so they are not picked up by accident.
   clean; both pass as of this file being written.
 - Regenerate `contracts/` when a versioned route or wire type changes. Contract
   drift is a test failure, not a documentation follow-up.
+- Keep stream planning side-effect free and allocate against the full candidate
+  stream set. A one-stream preview can otherwise promise ports apply will not use.

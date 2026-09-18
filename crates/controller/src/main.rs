@@ -30,12 +30,12 @@ use weave_core::webhook::{EventType, NodeSummary};
 use weave_core::{
     API_PREFIX, AcceptedState, ApiError, ApiErrorCode, DesiredHop, EndpointDescriptor, HopStatus,
     NodeAccepted, NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus, ObservedState,
-    PROTOCOL_VERSION, PathStatus, ROUTE_ENDPOINTS, ROUTE_NODE_DESIRED, ROUTE_NODE_HEARTBEAT,
-    ROUTE_NODE_REGISTER, ROUTE_NODES, ROUTE_STATE, ROUTE_STATUS, ROUTE_STREAM,
-    ROUTE_STREAM_ENDPOINTS, ROUTE_STREAMS, ReconcileReport, ReconcileStatus, RunningStatus,
-    StartingState, StartingStatus, StatusResponse, StreamAccepted, StreamDefinition,
-    StreamEndpoints, StreamStatus, ValidationIssue, protocol_compatible, resource_id_issue,
-    validate_resource_id, validate_stream,
+    PROTOCOL_VERSION, PathStatus, PlanStatus, ROUTE_ENDPOINTS, ROUTE_NODE_DESIRED,
+    ROUTE_NODE_HEARTBEAT, ROUTE_NODE_REGISTER, ROUTE_NODES, ROUTE_STATE, ROUTE_STATUS,
+    ROUTE_STREAM, ROUTE_STREAM_ENDPOINTS, ROUTE_STREAM_PLANS, ROUTE_STREAMS, ReconcileReport,
+    ReconcileStatus, RunningStatus, StartingState, StartingStatus, StatusResponse, StreamAccepted,
+    StreamDefinition, StreamEndpoints, StreamPlan, StreamStatus, ValidationIssue,
+    protocol_compatible, resource_id_issue, validate_resource_id, validate_stream,
 };
 
 use path::{PortAllocator, derive_path, path_status, stream_endpoints};
@@ -435,6 +435,7 @@ fn router(state: AppState, north: Guard, south: Guard) -> Router {
         .route(ROUTE_STREAMS, get(list_streams).post(submit_stream))
         .route(ROUTE_STREAM, get(get_stream).delete(delete_stream))
         .route(ROUTE_STREAM_ENDPOINTS, get(get_endpoints))
+        .route(ROUTE_STREAM_PLANS, post(plan_stream))
         .layer(axum::middleware::from_fn_with_state(north, require_bearer));
 
     let nodes = Router::new()
@@ -665,6 +666,54 @@ async fn submit_stream(
         }),
     )
         .into_response()
+}
+
+async fn plan_stream(
+    State(state): State<AppState>,
+    payload: Result<Json<StreamDefinition>, JsonRejection>,
+) -> Response {
+    let Json(stream) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return invalid_json(rejection),
+    };
+    let issues = validate_stream(&stream);
+    if !issues.is_empty() {
+        return invalid_request("stream validation failed", issues);
+    }
+
+    let mut streams = state.streams.read().await.clone();
+    streams.insert(stream.name.clone(), stream.clone());
+    let nodes = state.nodes.read().await;
+    let mut observed = observed_state(&nodes);
+    drop(nodes);
+    observed.hops.clear();
+    let mut outcome = reconcile(streams.into_values().collect(), &observed);
+    let planned = outcome
+        .streams
+        .into_iter()
+        .find(|status| status.name == stream.name)
+        .expect("candidate stream is included in plan");
+    let hops = outcome
+        .hops_by_stream
+        .remove(&stream.name)
+        .unwrap_or_default();
+    let status = if !stream.enabled {
+        PlanStatus::Disabled
+    } else if hops.is_empty() {
+        PlanStatus::Unplaced
+    } else {
+        PlanStatus::Placed
+    };
+
+    Json(StreamPlan {
+        name: planned.name,
+        status,
+        nodes: planned.nodes,
+        hops,
+        endpoints: planned.endpoints,
+        reason: planned.reason,
+    })
+    .into_response()
 }
 
 async fn delete_stream(State(state): State<AppState>, Path(name): Path<String>) -> Response {
@@ -1333,7 +1382,7 @@ mod tests {
             &app,
             "POST",
             "/v4/streams",
-            Some(serde_json::to_value(invalid).unwrap()),
+            Some(serde_json::to_value(&invalid).unwrap()),
         )
         .await;
 
@@ -1343,9 +1392,139 @@ mod tests {
         assert_eq!(body["details"][0]["code"], "mutually_exclusive");
         assert_eq!(mem.upsert_stream_calls(), 0);
 
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v4/stream-plans",
+            Some(serde_json::to_value(invalid).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "invalid_request");
+        assert_eq!(mem.upsert_stream_calls(), 0);
+
         let (_, body) = send(&app, "GET", "/v4/streams", None).await;
         let listed: Vec<StreamDefinition> = serde_json::from_value(body).unwrap();
         assert!(listed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_places_without_changing_desired_state() {
+        let (state, mem) = mem_state();
+        let app = open_router(state.clone());
+        for registration in [
+            node_registration("strom-node-1", "172.26.0.10"),
+            node_registration("strom-node-2", "172.27.0.10"),
+        ] {
+            let (status, _) = send(
+                &app,
+                "POST",
+                "/v4/nodes/register",
+                Some(serde_json::to_value(registration).unwrap()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+        }
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v4/stream-plans",
+            Some(serde_json::to_value(stream("preview")).unwrap()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let plan: StreamPlan = serde_json::from_value(body).unwrap();
+        assert_eq!(plan.status, PlanStatus::Placed);
+        assert_eq!(plan.nodes, ["strom-node-1", "strom-node-2"]);
+        assert_eq!(plan.hops.len(), 2);
+        assert!(plan.endpoints.is_some());
+        assert_eq!(mem.upsert_stream_calls(), 0);
+        assert!(state.streams.read().await.is_empty());
+        assert!(state.desired.read().await.is_empty());
+        assert!(state.view.read().await.streams.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_distinguishes_unplaced_and_disabled_streams() {
+        let (state, mem) = mem_state();
+        let app = open_router(state);
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v4/stream-plans",
+            Some(serde_json::to_value(stream("unplaced")).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let plan: StreamPlan = serde_json::from_value(body).unwrap();
+        assert_eq!(plan.status, PlanStatus::Unplaced);
+        assert!(plan.hops.is_empty());
+        assert!(plan.reason.unwrap().contains("not registered"));
+
+        let mut disabled = stream("disabled");
+        disabled.enabled = false;
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v4/stream-plans",
+            Some(serde_json::to_value(disabled).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let plan: StreamPlan = serde_json::from_value(body).unwrap();
+        assert_eq!(plan.status, PlanStatus::Disabled);
+        assert!(plan.hops.is_empty());
+        assert!(plan.reason.is_none());
+        assert_eq!(mem.upsert_stream_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn plan_allocates_ports_alongside_existing_streams() {
+        let (state, mem) = mem_state();
+        let app = open_router(state);
+        for mut registration in [
+            node_registration("strom-node-1", "172.26.0.10"),
+            node_registration("strom-node-2", "172.27.0.10"),
+        ] {
+            registration.node.capabilities.port_range = Some(PortRange {
+                start: 7000,
+                end: 7000,
+            });
+            send(
+                &app,
+                "POST",
+                "/v4/nodes/register",
+                Some(serde_json::to_value(registration).unwrap()),
+            )
+            .await;
+        }
+        send(
+            &app,
+            "POST",
+            "/v4/streams",
+            Some(serde_json::to_value(stream("existing")).unwrap()),
+        )
+        .await;
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v4/stream-plans",
+            Some(serde_json::to_value(stream("preview")).unwrap()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let plan: StreamPlan = serde_json::from_value(body).unwrap();
+        assert_eq!(plan.status, PlanStatus::Unplaced);
+        assert!(plan.reason.unwrap().contains("no free port"));
+        assert_eq!(mem.upsert_stream_calls(), 1, "plan did not write a stream");
+        let (_, body) = send(&app, "GET", "/v4/streams", None).await;
+        let streams: Vec<StreamDefinition> = serde_json::from_value(body).unwrap();
+        assert_eq!(streams, [stream("existing")]);
     }
 
     #[tokio::test]
@@ -2269,9 +2448,10 @@ mod tests {
         (response.status(), challenge)
     }
 
-    const NORTH_ROUTES: [(&str, &str); 5] = [
+    const NORTH_ROUTES: [(&str, &str); 6] = [
         ("GET", "/v4/streams"),
         ("POST", "/v4/streams"),
+        ("POST", "/v4/stream-plans"),
         ("GET", "/v4/streams/basic"),
         ("DELETE", "/v4/streams/basic"),
         ("GET", "/v4/streams/basic/endpoints"),

@@ -1,7 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{PathStatus, ReconcileStatus, StreamEndpoints, ValidationIssue};
+use crate::{DesiredHop, PathStatus, ReconcileStatus, StreamEndpoints, ValidationIssue};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
@@ -76,6 +76,35 @@ pub struct NodeAccepted {
 #[serde(rename_all = "snake_case")]
 pub enum AcceptedState {
     Accepted,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StreamPlan {
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
+    pub name: String,
+    pub status: PlanStatus,
+    #[schemars(inner(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    ))]
+    pub nodes: Vec<String>,
+    pub hops: Vec<DesiredHop>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoints: Option<StreamEndpoints>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    Disabled,
+    Placed,
+    Unplaced,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

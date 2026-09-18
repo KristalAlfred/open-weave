@@ -1,0 +1,298 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "endpoints": {
+      "additionalProperties": false,
+      "properties": {
+        "ingress": {
+          "additionalProperties": false,
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "node": {
+              "type": "string"
+            },
+            "port": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "node",
+            "host",
+            "port",
+            "url"
+          ],
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "outputs": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "host": {
+                "type": "string"
+              },
+              "node": {
+                "type": "string"
+              },
+              "port": {
+                "format": "uint16",
+                "maximum": 65535,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "url": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "node",
+              "host",
+              "port",
+              "url"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "outputs"
+      ],
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "hops": {
+      "items": {
+        "description": "One provisioning unit placed on a single node: one ingress socket fanned out\n to one or more egress sockets (a sender tees to every destination).",
+        "properties": {
+          "egresses": {
+            "items": {
+              "description": "One identified output branch of a desired hop.",
+              "properties": {
+                "branch_id": {
+                  "type": "string"
+                },
+                "endpoint_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "host": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "params": {
+                  "properties": {
+                    "latency": {
+                      "format": "uint32",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  },
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "port": {
+                  "format": "uint16",
+                  "maximum": 65535,
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "role": {
+                  "enum": [
+                    "listen",
+                    "connect",
+                    "capture",
+                    "display"
+                  ],
+                  "type": "string"
+                },
+                "transport": {
+                  "enum": [
+                    "srt",
+                    "whip",
+                    "whep",
+                    "device"
+                  ],
+                  "type": "string"
+                },
+                "url": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "branch_id",
+                "transport",
+                "role"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "id": {
+            "type": "string"
+          },
+          "ingress": {
+            "additionalProperties": false,
+            "description": "Flat wire form of a [`SocketSpec`]: a `transport` and `role` naming the\n variant, plus the fields that variant carries.",
+            "properties": {
+              "endpoint_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "host": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "params": {
+                "properties": {
+                  "latency": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  }
+                },
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "port": {
+                "format": "uint16",
+                "maximum": 65535,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "role": {
+                "enum": [
+                  "listen",
+                  "connect",
+                  "capture",
+                  "display"
+                ],
+                "type": "string"
+              },
+              "transport": {
+                "enum": [
+                  "srt",
+                  "whip",
+                  "whep",
+                  "device"
+                ],
+                "type": "string"
+              },
+              "url": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "transport",
+              "role"
+            ],
+            "type": "object"
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "role": {
+            "enum": [
+              "sender",
+              "bridge",
+              "receiver"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "node_id",
+          "role",
+          "ingress",
+          "egresses"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "name": {
+      "maxLength": 63,
+      "minLength": 1,
+      "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+      "type": "string"
+    },
+    "nodes": {
+      "items": {
+        "maxLength": 63,
+        "minLength": 1,
+        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "enum": [
+        "disabled",
+        "placed",
+        "unplaced"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "status",
+    "nodes",
+    "hops"
+  ],
+  "title": "StreamPlan",
+  "type": "object"
+}

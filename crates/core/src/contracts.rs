@@ -5,8 +5,8 @@ use crate::{
     API_PREFIX, ApiError, DesiredHop, EndpointDescriptor, NodeAccepted, NodeDescriptor,
     NodeHeartbeat, NodeRegistration, ObservedState, ROUTE_ENDPOINTS, ROUTE_NODE_DESIRED,
     ROUTE_NODE_HEARTBEAT, ROUTE_NODE_REGISTER, ROUTE_NODES, ROUTE_STATE, ROUTE_STATUS,
-    ROUTE_STREAM, ROUTE_STREAM_ENDPOINTS, ROUTE_STREAMS, StatusResponse, StreamAccepted,
-    StreamDefinition, StreamEndpoints,
+    ROUTE_STREAM, ROUTE_STREAM_ENDPOINTS, ROUTE_STREAM_PLANS, ROUTE_STREAMS, StatusResponse,
+    StreamAccepted, StreamDefinition, StreamEndpoints, StreamPlan,
 };
 
 pub struct ContractArtifact {
@@ -24,6 +24,7 @@ pub fn artifacts() -> Vec<ContractArtifact> {
         schema_artifact::<StreamAccepted>("contracts/json-schema/v4/stream-accepted.json"),
         schema_artifact::<StreamDefinition>("contracts/json-schema/v4/stream-definition.json"),
         schema_artifact::<StreamEndpoints>("contracts/json-schema/v4/stream-endpoints.json"),
+        schema_artifact::<StreamPlan>("contracts/json-schema/v4/stream-plan.json"),
         schema_artifact::<NodeAccepted>("contracts/json-schema/v4/node-accepted.json"),
         schema_artifact::<NodeHeartbeat>("contracts/json-schema/v4/node-heartbeat.json"),
         schema_artifact::<NodeRegistration>("contracts/json-schema/v4/node-registration.json"),
@@ -178,6 +179,19 @@ pub fn northbound_openapi() -> Value {
                     }
                 }
             },
+            format!("{API_PREFIX}{ROUTE_STREAM_PLANS}"): {
+                "post": {
+                    "operationId": "planStream",
+                    "requestBody": request_body("StreamDefinition"),
+                    "responses": {
+                        "200": response("Stream placement plan", Some(schema_ref("StreamPlan"))),
+                        "400": error_response("Invalid stream"),
+                        "401": error_response("Authentication failed"),
+                        "500": error_response("Encoding failed"),
+                        "502": error_response("Controller unavailable")
+                    }
+                }
+            },
             format!("{API_PREFIX}{ROUTE_STATUS}"): {
                 "get": {
                     "operationId": "getStatus",
@@ -195,6 +209,7 @@ pub fn northbound_openapi() -> Value {
             ("StreamAccepted", schema::<StreamAccepted>()),
             ("StreamDefinition", schema::<StreamDefinition>()),
             ("StreamEndpoints", schema::<StreamEndpoints>()),
+            ("StreamPlan", schema::<StreamPlan>()),
             ("StreamList", schema::<Vec<StreamDefinition>>()),
         ]),
     )
@@ -328,6 +343,7 @@ mod tests {
             north_paths.keys().copied().collect::<Vec<_>>(),
             [
                 "/v4/status",
+                "/v4/stream-plans",
                 "/v4/streams",
                 "/v4/streams/{name}",
                 "/v4/streams/{name}/endpoints"

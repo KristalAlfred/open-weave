@@ -13,8 +13,8 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
 pub use api::{
-    AcceptedState, ApiError, ApiErrorCode, NodeAccepted, RunningStatus, StartingState,
-    StartingStatus, StatusResponse, StreamAccepted, StreamStatus,
+    AcceptedState, ApiError, ApiErrorCode, NodeAccepted, PlanStatus, RunningStatus, StartingState,
+    StartingStatus, StatusResponse, StreamAccepted, StreamPlan, StreamStatus,
 };
 pub use media::{
     AudioCodec, AudioConstraint, AudioFormat, ChromaSubsampling, Container, FormatConstraint,
@@ -49,6 +49,7 @@ pub const ROUTE_STATE: &str = "/state";
 pub const ROUTE_STATUS: &str = "/status";
 pub const ROUTE_STREAM: &str = "/streams/{name}";
 pub const ROUTE_STREAM_ENDPOINTS: &str = "/streams/{name}/endpoints";
+pub const ROUTE_STREAM_PLANS: &str = "/stream-plans";
 pub const ROUTE_STREAMS: &str = "/streams";
 
 /// Wire-protocol version an adapter declares when it registers.

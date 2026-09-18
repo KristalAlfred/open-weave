@@ -16,8 +16,8 @@ use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Guard, Token, require_bearer};
 use weave_core::{
     API_PREFIX, ApiError, ApiErrorCode, ROUTE_STATUS, ROUTE_STREAM, ROUTE_STREAM_ENDPOINTS,
-    ROUTE_STREAMS, StreamDefinition, ValidationIssue, resource_id_issue, validate_resource_id,
-    validate_stream,
+    ROUTE_STREAM_PLANS, ROUTE_STREAMS, StreamDefinition, ValidationIssue, resource_id_issue,
+    validate_resource_id, validate_stream,
 };
 
 const DEFAULT_ADDR: &str = "127.0.0.1:9080";
@@ -86,6 +86,7 @@ fn router(state: AppState, guard: Guard) -> Router {
         .route(ROUTE_STREAMS, get(list_streams).post(submit_stream))
         .route(ROUTE_STREAM, get(get_stream).delete(delete_stream))
         .route(ROUTE_STREAM_ENDPOINTS, get(get_endpoints))
+        .route(ROUTE_STREAM_PLANS, axum::routing::post(plan_stream))
         .route(ROUTE_STATUS, get(get_status))
         .fallback(api_route_not_found)
         .method_not_allowed_fallback(api_method_not_allowed)
@@ -162,6 +163,38 @@ async fn submit_stream(
         }
     };
     proxy(&state, reqwest::Method::POST, "/streams", Some(body.into())).await
+}
+
+async fn plan_stream(
+    State(state): State<AppState>,
+    payload: Result<Json<StreamDefinition>, JsonRejection>,
+) -> Response {
+    let Json(stream) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return invalid_json(rejection),
+    };
+    let issues = validate_stream(&stream);
+    if !issues.is_empty() {
+        return invalid_request("stream validation failed", issues);
+    }
+    let body = match serde_json::to_vec(&stream) {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::error!(%err, "serializing validated stream plan failed");
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiErrorCode::EncodingFailed,
+                "failed to encode stream",
+            );
+        }
+    };
+    proxy(
+        &state,
+        reqwest::Method::POST,
+        ROUTE_STREAM_PLANS,
+        Some(body.into()),
+    )
+    .await
 }
 
 async fn delete_stream(State(state): State<AppState>, Path(name): Path<String>) -> Response {
@@ -472,6 +505,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plan_forwards_body_and_passes_status_through() {
+        let (url, captured) = stub_controller(StatusCode::OK).await;
+        let app = open_app(url);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v4/stream-plans")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&sample_stream()).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let seen = captured.lock().unwrap().clone().expect("forwarded");
+        assert_eq!(seen.method, "POST");
+        assert_eq!(seen.path, "/v4/stream-plans");
+        assert_eq!(
+            serde_json::from_slice::<StreamDefinition>(&seen.body).unwrap(),
+            sample_stream()
+        );
+    }
+
+    #[tokio::test]
     async fn delete_forwards_method_and_path() {
         let (url, captured) = stub_controller(StatusCode::NO_CONTENT).await;
         let app = open_app(url);
@@ -600,22 +660,25 @@ mod tests {
             port: 9000,
         });
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v4/streams")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&stream).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = body_json(response).await;
-        assert_eq!(body["code"], "invalid_request");
-        assert_eq!(body["details"][0]["field"], "destinations[0].srt");
-        assert_eq!(body["details"][0]["code"], "mutually_exclusive");
+        for uri in ["/v4/streams", "/v4/stream-plans"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&stream).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = body_json(response).await;
+            assert_eq!(body["code"], "invalid_request");
+            assert_eq!(body["details"][0]["field"], "destinations[0].srt");
+            assert_eq!(body["details"][0]["code"], "mutually_exclusive");
+        }
         assert!(
             captured.lock().unwrap().is_none(),
             "invalid stream never reaches the controller"
@@ -732,24 +795,28 @@ mod tests {
         for (method, uri) in [
             ("GET", "/streams"),
             ("POST", "/streams"),
+            ("POST", "/stream-plans"),
             ("GET", "/streams/basic"),
             ("DELETE", "/streams/basic"),
             ("GET", "/streams/basic/endpoints"),
             ("GET", "/status"),
             ("GET", "/v1/streams"),
             ("POST", "/v1/streams"),
+            ("POST", "/v1/stream-plans"),
             ("GET", "/v1/streams/basic"),
             ("DELETE", "/v1/streams/basic"),
             ("GET", "/v1/streams/basic/endpoints"),
             ("GET", "/v1/status"),
             ("GET", "/v2/streams"),
             ("POST", "/v2/streams"),
+            ("POST", "/v2/stream-plans"),
             ("GET", "/v2/streams/basic"),
             ("DELETE", "/v2/streams/basic"),
             ("GET", "/v2/streams/basic/endpoints"),
             ("GET", "/v2/status"),
             ("GET", "/v3/streams"),
             ("POST", "/v3/streams"),
+            ("POST", "/v3/stream-plans"),
             ("GET", "/v3/streams/basic"),
             ("DELETE", "/v3/streams/basic"),
             ("GET", "/v3/streams/basic/endpoints"),
@@ -803,6 +870,11 @@ mod tests {
                 (
                     "POST",
                     "/v4/streams",
+                    Body::from(serde_json::to_vec(&sample_stream()).unwrap()),
+                ),
+                (
+                    "POST",
+                    "/v4/stream-plans",
                     Body::from(serde_json::to_vec(&sample_stream()).unwrap()),
                 ),
                 ("GET", "/v4/streams/basic", Body::empty()),
