@@ -350,6 +350,7 @@ pub(crate) mod tests {
             status: NodeStatus::Ready,
             endpoint: format!("http://{id}:8080"),
             capabilities: NodeCapabilities::default(),
+            topology: weave_core::NodeTopology::default(),
         }
     }
 

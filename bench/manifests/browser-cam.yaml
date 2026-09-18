@@ -6,6 +6,7 @@ source:
   device:
     node: browser-placeholder
 destinations:
-  - srt:
+  - id: output
+    srt:
       node: strom-node-1
       latency: 1000

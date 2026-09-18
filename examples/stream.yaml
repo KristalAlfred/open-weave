@@ -1,8 +1,5 @@
 # Fan-out demonstrating node-referenced addressing: destinations name their node
-# instead of a raw IP. The first uses the node's default data-plane address; the
-# second pins the `wan` alias. The controller resolves both at planning time and
-# assigns ports from each node's declared range. Their desired and observed hop
-# egresses are identified as destination-0 and destination-1.
+# instead of a raw IP. Stable destination ids identify each branch.
 name: cam1-to-studio
 enabled: true
 source:
@@ -10,23 +7,28 @@ source:
     node: strom-node-1
     latency: 200
 destinations:
-  - srt:
+  - id: studio
+    srt:
       node: strom-node-2
-  - srt:
+  - id: preview
+    srt:
       node: strom-node-2
-      network: wan
+      network: internet
   # A destination may instead dial out to an external SRT listener. No node
   # hosts it and no port is assigned; the sender just adds a caller egress.
-  # - srt:
+  # - id: remote
+  #   srt:
   #     remote:
   #       host: 198.51.100.5
   #       port: 9000
+  #       network: internet
   # A destination may pin the nodes it relays through, upstream-first. Each
   # becomes a bridge hop. Pins are policy — forcing traffic through a site — and
   # are honoured even when the link would have resolved directly. The controller
   # inserts a relay on its own when neither end of a link can be dialled, so NAT
   # traversal needs no pin.
-  # - srt:
+  # - id: relayed
+  #   srt:
   #     node: strom-node-2
   #     via: [edge-relay]
   # A destination may declare what it accepts. Each field lists tolerated values
@@ -34,7 +36,8 @@ destinations:
   # subsampling and sample rate, and nothing else. Pair it with `format` on the
   # source (what the producer sends) and a mismatch is reported on the stream —
   # it is not converted.
-  # - srt:
+  # - id: constrained
+  #   srt:
   #     node: strom-node-2
   #     accepts:
   #       video:

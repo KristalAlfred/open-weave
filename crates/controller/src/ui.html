@@ -211,11 +211,10 @@ function renderNodes(nodes) {
   if (!nodes.length) { root.className = "empty"; root.textContent = "no nodes registered"; return; }
   root.className = "";
   root.replaceChildren(...nodes.map(node => {
-    // An outbound-only address is marked; a dialable one is the unremarkable case.
-    const details = Object.entries(node.data_plane || {}).map(([alias, addr]) =>
-      `${alias} ${addr.host}${addr.reachability === "outbound_only" ? " (outbound-only)" : ""}`);
-    if (node.port_range) details.push(`ports ${node.port_range.start}–${node.port_range.end}`);
-    if (node.relay) details.push("relay");
+    const details = (node.topology.attachments || []).map(attachment => {
+      const listeners = Object.keys(attachment.listeners || {}).join(",");
+      return `${attachment.id} ${attachment.network}${attachment.dial ? " dial" : ""}${listeners ? ` listen:${listeners}` : ""}`;
+    });
     return h("div", "node",
       dot(node.status, node.status),
       h("span", "id", node.id),
@@ -237,7 +236,7 @@ function rate(hop) {
 
 function hopChip(hop) {
   const short = hop.role === "receiver"
-    ? hop.id.replace(/^weave-.*-(receiver-\d+)$/, "$1")
+    ? hop.id.replace(/^weave-.*-receiver-/, "receiver-")
     : hop.role;
   const reported = hop.state != null;
   const chip = h("span", "chip hop" + (reported ? "" : " unreported"),
@@ -285,14 +284,12 @@ function deviceChip(tag, socket) {
   return addrChip(tag, socket.mode === "capture" ? "camera" : "screen", "the node's own device");
 }
 
-// Bridges on destination `i`'s chain, upstream-first. A bridge id carries both
+// Bridges on a destination's chain, upstream-first. A bridge id carries both
 // the destination it serves and its position along that destination's chain.
-function bridgesFor(hops, i) {
+function bridgesFor(hops, id) {
   return hops
-    .map(hop => ({ hop, at: hop.id.match(/-bridge-(\d+)-(\d+)$/) }))
-    .filter(({ at }) => at && Number(at[1]) === i)
-    .sort((a, b) => Number(a.at[2]) - Number(b.at[2]))
-    .map(({ hop }) => hop);
+    .filter(hop => hop.role === "bridge" && hop.egresses.some(egress => egress.branch_id === id))
+    .sort((a, b) => a.id.localeCompare(b.id));
 }
 
 // A trunk line (ingress address -> sender), then one indented branch line per
@@ -309,19 +306,22 @@ function renderPath(stream) {
   if (sender) trunk.append(hopChip(sender));
   if (trunk.childNodes.length) path.append(trunk);
 
-  const outputs = endpoints ? endpoints.outputs : [];
-  const count = Math.max(outputs.length, sender ? sender.egresses.length : 0);
-  for (let i = 0; i < count; i++) {
+  const destinationEndpoints = endpoints ? endpoints.destinations : [];
+  const ids = [...new Set([
+    ...destinationEndpoints.map(destination => destination.id),
+    ...(sender ? sender.egresses.map(egress => egress.branch_id) : []),
+  ])].sort();
+  for (const id of ids) {
     const branch = h("div", "branch", h("span", "fork", "↳"));
-    const output = outputs[i];
-    let link = sender ? sender.egresses[i] : null;
-    for (const bridge of bridgesFor(downstream, i)) {
+    const output = destinationEndpoints.find(destination => destination.id === id)?.endpoint;
+    let link = sender ? sender.egresses.find(egress => egress.branch_id === id) : null;
+    for (const bridge of bridgesFor(downstream, id)) {
       branch.append(arrow(link), hopChip(bridge));
       link = bridge.egresses[0];
     }
     const receiver = output && output.node === ""
       ? null // remote destination: the chain dials out, no receiver hop
-      : downstream.find(r => r.id.endsWith(`-receiver-${i}`));
+      : downstream.find(r => r.id === `weave-${stream.name}-receiver-${id}`);
     if (receiver) {
       branch.append(arrow(link), hopChip(receiver));
       link = receiver.egresses[0];

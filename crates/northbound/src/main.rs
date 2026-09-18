@@ -409,7 +409,7 @@ mod tests {
     use http_body_util::BodyExt;
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
-    use weave_core::{RemoteAddr, SrtEndpoint, StreamTransport};
+    use weave_core::{RemoteAddr, SrtEndpoint, StreamDestination, StreamTransport};
 
     const TOKEN: &str = "northbound-test-token";
 
@@ -518,7 +518,10 @@ mod tests {
             name: "cam1-to-studio".to_string(),
             enabled: true,
             source: StreamTransport::Srt(node_ref("strom-node-1")),
-            destinations: vec![StreamTransport::Srt(node_ref("strom-node-2"))],
+            destinations: vec![StreamDestination {
+                id: "studio".to_string(),
+                endpoint: StreamTransport::Srt(node_ref("strom-node-2")),
+            }],
         }
     }
 
@@ -535,7 +538,7 @@ mod tests {
         let payload = json!({
             "name": "alice-cam",
             "source": { "device": { "node": "browser-a1b2" } },
-            "destinations": [ { "srt": { "node": "strom-node-2" } } ]
+            "destinations": [ { "id": "studio", "srt": { "node": "strom-node-2" } } ]
         });
         let response = app
             .oneshot(
@@ -563,7 +566,7 @@ mod tests {
         let payload = json!({
             "name": "alice-return",
             "source": { "srt": { "node": "strom-node-2" } },
-            "destinations": [ { "device": { "node": "  " } } ]
+            "destinations": [ { "id": "preview", "device": { "node": "  " } } ]
         });
         let response = app
             .oneshot(
@@ -964,12 +967,13 @@ mod tests {
         let app = open_app(url);
 
         let mut stream = sample_stream();
-        let StreamTransport::Srt(dest) = &mut stream.destinations[0] else {
+        let StreamTransport::Srt(dest) = &mut stream.destinations[0].endpoint else {
             unreachable!("fixture endpoint is srt");
         };
         dest.remote = Some(RemoteAddr {
             host: "198.51.100.5".to_string(),
             port: 9000,
+            network: "internet".to_string(),
         });
 
         for uri in ["/streams", "/stream-plans"] {

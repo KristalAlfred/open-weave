@@ -181,8 +181,7 @@ impl fmt::Display for Mismatch {
 /// A destination whose declared constraint the source format does not satisfy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct FormatConflict {
-    /// Index of the destination in the stream's list, as written in the manifest.
-    pub destination: usize,
+    pub destination: String,
     pub mismatches: Vec<Mismatch>,
 }
 

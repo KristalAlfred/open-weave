@@ -142,8 +142,7 @@ open one toward it. That asymmetry is load-bearing: adding a return route would
 silently delete the boundary and the `nat-*` manifests would start passing for
 the wrong reason.
 
-Node 1 is the only node advertising `relay: true`, so it is what the controller
-picks when a link needs transit.
+Node 1 has the SRT profile and network attachments needed to carry transit.
 
 Because a NAT'd node's sockets can only be dialled from inside its network, the
 bench carries a second pair of media endpoints (`producer-3`, `consumer-3`) on
@@ -192,14 +191,14 @@ the controller's discovery API.
 ```sh
 curl -s -H "Authorization: Bearer bench-northbound-token" \
   localhost:29082/streams/basic/endpoints | jq
-# { "ingress": {node,host,port,url}, "outputs": [{node,host,port,url}] }
+# { "ingress": {node,host,port,url}, "destinations": [{id,endpoint}] }
 ```
 
 `200` once placed, `503` while known-but-unplaced, `404` if unknown, `401`
 without the northbound token. The
-`scripts/endpoints.sh <stream> ingress|output|outputs [index]` helper polls this
-until placed and prints `host:port` — or, for `outputs`, how many receiver
-outputs the stream has, which is how `stream-up` knows how many consumers to
+`scripts/endpoints.sh <stream> ingress|destination|destinations [id]` polls this
+until placed and prints `host:port` — or, for `destinations`, how many receiver
+endpoints the stream has, which is how `stream-up` knows how many consumers to
 attach. It reads `WEAVE_NORTHBOUND_TOKEN` from its environment and fails fast on
 `401` rather than polling a rejected token.
 
@@ -229,10 +228,8 @@ encoder on arm64, so only Opus audio negotiates and the gateway flow stalls.
 `browser-stream` prints its status rather than waiting on it. `BACKLOG.md` has
 the item and what would fix it.
 
-Node 1 offers `whip [listen]` and `whep [listen]` and names the base URL
-browsers reach its signalling at (`strom.signalling_base` in
-`config/adapter-1.yaml`, one entry per data-plane alias; the adapter appends
-`/whip` and `/whep` and advertises the result on that alias). Southbound allows
+Node 1 advertises `whip-to-srt` and `srt-to-whep` profiles and declares the
+signalling listener bases in `config/adapter-1.yaml`. Southbound allows
 the page's origin with `WEAVE_SOUTHBOUND_CORS_ORIGIN=*`, a development value
 like the tokens.
 
@@ -255,11 +252,10 @@ pointing at it. Unpinned, every tab is a new node. Pass
 `just bench page 8000 guest-2` for a second, concurrent guest.
 
 A browser on the host generally cannot reach `172.26.0.10:8080`, so node 1
-advertises a second data-plane alias, `docker-host`, with the same SRT address
-as `default` and signalling at `localhost:28080` instead. The
+advertises a second attachment on the `docker-host` network, with the same SRT
+address and signalling at `localhost:28080`. The
 `browser-cam-host` manifest selects it with `network: docker-host` on the
-destination, and the planner resolves both the WHIP URL the page dials and the
-SRT output host from that one alias. With nothing dialling the SRT output the
+destination, and the page registers on that network. With nothing dialling the SRT output the
 stream reads `degraded`, which is the roll-up for a source that flows and a
 destination that does not.
 

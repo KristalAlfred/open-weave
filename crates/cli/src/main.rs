@@ -277,26 +277,30 @@ fn render_nodes(nodes: &[NodeDescriptor]) -> String {
     let rows = nodes
         .into_iter()
         .map(|node| {
-            let transports = if node.capabilities.transports.is_empty() {
-                "srt".to_string()
-            } else {
-                node.capabilities
-                    .transports
-                    .iter()
-                    .map(|offer| offer.name.name())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            };
+            let profiles = node
+                .capabilities
+                .hop_profiles
+                .iter()
+                .map(|profile| profile.id.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let networks = node
+                .topology
+                .attachments
+                .iter()
+                .map(|attachment| attachment.network.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
             vec![
                 node.id.clone(),
                 format!("{:?}", node.status).to_ascii_lowercase(),
                 node.endpoint.clone(),
-                transports,
-                node.capabilities.relay.to_string(),
+                profiles,
+                networks,
             ]
         })
         .collect();
-    table(&["ID", "STATUS", "ENDPOINT", "TRANSPORTS", "RELAY"], rows)
+    table(&["ID", "STATUS", "ENDPOINT", "PROFILES", "NETWORKS"], rows)
 }
 
 fn path_status_name(status: PathStatus) -> &'static str {
@@ -354,7 +358,7 @@ fn render_status(status: &StatusResponse) -> String {
 }
 
 fn render_endpoints(endpoints: &StreamEndpoints) -> String {
-    let mut rows = Vec::with_capacity(endpoints.outputs.len() + 1);
+    let mut rows = Vec::with_capacity(endpoints.destinations.len() + 1);
     rows.push(match &endpoints.ingress {
         Some(endpoint) => vec![
             "ingress".to_string(),
@@ -371,25 +375,24 @@ fn render_endpoints(endpoints: &StreamEndpoints) -> String {
     });
     rows.extend(
         endpoints
-            .outputs
+            .destinations
             .iter()
-            .enumerate()
-            .map(|(index, endpoint)| match endpoint {
+            .map(|destination| match &destination.endpoint {
                 Some(endpoint) => vec![
-                    "output".to_string(),
-                    index.to_string(),
+                    "destination".to_string(),
+                    destination.id.clone(),
                     endpoint.node.clone(),
                     endpoint.url.clone(),
                 ],
                 None => vec![
-                    "output".to_string(),
-                    index.to_string(),
+                    "destination".to_string(),
+                    destination.id.clone(),
                     "-".to_string(),
                     "-".to_string(),
                 ],
             }),
     );
-    table(&["ROLE", "INDEX", "NODE", "URL"], rows)
+    table(&["ROLE", "ID", "NODE", "URL"], rows)
 }
 
 fn render_stream_sets(stream_sets: &[StreamSetResource]) -> String {
@@ -909,7 +912,8 @@ mod tests {
     use serde_json::Value;
     use std::sync::{Arc, Mutex};
     use weave_core::{
-        ApiErrorCode, SrtEndpoint, StreamAccepted, StreamSetMemberResult, StreamTransport,
+        ApiErrorCode, SrtEndpoint, StreamAccepted, StreamDestination, StreamSetMemberResult,
+        StreamTransport,
     };
 
     #[test]
@@ -921,9 +925,11 @@ source:
     node: strom-node-1
     latency: 200
 destinations:
-  - srt:
+  - id: studio
+    srt:
       node: strom-node-2
-  - srt:
+  - id: preview
+    srt:
       node: strom-node-2
       network: wan
 "#;
@@ -946,7 +952,7 @@ destinations:
         );
         assert_eq!(stream.destinations.len(), 2);
         assert_eq!(
-            stream.destinations[1],
+            stream.destinations[1].endpoint,
             StreamTransport::Srt(SrtEndpoint {
                 node: Some("strom-node-2".to_string()),
                 remote: None,
@@ -1067,7 +1073,8 @@ streams:
     source:
       srt: { node: strom-node-1 }
     destinations:
-      - srt: { node: strom-node-2 }
+      - id: studio
+        srt: { node: strom-node-2 }
 "#;
         let apply = parse_stream_set(yaml).unwrap();
         assert!(!apply.prune);
@@ -1111,12 +1118,12 @@ streams:
                 "port": 20000,
                 "url": "srt://172.26.0.10:20000"
             },
-            "outputs": [null]
+            "destinations": [{ "id": "studio", "endpoint": null }]
         }))
         .unwrap();
         assert_eq!(
             render_endpoints(&endpoints),
-            "ROLE     INDEX  NODE          URL\ningress  -      strom-node-1  srt://172.26.0.10:20000\noutput   0      -             -"
+            "ROLE         ID      NODE          URL\ningress      -       strom-node-1  srt://172.26.0.10:20000\ndestination  studio  -             -"
         );
     }
 
@@ -1129,7 +1136,8 @@ source:
   srt:
     node: strom-node-1
 destinations:
-  - srt:
+  - id: studio
+    srt:
       node: strom-node-2
 "#;
 
@@ -1154,15 +1162,18 @@ destinations:
                 format: None,
                 accepts: None,
             }),
-            destinations: vec![StreamTransport::Srt(SrtEndpoint {
-                node: Some("strom-node-2".to_string()),
-                remote: None,
-                via: Vec::new(),
-                network: None,
-                latency: None,
-                format: None,
-                accepts: None,
-            })],
+            destinations: vec![StreamDestination {
+                id: "studio".to_string(),
+                endpoint: StreamTransport::Srt(SrtEndpoint {
+                    node: Some("strom-node-2".to_string()),
+                    remote: None,
+                    via: Vec::new(),
+                    network: None,
+                    latency: None,
+                    format: None,
+                    accepts: None,
+                }),
+            }],
         }
     }
 
@@ -1465,7 +1476,8 @@ destinations:
                 serde_json::json!([{
                     "id": "strom-node-1",
                     "endpoint": "http://strom-node-1:8091",
-                    "status": "ready"
+                    "status": "ready",
+                    "topology": { "attachments": [] }
                 }]),
                 "nodes",
             ),
@@ -1476,7 +1488,10 @@ destinations:
             ),
             (
                 "/streams/cam1-to-studio/endpoints",
-                serde_json::json!({ "ingress": null, "outputs": [null] }),
+                serde_json::json!({
+                    "ingress": null,
+                    "destinations": [{ "id": "studio", "endpoint": null }]
+                }),
                 "endpoints",
             ),
             ("/stream-sets", serde_json::json!([]), "stream-sets"),
@@ -1580,15 +1595,18 @@ destinations:
                 format: None,
                 accepts: None,
             }),
-            destinations: vec![StreamTransport::Srt(SrtEndpoint {
-                node: Some("also-missing".to_string()),
-                remote: None,
-                via: Vec::new(),
-                network: None,
-                latency: None,
-                format: None,
-                accepts: None,
-            })],
+            destinations: vec![StreamDestination {
+                id: "preview".to_string(),
+                endpoint: StreamTransport::Srt(SrtEndpoint {
+                    node: Some("also-missing".to_string()),
+                    remote: None,
+                    via: Vec::new(),
+                    network: None,
+                    latency: None,
+                    format: None,
+                    accepts: None,
+                }),
+            }],
         };
         let (url, seen) = stub_plan().await;
 

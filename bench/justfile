@@ -130,13 +130,16 @@ stream-up name="basic":
                  "so there is no ingress to feed. 'just bench status' shows registered nodes." >&2
             exit 1 ;;
     esac
-    outputs="$(WEAVE_NORTHBOUND_TOKEN={{nb_token}} bash {{scripts}}/endpoints.sh {{name}} outputs)"
+    outputs="$(WEAVE_NORTHBOUND_TOKEN={{nb_token}} bash {{scripts}}/endpoints.sh {{name}} destinations)"
+    ids="$(WEAVE_NORTHBOUND_TOKEN={{nb_token}} bash {{scripts}}/endpoints.sh {{name}} destination-ids)"
+    first="$(printf '%s\n' "$ids" | awk '{print $1}')"
+    second="$(printf '%s\n' "$ids" | awk '{print $2}')"
     echo "{{name}} placed with $outputs receiver output(s); attaching endpoints"
     just producer-up {{name}}
-    just consumer-up {{name}}
+    just consumer-up {{name}} "$first"
     # Only two consumer slots exist; say so rather than silently under-driving a
     # path, which would look like a stuck `degraded`.
-    if [ "$outputs" -ge 2 ]; then just consumer-2-up {{name}}; fi
+    if [ "$outputs" -ge 2 ]; then just consumer-2-up {{name}} "$second"; fi
     if [ "$outputs" -gt 2 ]; then
         echo "warning: {{name}} has $outputs outputs but the bench has 2 consumers;" \
              "outputs 2+ stay unattached and the stream will report degraded" >&2
@@ -195,10 +198,10 @@ producer-down:
 # Pass a stream name; the first output address is resolved via discovery.
 [doc("Start the external ffmpeg consumer (SRT caller pulling a receiver output).")]
 [group("media")]
-consumer-up stream="basic":
+consumer-up stream="basic" destination="output":
     #!/usr/bin/env bash
     set -euo pipefail
-    source="$(WEAVE_NORTHBOUND_TOKEN={{nb_token}} bash {{scripts}}/endpoints.sh {{stream}} output 0)"
+    source="$(WEAVE_NORTHBOUND_TOKEN={{nb_token}} bash {{scripts}}/endpoints.sh {{stream}} destination {{destination}})"
     svc="consumer$(bash {{scripts}}/inside.sh "$source")"
     echo "consumer: dialling $source from $svc"
     CONSUMER_SOURCE="$source" {{compose}} --profile consumer up -d "$svc"
@@ -212,10 +215,10 @@ consumer-down:
 # Pass a stream name; the second output address is resolved via discovery.
 [doc("Start a second external consumer, attached to a stream's output 1.")]
 [group("media")]
-consumer-2-up stream="fanout":
+consumer-2-up stream="fanout" destination="studio":
     #!/usr/bin/env bash
     set -euo pipefail
-    source="$(WEAVE_NORTHBOUND_TOKEN={{nb_token}} bash {{scripts}}/endpoints.sh {{stream}} output 1)"
+    source="$(WEAVE_NORTHBOUND_TOKEN={{nb_token}} bash {{scripts}}/endpoints.sh {{stream}} destination {{destination}})"
     CONSUMER_SOURCE_2="$source" {{compose}} --profile consumer up -d consumer-2
 
 # Stop and remove the second external consumer.
@@ -290,11 +293,11 @@ browser-down:
 [doc("Serve nodes/browser on localhost:<port> pinned to <seat>, for a browser on this host; prints the URL to open.")]
 [group("browser")]
 page port="8000" seat="guest-1":
-    @echo "open  http://localhost:{{port}}/#southbound={{sb}}&token={{sb_token}}&node={{seat}}"
+    @echo "open  http://localhost:{{port}}/#southbound={{sb}}&token={{sb_token}}&node={{seat}}&network=docker-host"
     python3 -m http.server {{port}} -d {{page_dir}} --bind 127.0.0.1
 
 # The stream a page on this host feeds: WHIP signalled at localhost:28080 via node
-# 1's `docker-host` alias, SRT out on the node subnet for open-live's Strom.
+# 1's `docker-host` attachment, SRT out on the node subnet for open-live's Strom.
 [doc("Apply browser-cam-host for <seat> (the id `just bench page` pinned); print its WHIP URL and SRT output.")]
 [group("browser")]
 host-cam seat="guest-1":
@@ -315,7 +318,7 @@ host-cam seat="guest-1":
         echo "browser-cam-host has no hop on {{seat}} yet — is that page registered? 'just bench status' lists nodes" >&2
         exit 1
     fi
-    out="$(WEAVE_NORTHBOUND_TOKEN={{nb_token}} bash {{scripts}}/endpoints.sh browser-cam-host output 0)"
+    out="$(WEAVE_NORTHBOUND_TOKEN={{nb_token}} bash {{scripts}}/endpoints.sh browser-cam-host destination output)"
     echo "page sends WHIP to:     $url"
     echo "open-live dials:        srt://$out?mode=caller  (listed by its weave provider)"
 

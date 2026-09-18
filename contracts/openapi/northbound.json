@@ -66,11 +66,10 @@
         "items": {
           "properties": {
             "capabilities": {
+              "additionalProperties": false,
               "default": {
                 "adapters": [],
-                "data_plane": {},
-                "relay": false,
-                "transports": []
+                "hop_profiles": []
               },
               "properties": {
                 "adapters": {
@@ -101,179 +100,160 @@
                   },
                   "type": "array"
                 },
-                "data_plane": {
-                  "additionalProperties": {
-                    "anyOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "properties": {
-                          "host": {
-                            "type": "string"
-                          },
-                          "reachability": {
-                            "default": "dialable",
-                            "description": "Whether peers can open a connection to an address, or the node behind it can\n only dial out. Planning reads this to decide which end of a link listens.",
-                            "oneOf": [
-                              {
-                                "const": "dialable",
-                                "description": "Peers can connect to this address.",
-                                "type": "string"
-                              },
-                              {
-                                "const": "outbound_only",
-                                "description": "Behind NAT or a firewall: this node must initiate every connection.",
-                                "type": "string"
-                              }
-                            ]
-                          },
-                          "signalling": {
+                "hop_profiles": {
+                  "default": [],
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "egress": {
+                        "anyOf": [
+                          {
                             "additionalProperties": false,
-                            "default": {},
-                            "description": "Base URLs a node serves WHIP and WHEP signalling at, per WebRTC transport.\n A transport with no base is not offered for hosting at that address.",
                             "properties": {
-                              "whep": {
-                                "type": [
-                                  "string",
-                                  "null"
-                                ]
+                              "roles": {
+                                "items": {
+                                  "description": "Which end of a link a socket is: `Listen` hosts and `Connect` dials.",
+                                  "enum": [
+                                    "listen",
+                                    "connect"
+                                  ],
+                                  "type": "string"
+                                },
+                                "minItems": 1,
+                                "type": "array"
                               },
-                              "whip": {
-                                "type": [
-                                  "string",
-                                  "null"
+                              "transport": {
+                                "description": "A transport that carries media between two nodes.",
+                                "oneOf": [
+                                  {
+                                    "enum": [
+                                      "srt"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  {
+                                    "const": "whip",
+                                    "description": "WebRTC ingest. The `Connect` end pushes media to the `Listen` end's\n signalling URL.",
+                                    "type": "string"
+                                  },
+                                  {
+                                    "const": "whep",
+                                    "description": "WebRTC playback. The `Connect` end pulls media from the `Listen` end's\n signalling URL.",
+                                    "type": "string"
+                                  }
                                 ]
                               }
                             },
-                            "type": "object"
-                          }
-                        },
-                        "required": [
-                          "host"
-                        ],
-                        "type": "object"
-                      }
-                    ]
-                  },
-                  "default": {},
-                  "description": "Data-plane addresses this node advertises, keyed by alias. The\n [`DEFAULT_DATA_PLANE_ALIAS`] entry serves node-referenced endpoints\n that pin no network.",
-                  "type": "object"
-                },
-                "devices": {
-                  "description": "Devices the node can capture from or display on.",
-                  "items": {
-                    "description": "The node's own capture or display device, where media starts or ends.",
-                    "enum": [
-                      "capture",
-                      "display"
-                    ],
-                    "type": "string"
-                  },
-                  "type": "array"
-                },
-                "port_range": {
-                  "description": "Inclusive port range the controller may assign from for this node's\n hops. A soft contract: bind failures surface as [`HopState::Failed`].",
-                  "properties": {
-                    "end": {
-                      "format": "uint16",
-                      "maximum": 65535,
-                      "minimum": 0,
-                      "type": "integer"
-                    },
-                    "start": {
-                      "format": "uint16",
-                      "maximum": 65535,
-                      "minimum": 0,
-                      "type": "integer"
-                    }
-                  },
-                  "required": [
-                    "start",
-                    "end"
-                  ],
-                  "type": [
-                    "object",
-                    "null"
-                  ]
-                },
-                "relay": {
-                  "default": false,
-                  "description": "Whether this node may carry transit for streams that neither terminate\n nor originate on it — the pool the planner draws a relay from when two\n endpoints cannot dial each other.",
-                  "type": "boolean"
-                },
-                "transports": {
-                  "default": [],
-                  "description": "Link transports this node offers, with the roles it can take.",
-                  "items": {
-                    "anyOf": [
-                      {
-                        "description": "A transport that carries media between two nodes.",
-                        "oneOf": [
-                          {
-                            "enum": [
-                              "srt"
+                            "required": [
+                              "transport",
+                              "roles"
                             ],
-                            "type": "string"
+                            "type": "object"
                           },
                           {
-                            "const": "whip",
-                            "description": "WebRTC ingest. The `Connect` end pushes media to the `Listen` end's\n signalling URL.",
-                            "type": "string"
-                          },
-                          {
-                            "const": "whep",
-                            "description": "WebRTC playback. The `Connect` end pulls media from the `Listen` end's\n signalling URL.",
-                            "type": "string"
+                            "additionalProperties": false,
+                            "properties": {
+                              "device": {
+                                "description": "The node's own capture or display device, where media starts or ends.",
+                                "enum": [
+                                  "capture",
+                                  "display"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "device"
+                            ],
+                            "type": "object"
                           }
                         ]
                       },
-                      {
-                        "properties": {
-                          "name": {
-                            "description": "A transport that carries media between two nodes.",
-                            "oneOf": [
-                              {
+                      "id": {
+                        "maxLength": 63,
+                        "minLength": 1,
+                        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                        "type": "string"
+                      },
+                      "ingress": {
+                        "anyOf": [
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "roles": {
+                                "items": {
+                                  "description": "Which end of a link a socket is: `Listen` hosts and `Connect` dials.",
+                                  "enum": [
+                                    "listen",
+                                    "connect"
+                                  ],
+                                  "type": "string"
+                                },
+                                "minItems": 1,
+                                "type": "array"
+                              },
+                              "transport": {
+                                "description": "A transport that carries media between two nodes.",
+                                "oneOf": [
+                                  {
+                                    "enum": [
+                                      "srt"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  {
+                                    "const": "whip",
+                                    "description": "WebRTC ingest. The `Connect` end pushes media to the `Listen` end's\n signalling URL.",
+                                    "type": "string"
+                                  },
+                                  {
+                                    "const": "whep",
+                                    "description": "WebRTC playback. The `Connect` end pulls media from the `Listen` end's\n signalling URL.",
+                                    "type": "string"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "transport",
+                              "roles"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "device": {
+                                "description": "The node's own capture or display device, where media starts or ends.",
                                 "enum": [
-                                  "srt"
+                                  "capture",
+                                  "display"
                                 ],
                                 "type": "string"
-                              },
-                              {
-                                "const": "whip",
-                                "description": "WebRTC ingest. The `Connect` end pushes media to the `Listen` end's\n signalling URL.",
-                                "type": "string"
-                              },
-                              {
-                                "const": "whep",
-                                "description": "WebRTC playback. The `Connect` end pulls media from the `Listen` end's\n signalling URL.",
-                                "type": "string"
                               }
-                            ]
-                          },
-                          "roles": {
-                            "default": [
-                              "listen",
-                              "connect"
-                            ],
-                            "items": {
-                              "description": "Which end of a link a socket is: `Listen` hosts and `Connect` dials.",
-                              "enum": [
-                                "listen",
-                                "connect"
-                              ],
-                              "type": "string"
                             },
-                            "minItems": 1,
-                            "type": "array"
+                            "required": [
+                              "device"
+                            ],
+                            "type": "object"
                           }
-                        },
-                        "required": [
-                          "name"
-                        ],
-                        "type": "object"
+                        ]
+                      },
+                      "max_egresses": {
+                        "format": "uint",
+                        "minimum": 1,
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
                       }
-                    ]
+                    },
+                    "required": [
+                      "id",
+                      "ingress",
+                      "egress"
+                    ],
+                    "type": "object"
                   },
                   "type": "array"
                 }
@@ -297,12 +277,124 @@
                 "offline"
               ],
               "type": "string"
+            },
+            "topology": {
+              "additionalProperties": false,
+              "properties": {
+                "attachments": {
+                  "default": [],
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "dial": {
+                        "default": false,
+                        "type": "boolean"
+                      },
+                      "id": {
+                        "maxLength": 63,
+                        "minLength": 1,
+                        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                        "type": "string"
+                      },
+                      "listeners": {
+                        "additionalProperties": false,
+                        "default": {},
+                        "properties": {
+                          "srt": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "host": {
+                                "type": "string"
+                              },
+                              "port_range": {
+                                "description": "Inclusive `[start, end]` range of ports a node offers for controller-side\n assignment.",
+                                "properties": {
+                                  "end": {
+                                    "format": "uint16",
+                                    "maximum": 65535,
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "start": {
+                                    "format": "uint16",
+                                    "maximum": 65535,
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "start",
+                                  "end"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "required": [
+                              "host",
+                              "port_range"
+                            ],
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "whep": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "base_url": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "base_url"
+                            ],
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "whip": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "base_url": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "base_url"
+                            ],
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "network": {
+                        "maxLength": 63,
+                        "minLength": 1,
+                        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "network"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              },
+              "type": "object"
             }
           },
           "required": [
             "id",
             "endpoint",
-            "status"
+            "status",
+            "topology"
           ],
           "type": "object"
         },
@@ -407,41 +499,75 @@
                       },
                       "type": "array"
                     },
-                    "endpoints": {
-                      "additionalProperties": false,
-                      "properties": {
-                        "ingress": {
-                          "additionalProperties": false,
-                          "properties": {
-                            "host": {
-                              "type": "string"
+                    "destinations": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "conditions": {
+                            "items": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "detail": {
+                                  "type": "string"
+                                },
+                                "last_transition_time": {
+                                  "format": "date-time",
+                                  "type": "string"
+                                },
+                                "reason": {
+                                  "enum": [
+                                    "placed",
+                                    "disabled",
+                                    "placement_failed",
+                                    "nodes_available",
+                                    "node_missing",
+                                    "node_offline",
+                                    "hops_ready",
+                                    "hops_pending",
+                                    "hop_failed",
+                                    "format_compatible",
+                                    "format_unknown",
+                                    "format_mismatch",
+                                    "media_flowing",
+                                    "awaiting_input",
+                                    "media_degraded",
+                                    "media_failed",
+                                    "media_idle",
+                                    "not_ready"
+                                  ],
+                                  "type": "string"
+                                },
+                                "status": {
+                                  "enum": [
+                                    "true",
+                                    "false",
+                                    "unknown"
+                                  ],
+                                  "type": "string"
+                                },
+                                "type": {
+                                  "enum": [
+                                    "placement_ready",
+                                    "nodes_available",
+                                    "hops_ready",
+                                    "format_compatible",
+                                    "media_flowing"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "type",
+                                "status",
+                                "reason",
+                                "detail",
+                                "last_transition_time"
+                              ],
+                              "type": "object"
                             },
-                            "node": {
-                              "type": "string"
-                            },
-                            "port": {
-                              "format": "uint16",
-                              "maximum": 65535,
-                              "minimum": 0,
-                              "type": "integer"
-                            },
-                            "url": {
-                              "type": "string"
-                            }
+                            "type": "array"
                           },
-                          "required": [
-                            "node",
-                            "host",
-                            "port",
-                            "url"
-                          ],
-                          "type": [
-                            "object",
-                            "null"
-                          ]
-                        },
-                        "outputs": {
-                          "items": {
+                          "endpoint": {
                             "additionalProperties": false,
                             "properties": {
                               "host": {
@@ -471,21 +597,101 @@
                               "null"
                             ]
                           },
-                          "type": "array"
-                        }
+                          "id": {
+                            "maxLength": 63,
+                            "minLength": 1,
+                            "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                            "type": "string"
+                          },
+                          "nodes": {
+                            "items": {
+                              "maxLength": 63,
+                              "minLength": 1,
+                              "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "status": {
+                            "description": "End-to-end status of a path, derived from its hops' conditions.",
+                            "oneOf": [
+                              {
+                                "const": "idle",
+                                "description": "The path is disabled.",
+                                "type": "string"
+                              },
+                              {
+                                "const": "failed",
+                                "description": "At least one hop failed to provision.",
+                                "type": "string"
+                              },
+                              {
+                                "const": "pending",
+                                "description": "A hop is still provisioning or has not reported yet.",
+                                "type": "string"
+                              },
+                              {
+                                "const": "awaiting_input",
+                                "description": "Provisioned end to end, but no media is entering at the source.",
+                                "type": "string"
+                              },
+                              {
+                                "const": "degraded",
+                                "description": "Media is entering at the source but not flowing all the way through.",
+                                "type": "string"
+                              },
+                              {
+                                "const": "flowing",
+                                "description": "Media is flowing across every hop.",
+                                "type": "string"
+                              }
+                            ]
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "status",
+                          "nodes",
+                          "conditions"
+                        ],
+                        "type": "object"
                       },
-                      "required": [
-                        "outputs"
-                      ],
-                      "type": [
-                        "object",
-                        "null"
-                      ]
+                      "type": "array"
                     },
                     "generation": {
                       "format": "uint64",
                       "minimum": 1,
                       "type": "integer"
+                    },
+                    "ingress": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "host": {
+                          "type": "string"
+                        },
+                        "node": {
+                          "type": "string"
+                        },
+                        "port": {
+                          "format": "uint16",
+                          "maximum": 65535,
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "url": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "node",
+                        "host",
+                        "port",
+                        "url"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
                     },
                     "name": {
                       "maxLength": 63,
@@ -551,7 +757,8 @@
                     "generation",
                     "status",
                     "nodes",
-                    "conditions"
+                    "conditions",
+                    "destinations"
                   ],
                   "type": "object"
                 },
@@ -612,10 +819,9 @@
         "properties": {
           "destinations": {
             "items": {
-              "description": "Transport carrying a stream endpoint. Externally tagged by transport name.",
+              "description": "One stable, named output branch of a stream.",
               "oneOf": [
                 {
-                  "additionalProperties": false,
                   "properties": {
                     "srt": {
                       "additionalProperties": false,
@@ -916,7 +1122,7 @@
                           ]
                         },
                         "network": {
-                          "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                          "description": "Shared network constraint for a node endpoint. Absent lets the planner\n choose an attachment.",
                           "type": [
                             "string",
                             "null"
@@ -939,6 +1145,12 @@
                             "host": {
                               "type": "string"
                             },
+                            "network": {
+                              "maxLength": 63,
+                              "minLength": 1,
+                              "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                              "type": "string"
+                            },
                             "port": {
                               "format": "uint16",
                               "maximum": 65535,
@@ -948,7 +1160,8 @@
                           },
                           "required": [
                             "host",
-                            "port"
+                            "port",
+                            "network"
                           ],
                           "type": [
                             "object",
@@ -975,7 +1188,6 @@
                   "type": "object"
                 },
                 {
-                  "additionalProperties": false,
                   "description": "The media starts or ends at a node's own capture or display device: a\n camera when this is the source, a screen when it is a destination. The\n controller chooses the transport that carries it to or from the node.",
                   "properties": {
                     "device": {
@@ -983,7 +1195,7 @@
                       "description": "An endpoint that is nothing but a node: the node itself produces or consumes\n the media, so there is no address, latency, or format to declare.",
                       "properties": {
                         "network": {
-                          "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                          "description": "Shared network constraint. Absent lets the planner choose an attachment.",
                           "type": [
                             "string",
                             "null"
@@ -1007,7 +1219,20 @@
                   ],
                   "type": "object"
                 }
-              ]
+              ],
+              "properties": {
+                "id": {
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object",
+              "unevaluatedProperties": false
             },
             "minItems": 1,
             "type": "array"
@@ -1327,7 +1552,7 @@
                         ]
                       },
                       "network": {
-                        "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                        "description": "Shared network constraint for a node endpoint. Absent lets the planner\n choose an attachment.",
                         "type": [
                           "string",
                           "null"
@@ -1350,6 +1575,12 @@
                           "host": {
                             "type": "string"
                           },
+                          "network": {
+                            "maxLength": 63,
+                            "minLength": 1,
+                            "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                            "type": "string"
+                          },
                           "port": {
                             "format": "uint16",
                             "maximum": 65535,
@@ -1359,7 +1590,8 @@
                         },
                         "required": [
                           "host",
-                          "port"
+                          "port",
+                          "network"
                         ],
                         "type": [
                           "object",
@@ -1394,7 +1626,7 @@
                     "description": "An endpoint that is nothing but a node: the node itself produces or consumes\n the media, so there is no address, latency, or format to declare.",
                     "properties": {
                       "network": {
-                        "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                        "description": "Shared network constraint. Absent lets the planner choose an attachment.",
                         "type": [
                           "string",
                           "null"
@@ -1433,6 +1665,54 @@
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
         "properties": {
+          "destinations": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "endpoint": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "host": {
+                      "type": "string"
+                    },
+                    "node": {
+                      "type": "string"
+                    },
+                    "port": {
+                      "format": "uint16",
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "url": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "node",
+                    "host",
+                    "port",
+                    "url"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "id": {
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
           "ingress": {
             "additionalProperties": false,
             "properties": {
@@ -1462,43 +1742,10 @@
               "object",
               "null"
             ]
-          },
-          "outputs": {
-            "items": {
-              "additionalProperties": false,
-              "properties": {
-                "host": {
-                  "type": "string"
-                },
-                "node": {
-                  "type": "string"
-                },
-                "port": {
-                  "format": "uint16",
-                  "maximum": 65535,
-                  "minimum": 0,
-                  "type": "integer"
-                },
-                "url": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "node",
-                "host",
-                "port",
-                "url"
-              ],
-              "type": [
-                "object",
-                "null"
-              ]
-            },
-            "type": "array"
           }
         },
         "required": [
-          "outputs"
+          "destinations"
         ],
         "title": "StreamEndpoints",
         "type": "object"
@@ -1528,10 +1775,9 @@
               "properties": {
                 "destinations": {
                   "items": {
-                    "description": "Transport carrying a stream endpoint. Externally tagged by transport name.",
+                    "description": "One stable, named output branch of a stream.",
                     "oneOf": [
                       {
-                        "additionalProperties": false,
                         "properties": {
                           "srt": {
                             "additionalProperties": false,
@@ -1832,7 +2078,7 @@
                                 ]
                               },
                               "network": {
-                                "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                                "description": "Shared network constraint for a node endpoint. Absent lets the planner\n choose an attachment.",
                                 "type": [
                                   "string",
                                   "null"
@@ -1855,6 +2101,12 @@
                                   "host": {
                                     "type": "string"
                                   },
+                                  "network": {
+                                    "maxLength": 63,
+                                    "minLength": 1,
+                                    "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                                    "type": "string"
+                                  },
                                   "port": {
                                     "format": "uint16",
                                     "maximum": 65535,
@@ -1864,7 +2116,8 @@
                                 },
                                 "required": [
                                   "host",
-                                  "port"
+                                  "port",
+                                  "network"
                                 ],
                                 "type": [
                                   "object",
@@ -1891,7 +2144,6 @@
                         "type": "object"
                       },
                       {
-                        "additionalProperties": false,
                         "description": "The media starts or ends at a node's own capture or display device: a\n camera when this is the source, a screen when it is a destination. The\n controller chooses the transport that carries it to or from the node.",
                         "properties": {
                           "device": {
@@ -1899,7 +2151,7 @@
                             "description": "An endpoint that is nothing but a node: the node itself produces or consumes\n the media, so there is no address, latency, or format to declare.",
                             "properties": {
                               "network": {
-                                "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                                "description": "Shared network constraint. Absent lets the planner choose an attachment.",
                                 "type": [
                                   "string",
                                   "null"
@@ -1923,7 +2175,20 @@
                         ],
                         "type": "object"
                       }
-                    ]
+                    ],
+                    "properties": {
+                      "id": {
+                        "maxLength": 63,
+                        "minLength": 1,
+                        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id"
+                    ],
+                    "type": "object",
+                    "unevaluatedProperties": false
                   },
                   "minItems": 1,
                   "type": "array"
@@ -2243,7 +2508,7 @@
                               ]
                             },
                             "network": {
-                              "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                              "description": "Shared network constraint for a node endpoint. Absent lets the planner\n choose an attachment.",
                               "type": [
                                 "string",
                                 "null"
@@ -2266,6 +2531,12 @@
                                 "host": {
                                   "type": "string"
                                 },
+                                "network": {
+                                  "maxLength": 63,
+                                  "minLength": 1,
+                                  "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                                  "type": "string"
+                                },
                                 "port": {
                                   "format": "uint16",
                                   "maximum": 65535,
@@ -2275,7 +2546,8 @@
                               },
                               "required": [
                                 "host",
-                                "port"
+                                "port",
+                                "network"
                               ],
                               "type": [
                                 "object",
@@ -2310,7 +2582,7 @@
                           "description": "An endpoint that is nothing but a node: the node itself produces or consumes\n the media, so there is no address, latency, or format to declare.",
                           "properties": {
                             "network": {
-                              "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                              "description": "Shared network constraint. Absent lets the planner choose an attachment.",
                               "type": [
                                 "string",
                                 "null"
@@ -2361,6 +2633,54 @@
           "endpoints": {
             "additionalProperties": false,
             "properties": {
+              "destinations": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "endpoint": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "host": {
+                          "type": "string"
+                        },
+                        "node": {
+                          "type": "string"
+                        },
+                        "port": {
+                          "format": "uint16",
+                          "maximum": 65535,
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "url": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "node",
+                        "host",
+                        "port",
+                        "url"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "id": {
+                      "maxLength": 63,
+                      "minLength": 1,
+                      "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
               "ingress": {
                 "additionalProperties": false,
                 "properties": {
@@ -2390,43 +2710,10 @@
                   "object",
                   "null"
                 ]
-              },
-              "outputs": {
-                "items": {
-                  "additionalProperties": false,
-                  "properties": {
-                    "host": {
-                      "type": "string"
-                    },
-                    "node": {
-                      "type": "string"
-                    },
-                    "port": {
-                      "format": "uint16",
-                      "maximum": 65535,
-                      "minimum": 0,
-                      "type": "integer"
-                    },
-                    "url": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "node",
-                    "host",
-                    "port",
-                    "url"
-                  ],
-                  "type": [
-                    "object",
-                    "null"
-                  ]
-                },
-                "type": "array"
               }
             },
             "required": [
-              "outputs"
+              "destinations"
             ],
             "type": [
               "object",
@@ -2593,6 +2880,9 @@
                 "node_id": {
                   "type": "string"
                 },
+                "profile_id": {
+                  "type": "string"
+                },
                 "role": {
                   "enum": [
                     "sender",
@@ -2605,6 +2895,7 @@
               "required": [
                 "id",
                 "node_id",
+                "profile_id",
                 "role",
                 "ingress",
                 "egresses"
@@ -2676,10 +2967,9 @@
             "properties": {
               "destinations": {
                 "items": {
-                  "description": "Transport carrying a stream endpoint. Externally tagged by transport name.",
+                  "description": "One stable, named output branch of a stream.",
                   "oneOf": [
                     {
-                      "additionalProperties": false,
                       "properties": {
                         "srt": {
                           "additionalProperties": false,
@@ -2980,7 +3270,7 @@
                               ]
                             },
                             "network": {
-                              "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                              "description": "Shared network constraint for a node endpoint. Absent lets the planner\n choose an attachment.",
                               "type": [
                                 "string",
                                 "null"
@@ -3003,6 +3293,12 @@
                                 "host": {
                                   "type": "string"
                                 },
+                                "network": {
+                                  "maxLength": 63,
+                                  "minLength": 1,
+                                  "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                                  "type": "string"
+                                },
                                 "port": {
                                   "format": "uint16",
                                   "maximum": 65535,
@@ -3012,7 +3308,8 @@
                               },
                               "required": [
                                 "host",
-                                "port"
+                                "port",
+                                "network"
                               ],
                               "type": [
                                 "object",
@@ -3039,7 +3336,6 @@
                       "type": "object"
                     },
                     {
-                      "additionalProperties": false,
                       "description": "The media starts or ends at a node's own capture or display device: a\n camera when this is the source, a screen when it is a destination. The\n controller chooses the transport that carries it to or from the node.",
                       "properties": {
                         "device": {
@@ -3047,7 +3343,7 @@
                           "description": "An endpoint that is nothing but a node: the node itself produces or consumes\n the media, so there is no address, latency, or format to declare.",
                           "properties": {
                             "network": {
-                              "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                              "description": "Shared network constraint. Absent lets the planner choose an attachment.",
                               "type": [
                                 "string",
                                 "null"
@@ -3071,7 +3367,20 @@
                       ],
                       "type": "object"
                     }
-                  ]
+                  ],
+                  "properties": {
+                    "id": {
+                      "maxLength": 63,
+                      "minLength": 1,
+                      "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id"
+                  ],
+                  "type": "object",
+                  "unevaluatedProperties": false
                 },
                 "minItems": 1,
                 "type": "array"
@@ -3391,7 +3700,7 @@
                             ]
                           },
                           "network": {
-                            "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                            "description": "Shared network constraint for a node endpoint. Absent lets the planner\n choose an attachment.",
                             "type": [
                               "string",
                               "null"
@@ -3414,6 +3723,12 @@
                               "host": {
                                 "type": "string"
                               },
+                              "network": {
+                                "maxLength": 63,
+                                "minLength": 1,
+                                "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                                "type": "string"
+                              },
                               "port": {
                                 "format": "uint16",
                                 "maximum": 65535,
@@ -3423,7 +3738,8 @@
                             },
                             "required": [
                               "host",
-                              "port"
+                              "port",
+                              "network"
                             ],
                             "type": [
                               "object",
@@ -3458,7 +3774,7 @@
                         "description": "An endpoint that is nothing but a node: the node itself produces or consumes\n the media, so there is no address, latency, or format to declare.",
                         "properties": {
                           "network": {
-                            "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                            "description": "Shared network constraint. Absent lets the planner choose an attachment.",
                             "type": [
                               "string",
                               "null"
@@ -3587,10 +3903,9 @@
               "properties": {
                 "destinations": {
                   "items": {
-                    "description": "Transport carrying a stream endpoint. Externally tagged by transport name.",
+                    "description": "One stable, named output branch of a stream.",
                     "oneOf": [
                       {
-                        "additionalProperties": false,
                         "properties": {
                           "srt": {
                             "additionalProperties": false,
@@ -3891,7 +4206,7 @@
                                 ]
                               },
                               "network": {
-                                "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                                "description": "Shared network constraint for a node endpoint. Absent lets the planner\n choose an attachment.",
                                 "type": [
                                   "string",
                                   "null"
@@ -3914,6 +4229,12 @@
                                   "host": {
                                     "type": "string"
                                   },
+                                  "network": {
+                                    "maxLength": 63,
+                                    "minLength": 1,
+                                    "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                                    "type": "string"
+                                  },
                                   "port": {
                                     "format": "uint16",
                                     "maximum": 65535,
@@ -3923,7 +4244,8 @@
                                 },
                                 "required": [
                                   "host",
-                                  "port"
+                                  "port",
+                                  "network"
                                 ],
                                 "type": [
                                   "object",
@@ -3950,7 +4272,6 @@
                         "type": "object"
                       },
                       {
-                        "additionalProperties": false,
                         "description": "The media starts or ends at a node's own capture or display device: a\n camera when this is the source, a screen when it is a destination. The\n controller chooses the transport that carries it to or from the node.",
                         "properties": {
                           "device": {
@@ -3958,7 +4279,7 @@
                             "description": "An endpoint that is nothing but a node: the node itself produces or consumes\n the media, so there is no address, latency, or format to declare.",
                             "properties": {
                               "network": {
-                                "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                                "description": "Shared network constraint. Absent lets the planner choose an attachment.",
                                 "type": [
                                   "string",
                                   "null"
@@ -3982,7 +4303,20 @@
                         ],
                         "type": "object"
                       }
-                    ]
+                    ],
+                    "properties": {
+                      "id": {
+                        "maxLength": 63,
+                        "minLength": 1,
+                        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id"
+                    ],
+                    "type": "object",
+                    "unevaluatedProperties": false
                   },
                   "minItems": 1,
                   "type": "array"
@@ -4302,7 +4636,7 @@
                               ]
                             },
                             "network": {
-                              "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                              "description": "Shared network constraint for a node endpoint. Absent lets the planner\n choose an attachment.",
                               "type": [
                                 "string",
                                 "null"
@@ -4325,6 +4659,12 @@
                                 "host": {
                                   "type": "string"
                                 },
+                                "network": {
+                                  "maxLength": 63,
+                                  "minLength": 1,
+                                  "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                                  "type": "string"
+                                },
                                 "port": {
                                   "format": "uint16",
                                   "maximum": 65535,
@@ -4334,7 +4674,8 @@
                               },
                               "required": [
                                 "host",
-                                "port"
+                                "port",
+                                "network"
                               ],
                               "type": [
                                 "object",
@@ -4369,7 +4710,7 @@
                           "description": "An endpoint that is nothing but a node: the node itself produces or consumes\n the media, so there is no address, latency, or format to declare.",
                           "properties": {
                             "network": {
-                              "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                              "description": "Shared network constraint. Absent lets the planner choose an attachment.",
                               "type": [
                                 "string",
                                 "null"
@@ -4447,10 +4788,9 @@
                     "properties": {
                       "destinations": {
                         "items": {
-                          "description": "Transport carrying a stream endpoint. Externally tagged by transport name.",
+                          "description": "One stable, named output branch of a stream.",
                           "oneOf": [
                             {
-                              "additionalProperties": false,
                               "properties": {
                                 "srt": {
                                   "additionalProperties": false,
@@ -4751,7 +5091,7 @@
                                       ]
                                     },
                                     "network": {
-                                      "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                                      "description": "Shared network constraint for a node endpoint. Absent lets the planner\n choose an attachment.",
                                       "type": [
                                         "string",
                                         "null"
@@ -4774,6 +5114,12 @@
                                         "host": {
                                           "type": "string"
                                         },
+                                        "network": {
+                                          "maxLength": 63,
+                                          "minLength": 1,
+                                          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                                          "type": "string"
+                                        },
                                         "port": {
                                           "format": "uint16",
                                           "maximum": 65535,
@@ -4783,7 +5129,8 @@
                                       },
                                       "required": [
                                         "host",
-                                        "port"
+                                        "port",
+                                        "network"
                                       ],
                                       "type": [
                                         "object",
@@ -4810,7 +5157,6 @@
                               "type": "object"
                             },
                             {
-                              "additionalProperties": false,
                               "description": "The media starts or ends at a node's own capture or display device: a\n camera when this is the source, a screen when it is a destination. The\n controller chooses the transport that carries it to or from the node.",
                               "properties": {
                                 "device": {
@@ -4818,7 +5164,7 @@
                                   "description": "An endpoint that is nothing but a node: the node itself produces or consumes\n the media, so there is no address, latency, or format to declare.",
                                   "properties": {
                                     "network": {
-                                      "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                                      "description": "Shared network constraint. Absent lets the planner choose an attachment.",
                                       "type": [
                                         "string",
                                         "null"
@@ -4842,7 +5188,20 @@
                               ],
                               "type": "object"
                             }
-                          ]
+                          ],
+                          "properties": {
+                            "id": {
+                              "maxLength": 63,
+                              "minLength": 1,
+                              "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "id"
+                          ],
+                          "type": "object",
+                          "unevaluatedProperties": false
                         },
                         "minItems": 1,
                         "type": "array"
@@ -5162,7 +5521,7 @@
                                     ]
                                   },
                                   "network": {
-                                    "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                                    "description": "Shared network constraint for a node endpoint. Absent lets the planner\n choose an attachment.",
                                     "type": [
                                       "string",
                                       "null"
@@ -5185,6 +5544,12 @@
                                       "host": {
                                         "type": "string"
                                       },
+                                      "network": {
+                                        "maxLength": 63,
+                                        "minLength": 1,
+                                        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                                        "type": "string"
+                                      },
                                       "port": {
                                         "format": "uint16",
                                         "maximum": 65535,
@@ -5194,7 +5559,8 @@
                                     },
                                     "required": [
                                       "host",
-                                      "port"
+                                      "port",
+                                      "network"
                                     ],
                                     "type": [
                                       "object",
@@ -5229,7 +5595,7 @@
                                 "description": "An endpoint that is nothing but a node: the node itself produces or consumes\n the media, so there is no address, latency, or format to declare.",
                                 "properties": {
                                   "network": {
-                                    "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                                    "description": "Shared network constraint. Absent lets the planner choose an attachment.",
                                     "type": [
                                       "string",
                                       "null"
@@ -5316,10 +5682,9 @@
                   "properties": {
                     "destinations": {
                       "items": {
-                        "description": "Transport carrying a stream endpoint. Externally tagged by transport name.",
+                        "description": "One stable, named output branch of a stream.",
                         "oneOf": [
                           {
-                            "additionalProperties": false,
                             "properties": {
                               "srt": {
                                 "additionalProperties": false,
@@ -5620,7 +5985,7 @@
                                     ]
                                   },
                                   "network": {
-                                    "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                                    "description": "Shared network constraint for a node endpoint. Absent lets the planner\n choose an attachment.",
                                     "type": [
                                       "string",
                                       "null"
@@ -5643,6 +6008,12 @@
                                       "host": {
                                         "type": "string"
                                       },
+                                      "network": {
+                                        "maxLength": 63,
+                                        "minLength": 1,
+                                        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                                        "type": "string"
+                                      },
                                       "port": {
                                         "format": "uint16",
                                         "maximum": 65535,
@@ -5652,7 +6023,8 @@
                                     },
                                     "required": [
                                       "host",
-                                      "port"
+                                      "port",
+                                      "network"
                                     ],
                                     "type": [
                                       "object",
@@ -5679,7 +6051,6 @@
                             "type": "object"
                           },
                           {
-                            "additionalProperties": false,
                             "description": "The media starts or ends at a node's own capture or display device: a\n camera when this is the source, a screen when it is a destination. The\n controller chooses the transport that carries it to or from the node.",
                             "properties": {
                               "device": {
@@ -5687,7 +6058,7 @@
                                 "description": "An endpoint that is nothing but a node: the node itself produces or consumes\n the media, so there is no address, latency, or format to declare.",
                                 "properties": {
                                   "network": {
-                                    "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                                    "description": "Shared network constraint. Absent lets the planner choose an attachment.",
                                     "type": [
                                       "string",
                                       "null"
@@ -5711,7 +6082,20 @@
                             ],
                             "type": "object"
                           }
-                        ]
+                        ],
+                        "properties": {
+                          "id": {
+                            "maxLength": 63,
+                            "minLength": 1,
+                            "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "id"
+                        ],
+                        "type": "object",
+                        "unevaluatedProperties": false
                       },
                       "minItems": 1,
                       "type": "array"
@@ -6031,7 +6415,7 @@
                                   ]
                                 },
                                 "network": {
-                                  "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                                  "description": "Shared network constraint for a node endpoint. Absent lets the planner\n choose an attachment.",
                                   "type": [
                                     "string",
                                     "null"
@@ -6054,6 +6438,12 @@
                                     "host": {
                                       "type": "string"
                                     },
+                                    "network": {
+                                      "maxLength": 63,
+                                      "minLength": 1,
+                                      "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                                      "type": "string"
+                                    },
                                     "port": {
                                       "format": "uint16",
                                       "maximum": 65535,
@@ -6063,7 +6453,8 @@
                                   },
                                   "required": [
                                     "host",
-                                    "port"
+                                    "port",
+                                    "network"
                                   ],
                                   "type": [
                                     "object",
@@ -6098,7 +6489,7 @@
                               "description": "An endpoint that is nothing but a node: the node itself produces or consumes\n the media, so there is no address, latency, or format to declare.",
                               "properties": {
                                 "network": {
-                                  "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                                  "description": "Shared network constraint. Absent lets the planner choose an attachment.",
                                   "type": [
                                     "string",
                                     "null"

@@ -1,6 +1,6 @@
-# Both ends behind the same NAT, bridged through node 1.
-# Neither end can be dialled, so the controller inserts a bridge on node 1 (the
-# bench's only `relay: true` node) that both call out to. Source and destination
+# Both ends on the same NAT'd node, pinned through node 1.
+# Both node-3 hops call out to node 1. Automatic transit is covered by planner
+# tests with two separate dial-only routing domains.
 # are the same node because the bench has one NAT'd site; the media still
 # crosses the NAT twice, outbound each time, which is the mechanism two separate
 # NAT'd sites would rely on.
@@ -11,6 +11,8 @@ source:
     node: strom-node-3
     latency: 200
 destinations:
-  - srt:
+  - id: output
+    srt:
       node: strom-node-3
+      via: [strom-node-1]
       latency: 1000

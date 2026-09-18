@@ -18,12 +18,10 @@ any scenario can be driven end to end
 Addresses are not hardcoded: the recipes resolve them from the controller's
 discovery API (`GET :29082/streams/<name>/endpoints`, or the
 `scripts/endpoints.sh` helper) — the producer dials the reported `ingress` and
-each consumer dials an `outputs[]` entry. Fan-out has one output per destination,
-so a consumer attaches to each: `consumer-up <stream>` (output 0) and
-`consumer-2-up <stream>` (output 1).
+each consumer dials a `destinations[].endpoint` selected by stable id.
 
 `stream-up` does all of that in one step — it reads the output count from
-discovery (`endpoints.sh <stream> outputs`) and attaches that many consumers, so
+discovery (`endpoints.sh <stream> destinations`) and attaches that many consumers, so
 the "With producer + consumer" column below is what a bare `stream-up <name>`
 produces. The media endpoints are singletons, so driving a second stream takes
 them from the first.
@@ -50,7 +48,7 @@ not measured.
 | `format-ok` | declared source format the destination accepts | `awaiting_input` | — | `flowing` |
 | `format-mismatch` | 48 kHz source into a 44.1 kHz-only destination | `degraded` | — | `degraded` |
 | `browser-cam` | page camera → node-1 over WHIP, consumer pulls SRT | `degraded` (see note) | — | `degraded` (see note) |
-| `browser-cam-host` | camera of a page on the docker host → node-1 via the `docker-host` alias | `degraded` (see note) | — | — |
+| `browser-cam-host` | camera of a page on the docker host → node-1 via the `docker-host` network | `degraded` (see note) | — | — |
 | `browser-return` | producer → node-1 → page screen over WHEP | `awaiting_input` | `flowing` | `flowing` |
 
 Notes:
@@ -61,8 +59,9 @@ Notes:
   node with that id and it would converge — Kubernetes-style unschedulable.
 - **`fanout`**: the sender tees to both destinations (one srtsink per
   destination) and there is one receiver hop per destination —
-  `weave-fanout-receiver-0` on node-2 and `weave-fanout-receiver-1` on node-1,
-  co-located with the source. The `flowing` cell requires a consumer on each
+  `weave-fanout-receiver-studio` on node-2 and
+  `weave-fanout-receiver-preview` on node-1, co-located with the source. The
+  `flowing` cell requires a consumer on each
   receiver output at the same time (`consumer-up` + `consumer-2-up`); with the
   producer but no consumers it is `degraded`, and detaching either consumer drops
   it back to `degraded` (that receiver's egress falls to `connected`) — observed,
@@ -73,7 +72,7 @@ Notes:
   sends, read off `ffprobe` against a receiver output rather than assumed — the
   audio is **mono**, which `-i sine=...` gives you unless told otherwise.
   `format-mismatch` is degraded from the moment it is applied, before any media
-  exists, with `destination 0 cannot accept the source format: audio.sample_rate
+  exists, with `destination output cannot accept the source format: audio.sample_rate
   is 48000 but accepts 44100`. Driving it changes the reason not at all: every
   hop reports `flowing` on both sockets, because the bytes do arrive — at an
   endpoint that cannot use them. Nothing converts anything yet; the diagnosis is
@@ -89,12 +88,9 @@ Notes:
   - **`nat-ingress`** is the reversal. Observed sockets: the sender's egress on
     node 1 is `listen`, and node 3's receiver ingress is `connect` to
     `172.26.0.10`. Delivery into a NAT'd site costs a socket role, not a relay.
-  - **`nat-relay`** is the jump node. Observed: `weave-nat-relay-bridge-0-0` on
-    node 1 listens on *both* sockets while both node-3 hops dial out to it.
-    Removing `relay: true` from node 1 makes the stream unplaceable with
-    `no route from strom-node-3 to strom-node-3: neither can be dialled and no
-    relay node is available`, so the bridge is doing the work rather than
-    decorating a path that would have worked anyway.
+  - **`nat-relay`** pins node 1 as transit. Observed:
+    `weave-nat-relay-bridge-output-0` on node 1 listens on both sockets while
+    both node-3 hops dial out to it.
 
   Source and destination are the same node in `nat-relay` because the bench has
   one NAT'd site. The media still crosses the NAT twice, outbound each time,
@@ -107,8 +103,9 @@ Notes:
   encoder and decoder. `producer-up`/`consumer-up` pick the right container from
   the resolved address via `scripts/inside.sh`.
 
-- **`via`**: three hops — `weave-via-sender` on node-1, `weave-via-bridge-0-0`
-  on node-2, `weave-via-receiver-0` back on node-1 — so the media crosses both
+- **`via`**: three hops — `weave-via-sender` on node-1,
+  `weave-via-bridge-output-0` on node-2, `weave-via-receiver-output` back on
+  node-1 — so the media crosses both
   routers twice. Observed with every hop `flowing` on both sockets. The bridge is
   an ordinary Strom flow (`srtsrc` listener → `srtsink` caller); relaying needed
   no adapter change. Both nodes here are dialable, so this covers a `via` pin
@@ -127,7 +124,7 @@ Notes:
   at ~8 Mb/s).
 - **`browser-cam-host`**: `browser-cam` for a page in a browser on the docker
   host, which `just bench host-cam <seat>` fills in. Its destination names node
-  1's `docker-host` alias, so the page is told to signal at `localhost:28080`
+  1's `docker-host` attachment, so the page is told to signal at `localhost:28080`
   while the SRT output stays on `172.26.0.10` (`bench/README.md`, "A page in
   your own browser"). Applied for the in-bench page it stays `pending`: that
   page's hop fails with `Failed to fetch`, because `localhost` in its container

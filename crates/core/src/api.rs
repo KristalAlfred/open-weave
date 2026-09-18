@@ -2,7 +2,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DesiredHop, PathStatus, ReconcileStatus, StreamDefinition, StreamEndpoints, ValidationIssue,
+    DesiredHop, EndpointAddr, PathStatus, ReconcileStatus, StreamDefinition, StreamEndpoints,
+    ValidationIssue,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -51,8 +52,26 @@ pub struct StreamStatus {
     ))]
     pub nodes: Vec<String>,
     pub conditions: Vec<StreamCondition>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub endpoints: Option<StreamEndpoints>,
+    pub ingress: Option<EndpointAddr>,
+    pub destinations: Vec<StreamDestinationStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StreamDestinationStatus {
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
+    pub id: String,
+    pub status: PathStatus,
+    #[schemars(inner(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    ))]
+    pub nodes: Vec<String>,
+    pub conditions: Vec<StreamCondition>,
+    pub endpoint: Option<EndpointAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

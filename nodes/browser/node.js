@@ -2,7 +2,7 @@
 
 // Must equal weave_core::PROTOCOL_VERSION; check.mjs reads this line and
 // compares it with the constant in crates/core.
-const PROTOCOL_VERSION = 3;
+const PROTOCOL_VERSION = 4;
 const HEARTBEAT_MS = 5000;
 const POLL_MS = 2000;
 const STALL_POLLS = 3;
@@ -30,6 +30,7 @@ function readConfig() {
     token: params.get("token") || "",
     media: params.get("media") === "video" ? { video: true } : { video: true, audio: true },
     node: params.get("node") || "",
+    network: params.get("network") || "internet",
   };
 }
 
@@ -73,13 +74,23 @@ function registration() {
       status: "ready",
       capabilities: {
         adapters: [],
-        transports: [
-          { name: "whip", roles: ["connect"] },
-          { name: "whep", roles: ["connect"] },
+        hop_profiles: [
+          {
+            id: "camera-to-whip",
+            ingress: { device: "capture" },
+            egress: { transport: "whip", roles: ["connect"] },
+            max_egresses: 1,
+          },
+          {
+            id: "whep-to-display",
+            ingress: { transport: "whep", roles: ["connect"] },
+            egress: { device: "display" },
+            max_egresses: 1,
+          },
         ],
-        devices: ["capture", "display"],
-        data_plane: { default: { host: "browser", reachability: "outbound_only" } },
-        relay: false,
+      },
+      topology: {
+        attachments: [{ id: "client", network: config.network, dial: true, listeners: {} }],
       },
     },
     endpoints: [],
@@ -222,10 +233,18 @@ class Hop {
       );
     }
     const egress = spec.egresses[0];
-    if (spec.ingress.transport === DEVICE_TRANSPORT && egress.transport === "whip") {
+    if (
+      spec.profile_id === "camera-to-whip" &&
+      spec.ingress.transport === DEVICE_TRANSPORT &&
+      egress.transport === "whip"
+    ) {
       return new SenderHop(spec);
     }
-    if (spec.ingress.transport === "whep" && egress.transport === DEVICE_TRANSPORT) {
+    if (
+      spec.profile_id === "whep-to-display" &&
+      spec.ingress.transport === "whep" &&
+      egress.transport === DEVICE_TRANSPORT
+    ) {
       return new ReceiverHop(spec);
     }
     return new UnsupportedHop(spec);

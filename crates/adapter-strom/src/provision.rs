@@ -293,10 +293,10 @@ pub fn webrtc_condition(
 /// falling back to the wildcard when the node declares none; a socket carrying
 /// no address of its own cannot be resolved.
 #[must_use]
-pub fn resolved_addr(spec: &SocketSpec, data_plane_host: Option<&str>) -> Option<ResolvedAddr> {
+pub fn resolved_addr(spec: &SocketSpec, listener_host: Option<&str>) -> Option<ResolvedAddr> {
     let (host, port) = match spec {
         SocketSpec::Srt(SrtSocket::Listen { port, .. }) => {
-            (data_plane_host.unwrap_or("0.0.0.0").to_string(), *port)
+            (listener_host.unwrap_or("0.0.0.0").to_string(), *port)
         }
         SocketSpec::Srt(SrtSocket::Connect { host, port, .. }) => (host.clone(), *port),
         SocketSpec::Whip(_) | SocketSpec::Whep(_) | SocketSpec::Device(_) => return None,
@@ -313,10 +313,11 @@ mod tests {
         DesiredHop {
             id: id.to_string(),
             node_id: "strom-node-1".to_string(),
+            profile_id: "srt-forward".to_string(),
             role: HopRole::Sender,
             ingress: SocketSpec::srt_listen(7001, 200),
             egresses: vec![DesiredEgress {
-                branch_id: "destination-0".to_string(),
+                branch_id: "studio".to_string(),
                 socket: SocketSpec::srt_connect("10.0.0.2", 7002, 1000),
             }],
         }
@@ -703,17 +704,18 @@ mod tests {
 
     fn whip_gateway_hop() -> DesiredHop {
         DesiredHop {
-            id: "weave-alice-cam-receiver-0".to_string(),
+            id: "weave-alice-cam-receiver-studio".to_string(),
             node_id: "strom-node-2".to_string(),
+            profile_id: "whip-to-srt".to_string(),
             role: HopRole::Receiver,
             ingress: SocketSpec::signalling(
                 SignallingTransport::Whip,
                 SocketRole::Listen,
                 "http://172.27.0.10:8080/whip",
-                "weave-alice-cam-receiver-0",
+                "weave-alice-cam-receiver-studio",
             ),
             egresses: vec![DesiredEgress {
-                branch_id: "destination-0".to_string(),
+                branch_id: "studio".to_string(),
                 socket: SocketSpec::srt_listen(7003, 200),
             }],
         }
@@ -738,8 +740,8 @@ mod tests {
     fn block_flow_with_matching_sockets_is_adopted() {
         let desired = vec![whip_gateway_hop()];
         let flows = vec![block_flow(
-            "weave-alice-cam-receiver-0",
-            "weave-alice-cam-receiver-0",
+            "weave-alice-cam-receiver-studio",
+            "weave-alice-cam-receiver-studio",
             "srt://:7003?mode=listener",
         )];
         assert!(diff_hops(&desired, &flows).is_empty());
@@ -749,11 +751,17 @@ mod tests {
     fn block_flow_with_a_changed_endpoint_id_or_srt_uri_drifts() {
         let desired = vec![whip_gateway_hop()];
         for (endpoint_id, srt_uri) in [
-            ("weave-alice-cam-receiver-1", "srt://:7003?mode=listener"),
-            ("weave-alice-cam-receiver-0", "srt://:7004?mode=listener"),
+            (
+                "weave-alice-cam-receiver-preview",
+                "srt://:7003?mode=listener",
+            ),
+            (
+                "weave-alice-cam-receiver-studio",
+                "srt://:7004?mode=listener",
+            ),
         ] {
             let flows = vec![block_flow(
-                "weave-alice-cam-receiver-0",
+                "weave-alice-cam-receiver-studio",
                 endpoint_id,
                 srt_uri,
             )];
@@ -768,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_addr_uses_data_plane_host_for_listener_else_wildcard() {
+    fn resolved_addr_uses_listener_host_for_listener_else_wildcard() {
         let listen = SocketSpec::srt_listen(7001, 200);
         assert_eq!(
             resolved_addr(&listen, Some("172.26.0.10")),

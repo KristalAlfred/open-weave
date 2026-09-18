@@ -8,7 +8,8 @@ source:
     node: strom-node-1
     latency: 200
 destinations:
-  - srt:
+  - id: output
+    srt:
       node: strom-node-1
       via: [strom-node-2]
       latency: 1000

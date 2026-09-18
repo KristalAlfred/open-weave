@@ -6,9 +6,11 @@ source:
     node: strom-node-1
     latency: 200
 destinations:
-  - srt:
+  - id: studio
+    srt:
       node: strom-node-2
       latency: 1000
-  - srt:
+  - id: preview
+    srt:
       node: strom-node-1
       latency: 1000

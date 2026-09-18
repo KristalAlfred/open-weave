@@ -11,7 +11,8 @@ name: cam1-to-studio
 source:
   srt: { node: remote-site }
 destinations:
-  - srt: { node: studio }
+  - id: studio
+    srt: { node: studio }
 ```
 
 `weave apply -f` that, and `weave get streams` reports it `flowing` once the
@@ -184,7 +185,7 @@ and return `404`.
 `protocol_version` field, which adapters set from `weave_core::PROTOCOL_VERSION`:
 
 ```json
-{ "protocol_version": 3, "node": { "id": "strom-node-1", "...": "..." } }
+{ "protocol_version": 4, "node": { "id": "strom-node-1", "...": "..." } }
 ```
 
 The controller accepts only the version it speaks. Anything else — including an
@@ -199,7 +200,7 @@ naming the node id:
   "details": [{
     "field": "protocol_version",
     "code": "unsupported",
-    "message": "reported 1; supported 3"
+    "message": "reported 3; supported 4"
   }]
 }
 ```
@@ -210,34 +211,35 @@ fatal and exits — retrying never converges — so a version mismatch surfaces 
 stopped container with a clear reason instead of a node that looks alive.
 `PROTOCOL_VERSION` is a southbound handshake. It moves when adapter behavior or
 payload semantics become incompatible, so the controller can reject a stale
-process at registration rather than wait for a later request to fail. It is `3`:
-desired egresses and their observed status now carry branch identities, and
-socket status and statistics are reported per branch. An adapter built against
-`2` is refused rather than allowed to hide every fan-out destination after the
-first.
+process at registration rather than wait for a later request to fail. It is `4`:
+stable destination ids, hop profiles, selected profile ids, and network
+attachments replace positional branches and independent capability and
+reachability fields.
 
 ### Hop status and fan-out
 
-Every egress in desired state carries a branch id derived from its destination's
-manifest index. The same id follows that destination through sender, bridge, and
-receiver hops:
+Every destination has a stable resource id. The same id is the `branch_id` on
+every hop that carries it. Receiver ids use the destination id; bridge ids use
+the destination id and bridge position. Reordering the manifest list changes no
+hop ids, ports, or desired snapshots.
 
 ```json
 {
   "id": "weave-cam1-to-studio-sender",
   "node_id": "strom-node-1",
+  "profile_id": "srt-forward",
   "role": "sender",
   "ingress": { "transport": "srt", "role": "listen", "port": 20000 },
   "egresses": [
     {
-      "branch_id": "destination-0",
+      "branch_id": "studio",
       "transport": "srt",
       "role": "connect",
       "host": "172.27.0.10",
       "port": 20000
     },
     {
-      "branch_id": "destination-1",
+      "branch_id": "preview",
       "transport": "srt",
       "role": "connect",
       "host": "203.0.113.7",
@@ -264,13 +266,13 @@ duplicate, or unknown branch ids make the hop report incomplete, so it remains
   },
   "egresses": [
     {
-      "branch_id": "destination-0",
+      "branch_id": "studio",
       "condition": "flowing",
       "resolved": { "host": "172.27.0.10", "port": 20000 },
       "stats": { "connections": 1, "rate_mbps": 8.0 }
     },
     {
-      "branch_id": "destination-1",
+      "branch_id": "preview",
       "condition": "connecting",
       "resolved": { "host": "203.0.113.7", "port": 20001 },
       "stats": { "connections": 0, "rate_mbps": 0.0 }
@@ -279,10 +281,31 @@ duplicate, or unknown branch ids make the hop report incomplete, so it remains
 }
 ```
 
-The second branch keeps this stream `degraded` once its source is flowing. A
-fan-out is `flowing` only when every hop ingress and every egress branch is
-flowing. Reordering destinations changes their ids because destinations do not
-yet have user-supplied identities.
+The second branch keeps the aggregate stream `degraded`. `/status` also carries
+one entry per destination with its own status, nodes, conditions, and endpoint.
+A fan-out is `flowing` only when every branch is flowing.
+
+```json
+{
+  "name": "cam1-to-studio",
+  "status": "degraded",
+  "conditions": [],
+  "destinations": [
+    {
+      "id": "studio",
+      "status": "flowing",
+      "nodes": ["strom-node-1", "strom-node-2"],
+      "conditions": [],
+      "endpoint": {
+        "node": "strom-node-2",
+        "host": "172.27.0.10",
+        "port": 20001,
+        "url": "srt://172.27.0.10:20001"
+      }
+    }
+  ]
+}
+```
 
 ### Manifest validation
 
@@ -337,8 +360,8 @@ Stream and node ids are 1–63 characters and match
 `^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`: lowercase ASCII letters, digits, and
 interior hyphens. They are not trimmed or normalized. The same rule applies to
 stream names, registered node ids, and every node reference in `node`, `device`,
-and `via` fields. Invalid request paths return `400` before a proxy constructs an
-upstream URL.
+`via`, destination ids, profile ids, attachment ids, and network ids. Invalid
+request paths return `400` before a proxy constructs an upstream URL.
 
 This keeps ids safe as URL segments, database keys, log fields, hop ids, and
 Strom flow names. Invalid persisted stream definitions stop controller startup
@@ -458,21 +481,22 @@ rather than polling `/nodes`.
     "endpoint": "browser://guest-1",
     "capabilities": {
       "adapters": [],
-      "transports": [
-        { "name": "whip", "roles": ["connect"] },
-        { "name": "whep", "roles": ["connect"] }
-      ],
-      "devices": ["capture", "display"],
-      "data_plane": { "default": { "host": "browser", "reachability": "outbound_only" } },
-      "relay": false
+      "hop_profiles": [{
+        "id": "camera-to-whip",
+        "ingress": { "device": "capture" },
+        "egress": { "transport": "whip", "roles": ["connect"] },
+        "max_egresses": 1
+      }]
+    },
+    "topology": {
+      "attachments": [{ "id": "client", "network": "internet", "dial": true }]
     }
   }
 }
 ```
 
-That is a browser node's registration as `nodes/browser/` sends it. `devices`
-and `transports` are what a consumer reads to decide the node is a capture
-device worth declaring a stream for.
+That is an abbreviated browser registration. Its hop profiles show it can
+capture, while its dial-only attachment shows it exposes no media listener.
 
 `node` is the registering node's descriptor and nothing else: `endpoints` and
 `hop_status` describe hops rather than the node, and are not part of this
@@ -493,137 +517,86 @@ the receiver tell a genuine event from anyone who has learned the token. A
 receiver outside the trust boundary wants a body signature instead, which is not
 implemented.
 
-## Reachability, link direction, and jump nodes
+## Capabilities and topology
 
-A node advertises each data-plane address with whether peers can dial it. A bare
-host is dialable, the unremarkable case; spell the entry out to say otherwise:
+Capabilities say which complete hop shapes an adapter can build. Each profile
+has one ingress class, one homogeneous egress class, and an optional static
+egress limit:
 
 ```yaml
-data_plane:
-  default: 172.26.0.10
-  wan:
-    host: 203.0.113.7
-    reachability: outbound_only
+capabilities:
+  adapters: []
+  hop_profiles:
+    - id: srt-forward
+      ingress: { transport: srt, roles: [listen, connect] }
+      egress: { transport: srt, roles: [listen, connect] }
+    - id: camera-to-whip
+      ingress: { device: capture }
+      egress: { transport: whip, roles: [connect] }
+      max_egresses: 1
 ```
 
-Planning reads this instead of assuming a fixed direction. Per link, upstream to
-downstream:
+Strom advertises `srt-forward`, `whip-to-srt`, and `srt-to-whep`. The browser
+advertises `camera-to-whip` and `whep-to-display`, both with one egress. It does
+not advertise WHIP to WHEP or mixed-transport fan-out. The controller writes the
+selected `profile_id` into every `DesiredHop`; adapters validate and dispatch on
+that id.
 
-| Dialable | Who listens | Who calls |
-|---|---|---|
-| downstream | downstream | upstream |
-| upstream only | upstream | downstream |
-| neither | a relay, on both sockets | both ends |
+Topology says where a node can dial and what peers can reach. Attachment ids are
+local to one node. Network ids name shared routing domains:
 
-The first row is what a sender-calls-receiver template always did, so ordinary
-streams plan exactly as before. The second reverses the link — useful whenever
-the receiving side sits behind NAT — and costs nothing but a socket role, since
-SRT listeners and callers both work as source or sink.
+```yaml
+topology:
+  attachments:
+    - id: wan
+      network: internet
+      dial: true
+      listeners:
+        srt:
+          host: 203.0.113.10
+          port_range: { start: 20000, end: 20100 }
+        whip: { base_url: https://media.example/whip }
+    - id: production
+      network: studio-lan
+      dial: true
+      listeners:
+        srt:
+          host: 10.20.0.10
+          port_range: { start: 21000, end: 21100 }
+```
 
-The third row is the jump node. When neither end can be dialled, the controller
-inserts a **bridge hop** on a relay node that both ends call out to, sidestepping
-the NAT boundary in the only direction it permits. It is not a special path: the
-relay is dialable, so the two halves of the split link resolve under the same
-rule as everything else.
+An attachment with `dial: true` and no listeners models a NAT client. A link is
+possible when one end offers `connect`, has a dialing attachment, and the other
+offers `listen` with a listener on the same network. Transport support comes
+only from hop profiles. The controller chooses the lowest deterministic
+transport, network, attachment, address, URL, and port that satisfies both.
 
-A node offers itself as transit with `relay: true`; the controller draws the
-lowest-id eligible relay so the choice stays stable across ticks. A node that has
-gone offline is not eligible, so a stream moves to the next relay that is up. A
-stream that needs transit and finds none stays `pending` and reports why, the same
-as any other unplaceable stream.
-
-Destinations may also pin transit themselves, upstream-first:
+Planning first tries a direct link. If none works, it tries one online transit
+node whose profile supports the required ingress-to-egress shape and whose
+attachments carry both halves. There is no `relay` flag. An explicit `via`
+chain remains an exact node constraint:
 
 ```yaml
 destinations:
-  - srt:
+  - id: studio
+    srt:
       node: studio-node
       via: [edge-relay]
 ```
 
-A pin is policy — forcing traffic through a site or region — so it is honoured
-even when the link would have resolved directly, and it does not consult
-`relay: true`. Pins and automatic insertion compose: if a pinned relay cannot be
-dialled from the hop before it, the controller relays into it as well. A pinned
-node that goes offline is reported `degraded`, not swapped out: the manifest named
-it, so no other node stands in for it.
-
-A relay carries bytes and terminates nothing. Consumers still attach at the
-destination node, and `GET /streams/{name}/endpoints` is unchanged by transit.
-One consequence worth stating: a consumer output on an `outbound_only` node is
-only dialable from inside that node's network, because that is what the node
-declared about itself.
-
-## Transports
-
-Manifests name nodes, never transports between them. `srt: { node: X }` says the
-media enters or leaves X through an SRT socket a producer or consumer dials;
-`device: { node: X }` says it starts at X's own camera or ends on X's own screen:
+Manifests still name terminal nodes, never inter-node transports. A remote SRT
+listener includes its network because its reachability cannot be inferred:
 
 ```yaml
-name: alice-cam
-source:
-  device:
-    node: browser-a1b2          # the node's own camera
 destinations:
-  - srt:
-      node: strom-node-2        # a consumer dials this receiver's output
+  - id: uplink
+    srt:
+      remote: { host: 198.51.100.5, port: 9000, network: internet }
 ```
 
-Nodes declare what they can carry when they register. A `transports` list holds
-the link transports — `srt`, `whip`, `whep` — each with the socket roles the
-node can take over it; a bare name offers both, which is what every Strom node
-has always said. A device is not a transport but a terminal, so it sits in its
-own `devices` list. A browser page offers `whip` and `whep` in the `connect`
-role only, and declares `devices: [capture, display]`. A Strom node hosting
-WebRTC for it offers `whip` and `whep` in the `listen` role:
-
-```yaml
-transports:
-  - srt
-  - { name: whip, roles: [listen] }
-  - { name: whep, roles: [listen] }
-```
-
-A WebRTC link needs a signalling URL, and only the node serving it knows its
-path. So each data-plane address may carry the base URL per transport, and the
-controller appends `/<hop id>` and assumes nothing else:
-
-```yaml
-data_plane:
-  default:
-    host: 172.26.0.10
-    signalling:
-      whip: http://172.26.0.10:8080/whip
-      whep: http://172.26.0.10:8080/whep
-```
-
-A node normally does not write that itself — its adapter fills it in at
-registration. `weave-adapter-strom` builds it from `strom.signalling_base`, a
-data-plane alias to base URL map, plus the routes its own Strom serves.
-
-The controller chooses the transport per link from both ends' capabilities and
-writes the concrete sockets into each desired hop. Preference is `srt`, then
-`whip`, then `whep`; a candidate needs the listening end to offer `listen`, be
-dialable, and the other end to offer `connect`. WHIP is only ever hosted
-downstream (the connecting end pushes media), WHEP only upstream (the
-connecting end pulls). Two ends with no transport in common get a relay that
-can carry both halves, or the stream stays `pending` with the reason. A WebRTC
-socket carries that signalling URL and the endpoint id it was built from
-instead of a host and port, and claims no port.
-
-Adapters map the sockets they are given. The Strom adapter has one flow shape
-per (ingress, egress) transport pair: `srt → srt` is the byte relay it always
-built; `whip → srt` is `whip_input → videoenc → mpegtssrt_output`; `srt → whep`
-is `mpegtssrt_input → whep_output`. A hop with WebRTC on both sides is refused,
-because the adapter reads media progress from a hop's SRT byte counters and
-such a hop has none. The browser node realises `device → whip` and
-`whep → device` and nothing else. Neither adapter ever decides a transport.
-
-`GET /streams/{name}/endpoints` lists only what an external peer can dial,
-so a `device` end reads `null` in its place (`ingress: null` for a camera
-source, a `null` output for a screen destination). See `nodes/browser/README.md`
-for the page and `bench/README.md` for running it against the bench.
+`GET /streams/{name}/endpoints` returns `ingress` plus a `destinations` list of
+`{id, endpoint}` objects. A device end has a null endpoint. See
+`nodes/browser/README.md` and `bench/README.md` for the shipped nodes.
 
 ## Media formats
 
@@ -674,7 +647,7 @@ stream places and the media flows — it just arrives somewhere it cannot be
 decoded. That is reported rather than acted on:
 
 ```
-degraded — destination 0 cannot accept the source format:
+degraded — destination studio cannot accept the source format:
            audio.sample_rate is 48000 but accepts 44100
 ```
 

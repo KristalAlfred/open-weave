@@ -21,9 +21,10 @@ The page generates a `browser-<8 hex>` node id per tab (`&node=<id>` pins one
 instead, so a page that restarts keeps its name). A pinned id must be 1–63
 lowercase ASCII letters, digits, or interior hyphens. An invalid pin is shown as
 rejected and is not retried. The page registers a valid id with
-transports `whip [connect]` and `whep [connect]`, devices `capture, display`,
-and an `outbound_only` data plane, then heartbeats every 5 s and polls its
-desired hops every 2 s. It realises two hop shapes and nothing else:
+`camera-to-whip` and `whep-to-display` hop profiles, plus one dial-only
+attachment to the `internet` network. `&network=<id>` selects another network.
+It heartbeats every 5 s and polls desired hops every 2 s. It realises two hop
+shapes and nothing else:
 
 - `device → whip connect`: the camera and microphone, sent over WHIP to the URL
   the controller planned.
@@ -31,9 +32,9 @@ desired hops every 2 s. It realises two hop shapes and nothing else:
 
 Each desired egress carries a branch id. Heartbeats report condition and stats
 per branch, so one failed destination cannot be hidden by another. The browser
-node currently supports one egress per hop. It reports a multi-egress hop as
-failed and includes every desired branch in the hop status rather than using
-only the first one.
+node declares `max_egresses: 1` on both profiles, so the controller rejects
+capture fan-out during placement. The page also refuses a mismatched profile id
+or shape instead of guessing a constructor from sockets.
 
 The page shows manifests naming its node id; copy one, change the Strom node,
 and apply it. Southbound must allow the page's origin

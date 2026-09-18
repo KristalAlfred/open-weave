@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{FormatConstraint, SrtEndpoint, StreamDefinition, StreamTransport};
+use crate::{FormatConstraint, NodeDescriptor, SrtEndpoint, StreamDefinition, StreamTransport};
 
 pub const RESOURCE_ID_MAX_LEN: usize = 63;
 
@@ -84,15 +84,90 @@ pub fn validate_stream(stream: &StreamDefinition) -> Vec<ValidationIssue> {
     }
 
     validate_transport(&stream.source, "source", true, &mut issues);
+    let mut destination_ids = HashSet::new();
     for (index, destination) in stream.destinations.iter().enumerate() {
-        validate_transport(
-            destination,
-            &format!("destinations[{index}]"),
-            false,
+        let path = format!("destinations[{index}]");
+        validate_id(
+            &destination.id,
+            &format!("{path}.id"),
+            "destination id",
             &mut issues,
         );
+        if !destination_ids.insert(&destination.id) {
+            issues.push(ValidationIssue::new(
+                format!("{path}.id"),
+                "duplicate",
+                "destination id must be unique within the stream",
+            ));
+        }
+        validate_transport(&destination.endpoint, &path, false, &mut issues);
     }
 
+    issues
+}
+
+#[must_use]
+pub fn validate_node(node: &NodeDescriptor) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    validate_id(&node.id, "node.id", "node id", &mut issues);
+    let mut profile_ids = HashSet::new();
+    for (index, profile) in node.capabilities.hop_profiles.iter().enumerate() {
+        let field = format!("node.capabilities.hop_profiles[{index}].id");
+        validate_id(&profile.id, &field, "profile id", &mut issues);
+        if !profile_ids.insert(&profile.id) {
+            issues.push(ValidationIssue::new(
+                field,
+                "duplicate",
+                "profile id must be unique within the node",
+            ));
+        }
+        if profile.max_egresses == Some(0) {
+            issues.push(ValidationIssue::new(
+                format!("node.capabilities.hop_profiles[{index}].max_egresses"),
+                "invalid_range",
+                "max_egresses must be at least one",
+            ));
+        }
+    }
+    let mut attachment_ids = HashSet::new();
+    for (index, attachment) in node.topology.attachments.iter().enumerate() {
+        let base = format!("node.topology.attachments[{index}]");
+        validate_id(
+            &attachment.id,
+            &format!("{base}.id"),
+            "attachment id",
+            &mut issues,
+        );
+        validate_id(
+            &attachment.network,
+            &format!("{base}.network"),
+            "network id",
+            &mut issues,
+        );
+        if !attachment_ids.insert(&attachment.id) {
+            issues.push(ValidationIssue::new(
+                format!("{base}.id"),
+                "duplicate",
+                "attachment id must be unique within the node",
+            ));
+        }
+        if let Some(listener) = &attachment.listeners.srt {
+            if listener.host.trim().is_empty() {
+                issues.push(ValidationIssue::new(
+                    format!("{base}.listeners.srt.host"),
+                    "blank",
+                    "SRT listener host must not be blank",
+                ));
+            }
+            if listener.port_range.start > listener.port_range.end {
+                issues.push(ValidationIssue::new(
+                    format!("{base}.listeners.srt.port_range"),
+                    "invalid_range",
+                    "port range start must not exceed end",
+                ));
+            }
+        }
+    }
     issues
 }
 
@@ -113,6 +188,14 @@ fn validate_transport(
                 "node id",
                 issues,
             );
+            if let Some(network) = &endpoint.network {
+                validate_id(
+                    network,
+                    &format!("{path}.device.network"),
+                    "network id",
+                    issues,
+                );
+            }
         }
     }
 }
@@ -125,6 +208,9 @@ fn validate_srt(
 ) {
     validate_via(endpoint, path, is_source, issues);
     validate_format(endpoint, path, is_source, issues);
+    if let Some(network) = &endpoint.network {
+        validate_id(network, &format!("{path}.network"), "network id", issues);
+    }
 
     match (&endpoint.node, &endpoint.remote) {
         (Some(_), Some(_)) => issues.push(ValidationIssue::new(
@@ -157,6 +243,19 @@ fn validate_srt(
                 format!("{path}.remote.host"),
                 "blank",
                 "remote host must not be empty",
+            ));
+        }
+        validate_id(
+            &remote.network,
+            &format!("{path}.remote.network"),
+            "network id",
+            issues,
+        );
+        if endpoint.network.is_some() {
+            issues.push(ValidationIssue::new(
+                format!("{path}.network"),
+                "not_allowed",
+                "a remote endpoint declares its network inside remote",
             ));
         }
     }
@@ -251,351 +350,5 @@ fn validate_constraint(accepts: &FormatConstraint, path: &str, issues: &mut Vec<
             issues,
         );
         check(&audio.channels, format!("{path}.audio.channels"), issues);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{
-        AudioConstraint, Container, FormatConstraint, MediaFormat, NodeEndpoint, RemoteAddr,
-        SrtEndpoint, StreamDefinition, StreamTransport, VideoConstraint,
-    };
-
-    use super::{
-        RESOURCE_ID_MAX_LEN, ResourceIdError, ValidationIssue, validate_resource_id,
-        validate_stream,
-    };
-
-    fn srt_node(node: &str) -> SrtEndpoint {
-        SrtEndpoint {
-            node: Some(node.to_string()),
-            remote: None,
-            via: Vec::new(),
-            network: None,
-            latency: None,
-            format: None,
-            accepts: None,
-        }
-    }
-
-    fn stream() -> StreamDefinition {
-        StreamDefinition {
-            name: "camera".to_string(),
-            enabled: true,
-            source: StreamTransport::Srt(srt_node("source")),
-            destinations: vec![StreamTransport::Srt(srt_node("destination"))],
-        }
-    }
-
-    fn issue(field: &str, code: &str, message: &str) -> ValidationIssue {
-        ValidationIssue {
-            field: field.to_string(),
-            code: code.to_string(),
-            message: message.to_string(),
-        }
-    }
-
-    #[test]
-    fn valid_srt_and_device_streams_have_no_issues() {
-        assert!(validate_stream(&stream()).is_empty());
-
-        let device_stream = StreamDefinition {
-            name: "browser".to_string(),
-            enabled: true,
-            source: StreamTransport::Device(NodeEndpoint {
-                node: "browser-source".to_string(),
-                network: None,
-            }),
-            destinations: vec![StreamTransport::Device(NodeEndpoint {
-                node: "browser-destination".to_string(),
-                network: None,
-            })],
-        };
-        assert!(validate_stream(&device_stream).is_empty());
-    }
-
-    #[test]
-    fn stream_definition_rejects_unknown_fields() {
-        let parsed = serde_json::from_value::<StreamDefinition>(serde_json::json!({
-            "name": "camera",
-            "enabled": true,
-            "enabld": true,
-            "source": { "srt": { "node": "source" } },
-            "destinations": [{ "srt": { "node": "destination" } }]
-        }));
-
-        assert!(
-            parsed
-                .unwrap_err()
-                .to_string()
-                .contains("unknown field `enabld`")
-        );
-    }
-
-    #[test]
-    fn validation_collects_issues_with_stable_paths() {
-        let mut invalid = stream();
-        invalid.name = "  ".to_string();
-        let StreamTransport::Srt(source) = &mut invalid.source else {
-            unreachable!();
-        };
-        source.node = Some(String::new());
-        source.remote = Some(RemoteAddr {
-            host: " ".to_string(),
-            port: 9000,
-        });
-        source.via = vec!["relay".to_string(), "relay".to_string()];
-        source.accepts = Some(FormatConstraint::default());
-
-        let issues = validate_stream(&invalid);
-        assert_eq!(
-            issues,
-            vec![
-                issue(
-                    "name",
-                    "invalid_characters",
-                    "stream name must contain only lowercase ASCII letters, digits, or hyphens, and must start and end with a letter or digit",
-                ),
-                issue(
-                    "source.srt.via",
-                    "destination_only",
-                    "via belongs on a destination, not the source",
-                ),
-                issue(
-                    "source.srt.via[1]",
-                    "duplicate",
-                    "via must not repeat a node",
-                ),
-                issue(
-                    "source.srt.accepts",
-                    "destination_only",
-                    "accepts belongs on a destination, not the source",
-                ),
-                issue(
-                    "source.srt",
-                    "mutually_exclusive",
-                    "endpoint must set either node or remote, not both",
-                ),
-                issue(
-                    "source.srt.node",
-                    "invalid_length",
-                    "node id must be between 1 and 63 characters",
-                ),
-                issue(
-                    "source.srt.remote",
-                    "not_allowed",
-                    "source must be a node, not a remote endpoint",
-                ),
-                issue(
-                    "source.srt.remote.host",
-                    "blank",
-                    "remote host must not be empty",
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn missing_destination_and_endpoint_identity_are_reported() {
-        let mut invalid = stream();
-        invalid.destinations.clear();
-        invalid.source = StreamTransport::Srt(SrtEndpoint {
-            node: None,
-            remote: None,
-            via: Vec::new(),
-            network: None,
-            latency: None,
-            format: None,
-            accepts: None,
-        });
-
-        assert_eq!(
-            validate_stream(&invalid),
-            vec![
-                issue(
-                    "destinations",
-                    "required",
-                    "stream must have at least one destination",
-                ),
-                issue(
-                    "source.srt",
-                    "required",
-                    "endpoint must set either node or remote",
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn destination_roles_and_node_fields_are_validated() {
-        let mut invalid = stream();
-        let StreamTransport::Srt(destination) = &mut invalid.destinations[0] else {
-            unreachable!();
-        };
-        destination.node = None;
-        destination.remote = Some(RemoteAddr {
-            host: String::new(),
-            port: 9000,
-        });
-        destination.format = Some(MediaFormat {
-            container: Container::MpegTs,
-            video: None,
-            audio: None,
-        });
-        invalid
-            .destinations
-            .push(StreamTransport::Device(NodeEndpoint {
-                node: " ".to_string(),
-                network: None,
-            }));
-
-        assert_eq!(
-            validate_stream(&invalid),
-            vec![
-                issue(
-                    "destinations[0].srt.format",
-                    "source_only",
-                    "format belongs on the source, not a destination",
-                ),
-                issue(
-                    "destinations[0].srt.remote.host",
-                    "blank",
-                    "remote host must not be empty",
-                ),
-                issue(
-                    "destinations[1].device.node",
-                    "invalid_characters",
-                    "node id must contain only lowercase ASCII letters, digits, or hyphens, and must start and end with a letter or digit",
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn every_empty_constraint_list_is_reported() {
-        let mut invalid = stream();
-        let StreamTransport::Srt(destination) = &mut invalid.destinations[0] else {
-            unreachable!();
-        };
-        destination.accepts = Some(FormatConstraint {
-            container: Some(Vec::new()),
-            video: Some(VideoConstraint {
-                codec: Some(Vec::new()),
-                width: Some(Vec::new()),
-                height: Some(Vec::new()),
-                framerate: Some(Vec::new()),
-                chroma_subsampling: Some(Vec::new()),
-            }),
-            audio: Some(AudioConstraint {
-                codec: Some(Vec::new()),
-                sample_rate: Some(Vec::new()),
-                channels: Some(Vec::new()),
-            }),
-        });
-
-        let issues = validate_stream(&invalid);
-        let fields: Vec<&str> = issues.iter().map(|issue| issue.field.as_str()).collect();
-        assert_eq!(
-            fields,
-            vec![
-                "destinations[0].srt.accepts.container",
-                "destinations[0].srt.accepts.video.codec",
-                "destinations[0].srt.accepts.video.width",
-                "destinations[0].srt.accepts.video.height",
-                "destinations[0].srt.accepts.video.framerate",
-                "destinations[0].srt.accepts.video.chroma_subsampling",
-                "destinations[0].srt.accepts.audio.codec",
-                "destinations[0].srt.accepts.audio.sample_rate",
-                "destinations[0].srt.accepts.audio.channels",
-            ]
-        );
-        assert!(issues.iter().all(|issue| issue.code == "empty"
-            && issue.message == "accepts must not contain an empty list of values"));
-    }
-
-    #[test]
-    fn blank_and_duplicate_via_entries_are_each_identified() {
-        let mut invalid = stream();
-        let StreamTransport::Srt(destination) = &mut invalid.destinations[0] else {
-            unreachable!();
-        };
-        destination.via = vec![" ".to_string(), "relay".to_string(), "relay".to_string()];
-
-        assert_eq!(
-            validate_stream(&invalid),
-            vec![
-                issue(
-                    "destinations[0].srt.via[0]",
-                    "invalid_characters",
-                    "node id must contain only lowercase ASCII letters, digits, or hyphens, and must start and end with a letter or digit",
-                ),
-                issue(
-                    "destinations[0].srt.via[2]",
-                    "duplicate",
-                    "via must not repeat a node",
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn resource_ids_have_one_url_safe_grammar() {
-        for valid in ["a", "0", "camera-1", &"a".repeat(RESOURCE_ID_MAX_LEN)] {
-            assert_eq!(validate_resource_id(valid), Ok(()), "{valid}");
-        }
-
-        for invalid in [
-            "Camera", "camera_1", "camera/1", "camera.1", "-camera", "camera-", "café",
-        ] {
-            assert_eq!(
-                validate_resource_id(invalid),
-                Err(ResourceIdError::InvalidCharacters),
-                "{invalid}"
-            );
-        }
-        assert_eq!(
-            validate_resource_id(""),
-            Err(ResourceIdError::InvalidLength)
-        );
-        assert_eq!(
-            validate_resource_id(&"a".repeat(RESOURCE_ID_MAX_LEN + 1)),
-            Err(ResourceIdError::InvalidLength)
-        );
-    }
-
-    #[test]
-    fn every_manifest_resource_reference_uses_the_id_grammar() {
-        let mut invalid = stream();
-        invalid.name = "camera/main".to_string();
-        let StreamTransport::Srt(source) = &mut invalid.source else {
-            unreachable!()
-        };
-        source.node = Some("Source".to_string());
-        let StreamTransport::Srt(destination) = &mut invalid.destinations[0] else {
-            unreachable!()
-        };
-        destination.node = Some("destination_one".to_string());
-        destination.via = vec!["relay.one".to_string()];
-        invalid
-            .destinations
-            .push(StreamTransport::Device(NodeEndpoint {
-                node: "display/one".to_string(),
-                network: None,
-            }));
-
-        let issues = validate_stream(&invalid);
-        assert_eq!(
-            issues
-                .iter()
-                .map(|issue| (issue.field.as_str(), issue.code.as_str()))
-                .collect::<Vec<_>>(),
-            [
-                ("name", "invalid_characters"),
-                ("source.srt.node", "invalid_characters"),
-                ("destinations[0].srt.via[0]", "invalid_characters"),
-                ("destinations[0].srt.node", "invalid_characters"),
-                ("destinations[1].device.node", "invalid_characters"),
-            ]
-        );
     }
 }

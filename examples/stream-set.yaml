@@ -6,6 +6,7 @@ streams:
         node: strom-node-1
         latency: 200
     destinations:
-      - srt:
+      - id: studio
+        srt:
           node: strom-node-2
 prune: false

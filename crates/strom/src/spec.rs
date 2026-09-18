@@ -45,6 +45,14 @@ pub struct Link {
 
 #[derive(Debug, thiserror::Error)]
 pub enum MappingError {
+    #[error("unknown Strom hop profile {0}")]
+    UnknownProfile(String),
+    #[error("hop profile {profile} does not match {ingress} to {egress}")]
+    ProfileMismatch {
+        profile: String,
+        ingress: String,
+        egress: String,
+    },
     #[error("hop has no egress socket")]
     NoEgress,
     #[error("no Strom flow shape carries a {0} socket")]
@@ -57,10 +65,6 @@ pub enum MappingError {
         first: String,
         second: String,
     },
-    #[error(
-        "media progress cannot be reported for a {ingress} ingress feeding a {egress} egress: the Strom adapter reads progress from a hop's SRT byte counters and this hop has no SRT side"
-    )]
-    WebRtcOnBothSides { ingress: String, egress: String },
 }
 
 /// Map a desired hop to a Strom flow. The flow name is the hop id, so flows are
@@ -76,26 +80,22 @@ pub enum MappingError {
 /// - `srt → whep`: `mpegtssrt_input(decode) → whep_output`. Several egresses tee
 ///   the decoded video and audio.
 ///
-/// A hop with WebRTC on both sides is [`MappingError::WebRtcOnBothSides`]:
-/// Strom can build `whip_input → whep_output`, but the adapter reports media
-/// progress from the hop's SRT byte counters and such a hop has none.
-///
 /// Every egress of a hop must ask for one shape; a hop asked to fan out over two
-/// is [`MappingError::MixedEgress`].
+/// is [`MappingError::MixedEgress`]. The selected profile id dispatches the
+/// constructor and its sockets are checked against that profile.
 pub fn flow_spec_from_hop(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
     let egress = sole_egress(hop)?;
-    match (shape(&hop.ingress), shape(egress)) {
-        (Shape::Srt, Shape::Srt) => srt_relay_flow(hop),
-        (Shape::Whip, Shape::Srt) => whip_to_srt_flow(hop),
-        (Shape::Srt, Shape::Whep) => srt_to_whep_flow(hop),
-        (Shape::Whip, Shape::Whep) => Err(MappingError::WebRtcOnBothSides {
+    let shapes = (shape(&hop.ingress), shape(egress));
+    match hop.profile_id.as_str() {
+        "srt-forward" if shapes == (Shape::Srt, Shape::Srt) => srt_relay_flow(hop),
+        "whip-to-srt" if shapes == (Shape::Whip, Shape::Srt) => whip_to_srt_flow(hop),
+        "srt-to-whep" if shapes == (Shape::Srt, Shape::Whep) => srt_to_whep_flow(hop),
+        "srt-forward" | "whip-to-srt" | "srt-to-whep" => Err(MappingError::ProfileMismatch {
+            profile: hop.profile_id.clone(),
             ingress: hop.ingress.to_string(),
             egress: egress.to_string(),
         }),
-        (_, Shape::Srt | Shape::Whep) => {
-            Err(MappingError::UnsupportedSocket(hop.ingress.to_string()))
-        }
-        (_, _) => Err(MappingError::UnsupportedSocket(egress.to_string())),
+        _ => Err(MappingError::UnknownProfile(hop.profile_id.clone())),
     }
 }
 
@@ -531,10 +531,11 @@ mod tests {
         DesiredHop {
             id: id.to_string(),
             node_id: "strom-node-1".to_string(),
+            profile_id: "srt-forward".to_string(),
             role: HopRole::Sender,
             ingress: SocketSpec::srt_listen(7001, 200),
             egresses: vec![egress(
-                "destination-0",
+                "studio",
                 SocketSpec::srt_connect("172.31.0.10", 7002, 1000),
             )],
         }
@@ -544,9 +545,10 @@ mod tests {
         DesiredHop {
             id: id.to_string(),
             node_id: "strom-node-2".to_string(),
+            profile_id: "srt-forward".to_string(),
             role: HopRole::Receiver,
             ingress: SocketSpec::srt_listen(7002, 1000),
-            egresses: vec![egress("destination-0", SocketSpec::srt_listen(7003, 200))],
+            egresses: vec![egress("studio", SocketSpec::srt_listen(7003, 200))],
         }
     }
 
@@ -575,7 +577,7 @@ mod tests {
     fn demo_tee_hop(id: &str) -> DesiredHop {
         let mut hop = demo_ingress_hop(id);
         hop.egresses.push(egress(
-            "destination-1",
+            "preview",
             SocketSpec::srt_connect("172.31.0.20", 7002, 1000),
         ));
         hop
@@ -611,15 +613,14 @@ mod tests {
             "http://172.26.0.10:8080/whep",
             "x",
         );
-        let error = flow_spec_from_hop(&pulled).expect_err("Strom cannot pull WHEP in");
-        assert_eq!(
-            error.to_string(),
-            "no Strom flow shape carries a whep socket"
-        );
+        assert!(matches!(
+            flow_spec_from_hop(&pulled),
+            Err(MappingError::ProfileMismatch { .. })
+        ));
 
         let mut pushed = demo_ingress_hop("x");
         pushed.egresses = vec![egress(
-            "destination-0",
+            "studio",
             SocketSpec::signalling(
                 SignallingTransport::Whip,
                 SocketRole::Connect,
@@ -627,19 +628,17 @@ mod tests {
                 "x",
             ),
         )];
-        let error = flow_spec_from_hop(&pushed).expect_err("Strom cannot push WHIP out");
-        assert_eq!(
-            error.to_string(),
-            "no Strom flow shape carries a whip socket"
-        );
+        assert!(matches!(
+            flow_spec_from_hop(&pushed),
+            Err(MappingError::ProfileMismatch { .. })
+        ));
 
         let mut device = demo_ingress_hop("x");
         device.ingress = SocketSpec::Device(DeviceKind::Capture);
-        let error = flow_spec_from_hop(&device).expect_err("a device has no flow shape");
-        assert_eq!(
-            error.to_string(),
-            "no Strom flow shape carries a capture device socket"
-        );
+        assert!(matches!(
+            flow_spec_from_hop(&device),
+            Err(MappingError::ProfileMismatch { .. })
+        ));
     }
 
     #[test]
@@ -692,11 +691,12 @@ mod tests {
     /// SRT out.
     fn whip_gateway_hop() -> DesiredHop {
         DesiredHop {
-            id: "weave-alice-cam-receiver-0".to_string(),
+            id: "weave-alice-cam-receiver-studio".to_string(),
             node_id: "strom-node-2".to_string(),
+            profile_id: "whip-to-srt".to_string(),
             role: HopRole::Receiver,
-            ingress: whip_socket(SocketRole::Listen, "weave-alice-cam-receiver-0"),
-            egresses: vec![egress("destination-0", SocketSpec::srt_listen(7003, 200))],
+            ingress: whip_socket(SocketRole::Listen, "weave-alice-cam-receiver-studio"),
+            egresses: vec![egress("studio", SocketSpec::srt_listen(7003, 200))],
         }
     }
 
@@ -706,11 +706,12 @@ mod tests {
         DesiredHop {
             id: "weave-alice-return-sender".to_string(),
             node_id: "strom-node-2".to_string(),
+            profile_id: "srt-to-whep".to_string(),
             role: HopRole::Sender,
             ingress: SocketSpec::srt_listen(7001, 200),
             egresses: vec![egress(
-                "destination-0",
-                whep_socket(SocketRole::Listen, "weave-alice-return-receiver-0"),
+                "studio",
+                whep_socket(SocketRole::Listen, "weave-alice-return-receiver-studio"),
             )],
         }
     }
@@ -749,12 +750,12 @@ mod tests {
         hop.ingress = SocketSpec::Whip(SignallingSocket {
             role: SocketRole::Listen,
             url: "http://172.27.0.10:8080/whip/not-the-endpoint-id".to_string(),
-            endpoint_id: "weave-alice-cam-receiver-0".to_string(),
+            endpoint_id: "weave-alice-cam-receiver-studio".to_string(),
         });
         let spec = flow_spec_from_hop(&hop).expect("map");
         assert_eq!(
             spec.blocks[0].properties["endpoint_id"],
-            Value::from("weave-alice-cam-receiver-0")
+            Value::from("weave-alice-cam-receiver-studio")
         );
     }
 
@@ -762,24 +763,21 @@ mod tests {
     fn a_hop_with_webrtc_on_both_sides_is_refused() {
         let mut hop = whip_gateway_hop();
         hop.egresses = vec![egress(
-            "destination-0",
-            whep_socket(SocketRole::Listen, "weave-relayed-receiver-0"),
+            "studio",
+            whep_socket(SocketRole::Listen, "weave-relayed-receiver-output"),
         )];
-        let error = flow_spec_from_hop(&hop).expect_err("no SRT side to read progress from");
-        assert_eq!(
-            error.to_string(),
-            "media progress cannot be reported for a whip ingress feeding a whep egress: \
-             the Strom adapter reads progress from a hop's SRT byte counters and this hop \
-             has no SRT side"
-        );
+        assert!(matches!(
+            flow_spec_from_hop(&hop),
+            Err(MappingError::ProfileMismatch { .. })
+        ));
     }
 
     #[test]
     fn whep_fanout_tees_decoded_video_and_audio_through_queues() {
         let mut hop = whep_gateway_hop();
         hop.egresses.push(egress(
-            "destination-1",
-            whep_socket(SocketRole::Listen, "weave-alice-return-receiver-1"),
+            "preview",
+            whep_socket(SocketRole::Listen, "weave-alice-return-receiver-preview"),
         ));
         let spec = flow_spec_from_hop(&hop).expect("map");
 
@@ -815,7 +813,7 @@ mod tests {
     fn mixed_egress_transports_are_an_error() {
         let mut hop = whep_gateway_hop();
         hop.egresses.push(egress(
-            "destination-1",
+            "preview",
             SocketSpec::srt_connect("172.26.0.10", 7002, 1000),
         ));
         let error = flow_spec_from_hop(&hop).expect_err("one flow carries one egress shape");

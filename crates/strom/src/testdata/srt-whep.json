@@ -19,7 +19,7 @@
       "id": "whep_out_0",
       "block_definition_id": "builtin.whep_output",
       "name": "WHEP playback",
-      "properties": { "endpoint_id": "weave-alice-return-receiver-0" },
+      "properties": { "endpoint_id": "weave-alice-return-receiver-studio" },
       "position": [800.0, 200.0]
     }
   ],

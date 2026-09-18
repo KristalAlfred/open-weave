@@ -1046,7 +1046,10 @@ impl StateStore for MemStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weave_core::{NodeCapabilities, NodeDescriptor, NodeStatus, SrtEndpoint, StreamTransport};
+    use weave_core::{
+        NodeCapabilities, NodeDescriptor, NodeStatus, NodeTopology, SrtEndpoint, StreamDestination,
+        StreamTransport,
+    };
 
     fn stream(name: &str) -> StreamDefinition {
         StreamDefinition {
@@ -1061,15 +1064,18 @@ mod tests {
                 network: None,
                 latency: None,
             }),
-            destinations: vec![StreamTransport::Srt(SrtEndpoint {
-                node: Some("strom-node-2".to_string()),
-                remote: None,
-                via: Vec::new(),
-                format: None,
-                accepts: None,
-                network: None,
-                latency: None,
-            })],
+            destinations: vec![StreamDestination {
+                id: "studio".to_string(),
+                endpoint: StreamTransport::Srt(SrtEndpoint {
+                    node: Some("strom-node-2".to_string()),
+                    remote: None,
+                    via: Vec::new(),
+                    format: None,
+                    accepts: None,
+                    network: None,
+                    latency: None,
+                }),
+            }],
         }
     }
 
@@ -1081,6 +1087,7 @@ mod tests {
                 endpoint: "http://10.0.0.1:8080".to_string(),
                 status: NodeStatus::Ready,
                 capabilities: NodeCapabilities::default(),
+                topology: NodeTopology::default(),
             },
             endpoints: Vec::new(),
             hop_status: Vec::new(),

@@ -9,7 +9,7 @@ use std::fmt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{NodeCapabilities, NodeDescriptor, NodeStatus};
+use crate::{NodeCapabilities, NodeDescriptor, NodeStatus, NodeTopology};
 
 /// One lifecycle event. The whole JSON body of a delivery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -69,6 +69,7 @@ pub struct NodeSummary {
     pub endpoint: String,
     #[serde(default)]
     pub capabilities: NodeCapabilities,
+    pub topology: NodeTopology,
 }
 
 impl From<&NodeDescriptor> for NodeSummary {
@@ -78,6 +79,7 @@ impl From<&NodeDescriptor> for NodeSummary {
             status: node.status,
             endpoint: node.endpoint.clone(),
             capabilities: node.capabilities.clone(),
+            topology: node.topology.clone(),
         }
     }
 }
@@ -85,7 +87,10 @@ impl From<&NodeDescriptor> for NodeSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DeviceKind, DeviceSet, NodeRegistration, PROTOCOL_VERSION};
+    use crate::{
+        DeviceClass, DeviceKind, HopEndpointClass, HopProfile, NodeRegistration, PROTOCOL_VERSION,
+        RoleSet, SocketRole, Transport, TransportClass,
+    };
 
     fn registration() -> NodeRegistration {
         NodeRegistration {
@@ -95,9 +100,20 @@ mod tests {
                 endpoint: "http://guest-1:8080".to_string(),
                 status: NodeStatus::Ready,
                 capabilities: NodeCapabilities {
-                    devices: DeviceSet::from_iter([DeviceKind::Capture]),
-                    ..NodeCapabilities::default()
+                    adapters: Vec::new(),
+                    hop_profiles: vec![HopProfile {
+                        id: "camera-to-whip".to_string(),
+                        ingress: HopEndpointClass::Device(DeviceClass {
+                            device: DeviceKind::Capture,
+                        }),
+                        egress: HopEndpointClass::Transport(TransportClass {
+                            transport: Transport::Whip,
+                            roles: RoleSet::only(SocketRole::Connect),
+                        }),
+                        max_egresses: Some(1),
+                    }],
                 },
+                topology: NodeTopology::default(),
             },
             endpoints: Vec::new(),
             hop_status: Vec::new(),
@@ -112,7 +128,11 @@ mod tests {
         assert_eq!(summary.id, "guest-1");
         assert_eq!(summary.status, NodeStatus::Ready);
         assert_eq!(summary.endpoint, "http://guest-1:8080");
-        assert!(summary.capabilities.offers_device(DeviceKind::Capture));
+        assert!(
+            summary
+                .capabilities
+                .offers_ingress_device(DeviceKind::Capture)
+        );
 
         let body = serde_json::to_value(&summary).unwrap();
         let fields: Vec<&str> = body
@@ -121,7 +141,10 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(fields, ["capabilities", "endpoint", "id", "status"]);
+        assert_eq!(
+            fields,
+            ["capabilities", "endpoint", "id", "status", "topology"]
+        );
     }
 
     #[test]

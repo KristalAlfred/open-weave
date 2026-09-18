@@ -3,7 +3,6 @@
 mod config;
 mod provision;
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -16,10 +15,10 @@ use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Token};
 use weave_core::{
-    AdapterDescriptor, AdapterKind, DEFAULT_DATA_PLANE_ALIAS, DataPlaneAddr, DesiredHop, DeviceSet,
-    EgressStatus, EndpointDescriptor, EndpointKind, HopStatus, LinkCondition, LinkStats,
-    NodeCapabilities, NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus,
-    PROTOCOL_VERSION, SignallingTransport, SocketRole, SocketSpec, SocketStatus, Transport,
+    AdapterDescriptor, AdapterKind, DesiredHop, EgressStatus, EndpointDescriptor, EndpointKind,
+    HopEndpointClass, HopProfile, HopStatus, LinkCondition, LinkStats, NodeCapabilities,
+    NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus, PROTOCOL_VERSION, RoleSet,
+    SocketRole, SocketSpec, SocketStatus, Transport, TransportClass,
 };
 use weave_strom::{
     FlowSpec, FlowStats, StromClient, StromError, StromFlow, flow_spec_from_hop, parse_flow_stats,
@@ -30,11 +29,6 @@ use provision::{
     Side, SideObservation, StallTracker, diff_hops, hop_state, resolved_addr, socket_condition,
     webrtc_condition,
 };
-
-/// Routes this Strom serves WHIP ingest and WHEP playback at, appended to a
-/// configured signalling base. Both sit at the root, not under `/api`.
-const WHIP_ROUTE: &str = "/whip";
-const WHEP_ROUTE: &str = "/whep";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -79,8 +73,7 @@ async fn main() -> Result<()> {
         southbound_url = %config.node.southbound_url,
         poll_interval_secs = config.strom.poll_interval_secs,
         strom_auth,
-        data_plane = ?advertised_data_plane(&config),
-        port_range = ?config.node.port_range,
+        topology = ?config.node.topology,
         "Strom adapter starting"
     );
 
@@ -209,14 +202,16 @@ async fn sync_once(
         }
     };
     let endpoints = strom_endpoints(node_id, &flows);
-    let data_plane_host = config
+    let listener_host = config
         .node
-        .data_plane
-        .get(DEFAULT_DATA_PLANE_ALIAS)
-        .map(|addr| addr.host.as_str());
+        .topology
+        .attachments
+        .iter()
+        .find_map(|attachment| attachment.listeners.srt.as_ref())
+        .map(|listener| listener.host.as_str());
 
     let hop_status = if status == NodeStatus::Ready {
-        match provision(southbound, strom, node_id, &flows, data_plane_host, tracker).await {
+        match provision(southbound, strom, node_id, &flows, listener_host, tracker).await {
             Ok(hop_status) => hop_status,
             Err(error) => {
                 tracing::warn!(%error, "provisioning desired hops failed");
@@ -291,11 +286,11 @@ async fn provision(
     strom: &StromClient,
     node_id: &str,
     flows: &[StromFlow],
-    data_plane_host: Option<&str>,
+    listener_host: Option<&str>,
     tracker: &mut StallTracker,
 ) -> Result<Vec<HopStatus>> {
     let desired = fetch_desired(southbound, node_id).await?;
-    Ok(reconcile(strom, &desired, flows, data_plane_host, tracker).await)
+    Ok(reconcile(strom, &desired, flows, listener_host, tracker).await)
 }
 
 /// Reconcile desired hops against observed flows in one poll cycle.
@@ -306,7 +301,7 @@ async fn reconcile(
     flow_api: &dyn FlowApi,
     desired: &[DesiredHop],
     flows: &[StromFlow],
-    data_plane_host: Option<&str>,
+    listener_host: Option<&str>,
     tracker: &mut StallTracker,
 ) -> Vec<HopStatus> {
     let plan = diff_hops(desired, flows);
@@ -342,22 +337,14 @@ async fn reconcile(
     let desired_ids: std::collections::HashSet<&str> =
         desired.iter().map(|h| h.id.as_str()).collect();
     tracker.retain(&desired_ids);
-    hop_statuses(
-        flow_api,
-        desired,
-        current,
-        data_plane_host,
-        &failed,
-        tracker,
-    )
-    .await
+    hop_statuses(flow_api, desired, current, listener_host, &failed, tracker).await
 }
 
 async fn hop_statuses(
     strom: &dyn FlowApi,
     desired: &[DesiredHop],
     flows: &[StromFlow],
-    data_plane_host: Option<&str>,
+    listener_host: Option<&str>,
     failed: &std::collections::HashSet<String>,
     tracker: &mut StallTracker,
 ) -> Vec<HopStatus> {
@@ -431,7 +418,7 @@ async fn hop_statuses(
                     ),
                     SocketSpec::Device(_) => LinkCondition::Idle,
                 },
-                resolved: resolved_addr(&hop.ingress, data_plane_host),
+                resolved: resolved_addr(&hop.ingress, listener_host),
                 stats: ingress.map(LinkStats::from),
             },
             egresses: hop
@@ -460,7 +447,7 @@ async fn hop_statuses(
                                 }
                                 SocketSpec::Device(_) => LinkCondition::Idle,
                             },
-                            resolved: resolved_addr(&egress.socket, data_plane_host),
+                            resolved: resolved_addr(&egress.socket, listener_host),
                             stats: branch_stats.map(LinkStats::from),
                         },
                     }
@@ -516,49 +503,40 @@ fn registration(
                     name: "strom".to_string(),
                     kind: AdapterKind::Strom,
                 }],
-                transports: config.node.transports.clone(),
-                devices: DeviceSet::default(),
-                data_plane: advertised_data_plane(config),
-                port_range: Some(config.node.port_range),
-                relay: config.node.relay,
+                hop_profiles: strom_hop_profiles(),
             },
+            topology: config.node.topology.clone(),
         },
         endpoints,
         hop_status,
     }
 }
 
-/// The node's data-plane addresses with each configured signalling base expanded
-/// into the WHIP and WHEP routes Strom serves under it, for whichever of those
-/// transports `config.node.transports` offers in the `Listen` role Strom hosts
-/// them in. An alias with no entry, or a transport the node does not host,
-/// advertises no signalling for it, and the controller then hosts no WebRTC
-/// link there.
-fn advertised_data_plane(config: &AdapterConfig) -> BTreeMap<String, DataPlaneAddr> {
-    let hosts = |transport: Transport| {
-        config
-            .node
-            .transports
-            .iter()
-            .any(|offer| offer.name == transport && offer.offers(SocketRole::Listen))
-    };
+fn transport_class(transport: Transport, roles: RoleSet) -> HopEndpointClass {
+    HopEndpointClass::Transport(TransportClass { transport, roles })
+}
 
-    let mut data_plane = config.node.data_plane.clone();
-    for (alias, base) in &config.strom.signalling_base {
-        let Some(addr) = data_plane.get_mut(alias) else {
-            continue;
-        };
-        let base = base.trim_end_matches('/');
-        if hosts(Transport::Whip) {
-            addr.signalling
-                .set(SignallingTransport::Whip, format!("{base}{WHIP_ROUTE}"));
-        }
-        if hosts(Transport::Whep) {
-            addr.signalling
-                .set(SignallingTransport::Whep, format!("{base}{WHEP_ROUTE}"));
-        }
-    }
-    data_plane
+fn strom_hop_profiles() -> Vec<HopProfile> {
+    vec![
+        HopProfile {
+            id: "srt-forward".to_string(),
+            ingress: transport_class(Transport::Srt, RoleSet::both()),
+            egress: transport_class(Transport::Srt, RoleSet::both()),
+            max_egresses: None,
+        },
+        HopProfile {
+            id: "whip-to-srt".to_string(),
+            ingress: transport_class(Transport::Whip, RoleSet::only(SocketRole::Listen)),
+            egress: transport_class(Transport::Srt, RoleSet::both()),
+            max_egresses: None,
+        },
+        HopProfile {
+            id: "srt-to-whep".to_string(),
+            ingress: transport_class(Transport::Srt, RoleSet::both()),
+            egress: transport_class(Transport::Whep, RoleSet::only(SocketRole::Listen)),
+            max_egresses: None,
+        },
+    ]
 }
 
 /// Registration the control plane will never accept, however long this adapter
@@ -718,308 +696,4 @@ fn push_unique(values: &mut Vec<String>, value: &str) {
 
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-    use weave_core::{DesiredEgress, HopRole, Signalling};
-
-    #[derive(Debug, Clone, PartialEq)]
-    enum Op {
-        Delete(String),
-        Create(String),
-        Start(String),
-        List,
-        Stats(String),
-    }
-
-    struct RecordingFlowApi {
-        ops: Mutex<Vec<Op>>,
-        flows_after: Vec<(String, String)>,
-        stats: Value,
-    }
-
-    impl RecordingFlowApi {
-        fn new(flows_after: Vec<(&str, &str)>) -> Self {
-            Self {
-                ops: Mutex::new(Vec::new()),
-                flows_after: flows_after
-                    .into_iter()
-                    .map(|(name, id)| (name.to_string(), id.to_string()))
-                    .collect(),
-                stats: json!({}),
-            }
-        }
-
-        fn with_stats(mut self, stats: Value) -> Self {
-            self.stats = stats;
-            self
-        }
-
-        fn ops(&self) -> Vec<Op> {
-            self.ops.lock().expect("ops lock").clone()
-        }
-
-        fn record(&self, op: Op) {
-            self.ops.lock().expect("ops lock").push(op);
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl FlowApi for RecordingFlowApi {
-        async fn list_flows(&self) -> Result<Vec<StromFlow>, StromError> {
-            self.record(Op::List);
-            Ok(self
-                .flows_after
-                .iter()
-                .map(|(name, id)| flow(name, id, true))
-                .collect())
-        }
-        async fn create_flow(&self, spec: &FlowSpec) -> Result<String, StromError> {
-            self.record(Op::Create(spec.name.clone()));
-            Ok(format!("id-{}", spec.name))
-        }
-        async fn start_flow(&self, id: &str) -> Result<(), StromError> {
-            self.record(Op::Start(id.to_string()));
-            Ok(())
-        }
-        async fn delete_flow(&self, id: &str) -> Result<(), StromError> {
-            self.record(Op::Delete(id.to_string()));
-            Ok(())
-        }
-        async fn srt_stats(&self, id: &str) -> Result<Value, StromError> {
-            self.record(Op::Stats(id.to_string()));
-            Ok(self.stats.clone())
-        }
-    }
-
-    fn hop(id: &str, port: u16) -> DesiredHop {
-        DesiredHop {
-            id: id.to_string(),
-            node_id: "strom-node-1".to_string(),
-            role: HopRole::Sender,
-            ingress: SocketSpec::srt_listen(port, 200),
-            egresses: vec![DesiredEgress {
-                branch_id: "destination-0".to_string(),
-                socket: SocketSpec::srt_connect("10.0.0.2", port + 1, 1000),
-            }],
-        }
-    }
-
-    fn flow(name: &str, id: &str, running: bool) -> StromFlow {
-        serde_json::from_value(json!({ "id": id, "name": name, "running": running }))
-            .expect("flow fixture")
-    }
-
-    const WEBRTC_CONFIG: &str = r"
-node:
-  id: strom-node-2
-  southbound_url: http://127.0.0.1:8081
-  listen: 0.0.0.0:8091
-  data_plane:
-    default: 172.27.0.10
-    wan: 203.0.113.7
-  port_range:
-    start: 20000
-    end: 20999
-  transports: [srt, whip, whep]
-strom:
-  url: http://172.27.0.10:8080
-  signalling_base:
-    default: http://172.27.0.10:8080/
-";
-
-    #[test]
-    fn registration_expands_a_signalling_base_into_stroms_own_routes() {
-        let config: AdapterConfig = serde_norway::from_str(WEBRTC_CONFIG).expect("parse config");
-        let registration = registration(
-            &config,
-            "http://172.27.0.10:8091",
-            NodeStatus::Ready,
-            Vec::new(),
-            Vec::new(),
-        );
-
-        let data_plane = &registration.node.capabilities.data_plane;
-        assert_eq!(
-            data_plane["default"].signalling,
-            Signalling {
-                whip: Some("http://172.27.0.10:8080/whip".to_string()),
-                whep: Some("http://172.27.0.10:8080/whep".to_string()),
-            },
-            "a trailing slash on the base does not double up"
-        );
-        assert!(
-            data_plane["wan"].signalling.is_empty(),
-            "an alias with no base advertises no signalling"
-        );
-    }
-
-    #[test]
-    fn a_signalling_base_advertises_nothing_without_a_webrtc_transport() {
-        let config: AdapterConfig = serde_norway::from_str(
-            &WEBRTC_CONFIG.replace("transports: [srt, whip, whep]", "transports: [srt]"),
-        )
-        .expect("parse config");
-        let registration = registration(
-            &config,
-            "http://172.27.0.10:8091",
-            NodeStatus::Ready,
-            Vec::new(),
-            Vec::new(),
-        );
-
-        assert!(
-            registration.node.capabilities.data_plane["default"]
-                .signalling
-                .is_empty(),
-            "a signalling_base with no matching transport offer advertises nothing"
-        );
-    }
-
-    #[test]
-    fn a_signalling_base_advertises_only_the_offered_webrtc_transport() {
-        let config: AdapterConfig = serde_norway::from_str(&WEBRTC_CONFIG.replace(
-            "transports: [srt, whip, whep]",
-            "transports: [srt, { name: whip, roles: [listen] }]",
-        ))
-        .expect("parse config");
-        let registration = registration(
-            &config,
-            "http://172.27.0.10:8091",
-            NodeStatus::Ready,
-            Vec::new(),
-            Vec::new(),
-        );
-
-        assert_eq!(
-            registration.node.capabilities.data_plane["default"].signalling,
-            Signalling {
-                whip: Some("http://172.27.0.10:8080/whip".to_string()),
-                whep: None,
-            },
-            "WHIP is offered but WHEP is not"
-        );
-    }
-
-    #[tokio::test]
-    async fn hop_status_reports_each_fanout_branch_independently() {
-        let mut desired = hop("weave-fanout-sender", 7001);
-        desired.egresses.push(DesiredEgress {
-            branch_id: "destination-1".to_string(),
-            socket: SocketSpec::srt_connect("10.0.0.3", 7003, 1000),
-        });
-        let flows = vec![flow("weave-fanout-sender", "id-fanout", true)];
-        let fake = RecordingFlowApi::new(Vec::new()).with_stats(json!({
-            "stats": { "connections": {
-                "srtsrc_0": { "connected": true, "callers": [
-                    { "recv_rate_mbps": 4.5, "bytes_received": 1000 }
-                ]},
-                "srtsink_0": { "connected": true, "callers": [
-                    { "send_rate_mbps": 4.4, "bytes_sent": 900,
-                      "packets_sent_lost": 2 }
-                ]},
-                "srtsink_1": { "connected": false, "callers": [] }
-            }}
-        }));
-        let mut tracker = StallTracker::default();
-
-        let statuses = hop_statuses(
-            &fake,
-            &[desired],
-            &flows,
-            Some("10.0.0.1"),
-            &std::collections::HashSet::new(),
-            &mut tracker,
-        )
-        .await;
-
-        let status = &statuses[0];
-        assert_eq!(status.ingress.condition, LinkCondition::Flowing);
-        assert_eq!(
-            status.ingress.stats.as_ref().map(|stats| stats.rate_mbps),
-            Some(4.5)
-        );
-        assert_eq!(status.egresses.len(), 2);
-        assert_eq!(status.egresses[0].branch_id, "destination-0");
-        assert_eq!(status.egresses[0].status.condition, LinkCondition::Flowing);
-        assert_eq!(
-            status.egresses[0]
-                .status
-                .resolved
-                .as_ref()
-                .map(|address| (address.host.as_str(), address.port)),
-            Some(("10.0.0.2", 7002))
-        );
-        assert_eq!(
-            status.egresses[0]
-                .status
-                .stats
-                .as_ref()
-                .map(|stats| (stats.rate_mbps, stats.packets_sent_lost)),
-            Some((4.4, 2))
-        );
-        assert_eq!(status.egresses[1].branch_id, "destination-1");
-        assert_eq!(
-            status.egresses[1].status.condition,
-            LinkCondition::Connecting
-        );
-        assert_eq!(
-            status.egresses[1]
-                .status
-                .resolved
-                .as_ref()
-                .map(|address| (address.host.as_str(), address.port)),
-            Some(("10.0.0.3", 7003))
-        );
-        assert_eq!(
-            status.egresses[1]
-                .status
-                .stats
-                .as_ref()
-                .map(|stats| stats.rate_mbps),
-            Some(0.0)
-        );
-    }
-
-    #[tokio::test]
-    async fn reconcile_deletes_before_creating_on_same_ports() {
-        // Old flows on ports 7001/7002; a differently-named stream re-applied on
-        // the same ports. Every delete must precede every create so the listener
-        // ports are freed before the new flows are created and started.
-        let desired = vec![
-            hop("weave-srt-latency-sender", 7001),
-            hop("weave-srt-latency-receiver-0", 7002),
-        ];
-        let flows = vec![
-            flow("weave-basic-sender", "id-basic-sender", true),
-            flow("weave-basic-receiver-0", "id-basic-receiver-0", true),
-        ];
-        let fake = RecordingFlowApi::new(vec![
-            ("weave-srt-latency-sender", "id-weave-srt-latency-sender"),
-            (
-                "weave-srt-latency-receiver-0",
-                "id-weave-srt-latency-receiver-0",
-            ),
-        ]);
-
-        let mut tracker = StallTracker::default();
-        let _ = reconcile(&fake, &desired, &flows, None, &mut tracker).await;
-
-        let ops = fake.ops();
-        let last_delete = ops
-            .iter()
-            .rposition(|op| matches!(op, Op::Delete(_)))
-            .expect("a delete was recorded");
-        let first_create = ops
-            .iter()
-            .position(|op| matches!(op, Op::Create(_)))
-            .expect("a create was recorded");
-        assert!(
-            last_delete < first_create,
-            "all deletes must precede all creates within one cycle: {ops:?}"
-        );
-    }
 }

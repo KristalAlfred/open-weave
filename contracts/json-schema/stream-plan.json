@@ -5,6 +5,54 @@
     "endpoints": {
       "additionalProperties": false,
       "properties": {
+        "destinations": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "endpoint": {
+                "additionalProperties": false,
+                "properties": {
+                  "host": {
+                    "type": "string"
+                  },
+                  "node": {
+                    "type": "string"
+                  },
+                  "port": {
+                    "format": "uint16",
+                    "maximum": 65535,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "node",
+                  "host",
+                  "port",
+                  "url"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "id": {
+                "maxLength": 63,
+                "minLength": 1,
+                "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
         "ingress": {
           "additionalProperties": false,
           "properties": {
@@ -34,43 +82,10 @@
             "object",
             "null"
           ]
-        },
-        "outputs": {
-          "items": {
-            "additionalProperties": false,
-            "properties": {
-              "host": {
-                "type": "string"
-              },
-              "node": {
-                "type": "string"
-              },
-              "port": {
-                "format": "uint16",
-                "maximum": 65535,
-                "minimum": 0,
-                "type": "integer"
-              },
-              "url": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "node",
-              "host",
-              "port",
-              "url"
-            ],
-            "type": [
-              "object",
-              "null"
-            ]
-          },
-          "type": "array"
         }
       },
       "required": [
-        "outputs"
+        "destinations"
       ],
       "type": [
         "object",
@@ -237,6 +252,9 @@
           "node_id": {
             "type": "string"
           },
+          "profile_id": {
+            "type": "string"
+          },
           "role": {
             "enum": [
               "sender",
@@ -249,6 +267,7 @@
         "required": [
           "id",
           "node_id",
+          "profile_id",
           "role",
           "ingress",
           "egresses"

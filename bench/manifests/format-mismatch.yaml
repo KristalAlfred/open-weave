@@ -21,7 +21,8 @@ source:
         sample_rate: 48000
         channels: 1
 destinations:
-  - srt:
+  - id: output
+    srt:
       node: strom-node-2
       latency: 1000
       accepts:

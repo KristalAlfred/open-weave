@@ -96,41 +96,75 @@
                 },
                 "type": "array"
               },
-              "endpoints": {
-                "additionalProperties": false,
-                "properties": {
-                  "ingress": {
-                    "additionalProperties": false,
-                    "properties": {
-                      "host": {
-                        "type": "string"
+              "destinations": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "conditions": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "detail": {
+                            "type": "string"
+                          },
+                          "last_transition_time": {
+                            "format": "date-time",
+                            "type": "string"
+                          },
+                          "reason": {
+                            "enum": [
+                              "placed",
+                              "disabled",
+                              "placement_failed",
+                              "nodes_available",
+                              "node_missing",
+                              "node_offline",
+                              "hops_ready",
+                              "hops_pending",
+                              "hop_failed",
+                              "format_compatible",
+                              "format_unknown",
+                              "format_mismatch",
+                              "media_flowing",
+                              "awaiting_input",
+                              "media_degraded",
+                              "media_failed",
+                              "media_idle",
+                              "not_ready"
+                            ],
+                            "type": "string"
+                          },
+                          "status": {
+                            "enum": [
+                              "true",
+                              "false",
+                              "unknown"
+                            ],
+                            "type": "string"
+                          },
+                          "type": {
+                            "enum": [
+                              "placement_ready",
+                              "nodes_available",
+                              "hops_ready",
+                              "format_compatible",
+                              "media_flowing"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "type",
+                          "status",
+                          "reason",
+                          "detail",
+                          "last_transition_time"
+                        ],
+                        "type": "object"
                       },
-                      "node": {
-                        "type": "string"
-                      },
-                      "port": {
-                        "format": "uint16",
-                        "maximum": 65535,
-                        "minimum": 0,
-                        "type": "integer"
-                      },
-                      "url": {
-                        "type": "string"
-                      }
+                      "type": "array"
                     },
-                    "required": [
-                      "node",
-                      "host",
-                      "port",
-                      "url"
-                    ],
-                    "type": [
-                      "object",
-                      "null"
-                    ]
-                  },
-                  "outputs": {
-                    "items": {
+                    "endpoint": {
                       "additionalProperties": false,
                       "properties": {
                         "host": {
@@ -160,21 +194,101 @@
                         "null"
                       ]
                     },
-                    "type": "array"
-                  }
+                    "id": {
+                      "maxLength": 63,
+                      "minLength": 1,
+                      "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                      "type": "string"
+                    },
+                    "nodes": {
+                      "items": {
+                        "maxLength": 63,
+                        "minLength": 1,
+                        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "status": {
+                      "description": "End-to-end status of a path, derived from its hops' conditions.",
+                      "oneOf": [
+                        {
+                          "const": "idle",
+                          "description": "The path is disabled.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "failed",
+                          "description": "At least one hop failed to provision.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "pending",
+                          "description": "A hop is still provisioning or has not reported yet.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "awaiting_input",
+                          "description": "Provisioned end to end, but no media is entering at the source.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "degraded",
+                          "description": "Media is entering at the source but not flowing all the way through.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "flowing",
+                          "description": "Media is flowing across every hop.",
+                          "type": "string"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "status",
+                    "nodes",
+                    "conditions"
+                  ],
+                  "type": "object"
                 },
-                "required": [
-                  "outputs"
-                ],
-                "type": [
-                  "object",
-                  "null"
-                ]
+                "type": "array"
               },
               "generation": {
                 "format": "uint64",
                 "minimum": 1,
                 "type": "integer"
+              },
+              "ingress": {
+                "additionalProperties": false,
+                "properties": {
+                  "host": {
+                    "type": "string"
+                  },
+                  "node": {
+                    "type": "string"
+                  },
+                  "port": {
+                    "format": "uint16",
+                    "maximum": 65535,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "node",
+                  "host",
+                  "port",
+                  "url"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "name": {
                 "maxLength": 63,
@@ -240,7 +354,8 @@
               "generation",
               "status",
               "nodes",
-              "conditions"
+              "conditions",
+              "destinations"
             ],
             "type": "object"
           },

@@ -7,5 +7,6 @@ source:
     node: strom-node-1
     latency: 200
 destinations:
-  - device:
+  - id: display
+    device:
       node: browser-placeholder

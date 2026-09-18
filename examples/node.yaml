@@ -13,35 +13,17 @@ node:
   listen: 0.0.0.0:8091
   # Optional; how peers reach this node's control API. Defaults to http://<listen>.
   public_endpoint: http://172.25.0.21:8091
-  # Data-plane addresses advertised for placement, keyed by alias. The only place
-  # concrete IPs live. Must contain the `default` alias.
-  #
-  # A bare host means peers can dial it. Spell an address out to say otherwise —
-  # a node behind NAT publishes where it dials *from*, and the controller plans
-  # around it by having the other end listen, or by relaying through a third node
-  # when neither end can be dialled.
-  data_plane:
-    default: 172.26.0.10
-    # wan:
-    #   host: 203.0.113.7
-    #   reachability: outbound_only   # or `dialable`, the default
-  # Inclusive port range the controller may assign SRT sockets from.
-  port_range:
-    start: 20000
-    end: 20999
-  # Optional link transports advertised to the controller: srt, whip or whep.
-  # Any other name is a config error. A bare name offers both socket roles;
-  # spell an entry out to offer only one — Strom hosts WHIP ingest and WHEP
-  # playback for browser nodes but never dials them.
-  transports: [srt]
-  # transports:
-  #   - srt
-  #   - { name: whip, roles: [listen] }
-  #   - { name: whep, roles: [listen] }
-  # Optional; offer this node as transit for streams that neither start nor end
-  # on it. The controller draws relays from nodes that set this and whose default
-  # alias is dialable. A `via` pin in a manifest does not consult it.
-  # relay: true
+  topology:
+    attachments:
+      - id: wan
+        network: internet
+        dial: true
+        listeners:
+          srt:
+            host: 172.26.0.10
+            port_range: { start: 20000, end: 20999 }
+          # whip: { base_url: http://172.26.0.10:8080/whip }
+          # whep: { base_url: http://172.26.0.10:8080/whep }
 strom:
   # Base URL of the Strom instance this adapter drives.
   url: http://172.26.0.10:8080
@@ -51,9 +33,3 @@ strom:
   # token: <token>
   # Optional; seconds between Strom observation polls. Defaults to 5.
   poll_interval_secs: 5
-  # Optional; base URL peers reach this Strom's WebRTC signalling at, keyed by
-  # data-plane alias. The adapter appends the routes Strom serves (/whip, /whep)
-  # and advertises the result. An alias with no entry advertises no signalling,
-  # and the controller then hosts no WebRTC link on that address.
-  # signalling_base:
-  #   default: http://172.26.0.10:8080

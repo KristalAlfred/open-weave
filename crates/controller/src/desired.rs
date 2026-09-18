@@ -40,6 +40,7 @@ mod tests {
         DesiredHop {
             id: id.to_string(),
             node_id: node_id.to_string(),
+            profile_id: "test-profile".to_string(),
             role: HopRole::Sender,
             ingress: SocketSpec::Device(DeviceKind::Capture),
             egresses: vec![DesiredEgress {
@@ -57,20 +58,20 @@ mod tests {
 
     #[test]
     fn same_node_and_ordered_hops_have_a_stable_revision() {
-        let hops = vec![hop("hop-a", "node-a", "destination-0")];
+        let hops = vec![hop("hop-a", "node-a", "studio")];
 
         assert_eq!(revision("node-a", hops.clone()), revision("node-a", hops));
     }
 
     #[test]
     fn node_or_hop_changes_change_the_revision() {
-        let hops = vec![hop("hop-a", "node-a", "destination-0")];
+        let hops = vec![hop("hop-a", "node-a", "studio")];
         let original = revision("node-a", hops.clone());
 
         assert_ne!(original, revision("node-b", hops));
         assert_ne!(
             original,
-            revision("node-a", vec![hop("hop-a", "node-a", "destination-1")])
+            revision("node-a", vec![hop("hop-a", "node-a", "preview")])
         );
     }
 

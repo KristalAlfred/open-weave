@@ -19,25 +19,27 @@ fi
 
 usage() {
   cat >&2 <<EOF
-usage: endpoints.sh <stream> ingress|output|outputs [index]
+usage: endpoints.sh <stream> ingress|destination|destinations|destination-ids [id]
   endpoints.sh basic ingress       producer target (source ingress) host:port
-  endpoints.sh basic output        first consumer output host:port
-  endpoints.sh fanout output 1     second consumer output host:port
-  endpoints.sh fanout outputs      number of receiver outputs (one per destination)
+  endpoints.sh basic destination output
+  endpoints.sh fanout destination studio
+  endpoints.sh fanout destinations
 EOF
   exit 2
 }
 
 stream="${1:-}"; [ -n "$stream" ] || usage
 role="${2:-}"; [ -n "$role" ] || usage
-index="${3:-0}"
+destination="${3:-}"
 
-# `outputs` reports how many consumers a stream needs; the others resolve one
+# `destinations` reports how many consumers a stream needs; the others resolve one
 # concrete address. Both wait for placement, so they share the polling loop.
 case "$role" in
   ingress) filter='.ingress | "\(.host):\(.port)"' ;;
-  output)  filter=".outputs[$index] | \"\(.host):\(.port)\"" ;;
-  outputs) filter='.outputs | length' ;;
+  destination) [ -n "$destination" ] || usage
+               filter=".destinations[] | select(.id == \"$destination\") | .endpoint | \"\(.host):\(.port)\"" ;;
+  destinations) filter='.destinations | length' ;;
+  destination-ids) filter='[.destinations[].id] | sort | join(" ")' ;;
   *) usage ;;
 esac
 
@@ -63,7 +65,7 @@ for _ in $(seq 1 "$attempts"); do
       printf '%s\n' "$value"
       exit 0
     fi
-    echo "stream '$stream' has no $role[$index]" >&2
+    echo "stream '$stream' has no $role ${destination:-}" >&2
     exit 1
   fi
   sleep "$interval"

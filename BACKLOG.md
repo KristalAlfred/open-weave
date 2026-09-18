@@ -5,14 +5,6 @@ that is easy to break while fixing it.
 
 ## Open
 
-- **A browser capture cannot fan out.** The capability model has no fan-out
-  limit, so the planner may put several destinations on one browser sender hop,
-  but `nodes/browser/node.js` owns one peer connection and accepts exactly one
-  egress. It reports the hop `failed` and includes every branch in status rather
-  than silently realising the first one. Done: the browser owns one peer and
-  progress tracker per branch, or capabilities let it declare a limit the
-  planner enforces. Easy to break: every desired branch must remain visible in
-  status even when the hop shape is unsupported.
 - **`browser-cam` carries audio and no video.** Strom's `whip_input` sets
   `video-codecs = ["H264"]` (`backend/src/blocks/builtin/whip.rs` in Strom) and
   the bench's Playwright Chromium on arm64 has no H264 encoder, so the session
@@ -24,7 +16,7 @@ that is easy to break while fixing it.
   the SRT output. Two routes: a Chromium that encodes H264 (Google Chrome on
   x86_64 — there is no Linux arm64 build), or VP8/VP9 accepted by `whip_input`,
   which is a change to Strom. The gateway flow itself is fine: Google Chrome on
-  the macOS host, through the `docker-host` alias and `browser-cam-host`, put
+  the macOS host, through the `docker-host` attachment and `browser-cam-host`, put
   H264 640x480 plus AAC on the SRT output with the flow `Playing`
   (`bench/README.md`, "A page in your own browser"). Easy to break:
   `bench/justfile` prints `browser-cam`'s status instead of waiting on it, and
@@ -59,17 +51,12 @@ that is easy to break while fixing it.
   flows. Done: a page restart reconnects without that window. Easy to break:
   `max_sessions: 1` is what makes one page own one endpoint, and what a second
   connection to the same endpoint does with a higher limit is untested.
-- **A hop with WebRTC on both sides is refused.** The planner can produce
-  `whip → whep` (two browser nodes bridged through a Strom) and Strom can build
-  `whip_input → whep_output`, but the adapter reads media progress from a hop's
-  SRT byte counters and such a hop has no SRT side, so the path would report
-  `degraded` for ever. `flow_spec_from_hop` returns
-  `MappingError::WebRtcOnBothSides` instead (`crates/strom/src/spec.rs`). Done:
-  browser to browser through a Strom places and reports its real condition. That
-  needs a per-session signal Strom does not expose: `webrtc-stats` walks the
-  flow pipeline and WHIP/WHEP sessions run in pipelines of their own. Easy to
-  break: accepting the shape without a signal makes a working path read
-  `degraded`, which is worse than refusing it.
+- **Browser-to-browser media has no supported Strom profile.** Strom can build
+  `whip_input → whep_output`, but the adapter reads media progress from SRT byte
+  counters and this shape has no SRT side. Strom therefore does not advertise a
+  `whip → whep` hop profile, and planning fails before desired state is sent.
+  Done: expose a per-session media signal and add the profile. Easy to break:
+  advertising it without that signal makes a working path read `degraded`.
 ## Not scheduled
 
 Listed so they are not picked up by accident.

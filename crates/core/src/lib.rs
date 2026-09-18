@@ -15,20 +15,18 @@ use serde::{Deserialize, Serialize};
 pub use api::{
     AcceptedState, ApiError, ApiErrorCode, NodeAccepted, PlanStatus, RunningStatus, StartingState,
     StartingStatus, StatusResponse, StreamAccepted, StreamCondition, StreamConditionReason,
-    StreamConditionStatus, StreamConditionType, StreamPlan, StreamResource, StreamSetAccepted,
-    StreamSetAction, StreamSetApply, StreamSetMemberResult, StreamSetResource, StreamStatus,
+    StreamConditionStatus, StreamConditionType, StreamDestinationStatus, StreamPlan,
+    StreamResource, StreamSetAccepted, StreamSetAction, StreamSetApply, StreamSetMemberResult,
+    StreamSetResource, StreamStatus,
 };
 pub use media::{
     AudioCodec, AudioConstraint, AudioFormat, ChromaSubsampling, Container, FormatConstraint,
     Framerate, MediaFormat, Mismatch, VideoCodec, VideoConstraint, VideoFormat,
 };
 pub use validation::{
-    RESOURCE_ID_MAX_LEN, ResourceIdError, ValidationIssue, resource_id_issue, validate_resource_id,
-    validate_stream,
+    RESOURCE_ID_MAX_LEN, ResourceIdError, ValidationIssue, resource_id_issue, validate_node,
+    validate_resource_id, validate_stream,
 };
-
-/// Conventional data-plane alias resolved when a manifest pins no network.
-pub const DEFAULT_DATA_PLANE_ALIAS: &str = "default";
 
 pub const ROUTE_ENDPOINTS: &str = "/endpoints";
 pub const ROUTE_NODES: &str = "/nodes";
@@ -49,7 +47,7 @@ pub const ROUTE_STREAMS: &str = "/streams";
 /// A stale adapter is rejected at registration instead of being served desired
 /// state it cannot realise. This changes when southbound behavior or payload
 /// semantics become incompatible.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Whether the controller can serve an adapter declaring protocol `version`.
 ///
@@ -61,8 +59,77 @@ pub fn protocol_compatible(version: u32) -> bool {
     version == PROTOCOL_VERSION
 }
 
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    fn endpoint(node: &str) -> StreamTransport {
+        StreamTransport::Srt(SrtEndpoint {
+            node: Some(node.to_string()),
+            remote: None,
+            via: Vec::new(),
+            network: None,
+            latency: None,
+            format: None,
+            accepts: None,
+        })
+    }
+
+    fn destination(id: &str, node: &str) -> StreamDestination {
+        StreamDestination {
+            id: id.to_string(),
+            endpoint: endpoint(node),
+        }
+    }
+
+    #[test]
+    fn destination_order_is_not_semantic() {
+        let left = StreamDefinition {
+            name: "feed".to_string(),
+            enabled: true,
+            source: endpoint("source"),
+            destinations: vec![destination("studio", "a"), destination("preview", "b")],
+        };
+        let mut right = left.clone();
+        right.destinations.reverse();
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn duplicate_destination_ids_are_rejected() {
+        let stream = StreamDefinition {
+            name: "feed".to_string(),
+            enabled: true,
+            source: endpoint("source"),
+            destinations: vec![destination("studio", "a"), destination("studio", "b")],
+        };
+        assert!(
+            validate_stream(&stream)
+                .iter()
+                .any(|issue| { issue.field == "destinations[1].id" && issue.code == "duplicate" })
+        );
+    }
+
+    #[test]
+    fn destination_endpoint_is_flattened() {
+        let value = serde_json::to_value(destination("studio", "studio-node")).unwrap();
+        assert_eq!(value["id"], "studio");
+        assert_eq!(value["srt"]["node"], "studio-node");
+        assert!(value.get("endpoint").is_none());
+    }
+
+    #[test]
+    fn superseded_capability_fields_are_rejected() {
+        let result = serde_json::from_value::<NodeCapabilities>(serde_json::json!({
+            "transports": ["srt"],
+            "relay": true
+        }));
+        assert!(result.is_err());
+    }
+}
+
 /// Operator intent: one source streamed to one or more destinations over a transport.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StreamDefinition {
     #[schemars(
@@ -74,7 +141,41 @@ pub struct StreamDefinition {
     pub enabled: bool,
     pub source: StreamTransport,
     #[schemars(length(min = 1))]
-    pub destinations: Vec<StreamTransport>,
+    pub destinations: Vec<StreamDestination>,
+}
+
+impl PartialEq for StreamDefinition {
+    fn eq(&self, other: &Self) -> bool {
+        if self.name != other.name || self.enabled != other.enabled || self.source != other.source {
+            return false;
+        }
+        let mut left: Vec<_> = self.destinations.iter().collect();
+        let mut right: Vec<_> = other.destinations.iter().collect();
+        left.sort_by(|a, b| a.id.cmp(&b.id));
+        right.sort_by(|a, b| a.id.cmp(&b.id));
+        left == right
+    }
+}
+
+/// One stable, named output branch of a stream.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StreamDestination {
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
+    pub id: String,
+    #[serde(flatten)]
+    pub endpoint: StreamTransport,
+}
+
+impl Deref for StreamDestination {
+    type Target = StreamTransport;
+
+    fn deref(&self) -> &Self::Target {
+        &self.endpoint
+    }
 }
 
 fn default_enabled() -> bool {
@@ -106,7 +207,7 @@ impl StreamTransport {
         }
     }
 
-    /// The data-plane alias this endpoint is addressed on, when pinned.
+    /// The shared network this endpoint uses, when pinned.
     #[must_use]
     pub fn network(&self) -> Option<&str> {
         match self {
@@ -135,8 +236,7 @@ pub struct NodeEndpoint {
         regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
     )]
     pub node: String,
-    /// Data-plane alias resolved against the node's declared address map.
-    /// Absent means [`DEFAULT_DATA_PLANE_ALIAS`].
+    /// Shared network constraint. Absent lets the planner choose an attachment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<String>,
 }
@@ -166,8 +266,8 @@ pub struct SrtEndpoint {
         regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
     ))]
     pub via: Vec<String>,
-    /// Data-plane alias resolved against the node's declared address map.
-    /// Absent means [`DEFAULT_DATA_PLANE_ALIAS`].
+    /// Shared network constraint for a node endpoint. Absent lets the planner
+    /// choose an attachment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -192,6 +292,11 @@ pub struct SrtEndpoint {
 pub struct RemoteAddr {
     pub host: String,
     pub port: u16,
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
+    pub network: String,
 }
 
 /// Destinations whose declared `accepts` the stream's source format does not
@@ -215,14 +320,13 @@ pub fn stream_format_conflicts(stream: &StreamDefinition) -> Vec<media::FormatCo
     stream
         .destinations
         .iter()
-        .enumerate()
-        .filter_map(|(index, destination)| {
-            let StreamTransport::Srt(destination) = destination else {
+        .filter_map(|destination| {
+            let StreamTransport::Srt(endpoint) = &destination.endpoint else {
                 return None;
             };
-            let mismatches = destination.accepts.as_ref()?.mismatches(format);
+            let mismatches = endpoint.accepts.as_ref()?.mismatches(format);
             (!mismatches.is_empty()).then_some(media::FormatConflict {
-                destination: index,
+                destination: destination.id.clone(),
                 mismatches,
             })
         })
@@ -255,6 +359,7 @@ pub struct Path {
 pub struct DesiredHop {
     pub id: String,
     pub node_id: String,
+    pub profile_id: String,
     pub role: HopRole,
     pub ingress: SocketSpec,
     pub egresses: Vec<DesiredEgress>,
@@ -982,202 +1087,170 @@ pub struct NodeDescriptor {
     pub status: NodeStatus,
     #[serde(default)]
     pub capabilities: NodeCapabilities,
+    pub topology: NodeTopology,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
 pub struct NodeCapabilities {
     #[serde(default)]
     pub adapters: Vec<AdapterDescriptor>,
-    /// Link transports this node offers, with the roles it can take.
     #[serde(default)]
-    pub transports: Vec<TransportOffer>,
-    /// Devices the node can capture from or display on.
-    #[serde(default, skip_serializing_if = "DeviceSet::is_empty")]
-    pub devices: DeviceSet,
-    /// Data-plane addresses this node advertises, keyed by alias. The
-    /// [`DEFAULT_DATA_PLANE_ALIAS`] entry serves node-referenced endpoints
-    /// that pin no network.
-    #[serde(default)]
-    pub data_plane: BTreeMap<String, DataPlaneAddr>,
-    /// Inclusive port range the controller may assign from for this node's
-    /// hops. A soft contract: bind failures surface as [`HopState::Failed`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub port_range: Option<PortRange>,
-    /// Whether this node may carry transit for streams that neither terminate
-    /// nor originate on it — the pool the planner draws a relay from when two
-    /// endpoints cannot dial each other.
-    #[serde(default)]
-    pub relay: bool,
+    pub hop_profiles: Vec<HopProfile>,
 }
 
 impl NodeCapabilities {
-    /// Whether this node can take `role` over `transport`.
-    ///
-    /// A node that declares no transports at all is read as SRT in both roles:
-    /// `transports` is an optional config field, so a node config that omits it
-    /// still reaches this.
     #[must_use]
-    pub fn offers(&self, transport: Transport, role: SocketRole) -> bool {
-        if self.transports.is_empty() {
-            return transport == Transport::Srt;
-        }
-        self.transports
+    pub fn offers_ingress(&self, transport: Transport, role: SocketRole) -> bool {
+        self.hop_profiles
             .iter()
-            .any(|offer| offer.name == transport && offer.roles.contains(role))
+            .any(|profile| profile.ingress.offers_transport(transport, role))
     }
 
-    /// Whether this node offers a `kind` device. Unlike [`Self::offers`] there
-    /// is no fallback: a node that declares no devices has none.
     #[must_use]
-    pub fn offers_device(&self, kind: DeviceKind) -> bool {
-        self.devices.contains(kind)
+    pub fn offers_egress(&self, transport: Transport, role: SocketRole) -> bool {
+        self.hop_profiles
+            .iter()
+            .any(|profile| profile.egress.offers_transport(transport, role))
+    }
+
+    #[must_use]
+    pub fn offers_ingress_device(&self, kind: DeviceKind) -> bool {
+        self.hop_profiles.iter().any(
+            |profile| matches!(&profile.ingress, HopEndpointClass::Device(device) if device.device == kind),
+        )
+    }
+
+    #[must_use]
+    pub fn offers_egress_device(&self, kind: DeviceKind) -> bool {
+        self.hop_profiles.iter().any(
+            |profile| matches!(&profile.egress, HopEndpointClass::Device(device) if device.device == kind),
+        )
     }
 }
 
-/// One data-plane address a node advertises, plus whether peers can open
-/// connections to it.
-///
-/// Deserializes from either a bare host string or a full mapping, so
-/// `default: 172.26.0.10` and
-/// `wan: { host: 203.0.113.7, reachability: outbound_only }` are both valid.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DataPlaneAddr {
-    pub host: String,
-    pub reachability: Reachability,
-    /// Signalling bases for WebRTC links hosted at this address, declared by
-    /// the node. A caller builds the full URL via [`SocketSpec::signalling`],
-    /// which owns the join with the endpoint id.
-    #[serde(default, skip_serializing_if = "Signalling::is_empty")]
-    pub signalling: Signalling,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HopProfile {
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
+    pub id: String,
+    pub ingress: HopEndpointClass,
+    pub egress: HopEndpointClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub max_egresses: Option<usize>,
 }
 
-#[derive(JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
-#[allow(dead_code)]
-enum DataPlaneAddrSchema {
-    Host(String),
-    Full {
-        host: String,
-        #[serde(default)]
-        reachability: Reachability,
-        #[serde(default)]
-        signalling: Signalling,
-    },
+pub enum HopEndpointClass {
+    Transport(TransportClass),
+    Device(DeviceClass),
 }
 
-impl JsonSchema for DataPlaneAddr {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        "DataPlaneAddr".into()
-    }
-
-    fn schema_id() -> std::borrow::Cow<'static, str> {
-        concat!(module_path!(), "::DataPlaneAddr").into()
-    }
-
-    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
-        generator.subschema_for::<DataPlaneAddrSchema>()
-    }
-}
-
-impl DataPlaneAddr {
-    /// An address peers can dial — the shorthand form's meaning.
+impl HopEndpointClass {
     #[must_use]
-    pub fn dialable(host: impl Into<String>) -> Self {
-        Self {
-            host: host.into(),
-            reachability: Reachability::Dialable,
-            signalling: Signalling::default(),
-        }
+    pub fn offers_transport(&self, transport: Transport, role: SocketRole) -> bool {
+        matches!(self, Self::Transport(class) if class.transport == transport && class.roles.contains(role))
     }
 
     #[must_use]
-    pub fn is_dialable(&self) -> bool {
-        self.reachability == Reachability::Dialable
+    pub fn matches_socket(&self, socket: &SocketSpec) -> bool {
+        match (self, socket) {
+            (Self::Transport(class), SocketSpec::Srt(socket)) => {
+                class.transport == Transport::Srt && class.roles.contains(socket.role())
+            }
+            (Self::Transport(class), SocketSpec::Whip(socket)) => {
+                class.transport == Transport::Whip && class.roles.contains(socket.role)
+            }
+            (Self::Transport(class), SocketSpec::Whep(socket)) => {
+                class.transport == Transport::Whep && class.roles.contains(socket.role)
+            }
+            (Self::Device(class), SocketSpec::Device(device)) => class.device == *device,
+            _ => false,
+        }
     }
 }
 
-impl<'de> Deserialize<'de> for DataPlaneAddr {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Full {
-            host: String,
-            #[serde(default)]
-            reachability: Reachability,
-            #[serde(default)]
-            signalling: Signalling,
-        }
-
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Repr {
-            Host(String),
-            Full(Full),
-        }
-
-        Ok(match Repr::deserialize(deserializer)? {
-            Repr::Host(host) => Self::dialable(host),
-            Repr::Full(Full {
-                host,
-                reachability,
-                signalling,
-            }) => Self {
-                host,
-                reachability,
-                signalling,
-            },
-        })
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TransportClass {
+    pub transport: Transport,
+    pub roles: RoleSet,
 }
 
-/// Base URLs a node serves WHIP and WHEP signalling at, per WebRTC transport.
-/// A transport with no base is not offered for hosting at that address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceClass {
+    pub device: DeviceKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub struct NodeTopology {
+    #[serde(default)]
+    pub attachments: Vec<NetworkAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkAttachment {
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
+    pub id: String,
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
+    pub network: String,
+    #[serde(default)]
+    pub dial: bool,
+    #[serde(default)]
+    pub listeners: NetworkListeners,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct Signalling {
+pub struct NetworkListeners {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub whip: Option<String>,
+    pub srt: Option<SrtListener>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub whep: Option<String>,
+    pub whip: Option<SignallingListener>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whep: Option<SignallingListener>,
 }
 
-impl Signalling {
+impl NetworkListeners {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.whip.is_none() && self.whep.is_none()
+        self.srt.is_none() && self.whip.is_none() && self.whep.is_none()
     }
 
-    /// The base URL hosted for `transport`, when this address offers one.
     #[must_use]
-    pub fn base(&self, transport: SignallingTransport) -> Option<&str> {
+    pub fn signalling(&self, transport: SignallingTransport) -> Option<&str> {
         match transport {
-            SignallingTransport::Whip => self.whip.as_deref(),
-            SignallingTransport::Whep => self.whep.as_deref(),
-        }
-    }
-
-    /// Declare the base URL this address hosts `transport` signalling at.
-    pub fn set(&mut self, transport: SignallingTransport, base: String) {
-        match transport {
-            SignallingTransport::Whip => self.whip = Some(base),
-            SignallingTransport::Whep => self.whep = Some(base),
+            SignallingTransport::Whip => self.whip.as_ref().map(|v| v.base_url.as_str()),
+            SignallingTransport::Whep => self.whep.as_ref().map(|v| v.base_url.as_str()),
         }
     }
 }
 
-/// Whether peers can open a connection to an address, or the node behind it can
-/// only dial out. Planning reads this to decide which end of a link listens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum Reachability {
-    /// Peers can connect to this address.
-    #[default]
-    Dialable,
-    /// Behind NAT or a firewall: this node must initiate every connection.
-    OutboundOnly,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SrtListener {
+    pub host: String,
+    pub port_range: PortRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SignallingListener {
+    pub base_url: String,
 }
 
 /// Inclusive `[start, end]` range of ports a node offers for controller-side
@@ -1218,19 +1291,7 @@ pub struct NodeConfig {
     /// `http://{listen}` via [`NodeConfig::public_endpoint`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_endpoint: Option<String>,
-    /// Data-plane addresses advertised for placement, keyed by alias. Must
-    /// contain the [`DEFAULT_DATA_PLANE_ALIAS`] entry. Each is either a bare
-    /// host (dialable) or a mapping pinning its [`Reachability`].
-    pub data_plane: BTreeMap<String, DataPlaneAddr>,
-    /// Inclusive port range the controller may assign from for this node.
-    pub port_range: PortRange,
-    /// Link transports this node advertises, each a bare name (both roles) or
-    /// `{ name, roles }`.
-    #[serde(default)]
-    pub transports: Vec<TransportOffer>,
-    /// Whether this node offers itself as transit for other nodes' streams.
-    #[serde(default)]
-    pub relay: bool,
+    pub topology: NodeTopology,
 }
 
 impl NodeConfig {
@@ -1264,28 +1325,38 @@ impl NodeConfig {
             })
     }
 
-    /// Enforce the invariants placement depends on: a valid node id, a `default`
-    /// data-plane alias with no blank entries, and a well-ordered port range.
-    ///
     /// # Errors
     /// Returns [`ConfigError`] describing the first violated invariant.
     pub fn validate(&self) -> Result<(), ConfigError> {
         validate_resource_id(&self.id).map_err(ConfigError::InvalidId)?;
-        if !self.data_plane.contains_key(DEFAULT_DATA_PLANE_ALIAS) {
-            return Err(ConfigError::MissingDefaultAlias);
-        }
-        if self
-            .data_plane
-            .iter()
-            .any(|(alias, addr)| alias.trim().is_empty() || addr.host.trim().is_empty())
-        {
-            return Err(ConfigError::EmptyDataPlaneEntry);
-        }
-        if self.port_range.start > self.port_range.end {
-            return Err(ConfigError::InvalidPortRange {
-                start: self.port_range.start,
-                end: self.port_range.end,
-            });
+        let mut ids = std::collections::HashSet::new();
+        for attachment in &self.topology.attachments {
+            validate_resource_id(&attachment.id).map_err(ConfigError::InvalidAttachmentId)?;
+            validate_resource_id(&attachment.network).map_err(ConfigError::InvalidNetworkId)?;
+            if !ids.insert(&attachment.id) {
+                return Err(ConfigError::DuplicateAttachment(attachment.id.clone()));
+            }
+            if let Some(listener) = &attachment.listeners.srt {
+                if listener.host.trim().is_empty() {
+                    return Err(ConfigError::BlankListener);
+                }
+                if listener.port_range.start > listener.port_range.end {
+                    return Err(ConfigError::InvalidPortRange {
+                        start: listener.port_range.start,
+                        end: listener.port_range.end,
+                    });
+                }
+            }
+            if attachment
+                .listeners
+                .whip
+                .as_ref()
+                .into_iter()
+                .chain(attachment.listeners.whep.as_ref())
+                .any(|listener| listener.base_url.trim().is_empty())
+            {
+                return Err(ConfigError::BlankListener);
+            }
         }
         Ok(())
     }
@@ -1295,10 +1366,14 @@ impl NodeConfig {
 pub enum ConfigError {
     #[error("node id {0}")]
     InvalidId(ResourceIdError),
-    #[error("data_plane must define the '{DEFAULT_DATA_PLANE_ALIAS}' alias")]
-    MissingDefaultAlias,
-    #[error("data_plane has an empty alias or host")]
-    EmptyDataPlaneEntry,
+    #[error("attachment id {0}")]
+    InvalidAttachmentId(ResourceIdError),
+    #[error("network id {0}")]
+    InvalidNetworkId(ResourceIdError),
+    #[error("duplicate attachment id {0}")]
+    DuplicateAttachment(String),
+    #[error("listener host or base_url must not be blank")]
+    BlankListener,
     #[error("port_range start {start} exceeds end {end}")]
     InvalidPortRange { start: u16, end: u16 },
 }
@@ -1319,91 +1394,6 @@ pub enum AdapterKind {
     Mcm,
     Vendor,
     Custom,
-}
-
-/// One transport a node offers, with the socket roles it can take over it.
-///
-/// Deserializes from a bare name or a full mapping, so `transports: [srt]` and
-/// `transports: [{ name: whip, roles: [listen] }]` are both valid. A bare name,
-/// or a mapping without `roles`, offers both roles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct TransportOffer {
-    pub name: Transport,
-    pub roles: RoleSet,
-}
-
-#[derive(JsonSchema)]
-#[serde(untagged)]
-#[allow(dead_code)]
-enum TransportOfferSchema {
-    Name(Transport),
-    Full {
-        name: Transport,
-        #[serde(default = "RoleSet::both")]
-        roles: RoleSet,
-    },
-}
-
-impl JsonSchema for TransportOffer {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        "TransportOffer".into()
-    }
-
-    fn schema_id() -> std::borrow::Cow<'static, str> {
-        concat!(module_path!(), "::TransportOffer").into()
-    }
-
-    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
-        generator.subschema_for::<TransportOfferSchema>()
-    }
-}
-
-impl TransportOffer {
-    /// A transport offered in both roles.
-    #[must_use]
-    pub fn new(name: Transport) -> Self {
-        Self {
-            name,
-            roles: RoleSet::both(),
-        }
-    }
-
-    #[must_use]
-    pub fn with_roles(name: Transport, roles: RoleSet) -> Self {
-        Self { name, roles }
-    }
-
-    #[must_use]
-    pub fn offers(&self, role: SocketRole) -> bool {
-        self.roles.contains(role)
-    }
-}
-
-impl<'de> Deserialize<'de> for TransportOffer {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Full {
-            name: Transport,
-            #[serde(default = "RoleSet::both")]
-            roles: RoleSet,
-        }
-
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Repr {
-            Name(Transport),
-            Full(Full),
-        }
-
-        Ok(match Repr::deserialize(deserializer)? {
-            Repr::Name(name) => Self::new(name),
-            Repr::Full(Full { name, roles }) => Self::with_roles(name, roles),
-        })
-    }
 }
 
 /// A non-empty set of the socket roles a node can take over one transport.
@@ -1495,84 +1485,6 @@ impl<'de> Deserialize<'de> for RoleSet {
     }
 }
 
-/// The devices a node offers, listed by [`DeviceKind`] name on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct DeviceSet {
-    capture: bool,
-    display: bool,
-}
-
-impl JsonSchema for DeviceSet {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        "DeviceSet".into()
-    }
-
-    fn schema_id() -> std::borrow::Cow<'static, str> {
-        concat!(module_path!(), "::DeviceSet").into()
-    }
-
-    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
-        generator.subschema_for::<Vec<DeviceKind>>()
-    }
-}
-
-impl DeviceSet {
-    #[must_use]
-    pub fn contains(self, kind: DeviceKind) -> bool {
-        match kind {
-            DeviceKind::Capture => self.capture,
-            DeviceKind::Display => self.display,
-        }
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        !self.capture && !self.display
-    }
-
-    fn kinds(self) -> impl Iterator<Item = DeviceKind> {
-        [
-            self.capture.then_some(DeviceKind::Capture),
-            self.display.then_some(DeviceKind::Display),
-        ]
-        .into_iter()
-        .flatten()
-    }
-}
-
-impl FromIterator<DeviceKind> for DeviceSet {
-    fn from_iter<I: IntoIterator<Item = DeviceKind>>(kinds: I) -> Self {
-        let mut set = Self::default();
-        for kind in kinds {
-            match kind {
-                DeviceKind::Capture => set.capture = true,
-                DeviceKind::Display => set.display = true,
-            }
-        }
-        set
-    }
-}
-
-impl Serialize for DeviceSet {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.collect_seq(self.kinds())
-    }
-}
-
-impl<'de> Deserialize<'de> for DeviceSet {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Ok(Vec::<DeviceKind>::deserialize(deserializer)?
-            .into_iter()
-            .collect())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct EndpointDescriptor {
     pub id: String,
@@ -1650,7 +1562,18 @@ pub struct ReconcileReport {
 #[serde(deny_unknown_fields)]
 pub struct StreamEndpoints {
     pub ingress: Option<EndpointAddr>,
-    pub outputs: Vec<Option<EndpointAddr>>,
+    pub destinations: Vec<DestinationEndpoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DestinationEndpoint {
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
+    pub id: String,
+    pub endpoint: Option<EndpointAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1678,1111 +1601,4 @@ pub enum NodeStatus {
     Ready,
     Degraded,
     Offline,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stream_json_uses_snake_case_transport_tag_and_defaults_enabled() {
-        let json = serde_json::json!({
-            "name": "cam1-to-studio",
-            "source": { "srt": { "node": "strom-node-1", "latency": 200 } },
-            "destinations": [
-                { "srt": { "node": "strom-node-2", "network": "wan" } }
-            ]
-        });
-
-        let stream: StreamDefinition = serde_json::from_value(json).expect("parse stream");
-
-        assert!(stream.enabled, "enabled defaults to true when omitted");
-        assert_eq!(
-            stream.source,
-            StreamTransport::Srt(SrtEndpoint {
-                node: Some("strom-node-1".to_string()),
-                remote: None,
-                via: Vec::new(),
-                format: None,
-                accepts: None,
-                network: None,
-                latency: Some(200),
-            })
-        );
-        assert_eq!(
-            stream.destinations[0],
-            StreamTransport::Srt(SrtEndpoint {
-                node: Some("strom-node-2".to_string()),
-                remote: None,
-                via: Vec::new(),
-                format: None,
-                accepts: None,
-                network: Some("wan".to_string()),
-                latency: None,
-            })
-        );
-
-        let round_trip: StreamDefinition =
-            serde_json::from_str(&serde_json::to_string(&stream).unwrap()).unwrap();
-        assert_eq!(stream, round_trip);
-        assert_eq!(
-            serde_json::to_value(&stream).unwrap()["source"]
-                .as_object()
-                .unwrap()
-                .keys()
-                .next()
-                .unwrap(),
-            "srt"
-        );
-    }
-
-    fn sample_hop() -> DesiredHop {
-        DesiredHop {
-            id: "weave-contribution-sender".to_string(),
-            node_id: "strom-node-1".to_string(),
-            role: HopRole::Sender,
-            ingress: SocketSpec::srt_listen(7001, 200),
-            egresses: vec![DesiredEgress {
-                branch_id: "destination-0".to_string(),
-                socket: SocketSpec::srt_connect("172.31.0.10", 7002, 1000),
-            }],
-        }
-    }
-
-    #[test]
-    fn path_round_trips_and_defaults_enabled_and_hops() {
-        let path = Path {
-            stream: "contribution".to_string(),
-            enabled: true,
-            hops: vec![sample_hop()],
-        };
-        let round_trip: Path =
-            serde_json::from_str(&serde_json::to_string(&path).unwrap()).unwrap();
-        assert_eq!(path, round_trip);
-
-        let minimal: Path = serde_json::from_value(serde_json::json!({
-            "stream": "contribution"
-        }))
-        .expect("parse minimal path");
-        assert!(minimal.enabled, "enabled defaults to true");
-        assert!(minimal.hops.is_empty(), "hops defaults to empty");
-    }
-
-    #[test]
-    fn hop_with_multiple_egresses_round_trips() {
-        let mut hop = sample_hop();
-        hop.egresses.push(DesiredEgress {
-            branch_id: "destination-1".to_string(),
-            socket: SocketSpec::srt_connect("172.31.0.10", 7003, 1000),
-        });
-        assert_eq!(hop.egresses.len(), 2);
-
-        let value = serde_json::to_value(&hop).unwrap();
-        assert_eq!(value["egresses"][1]["branch_id"], "destination-1");
-        assert_eq!(value["egresses"][1]["transport"], "srt");
-        let round_trip: DesiredHop = serde_json::from_value(value).unwrap();
-        assert_eq!(hop, round_trip);
-    }
-
-    #[test]
-    fn a_listening_srt_socket_carries_no_host() {
-        let value = serde_json::to_value(SocketSpec::srt_listen(7001, 200)).unwrap();
-        assert!(value.get("host").is_none(), "a listener has no host");
-        assert_eq!(value["role"], "listen");
-        assert_eq!(value["transport"], "srt");
-    }
-
-    #[test]
-    fn hop_status_round_trips_with_optional_fields_absent() {
-        let status = HopStatus {
-            id: "weave-contribution-sender".to_string(),
-            node_id: "strom-node-1".to_string(),
-            state: HopState::Provisioned,
-            ingress: SocketStatus {
-                condition: LinkCondition::Flowing,
-                resolved: Some(ResolvedAddr {
-                    host: "0.0.0.0".to_string(),
-                    port: 7001,
-                }),
-                stats: Some(LinkStats {
-                    connections: 1,
-                    rate_mbps: 4.5,
-                    ..LinkStats::default()
-                }),
-            },
-            egresses: vec![EgressStatus {
-                branch_id: "destination-0".to_string(),
-                status: SocketStatus {
-                    condition: LinkCondition::Connected,
-                    resolved: None,
-                    stats: None,
-                },
-            }],
-        };
-        let round_trip: HopStatus =
-            serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
-        assert_eq!(status, round_trip);
-    }
-
-    #[test]
-    fn heartbeat_parses_without_hop_status_field() {
-        let heartbeat: NodeHeartbeat = serde_json::from_value(serde_json::json!({
-            "node_id": "strom-node-1",
-            "status": "ready"
-        }))
-        .expect("parse legacy heartbeat");
-        assert!(heartbeat.hop_status.is_empty());
-    }
-
-    #[test]
-    fn registration_without_protocol_version_reads_as_incompatible_zero() {
-        let registration: NodeRegistration = serde_json::from_value(serde_json::json!({
-            "node": {
-                "id": "strom-node-1",
-                "endpoint": "http://strom-node-1:8091",
-                "status": "ready"
-            }
-        }))
-        .expect("parse pre-handshake registration");
-
-        assert_eq!(registration.protocol_version, 0);
-        assert!(
-            !protocol_compatible(registration.protocol_version),
-            "an adapter that declares no version is not compatible"
-        );
-    }
-
-    #[test]
-    fn protocol_compatible_accepts_only_the_supported_version() {
-        assert!(protocol_compatible(PROTOCOL_VERSION));
-        assert!(!protocol_compatible(PROTOCOL_VERSION + 1));
-        assert!(!protocol_compatible(0));
-    }
-
-    #[test]
-    fn is_managed_hop_id_matches_only_prefixed_names() {
-        assert!(is_managed_hop_id("weave-contribution-sender"));
-        assert!(!is_managed_hop_id("contribution"));
-        assert!(!is_managed_hop_id("contribution-recv"));
-    }
-
-    fn hc(state: HopState, ingress: LinkCondition, egress: LinkCondition) -> Option<HopConditions> {
-        Some(HopConditions {
-            state,
-            ingress,
-            egresses: vec![egress],
-        })
-    }
-
-    #[test]
-    fn rollup_disabled_is_idle() {
-        let hops = [hc(
-            HopState::Provisioned,
-            LinkCondition::Flowing,
-            LinkCondition::Flowing,
-        )];
-        assert_eq!(roll_up_path(false, &hops), PathStatus::Idle);
-    }
-
-    #[test]
-    fn rollup_failed_hop_wins_over_flowing() {
-        let hops = [
-            hc(
-                HopState::Provisioned,
-                LinkCondition::Flowing,
-                LinkCondition::Flowing,
-            ),
-            hc(
-                HopState::Failed,
-                LinkCondition::Flowing,
-                LinkCondition::Flowing,
-            ),
-        ];
-        assert_eq!(roll_up_path(true, &hops), PathStatus::Failed);
-    }
-
-    #[test]
-    fn rollup_pending_or_missing_hop_is_pending() {
-        let pending = [hc(
-            HopState::Pending,
-            LinkCondition::Idle,
-            LinkCondition::Idle,
-        )];
-        assert_eq!(roll_up_path(true, &pending), PathStatus::Pending);
-
-        let missing = [
-            hc(
-                HopState::Provisioned,
-                LinkCondition::Flowing,
-                LinkCondition::Flowing,
-            ),
-            None,
-        ];
-        assert_eq!(roll_up_path(true, &missing), PathStatus::Pending);
-    }
-
-    #[test]
-    fn rollup_source_not_receiving_is_awaiting_input() {
-        let idle = [hc(
-            HopState::Provisioned,
-            LinkCondition::Idle,
-            LinkCondition::Idle,
-        )];
-        assert_eq!(roll_up_path(true, &idle), PathStatus::AwaitingInput);
-
-        let silent = [hc(
-            HopState::Provisioned,
-            LinkCondition::Connected,
-            LinkCondition::Connected,
-        )];
-        assert_eq!(roll_up_path(true, &silent), PathStatus::AwaitingInput);
-    }
-
-    #[test]
-    fn rollup_flowing_source_with_stalled_downstream_is_degraded() {
-        let hops = [
-            hc(
-                HopState::Provisioned,
-                LinkCondition::Flowing,
-                LinkCondition::Flowing,
-            ),
-            hc(
-                HopState::Provisioned,
-                LinkCondition::Connected,
-                LinkCondition::Connected,
-            ),
-        ];
-        assert_eq!(roll_up_path(true, &hops), PathStatus::Degraded);
-    }
-
-    #[test]
-    fn rollup_stalled_source_is_degraded_not_awaiting_input() {
-        let stalled_source = [hc(
-            HopState::Provisioned,
-            LinkCondition::Stalled,
-            LinkCondition::Idle,
-        )];
-        assert_eq!(roll_up_path(true, &stalled_source), PathStatus::Degraded);
-    }
-
-    #[test]
-    fn rollup_stalled_downstream_hop_is_degraded() {
-        let hops = [
-            hc(
-                HopState::Provisioned,
-                LinkCondition::Flowing,
-                LinkCondition::Flowing,
-            ),
-            hc(
-                HopState::Provisioned,
-                LinkCondition::Stalled,
-                LinkCondition::Idle,
-            ),
-        ];
-        assert_eq!(roll_up_path(true, &hops), PathStatus::Degraded);
-    }
-
-    #[test]
-    fn rollup_all_flowing_is_flowing() {
-        let hops = [
-            hc(
-                HopState::Provisioned,
-                LinkCondition::Flowing,
-                LinkCondition::Flowing,
-            ),
-            hc(
-                HopState::Provisioned,
-                LinkCondition::Flowing,
-                LinkCondition::Flowing,
-            ),
-        ];
-        assert_eq!(roll_up_path(true, &hops), PathStatus::Flowing);
-    }
-
-    #[test]
-    fn rollup_checks_every_fanout_branch() {
-        let hops = [Some(HopConditions {
-            state: HopState::Provisioned,
-            ingress: LinkCondition::Flowing,
-            egresses: vec![LinkCondition::Flowing, LinkCondition::Connecting],
-        })];
-        assert_eq!(roll_up_path(true, &hops), PathStatus::Degraded);
-    }
-
-    #[test]
-    fn hop_status_conditions_match_desired_branches_by_id() {
-        let mut desired = sample_hop();
-        desired.egresses.push(DesiredEgress {
-            branch_id: "destination-1".to_string(),
-            socket: SocketSpec::srt_connect("172.31.0.11", 7003, 1000),
-        });
-        let status = HopStatus {
-            id: "weave-a".to_string(),
-            node_id: "n1".to_string(),
-            state: HopState::Provisioned,
-            ingress: SocketStatus {
-                condition: LinkCondition::Flowing,
-                resolved: None,
-                stats: None,
-            },
-            egresses: vec![
-                EgressStatus {
-                    branch_id: "destination-1".to_string(),
-                    status: SocketStatus {
-                        condition: LinkCondition::Connected,
-                        resolved: None,
-                        stats: None,
-                    },
-                },
-                EgressStatus {
-                    branch_id: "destination-0".to_string(),
-                    status: SocketStatus {
-                        condition: LinkCondition::Flowing,
-                        resolved: None,
-                        stats: None,
-                    },
-                },
-            ],
-        };
-        assert_eq!(
-            status.conditions(&desired),
-            Some(HopConditions {
-                state: HopState::Provisioned,
-                ingress: LinkCondition::Flowing,
-                egresses: vec![LinkCondition::Flowing, LinkCondition::Connected],
-            })
-        );
-    }
-
-    #[test]
-    fn hop_status_conditions_reject_missing_duplicate_and_extra_branches() {
-        let desired = sample_hop();
-        let socket = SocketStatus {
-            condition: LinkCondition::Flowing,
-            resolved: None,
-            stats: None,
-        };
-        let mut status = HopStatus {
-            id: desired.id.clone(),
-            node_id: desired.node_id.clone(),
-            state: HopState::Provisioned,
-            ingress: socket.clone(),
-            egresses: Vec::new(),
-        };
-        assert_eq!(status.conditions(&desired), None);
-
-        status.egresses = vec![
-            EgressStatus {
-                branch_id: "destination-0".to_string(),
-                status: socket.clone(),
-            },
-            EgressStatus {
-                branch_id: "destination-0".to_string(),
-                status: socket.clone(),
-            },
-        ];
-        assert_eq!(status.conditions(&desired), None);
-
-        status.egresses = vec![EgressStatus {
-            branch_id: "destination-1".to_string(),
-            status: socket,
-        }];
-        assert_eq!(status.conditions(&desired), None);
-    }
-
-    #[test]
-    fn srt_endpoint_serde_allows_node_or_remote_and_denies_unknown_fields() {
-        // node is now optional; the node-XOR-remote rule is enforced at
-        // validation, not by serde, so a bare endpoint still parses.
-        let bare: SrtEndpoint =
-            serde_json::from_value(serde_json::json!({ "network": "wan" })).expect("parse bare");
-        assert_eq!(bare.node, None);
-        assert_eq!(bare.remote, None);
-
-        let via: SrtEndpoint = serde_json::from_value(serde_json::json!({
-            "node": "strom-node-2",
-            "via": ["edge-relay"]
-        }))
-        .expect("parse via");
-        assert_eq!(via.via, vec!["edge-relay".to_string()]);
-        assert!(
-            serde_json::to_value(&bare).unwrap().get("via").is_none(),
-            "an empty via is not serialized"
-        );
-
-        let remote: SrtEndpoint = serde_json::from_value(serde_json::json!({
-            "remote": { "host": "198.51.100.5", "port": 9000 }
-        }))
-        .expect("parse remote");
-        assert_eq!(
-            remote.remote,
-            Some(RemoteAddr {
-                host: "198.51.100.5".to_string(),
-                port: 9000,
-            })
-        );
-        let round_trip: SrtEndpoint =
-            serde_json::from_str(&serde_json::to_string(&remote).unwrap()).unwrap();
-        assert_eq!(remote, round_trip);
-
-        let bogus: Result<SrtEndpoint, _> =
-            serde_json::from_value(serde_json::json!({ "node": "n", "bogus": true }));
-        assert!(bogus.is_err(), "deny_unknown_fields rejects typos");
-    }
-
-    fn node_config() -> NodeConfig {
-        NodeConfig {
-            id: "strom-node-1".to_string(),
-            southbound_url: "http://127.0.0.1:8081".to_string(),
-            southbound_token: None,
-            listen: "0.0.0.0:8091".to_string(),
-            public_endpoint: None,
-            data_plane: BTreeMap::from([(
-                DEFAULT_DATA_PLANE_ALIAS.to_string(),
-                DataPlaneAddr::dialable("172.26.0.10"),
-            )]),
-            port_range: PortRange {
-                start: 20000,
-                end: 20999,
-            },
-            transports: vec![TransportOffer::new(Transport::Srt)],
-            relay: false,
-        }
-    }
-
-    #[test]
-    fn node_config_public_endpoint_defaults_to_listen() {
-        let config = node_config();
-        assert_eq!(config.public_endpoint(), "http://0.0.0.0:8091");
-
-        let mut pinned = node_config();
-        pinned.public_endpoint = Some("http://172.25.0.21:8091".to_string());
-        assert_eq!(pinned.public_endpoint(), "http://172.25.0.21:8091");
-    }
-
-    #[test]
-    fn node_config_validate_accepts_valid_config() {
-        assert_eq!(node_config().validate(), Ok(()));
-    }
-
-    #[test]
-    fn node_config_validate_rejects_invariant_violations() {
-        let mut empty_id = node_config();
-        empty_id.id = "  ".to_string();
-        assert_eq!(
-            empty_id.validate(),
-            Err(ConfigError::InvalidId(ResourceIdError::InvalidCharacters))
-        );
-
-        let mut long_id = node_config();
-        long_id.id = "a".repeat(RESOURCE_ID_MAX_LEN + 1);
-        assert_eq!(
-            long_id.validate(),
-            Err(ConfigError::InvalidId(ResourceIdError::InvalidLength))
-        );
-
-        let mut no_default = node_config();
-        no_default.data_plane =
-            BTreeMap::from([("wan".to_string(), DataPlaneAddr::dialable("203.0.113.7"))]);
-        assert_eq!(no_default.validate(), Err(ConfigError::MissingDefaultAlias));
-
-        let mut blank_host = node_config();
-        blank_host
-            .data_plane
-            .insert("wan".to_string(), DataPlaneAddr::dialable(""));
-        assert_eq!(blank_host.validate(), Err(ConfigError::EmptyDataPlaneEntry));
-
-        let mut bad_range = node_config();
-        bad_range.port_range = PortRange {
-            start: 21000,
-            end: 20000,
-        };
-        assert_eq!(
-            bad_range.validate(),
-            Err(ConfigError::InvalidPortRange {
-                start: 21000,
-                end: 20000,
-            })
-        );
-    }
-
-    fn stream_with_formats(
-        format: Option<MediaFormat>,
-        accepts: Option<FormatConstraint>,
-    ) -> StreamDefinition {
-        let mut source = SrtEndpoint {
-            node: Some("strom-node-1".to_string()),
-            remote: None,
-            via: Vec::new(),
-            network: None,
-            latency: None,
-            format: None,
-            accepts: None,
-        };
-        let mut destination = source.clone();
-        source.format = format;
-        destination.node = Some("strom-node-2".to_string());
-        destination.accepts = accepts;
-
-        StreamDefinition {
-            name: "formats".to_string(),
-            enabled: true,
-            source: StreamTransport::Srt(source),
-            destinations: vec![StreamTransport::Srt(destination)],
-        }
-    }
-
-    fn aac_48k() -> MediaFormat {
-        MediaFormat {
-            container: Container::MpegTs,
-            video: None,
-            audio: Some(AudioFormat {
-                codec: AudioCodec::Aac,
-                sample_rate: 48_000,
-                channels: 2,
-            }),
-        }
-    }
-
-    fn wants_44k() -> FormatConstraint {
-        FormatConstraint {
-            audio: Some(AudioConstraint {
-                sample_rate: Some(vec![44_100]),
-                ..AudioConstraint::default()
-            }),
-            ..FormatConstraint::default()
-        }
-    }
-
-    #[test]
-    fn a_destination_that_cannot_accept_the_source_format_is_reported() {
-        let stream = stream_with_formats(Some(aac_48k()), Some(wants_44k()));
-        let conflicts = stream_format_conflicts(&stream);
-
-        assert_eq!(conflicts.len(), 1);
-        assert_eq!(conflicts[0].destination, 0);
-        assert_eq!(
-            conflicts[0].to_string(),
-            "destination 0 cannot accept the source format: \
-             audio.sample_rate is 48000 but accepts 44100"
-        );
-    }
-
-    #[test]
-    fn an_undeclared_format_or_constraint_conflicts_with_nothing() {
-        // Absence means unknown, not wrong: nothing is inferred either way.
-        assert!(stream_format_conflicts(&stream_with_formats(None, Some(wants_44k()))).is_empty());
-        assert!(stream_format_conflicts(&stream_with_formats(Some(aac_48k()), None)).is_empty());
-        assert!(stream_format_conflicts(&stream_with_formats(None, None)).is_empty());
-    }
-
-    #[test]
-    fn only_the_destinations_that_conflict_are_reported() {
-        let mut stream = stream_with_formats(Some(aac_48k()), None);
-        let StreamTransport::Srt(base) = &stream.destinations[0] else {
-            unreachable!("fixture destination is srt");
-        };
-
-        let mut fussy = base.clone();
-        fussy.accepts = Some(wants_44k());
-        let mut relaxed = base.clone();
-        relaxed.accepts = Some(FormatConstraint::default());
-
-        stream.destinations = vec![
-            StreamTransport::Srt(relaxed),
-            StreamTransport::Srt(fussy.clone()),
-            StreamTransport::Srt(fussy),
-        ];
-
-        let offenders: Vec<usize> = stream_format_conflicts(&stream)
-            .iter()
-            .map(|c| c.destination)
-            .collect();
-        assert_eq!(offenders, vec![1, 2], "indices match manifest order");
-    }
-
-    #[test]
-    fn data_plane_addr_parses_shorthand_and_full_forms() {
-        let capabilities: NodeCapabilities = serde_json::from_value(serde_json::json!({
-            "data_plane": {
-                "default": "172.26.0.10",
-                "wan": { "host": "203.0.113.7", "reachability": "outbound_only" },
-                "lan": { "host": "10.0.0.4" }
-            }
-        }))
-        .expect("parse capabilities");
-
-        assert_eq!(
-            capabilities.data_plane["default"],
-            DataPlaneAddr::dialable("172.26.0.10"),
-            "a bare host is dialable"
-        );
-        assert_eq!(
-            capabilities.data_plane["wan"].reachability,
-            Reachability::OutboundOnly
-        );
-        assert!(
-            capabilities.data_plane["lan"].is_dialable(),
-            "an omitted reachability defaults to dialable"
-        );
-        assert!(!capabilities.relay, "relay defaults off");
-
-        let round_trip: NodeCapabilities =
-            serde_json::from_str(&serde_json::to_string(&capabilities).unwrap()).unwrap();
-        assert_eq!(capabilities, round_trip);
-    }
-
-    /// Registrations persisted before reachability existed carry bare host
-    /// strings and no `relay`. They are read back, not migrated, so the shorthand
-    /// has to keep meaning what it always did.
-    #[test]
-    fn a_registration_stored_before_reachability_still_hydrates() {
-        let stored: NodeRegistration = serde_json::from_value(serde_json::json!({
-            "protocol_version": PROTOCOL_VERSION,
-            "node": {
-                "id": "strom-node-1",
-                "endpoint": "http://strom-node-1:8091",
-                "status": "ready",
-                "capabilities": {
-                    "data_plane": { "default": "172.26.0.10" },
-                    "port_range": { "start": 20000, "end": 20999 }
-                }
-            }
-        }))
-        .expect("hydrate stored registration");
-
-        let capabilities = &stored.node.capabilities;
-        assert!(capabilities.data_plane["default"].is_dialable());
-        assert!(!capabilities.relay);
-    }
-
-    #[test]
-    fn data_plane_addr_rejects_a_misspelled_field() {
-        let result: Result<DataPlaneAddr, _> = serde_json::from_value(serde_json::json!({
-            "host": "10.0.0.4",
-            "reachablity": "outbound_only"
-        }));
-        assert!(result.is_err(), "a typo must not read as dialable");
-    }
-
-    #[test]
-    fn node_config_rejects_unknown_fields() {
-        let result: Result<NodeConfig, _> = serde_json::from_value(serde_json::json!({
-            "id": "n1",
-            "southbound_url": "http://127.0.0.1:8081",
-            "listen": "0.0.0.0:8091",
-            "data_plane": { "default": "10.0.0.1" },
-            "port_range": { "start": 1, "end": 2 },
-            "bogus": true
-        }));
-        assert!(result.is_err(), "deny_unknown_fields rejects typos");
-    }
-
-    #[test]
-    fn device_endpoint_round_trips_and_denies_unknown_fields() {
-        let json = serde_json::json!({
-            "name": "alice-cam",
-            "source": { "device": { "node": "browser-a1b2" } },
-            "destinations": [ { "srt": { "node": "strom-node-2" } } ]
-        });
-        let stream: StreamDefinition = serde_json::from_value(json).expect("parse stream");
-        assert_eq!(
-            stream.source,
-            StreamTransport::Device(NodeEndpoint {
-                node: "browser-a1b2".to_string(),
-                network: None,
-            })
-        );
-        assert_eq!(stream.source.node(), Some("browser-a1b2"));
-        assert_eq!(stream.source.kind(), "device");
-
-        let round_trip: StreamDefinition =
-            serde_json::from_str(&serde_json::to_string(&stream).unwrap()).unwrap();
-        assert_eq!(stream, round_trip);
-        let value = serde_json::to_value(&stream).unwrap();
-        assert_eq!(
-            value["source"]["device"],
-            serde_json::json!({ "node": "browser-a1b2" })
-        );
-
-        let with_latency: Result<StreamTransport, _> = serde_json::from_value(serde_json::json!({
-            "device": { "node": "browser-a1b2", "latency": 200 }
-        }));
-        assert!(with_latency.is_err(), "a device endpoint has no SRT fields");
-    }
-
-    #[test]
-    fn device_source_declares_no_format_so_nothing_conflicts() {
-        let stream = StreamDefinition {
-            name: "alice-cam".to_string(),
-            enabled: true,
-            source: StreamTransport::Device(NodeEndpoint {
-                node: "browser-a1b2".to_string(),
-                network: None,
-            }),
-            destinations: vec![StreamTransport::Srt(SrtEndpoint {
-                node: Some("strom-node-2".to_string()),
-                remote: None,
-                via: Vec::new(),
-                network: None,
-                latency: None,
-                format: None,
-                accepts: Some(wants_44k()),
-            })],
-        };
-        assert!(stream_format_conflicts(&stream).is_empty());
-    }
-
-    #[test]
-    fn every_socket_variant_round_trips_through_its_flat_wire_form() {
-        let cases = [
-            (
-                SocketSpec::srt_listen(7001, 200),
-                serde_json::json!({
-                    "transport": "srt", "role": "listen", "port": 7001,
-                    "params": { "latency": 200 }
-                }),
-            ),
-            (
-                SocketSpec::srt_connect("10.0.0.2", 7002, 1000),
-                serde_json::json!({
-                    "transport": "srt", "role": "connect", "host": "10.0.0.2", "port": 7002,
-                    "params": { "latency": 1000 }
-                }),
-            ),
-            (
-                SocketSpec::signalling(
-                    SignallingTransport::Whip,
-                    SocketRole::Listen,
-                    "http://172.26.0.10:8080/whip",
-                    "weave-x",
-                ),
-                serde_json::json!({
-                    "transport": "whip", "role": "listen",
-                    "url": "http://172.26.0.10:8080/whip/weave-x", "endpoint_id": "weave-x"
-                }),
-            ),
-            (
-                SocketSpec::signalling(
-                    SignallingTransport::Whep,
-                    SocketRole::Connect,
-                    "http://172.26.0.10:8080/whep",
-                    "weave-x",
-                ),
-                serde_json::json!({
-                    "transport": "whep", "role": "connect",
-                    "url": "http://172.26.0.10:8080/whep/weave-x", "endpoint_id": "weave-x"
-                }),
-            ),
-            (
-                SocketSpec::Device(DeviceKind::Capture),
-                serde_json::json!({ "transport": "device", "role": "capture" }),
-            ),
-            (
-                SocketSpec::Device(DeviceKind::Display),
-                serde_json::json!({ "transport": "device", "role": "display" }),
-            ),
-        ];
-
-        for (socket, wire) in cases {
-            assert_eq!(serde_json::to_value(&socket).unwrap(), wire);
-            let parsed: SocketSpec = serde_json::from_value(wire).unwrap();
-            assert_eq!(parsed, socket);
-        }
-    }
-
-    /// A socket stored before `params` was optional on the wire.
-    #[test]
-    fn an_srt_socket_parses_with_empty_params() {
-        let stored: SocketSpec = serde_json::from_value(serde_json::json!({
-            "transport": "srt", "role": "listen", "port": 7001, "params": {}
-        }))
-        .expect("hydrate");
-        assert_eq!(
-            stored,
-            SocketSpec::Srt(SrtSocket::Listen {
-                port: 7001,
-                params: SrtParams::default(),
-            })
-        );
-    }
-
-    #[test]
-    fn a_socket_that_mixes_up_its_transport_is_rejected() {
-        let rejected = [
-            serde_json::json!({ "transport": "srt", "role": "listen", "params": {} }),
-            serde_json::json!({ "transport": "srt", "role": "connect", "port": 7002 }),
-            serde_json::json!({
-                "transport": "srt", "role": "listen", "port": 7001, "host": "10.0.0.2"
-            }),
-            serde_json::json!({
-                "transport": "srt", "role": "listen", "port": 7001, "url": "http://x/whip/y"
-            }),
-            serde_json::json!({ "transport": "whip", "role": "listen" }),
-            serde_json::json!({
-                "transport": "whip", "role": "listen", "url": "http://x/whip/y"
-            }),
-            serde_json::json!({
-                "transport": "whip", "role": "listen", "url": "http://x/whip/y", "port": 7001,
-                "endpoint_id": "y"
-            }),
-            serde_json::json!({
-                "transport": "whep", "role": "connect", "url": "http://x/whep/y",
-                "endpoint_id": "y", "params": {}
-            }),
-            serde_json::json!({ "transport": "device", "role": "connect" }),
-            serde_json::json!({ "transport": "srt", "role": "capture", "port": 7001 }),
-            serde_json::json!({ "transport": "device", "role": "capture", "port": 7001 }),
-            serde_json::json!({ "transport": "srt", "role": "listen", "port": 7001, "bogus": 1 }),
-            serde_json::json!({
-                "transport": "srt", "role": "listen", "port": 7001, "endpoint_id": "y"
-            }),
-            serde_json::json!({ "transport": "device", "role": "capture", "endpoint_id": "y" }),
-        ];
-
-        for wire in rejected {
-            let result: Result<SocketSpec, _> = serde_json::from_value(wire.clone());
-            assert!(result.is_err(), "{wire} must not parse");
-        }
-    }
-
-    #[test]
-    fn socket_display_names_the_transport_or_the_device() {
-        assert_eq!(SocketSpec::srt_listen(7001, 200).to_string(), "srt");
-        assert_eq!(
-            SocketSpec::signalling(
-                SignallingTransport::Whip,
-                SocketRole::Listen,
-                "http://x/whip",
-                "y"
-            )
-            .to_string(),
-            "whip"
-        );
-        assert_eq!(
-            SocketSpec::signalling(
-                SignallingTransport::Whep,
-                SocketRole::Connect,
-                "http://x/whep",
-                "y"
-            )
-            .to_string(),
-            "whep"
-        );
-        assert_eq!(
-            SocketSpec::Device(DeviceKind::Capture).to_string(),
-            "capture device"
-        );
-        assert_eq!(
-            SocketSpec::Device(DeviceKind::Display).to_string(),
-            "display device"
-        );
-    }
-
-    #[test]
-    fn transport_offer_reads_a_bare_name_as_both_roles() {
-        let capabilities: NodeCapabilities = serde_json::from_value(serde_json::json!({
-            "transports": [
-                "srt",
-                { "name": "whip", "roles": ["listen"] },
-                { "name": "whep" }
-            ]
-        }))
-        .expect("parse capabilities");
-
-        assert_eq!(
-            capabilities.transports[0],
-            TransportOffer::new(Transport::Srt)
-        );
-        assert!(capabilities.transports[0].offers(SocketRole::Listen));
-        assert!(capabilities.transports[0].offers(SocketRole::Connect));
-        assert_eq!(
-            capabilities.transports[1],
-            TransportOffer::with_roles(Transport::Whip, RoleSet::only(SocketRole::Listen))
-        );
-        assert!(!capabilities.transports[1].offers(SocketRole::Connect));
-        assert_eq!(
-            capabilities.transports[2],
-            TransportOffer::new(Transport::Whep)
-        );
-
-        let round_trip: NodeCapabilities =
-            serde_json::from_str(&serde_json::to_string(&capabilities).unwrap()).unwrap();
-        assert_eq!(capabilities, round_trip);
-        assert_eq!(
-            serde_json::to_value(capabilities.transports[0]).unwrap(),
-            serde_json::json!({ "name": "srt", "roles": ["listen", "connect"] })
-        );
-
-        let bogus: Result<TransportOffer, _> =
-            serde_json::from_value(serde_json::json!({ "name": "srt", "role": "listen" }));
-        assert!(bogus.is_err(), "deny_unknown_fields rejects typos");
-    }
-
-    #[test]
-    fn a_transport_offered_in_no_role_or_under_no_known_name_is_rejected() {
-        let no_role: Result<TransportOffer, _> =
-            serde_json::from_value(serde_json::json!({ "name": "whip", "roles": [] }));
-        assert!(no_role.is_err(), "a transport offered in no role");
-
-        let unknown: Result<TransportOffer, _> = serde_json::from_value(serde_json::json!("rist"));
-        assert!(unknown.is_err(), "an unknown transport name is an error");
-    }
-
-    /// Registrations persisted before roles existed carry `{ "name": "srt" }`.
-    #[test]
-    fn a_transport_stored_before_roles_offers_both() {
-        let stored: TransportOffer =
-            serde_json::from_value(serde_json::json!({ "name": "srt" })).expect("hydrate");
-        assert_eq!(stored, TransportOffer::new(Transport::Srt));
-    }
-
-    #[test]
-    fn capabilities_without_transports_read_as_srt_in_both_roles() {
-        let bare = NodeCapabilities::default();
-        assert!(bare.offers(Transport::Srt, SocketRole::Listen));
-        assert!(bare.offers(Transport::Srt, SocketRole::Connect));
-        assert!(!bare.offers(Transport::Whip, SocketRole::Listen));
-
-        let declared = NodeCapabilities {
-            transports: vec![TransportOffer::with_roles(
-                Transport::Whip,
-                RoleSet::only(SocketRole::Connect),
-            )],
-            ..NodeCapabilities::default()
-        };
-        assert!(declared.offers(Transport::Whip, SocketRole::Connect));
-        assert!(!declared.offers(Transport::Whip, SocketRole::Listen));
-        assert!(
-            !declared.offers(Transport::Srt, SocketRole::Listen),
-            "declaring any transport withdraws the SRT fallback"
-        );
-    }
-
-    #[test]
-    fn devices_parse_from_a_list_and_are_omitted_when_empty() {
-        let capabilities: NodeCapabilities = serde_json::from_value(serde_json::json!({
-            "devices": ["capture", "display"]
-        }))
-        .expect("parse capabilities");
-        assert!(capabilities.offers_device(DeviceKind::Capture));
-        assert!(capabilities.offers_device(DeviceKind::Display));
-        assert_eq!(
-            serde_json::to_value(&capabilities).unwrap()["devices"],
-            serde_json::json!(["capture", "display"])
-        );
-
-        let capture: DeviceSet = [DeviceKind::Capture].into_iter().collect();
-        assert!(capture.contains(DeviceKind::Capture));
-        assert!(!capture.contains(DeviceKind::Display));
-
-        let bare = NodeCapabilities::default();
-        assert!(bare.devices.is_empty());
-        assert!(!bare.offers_device(DeviceKind::Capture), "no fallback");
-        assert!(
-            serde_json::to_value(&bare)
-                .unwrap()
-                .get("devices")
-                .is_none(),
-            "an empty device set is not serialized"
-        );
-    }
-
-    #[test]
-    fn data_plane_addr_carries_signalling_bases_per_webrtc_transport() {
-        let addr: DataPlaneAddr = serde_json::from_value(serde_json::json!({
-            "host": "172.26.0.10",
-            "signalling": {
-                "whip": "http://172.26.0.10:8080/whip",
-                "whep": "http://172.26.0.10:8080/whep"
-            }
-        }))
-        .expect("parse");
-        assert!(addr.is_dialable());
-        assert_eq!(
-            addr.signalling.whip.as_deref(),
-            Some("http://172.26.0.10:8080/whip")
-        );
-        assert_eq!(
-            addr.signalling.whep.as_deref(),
-            Some("http://172.26.0.10:8080/whep")
-        );
-        assert_eq!(
-            addr.signalling.base(SignallingTransport::Whip),
-            Some("http://172.26.0.10:8080/whip")
-        );
-        assert_eq!(
-            addr.signalling.base(SignallingTransport::Whep),
-            Some("http://172.26.0.10:8080/whep")
-        );
-        let round_trip: DataPlaneAddr =
-            serde_json::from_str(&serde_json::to_string(&addr).unwrap()).unwrap();
-        assert_eq!(addr, round_trip);
-
-        let shorthand: DataPlaneAddr =
-            serde_json::from_value(serde_json::json!("172.26.0.10")).expect("parse shorthand");
-        assert_eq!(shorthand, DataPlaneAddr::dialable("172.26.0.10"));
-        assert!(shorthand.signalling.is_empty());
-        assert_eq!(
-            serde_json::to_value(&shorthand).unwrap(),
-            serde_json::json!({ "host": "172.26.0.10", "reachability": "dialable" }),
-            "an address hosting no signalling serializes none"
-        );
-    }
-
-    #[test]
-    fn signalling_socket_joins_base_and_endpoint_id() {
-        let trimmed = SignallingSocket::new(SocketRole::Listen, "http://x:8080/whip/", "weave-a");
-        let bare = SignallingSocket::new(SocketRole::Listen, "http://x:8080/whip", "weave-a");
-        assert_eq!(trimmed.url, "http://x:8080/whip/weave-a");
-        assert_eq!(trimmed.endpoint_id, "weave-a");
-        assert_eq!(
-            trimmed, bare,
-            "a trailing slash on the base changes nothing"
-        );
-    }
-
-    #[test]
-    fn signalling_transport_maps_both_ways_with_transport() {
-        assert_eq!(Transport::Srt.signalling(), None);
-        assert_eq!(
-            Transport::Whip.signalling(),
-            Some(SignallingTransport::Whip)
-        );
-        assert_eq!(
-            Transport::Whep.signalling(),
-            Some(SignallingTransport::Whep)
-        );
-        assert_eq!(SignallingTransport::Whip.transport(), Transport::Whip);
-        assert_eq!(SignallingTransport::Whep.transport(), Transport::Whep);
-    }
-
-    #[test]
-    fn signalling_set_is_read_back_by_transport() {
-        let mut signalling = Signalling::default();
-        signalling.set(SignallingTransport::Whip, "http://x/whip".to_string());
-        assert_eq!(
-            signalling.base(SignallingTransport::Whip),
-            Some("http://x/whip")
-        );
-        assert_eq!(signalling.base(SignallingTransport::Whep), None);
-    }
-
-    #[test]
-    fn transport_and_device_names_match_their_wire_form() {
-        for transport in [Transport::Srt, Transport::Whip, Transport::Whep] {
-            assert_eq!(
-                serde_json::to_value(transport).unwrap(),
-                serde_json::json!(transport.name())
-            );
-            assert_eq!(transport.to_string(), transport.name());
-        }
-        for kind in [DeviceKind::Capture, DeviceKind::Display] {
-            assert_eq!(
-                serde_json::to_value(kind).unwrap(),
-                serde_json::json!(kind.name())
-            );
-            assert_eq!(kind.to_string(), kind.name());
-        }
-    }
 }
