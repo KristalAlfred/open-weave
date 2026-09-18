@@ -28,13 +28,17 @@ use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Guard, require_bearer};
 use weave_core::webhook::{EventType, NodeSummary};
 use weave_core::{
-    API_PREFIX, ApiError, ApiErrorCode, DesiredHop, EndpointDescriptor, HopStatus, NodeDescriptor,
-    NodeHeartbeat, NodeRegistration, NodeStatus, ObservedState, PROTOCOL_VERSION, PathStatus,
-    ReconcileReport, ReconcileStatus, StreamDefinition, ValidationIssue, protocol_compatible,
-    resource_id_issue, validate_resource_id, validate_stream,
+    API_PREFIX, AcceptedState, ApiError, ApiErrorCode, DesiredHop, EndpointDescriptor, HopStatus,
+    NodeAccepted, NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus, ObservedState,
+    PROTOCOL_VERSION, PathStatus, ROUTE_ENDPOINTS, ROUTE_NODE_DESIRED, ROUTE_NODE_HEARTBEAT,
+    ROUTE_NODE_REGISTER, ROUTE_NODES, ROUTE_STATE, ROUTE_STATUS, ROUTE_STREAM,
+    ROUTE_STREAM_ENDPOINTS, ROUTE_STREAMS, ReconcileReport, ReconcileStatus, RunningStatus,
+    StartingState, StartingStatus, StatusResponse, StreamAccepted, StreamDefinition,
+    StreamEndpoints, StreamStatus, ValidationIssue, protocol_compatible, resource_id_issue,
+    validate_resource_id, validate_stream,
 };
 
-use path::{PortAllocator, StreamEndpoints, derive_path, path_status, stream_endpoints};
+use path::{PortAllocator, derive_path, path_status, stream_endpoints};
 use store::{MemStore, PgStore, StateStore};
 
 #[derive(Debug, Parser)]
@@ -147,17 +151,6 @@ impl AppState {
             emitter.emit(event_type, node);
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct StreamStatus {
-    name: String,
-    status: PathStatus,
-    nodes: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    endpoints: Option<StreamEndpoints>,
 }
 
 /// Everything the dashboard renders, in one response. See [`get_view`].
@@ -439,24 +432,24 @@ fn observed_state(nodes: &BTreeMap<String, NodeRegistration>) -> ObservedState {
 /// publicly exposed** — put it behind a proxy or keep it on a private network.
 fn router(state: AppState, north: Guard, south: Guard) -> Router {
     let streams = Router::new()
-        .route("/streams", get(list_streams).post(submit_stream))
-        .route("/streams/{name}", axum::routing::delete(delete_stream))
-        .route("/streams/{name}/endpoints", get(get_endpoints))
+        .route(ROUTE_STREAMS, get(list_streams).post(submit_stream))
+        .route(ROUTE_STREAM, axum::routing::delete(delete_stream))
+        .route(ROUTE_STREAM_ENDPOINTS, get(get_endpoints))
         .layer(axum::middleware::from_fn_with_state(north, require_bearer));
 
     let nodes = Router::new()
-        .route("/nodes", get(list_nodes))
-        .route("/nodes/register", post(register_node))
-        .route("/nodes/{node_id}/heartbeat", post(node_heartbeat))
-        .route("/nodes/{node_id}/desired", get(get_desired))
-        .route("/endpoints", get(list_endpoints))
-        .route("/state", get(get_state))
+        .route(ROUTE_NODES, get(list_nodes))
+        .route(ROUTE_NODE_REGISTER, post(register_node))
+        .route(ROUTE_NODE_HEARTBEAT, post(node_heartbeat))
+        .route(ROUTE_NODE_DESIRED, get(get_desired))
+        .route(ROUTE_ENDPOINTS, get(list_endpoints))
+        .route(ROUTE_STATE, get(get_state))
         .layer(axum::middleware::from_fn_with_state(south, require_bearer));
 
     // `/status` is versioned as part of the operator contract, but unauthenticated
     // like `/view`.
     let api = Router::new()
-        .route("/status", get(get_status))
+        .route(ROUTE_STATUS, get(get_status))
         .merge(streams)
         .merge(nodes)
         .fallback(api_route_not_found)
@@ -510,15 +503,17 @@ async fn api_method_not_allowed() -> Response {
     )
 }
 
-async fn get_status(State(state): State<AppState>) -> Json<Value> {
+async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
     let view = state.view.read().await;
     Json(match &view.report {
-        Some(report) => json!({
-            "status": report.status,
-            "summary": report.summary,
-            "streams": view.streams,
+        Some(report) => StatusResponse::Running(RunningStatus {
+            status: report.status,
+            summary: report.summary.clone(),
+            streams: view.streams.clone(),
         }),
-        None => json!({ "status": "starting" }),
+        None => StatusResponse::Starting(StartingStatus {
+            status: StartingState::Starting,
+        }),
     })
 }
 
@@ -647,7 +642,10 @@ async fn submit_stream(
     tracing::info!(%name, "stream accepted");
     (
         StatusCode::ACCEPTED,
-        Json(json!({ "status": "accepted", "name": name })),
+        Json(StreamAccepted {
+            status: AcceptedState::Accepted,
+            name,
+        }),
     )
         .into_response()
 }
@@ -827,7 +825,10 @@ async fn register_node(
     state.emit(EventType::NodeRegistered, summary);
     (
         StatusCode::ACCEPTED,
-        Json(json!({ "status": "accepted", "node_id": node_id })),
+        Json(NodeAccepted {
+            status: AcceptedState::Accepted,
+            node_id,
+        }),
     )
         .into_response()
 }
@@ -903,7 +904,10 @@ async fn node_heartbeat(
     tracing::debug!(%node_id, ?status, "node heartbeat");
     (
         StatusCode::ACCEPTED,
-        Json(json!({ "status": "accepted", "node_id": node_id })),
+        Json(NodeAccepted {
+            status: AcceptedState::Accepted,
+            node_id,
+        }),
     )
         .into_response()
 }

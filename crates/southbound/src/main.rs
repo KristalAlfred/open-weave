@@ -15,7 +15,10 @@ use serde_json::{Value, json};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Guard, Token, require_bearer};
-use weave_core::{API_PREFIX, ApiError, ApiErrorCode, resource_id_issue, validate_resource_id};
+use weave_core::{
+    API_PREFIX, ApiError, ApiErrorCode, ROUTE_ENDPOINTS, ROUTE_NODE_DESIRED, ROUTE_NODE_HEARTBEAT,
+    ROUTE_NODE_REGISTER, ROUTE_NODES, ROUTE_STATE, resource_id_issue, validate_resource_id,
+};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8081";
 const DEFAULT_CONTROLLER_URL: &str = "http://127.0.0.1:8082";
@@ -99,12 +102,12 @@ async fn main() -> Result<()> {
 /// before it, not refused by it.
 fn router(state: AppState, guard: Guard, cors: Option<CorsLayer>) -> Router {
     let mut nodes = Router::new()
-        .route("/nodes", get(list_nodes))
-        .route("/nodes/register", post(register_node))
-        .route("/nodes/{node_id}/heartbeat", post(node_heartbeat))
-        .route("/nodes/{node_id}/desired", get(get_desired))
-        .route("/endpoints", get(list_endpoints))
-        .route("/state", get(get_state))
+        .route(ROUTE_NODES, get(list_nodes))
+        .route(ROUTE_NODE_REGISTER, post(register_node))
+        .route(ROUTE_NODE_HEARTBEAT, post(node_heartbeat))
+        .route(ROUTE_NODE_DESIRED, get(get_desired))
+        .route(ROUTE_ENDPOINTS, get(list_endpoints))
+        .route(ROUTE_STATE, get(get_state))
         .fallback(api_route_not_found)
         .method_not_allowed_fallback(api_method_not_allowed)
         .layer(axum::middleware::from_fn_with_state(guard, require_bearer));

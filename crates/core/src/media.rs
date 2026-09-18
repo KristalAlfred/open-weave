@@ -14,10 +14,11 @@
 
 use std::fmt;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// A fully specified description of the media on a link.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MediaFormat {
     pub container: Container,
@@ -27,14 +28,14 @@ pub struct MediaFormat {
     pub audio: Option<AudioFormat>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Container {
     MpegTs,
     Rtp,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct VideoFormat {
     pub codec: VideoCodec,
@@ -44,7 +45,7 @@ pub struct VideoFormat {
     pub chroma_subsampling: ChromaSubsampling,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoCodec {
     H264,
@@ -53,7 +54,7 @@ pub enum VideoCodec {
     Vp9,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ChromaSubsampling {
     Yuv420,
@@ -61,7 +62,7 @@ pub enum ChromaSubsampling {
     Yuv444,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AudioFormat {
     pub codec: AudioCodec,
@@ -70,7 +71,7 @@ pub struct AudioFormat {
     pub channels: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioCodec {
     Aac,
@@ -82,7 +83,7 @@ pub enum AudioCodec {
 
 /// Frames per second as a rational, because broadcast rates are not integers:
 /// 29.97 is exactly 30000/1001 and rounding it loses the distinction from 30.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Framerate {
     pub numerator: u32,
@@ -107,10 +108,11 @@ impl fmt::Display for Framerate {
 
 /// The media an endpoint accepts. Every field is optional; an absent one accepts
 /// anything, so an empty constraint is satisfied by any format.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
 pub struct FormatConstraint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub container: Option<Vec<Container>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video: Option<VideoConstraint>,
@@ -118,29 +120,37 @@ pub struct FormatConstraint {
     pub audio: Option<AudioConstraint>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
 pub struct VideoConstraint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub codec: Option<Vec<VideoCodec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub width: Option<Vec<u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub height: Option<Vec<u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub framerate: Option<Vec<Framerate>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub chroma_subsampling: Option<Vec<ChromaSubsampling>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AudioConstraint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub codec: Option<Vec<AudioCodec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub sample_rate: Option<Vec<u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub channels: Option<Vec<u8>>,
 }
 
@@ -149,7 +159,7 @@ pub struct AudioConstraint {
 /// Carrying the field and both sides rather than a rendered sentence keeps the
 /// reason usable by more than a log line: it is what a conversion planner will
 /// read to decide which transform to look for.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Mismatch {
     /// Dotted path of the offending field, e.g. `audio.sample_rate`.
     pub field: String,
@@ -169,7 +179,7 @@ impl fmt::Display for Mismatch {
 }
 
 /// A destination whose declared constraint the source format does not satisfy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct FormatConflict {
     /// Index of the destination in the stream's list, as written in the manifest.
     pub destination: usize,

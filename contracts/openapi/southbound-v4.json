@@ -1,0 +1,2317 @@
+{
+  "components": {
+    "schemas": {
+      "ApiError": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "enum": [
+              "invalid_request",
+              "invalid_json",
+              "unauthorized",
+              "route_not_found",
+              "method_not_allowed",
+              "stream_not_found",
+              "node_not_found",
+              "stream_not_ready",
+              "incompatible_protocol_version",
+              "persistence_failed",
+              "controller_unreachable",
+              "encoding_failed"
+            ],
+            "type": "string"
+          },
+          "details": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "type": "string"
+                },
+                "field": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "field",
+                "code",
+                "message"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ApiError",
+        "type": "object"
+      },
+      "DesiredHopList": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "items": {
+          "description": "One provisioning unit placed on a single node: one ingress socket fanned out\n to one or more egress sockets (a sender tees to every destination).",
+          "properties": {
+            "egresses": {
+              "items": {
+                "description": "One identified output branch of a desired hop.",
+                "properties": {
+                  "branch_id": {
+                    "type": "string"
+                  },
+                  "endpoint_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "host": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "params": {
+                    "properties": {
+                      "latency": {
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      }
+                    },
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "port": {
+                    "format": "uint16",
+                    "maximum": 65535,
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "role": {
+                    "enum": [
+                      "listen",
+                      "connect",
+                      "capture",
+                      "display"
+                    ],
+                    "type": "string"
+                  },
+                  "transport": {
+                    "enum": [
+                      "srt",
+                      "whip",
+                      "whep",
+                      "device"
+                    ],
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "branch_id",
+                  "transport",
+                  "role"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "id": {
+              "type": "string"
+            },
+            "ingress": {
+              "additionalProperties": false,
+              "description": "Flat wire form of a [`SocketSpec`]: a `transport` and `role` naming the\n variant, plus the fields that variant carries.",
+              "properties": {
+                "endpoint_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "host": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "params": {
+                  "properties": {
+                    "latency": {
+                      "format": "uint32",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  },
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "port": {
+                  "format": "uint16",
+                  "maximum": 65535,
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "role": {
+                  "enum": [
+                    "listen",
+                    "connect",
+                    "capture",
+                    "display"
+                  ],
+                  "type": "string"
+                },
+                "transport": {
+                  "enum": [
+                    "srt",
+                    "whip",
+                    "whep",
+                    "device"
+                  ],
+                  "type": "string"
+                },
+                "url": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "transport",
+                "role"
+              ],
+              "type": "object"
+            },
+            "node_id": {
+              "type": "string"
+            },
+            "role": {
+              "enum": [
+                "sender",
+                "bridge",
+                "receiver"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "node_id",
+            "role",
+            "ingress",
+            "egresses"
+          ],
+          "type": "object"
+        },
+        "title": "Array_of_DesiredHop",
+        "type": "array"
+      },
+      "EndpointList": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "items": {
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "source",
+                "destination",
+                "bidirectional",
+                "flow",
+                "gateway",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "metadata": {
+              "default": null
+            },
+            "node_id": {
+              "maxLength": 63,
+              "minLength": 1,
+              "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "transports": {
+              "default": [],
+              "description": "Transport labels an adapter recognised on this endpoint, such as\n `webrtc` or `ndi`. Guesses read off the underlying system, not offers.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "id",
+            "label",
+            "kind"
+          ],
+          "type": "object"
+        },
+        "title": "Array_of_EndpointDescriptor",
+        "type": "array"
+      },
+      "NodeAccepted": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "node_id": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "accepted"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "node_id"
+        ],
+        "title": "NodeAccepted",
+        "type": "object"
+      },
+      "NodeHeartbeat": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "endpoints": {
+            "default": [],
+            "items": {
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "source",
+                    "destination",
+                    "bidirectional",
+                    "flow",
+                    "gateway",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "metadata": {
+                  "default": null
+                },
+                "node_id": {
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "transports": {
+                  "default": [],
+                  "description": "Transport labels an adapter recognised on this endpoint, such as\n `webrtc` or `ndi`. Guesses read off the underlying system, not offers.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "id",
+                "label",
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "hop_status": {
+            "default": [],
+            "items": {
+              "description": "Node-reported realisation status for one desired hop.",
+              "properties": {
+                "egresses": {
+                  "default": [],
+                  "items": {
+                    "description": "Observed status for one identified egress branch.",
+                    "properties": {
+                      "branch_id": {
+                        "type": "string"
+                      },
+                      "condition": {
+                        "default": "idle",
+                        "description": "Observed condition of one socket on a hop, independent of control-plane lifecycle.",
+                        "oneOf": [
+                          {
+                            "const": "idle",
+                            "description": "No connection; the socket is a listener patiently waiting. Healthy.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "connecting",
+                            "description": "No connection; the socket is a caller still retrying. Ambiguous, not degraded.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "connected",
+                            "description": "Connection up but rate ~0 — fine on our end, nothing coming through yet.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "flowing",
+                            "description": "Connection up and media flowing.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "stalled",
+                            "description": "Ingress once carried media but byte progress has frozen while the flow still\n claims to run — detected across polls, not from any instantaneous field.",
+                            "type": "string"
+                          }
+                        ]
+                      },
+                      "resolved": {
+                        "properties": {
+                          "host": {
+                            "type": "string"
+                          },
+                          "port": {
+                            "format": "uint16",
+                            "maximum": 65535,
+                            "minimum": 0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "host",
+                          "port"
+                        ],
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      },
+                      "stats": {
+                        "description": "Socket-level SRT stats mirrored from Strom's `srt-stats` payload.",
+                        "properties": {
+                          "connections": {
+                            "default": 0,
+                            "format": "uint",
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "packets_received_lost": {
+                            "default": 0,
+                            "format": "int64",
+                            "type": "integer"
+                          },
+                          "packets_received_retransmitted": {
+                            "default": 0,
+                            "format": "int64",
+                            "type": "integer"
+                          },
+                          "packets_retransmitted": {
+                            "default": 0,
+                            "format": "int64",
+                            "type": "integer"
+                          },
+                          "packets_sent_lost": {
+                            "default": 0,
+                            "format": "int64",
+                            "type": "integer"
+                          },
+                          "rate_mbps": {
+                            "default": 0.0,
+                            "format": "double",
+                            "type": "number"
+                          }
+                        },
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "branch_id"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "ingress": {
+                  "description": "Observed condition, address, and statistics for one socket.",
+                  "properties": {
+                    "condition": {
+                      "default": "idle",
+                      "description": "Observed condition of one socket on a hop, independent of control-plane lifecycle.",
+                      "oneOf": [
+                        {
+                          "const": "idle",
+                          "description": "No connection; the socket is a listener patiently waiting. Healthy.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "connecting",
+                          "description": "No connection; the socket is a caller still retrying. Ambiguous, not degraded.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "connected",
+                          "description": "Connection up but rate ~0 — fine on our end, nothing coming through yet.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "flowing",
+                          "description": "Connection up and media flowing.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "stalled",
+                          "description": "Ingress once carried media but byte progress has frozen while the flow still\n claims to run — detected across polls, not from any instantaneous field.",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "resolved": {
+                      "properties": {
+                        "host": {
+                          "type": "string"
+                        },
+                        "port": {
+                          "format": "uint16",
+                          "maximum": 65535,
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "host",
+                        "port"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "stats": {
+                      "description": "Socket-level SRT stats mirrored from Strom's `srt-stats` payload.",
+                      "properties": {
+                        "connections": {
+                          "default": 0,
+                          "format": "uint",
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "packets_received_lost": {
+                          "default": 0,
+                          "format": "int64",
+                          "type": "integer"
+                        },
+                        "packets_received_retransmitted": {
+                          "default": 0,
+                          "format": "int64",
+                          "type": "integer"
+                        },
+                        "packets_retransmitted": {
+                          "default": 0,
+                          "format": "int64",
+                          "type": "integer"
+                        },
+                        "packets_sent_lost": {
+                          "default": 0,
+                          "format": "int64",
+                          "type": "integer"
+                        },
+                        "rate_mbps": {
+                          "default": 0.0,
+                          "format": "double",
+                          "type": "number"
+                        }
+                      },
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
+                  },
+                  "type": "object"
+                },
+                "node_id": {
+                  "type": "string"
+                },
+                "state": {
+                  "description": "Control-plane lifecycle of a hop's provisioning. Runtime link health is\n reported separately per socket via [`LinkCondition`].",
+                  "enum": [
+                    "pending",
+                    "provisioned",
+                    "failed"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "node_id",
+                "state",
+                "ingress"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "node_id": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "unknown",
+              "ready",
+              "degraded",
+              "offline"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "status"
+        ],
+        "title": "NodeHeartbeat",
+        "type": "object"
+      },
+      "NodeList": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "items": {
+          "properties": {
+            "capabilities": {
+              "default": {
+                "adapters": [],
+                "data_plane": {},
+                "relay": false,
+                "transports": []
+              },
+              "properties": {
+                "adapters": {
+                  "default": [],
+                  "items": {
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "strom",
+                          "nmos",
+                          "mxl_domain",
+                          "mxl_k8s",
+                          "mcm",
+                          "vendor",
+                          "custom"
+                        ],
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name",
+                      "kind"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "data_plane": {
+                  "additionalProperties": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "properties": {
+                          "host": {
+                            "type": "string"
+                          },
+                          "reachability": {
+                            "default": "dialable",
+                            "description": "Whether peers can open a connection to an address, or the node behind it can\n only dial out. Planning reads this to decide which end of a link listens.",
+                            "oneOf": [
+                              {
+                                "const": "dialable",
+                                "description": "Peers can connect to this address.",
+                                "type": "string"
+                              },
+                              {
+                                "const": "outbound_only",
+                                "description": "Behind NAT or a firewall: this node must initiate every connection.",
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          "signalling": {
+                            "additionalProperties": false,
+                            "default": {},
+                            "description": "Base URLs a node serves WHIP and WHEP signalling at, per WebRTC transport.\n A transport with no base is not offered for hosting at that address.",
+                            "properties": {
+                              "whep": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "whip": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              }
+                            },
+                            "type": "object"
+                          }
+                        },
+                        "required": [
+                          "host"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
+                  "default": {},
+                  "description": "Data-plane addresses this node advertises, keyed by alias. The\n [`DEFAULT_DATA_PLANE_ALIAS`] entry serves node-referenced endpoints\n that pin no network.",
+                  "type": "object"
+                },
+                "devices": {
+                  "description": "Devices the node can capture from or display on.",
+                  "items": {
+                    "description": "The node's own capture or display device, where media starts or ends.",
+                    "enum": [
+                      "capture",
+                      "display"
+                    ],
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "port_range": {
+                  "description": "Inclusive port range the controller may assign from for this node's\n hops. A soft contract: bind failures surface as [`HopState::Failed`].",
+                  "properties": {
+                    "end": {
+                      "format": "uint16",
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "start": {
+                      "format": "uint16",
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "start",
+                    "end"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "relay": {
+                  "default": false,
+                  "description": "Whether this node may carry transit for streams that neither terminate\n nor originate on it — the pool the planner draws a relay from when two\n endpoints cannot dial each other.",
+                  "type": "boolean"
+                },
+                "transports": {
+                  "default": [],
+                  "description": "Link transports this node offers, with the roles it can take.",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "description": "A transport that carries media between two nodes.",
+                        "oneOf": [
+                          {
+                            "enum": [
+                              "srt"
+                            ],
+                            "type": "string"
+                          },
+                          {
+                            "const": "whip",
+                            "description": "WebRTC ingest. The `Connect` end pushes media to the `Listen` end's\n signalling URL.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "whep",
+                            "description": "WebRTC playback. The `Connect` end pulls media from the `Listen` end's\n signalling URL.",
+                            "type": "string"
+                          }
+                        ]
+                      },
+                      {
+                        "properties": {
+                          "name": {
+                            "description": "A transport that carries media between two nodes.",
+                            "oneOf": [
+                              {
+                                "enum": [
+                                  "srt"
+                                ],
+                                "type": "string"
+                              },
+                              {
+                                "const": "whip",
+                                "description": "WebRTC ingest. The `Connect` end pushes media to the `Listen` end's\n signalling URL.",
+                                "type": "string"
+                              },
+                              {
+                                "const": "whep",
+                                "description": "WebRTC playback. The `Connect` end pulls media from the `Listen` end's\n signalling URL.",
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          "roles": {
+                            "default": [
+                              "listen",
+                              "connect"
+                            ],
+                            "items": {
+                              "description": "Which end of a link a socket is: `Listen` hosts and `Connect` dials.",
+                              "enum": [
+                                "listen",
+                                "connect"
+                              ],
+                              "type": "string"
+                            },
+                            "minItems": 1,
+                            "type": "array"
+                          }
+                        },
+                        "required": [
+                          "name"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
+                  "type": "array"
+                }
+              },
+              "type": "object"
+            },
+            "endpoint": {
+              "type": "string"
+            },
+            "id": {
+              "maxLength": 63,
+              "minLength": 1,
+              "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "unknown",
+                "ready",
+                "degraded",
+                "offline"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "endpoint",
+            "status"
+          ],
+          "type": "object"
+        },
+        "title": "Array_of_NodeDescriptor",
+        "type": "array"
+      },
+      "NodeRegistration": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "endpoints": {
+            "default": [],
+            "items": {
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "source",
+                    "destination",
+                    "bidirectional",
+                    "flow",
+                    "gateway",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "metadata": {
+                  "default": null
+                },
+                "node_id": {
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "transports": {
+                  "default": [],
+                  "description": "Transport labels an adapter recognised on this endpoint, such as\n `webrtc` or `ndi`. Guesses read off the underlying system, not offers.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "id",
+                "label",
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "hop_status": {
+            "default": [],
+            "items": {
+              "description": "Node-reported realisation status for one desired hop.",
+              "properties": {
+                "egresses": {
+                  "default": [],
+                  "items": {
+                    "description": "Observed status for one identified egress branch.",
+                    "properties": {
+                      "branch_id": {
+                        "type": "string"
+                      },
+                      "condition": {
+                        "default": "idle",
+                        "description": "Observed condition of one socket on a hop, independent of control-plane lifecycle.",
+                        "oneOf": [
+                          {
+                            "const": "idle",
+                            "description": "No connection; the socket is a listener patiently waiting. Healthy.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "connecting",
+                            "description": "No connection; the socket is a caller still retrying. Ambiguous, not degraded.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "connected",
+                            "description": "Connection up but rate ~0 — fine on our end, nothing coming through yet.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "flowing",
+                            "description": "Connection up and media flowing.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "stalled",
+                            "description": "Ingress once carried media but byte progress has frozen while the flow still\n claims to run — detected across polls, not from any instantaneous field.",
+                            "type": "string"
+                          }
+                        ]
+                      },
+                      "resolved": {
+                        "properties": {
+                          "host": {
+                            "type": "string"
+                          },
+                          "port": {
+                            "format": "uint16",
+                            "maximum": 65535,
+                            "minimum": 0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "host",
+                          "port"
+                        ],
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      },
+                      "stats": {
+                        "description": "Socket-level SRT stats mirrored from Strom's `srt-stats` payload.",
+                        "properties": {
+                          "connections": {
+                            "default": 0,
+                            "format": "uint",
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "packets_received_lost": {
+                            "default": 0,
+                            "format": "int64",
+                            "type": "integer"
+                          },
+                          "packets_received_retransmitted": {
+                            "default": 0,
+                            "format": "int64",
+                            "type": "integer"
+                          },
+                          "packets_retransmitted": {
+                            "default": 0,
+                            "format": "int64",
+                            "type": "integer"
+                          },
+                          "packets_sent_lost": {
+                            "default": 0,
+                            "format": "int64",
+                            "type": "integer"
+                          },
+                          "rate_mbps": {
+                            "default": 0.0,
+                            "format": "double",
+                            "type": "number"
+                          }
+                        },
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "branch_id"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "ingress": {
+                  "description": "Observed condition, address, and statistics for one socket.",
+                  "properties": {
+                    "condition": {
+                      "default": "idle",
+                      "description": "Observed condition of one socket on a hop, independent of control-plane lifecycle.",
+                      "oneOf": [
+                        {
+                          "const": "idle",
+                          "description": "No connection; the socket is a listener patiently waiting. Healthy.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "connecting",
+                          "description": "No connection; the socket is a caller still retrying. Ambiguous, not degraded.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "connected",
+                          "description": "Connection up but rate ~0 — fine on our end, nothing coming through yet.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "flowing",
+                          "description": "Connection up and media flowing.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "stalled",
+                          "description": "Ingress once carried media but byte progress has frozen while the flow still\n claims to run — detected across polls, not from any instantaneous field.",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "resolved": {
+                      "properties": {
+                        "host": {
+                          "type": "string"
+                        },
+                        "port": {
+                          "format": "uint16",
+                          "maximum": 65535,
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "host",
+                        "port"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "stats": {
+                      "description": "Socket-level SRT stats mirrored from Strom's `srt-stats` payload.",
+                      "properties": {
+                        "connections": {
+                          "default": 0,
+                          "format": "uint",
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "packets_received_lost": {
+                          "default": 0,
+                          "format": "int64",
+                          "type": "integer"
+                        },
+                        "packets_received_retransmitted": {
+                          "default": 0,
+                          "format": "int64",
+                          "type": "integer"
+                        },
+                        "packets_retransmitted": {
+                          "default": 0,
+                          "format": "int64",
+                          "type": "integer"
+                        },
+                        "packets_sent_lost": {
+                          "default": 0,
+                          "format": "int64",
+                          "type": "integer"
+                        },
+                        "rate_mbps": {
+                          "default": 0.0,
+                          "format": "double",
+                          "type": "number"
+                        }
+                      },
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
+                  },
+                  "type": "object"
+                },
+                "node_id": {
+                  "type": "string"
+                },
+                "state": {
+                  "description": "Control-plane lifecycle of a hop's provisioning. Runtime link health is\n reported separately per socket via [`LinkCondition`].",
+                  "enum": [
+                    "pending",
+                    "provisioned",
+                    "failed"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "node_id",
+                "state",
+                "ingress"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "node": {
+            "properties": {
+              "capabilities": {
+                "default": {
+                  "adapters": [],
+                  "data_plane": {},
+                  "relay": false,
+                  "transports": []
+                },
+                "properties": {
+                  "adapters": {
+                    "default": [],
+                    "items": {
+                      "properties": {
+                        "kind": {
+                          "enum": [
+                            "strom",
+                            "nmos",
+                            "mxl_domain",
+                            "mxl_k8s",
+                            "mcm",
+                            "vendor",
+                            "custom"
+                          ],
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "kind"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "data_plane": {
+                    "additionalProperties": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "properties": {
+                            "host": {
+                              "type": "string"
+                            },
+                            "reachability": {
+                              "default": "dialable",
+                              "description": "Whether peers can open a connection to an address, or the node behind it can\n only dial out. Planning reads this to decide which end of a link listens.",
+                              "oneOf": [
+                                {
+                                  "const": "dialable",
+                                  "description": "Peers can connect to this address.",
+                                  "type": "string"
+                                },
+                                {
+                                  "const": "outbound_only",
+                                  "description": "Behind NAT or a firewall: this node must initiate every connection.",
+                                  "type": "string"
+                                }
+                              ]
+                            },
+                            "signalling": {
+                              "additionalProperties": false,
+                              "default": {},
+                              "description": "Base URLs a node serves WHIP and WHEP signalling at, per WebRTC transport.\n A transport with no base is not offered for hosting at that address.",
+                              "properties": {
+                                "whep": {
+                                  "type": [
+                                    "string",
+                                    "null"
+                                  ]
+                                },
+                                "whip": {
+                                  "type": [
+                                    "string",
+                                    "null"
+                                  ]
+                                }
+                              },
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "host"
+                          ],
+                          "type": "object"
+                        }
+                      ]
+                    },
+                    "default": {},
+                    "description": "Data-plane addresses this node advertises, keyed by alias. The\n [`DEFAULT_DATA_PLANE_ALIAS`] entry serves node-referenced endpoints\n that pin no network.",
+                    "type": "object"
+                  },
+                  "devices": {
+                    "description": "Devices the node can capture from or display on.",
+                    "items": {
+                      "description": "The node's own capture or display device, where media starts or ends.",
+                      "enum": [
+                        "capture",
+                        "display"
+                      ],
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "port_range": {
+                    "description": "Inclusive port range the controller may assign from for this node's\n hops. A soft contract: bind failures surface as [`HopState::Failed`].",
+                    "properties": {
+                      "end": {
+                        "format": "uint16",
+                        "maximum": 65535,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "start": {
+                        "format": "uint16",
+                        "maximum": 65535,
+                        "minimum": 0,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "start",
+                      "end"
+                    ],
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "relay": {
+                    "default": false,
+                    "description": "Whether this node may carry transit for streams that neither terminate\n nor originate on it — the pool the planner draws a relay from when two\n endpoints cannot dial each other.",
+                    "type": "boolean"
+                  },
+                  "transports": {
+                    "default": [],
+                    "description": "Link transports this node offers, with the roles it can take.",
+                    "items": {
+                      "anyOf": [
+                        {
+                          "description": "A transport that carries media between two nodes.",
+                          "oneOf": [
+                            {
+                              "enum": [
+                                "srt"
+                              ],
+                              "type": "string"
+                            },
+                            {
+                              "const": "whip",
+                              "description": "WebRTC ingest. The `Connect` end pushes media to the `Listen` end's\n signalling URL.",
+                              "type": "string"
+                            },
+                            {
+                              "const": "whep",
+                              "description": "WebRTC playback. The `Connect` end pulls media from the `Listen` end's\n signalling URL.",
+                              "type": "string"
+                            }
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "name": {
+                              "description": "A transport that carries media between two nodes.",
+                              "oneOf": [
+                                {
+                                  "enum": [
+                                    "srt"
+                                  ],
+                                  "type": "string"
+                                },
+                                {
+                                  "const": "whip",
+                                  "description": "WebRTC ingest. The `Connect` end pushes media to the `Listen` end's\n signalling URL.",
+                                  "type": "string"
+                                },
+                                {
+                                  "const": "whep",
+                                  "description": "WebRTC playback. The `Connect` end pulls media from the `Listen` end's\n signalling URL.",
+                                  "type": "string"
+                                }
+                              ]
+                            },
+                            "roles": {
+                              "default": [
+                                "listen",
+                                "connect"
+                              ],
+                              "items": {
+                                "description": "Which end of a link a socket is: `Listen` hosts and `Connect` dials.",
+                                "enum": [
+                                  "listen",
+                                  "connect"
+                                ],
+                                "type": "string"
+                              },
+                              "minItems": 1,
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "name"
+                          ],
+                          "type": "object"
+                        }
+                      ]
+                    },
+                    "type": "array"
+                  }
+                },
+                "type": "object"
+              },
+              "endpoint": {
+                "type": "string"
+              },
+              "id": {
+                "maxLength": 63,
+                "minLength": 1,
+                "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "unknown",
+                  "ready",
+                  "degraded",
+                  "offline"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "endpoint",
+              "status"
+            ],
+            "type": "object"
+          },
+          "protocol_version": {
+            "default": 0,
+            "description": "Southbound protocol version the registering adapter speaks. Absent means\n an adapter predating the handshake, which reads as `0` and is rejected —\n see [`protocol_compatible`].",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "node"
+        ],
+        "title": "NodeRegistration",
+        "type": "object"
+      },
+      "ObservedState": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "endpoints": {
+            "default": [],
+            "items": {
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "source",
+                    "destination",
+                    "bidirectional",
+                    "flow",
+                    "gateway",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "metadata": {
+                  "default": null
+                },
+                "node_id": {
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "transports": {
+                  "default": [],
+                  "description": "Transport labels an adapter recognised on this endpoint, such as\n `webrtc` or `ndi`. Guesses read off the underlying system, not offers.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "id",
+                "label",
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "hops": {
+            "default": [],
+            "items": {
+              "description": "Node-reported realisation status for one desired hop.",
+              "properties": {
+                "egresses": {
+                  "default": [],
+                  "items": {
+                    "description": "Observed status for one identified egress branch.",
+                    "properties": {
+                      "branch_id": {
+                        "type": "string"
+                      },
+                      "condition": {
+                        "default": "idle",
+                        "description": "Observed condition of one socket on a hop, independent of control-plane lifecycle.",
+                        "oneOf": [
+                          {
+                            "const": "idle",
+                            "description": "No connection; the socket is a listener patiently waiting. Healthy.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "connecting",
+                            "description": "No connection; the socket is a caller still retrying. Ambiguous, not degraded.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "connected",
+                            "description": "Connection up but rate ~0 — fine on our end, nothing coming through yet.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "flowing",
+                            "description": "Connection up and media flowing.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "stalled",
+                            "description": "Ingress once carried media but byte progress has frozen while the flow still\n claims to run — detected across polls, not from any instantaneous field.",
+                            "type": "string"
+                          }
+                        ]
+                      },
+                      "resolved": {
+                        "properties": {
+                          "host": {
+                            "type": "string"
+                          },
+                          "port": {
+                            "format": "uint16",
+                            "maximum": 65535,
+                            "minimum": 0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "host",
+                          "port"
+                        ],
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      },
+                      "stats": {
+                        "description": "Socket-level SRT stats mirrored from Strom's `srt-stats` payload.",
+                        "properties": {
+                          "connections": {
+                            "default": 0,
+                            "format": "uint",
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "packets_received_lost": {
+                            "default": 0,
+                            "format": "int64",
+                            "type": "integer"
+                          },
+                          "packets_received_retransmitted": {
+                            "default": 0,
+                            "format": "int64",
+                            "type": "integer"
+                          },
+                          "packets_retransmitted": {
+                            "default": 0,
+                            "format": "int64",
+                            "type": "integer"
+                          },
+                          "packets_sent_lost": {
+                            "default": 0,
+                            "format": "int64",
+                            "type": "integer"
+                          },
+                          "rate_mbps": {
+                            "default": 0.0,
+                            "format": "double",
+                            "type": "number"
+                          }
+                        },
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "branch_id"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "ingress": {
+                  "description": "Observed condition, address, and statistics for one socket.",
+                  "properties": {
+                    "condition": {
+                      "default": "idle",
+                      "description": "Observed condition of one socket on a hop, independent of control-plane lifecycle.",
+                      "oneOf": [
+                        {
+                          "const": "idle",
+                          "description": "No connection; the socket is a listener patiently waiting. Healthy.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "connecting",
+                          "description": "No connection; the socket is a caller still retrying. Ambiguous, not degraded.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "connected",
+                          "description": "Connection up but rate ~0 — fine on our end, nothing coming through yet.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "flowing",
+                          "description": "Connection up and media flowing.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "stalled",
+                          "description": "Ingress once carried media but byte progress has frozen while the flow still\n claims to run — detected across polls, not from any instantaneous field.",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "resolved": {
+                      "properties": {
+                        "host": {
+                          "type": "string"
+                        },
+                        "port": {
+                          "format": "uint16",
+                          "maximum": 65535,
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "host",
+                        "port"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "stats": {
+                      "description": "Socket-level SRT stats mirrored from Strom's `srt-stats` payload.",
+                      "properties": {
+                        "connections": {
+                          "default": 0,
+                          "format": "uint",
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "packets_received_lost": {
+                          "default": 0,
+                          "format": "int64",
+                          "type": "integer"
+                        },
+                        "packets_received_retransmitted": {
+                          "default": 0,
+                          "format": "int64",
+                          "type": "integer"
+                        },
+                        "packets_retransmitted": {
+                          "default": 0,
+                          "format": "int64",
+                          "type": "integer"
+                        },
+                        "packets_sent_lost": {
+                          "default": 0,
+                          "format": "int64",
+                          "type": "integer"
+                        },
+                        "rate_mbps": {
+                          "default": 0.0,
+                          "format": "double",
+                          "type": "number"
+                        }
+                      },
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
+                  },
+                  "type": "object"
+                },
+                "node_id": {
+                  "type": "string"
+                },
+                "state": {
+                  "description": "Control-plane lifecycle of a hop's provisioning. Runtime link health is\n reported separately per socket via [`LinkCondition`].",
+                  "enum": [
+                    "pending",
+                    "provisioned",
+                    "failed"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "node_id",
+                "state",
+                "ingress"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "nodes": {
+            "default": [],
+            "items": {
+              "properties": {
+                "capabilities": {
+                  "default": {
+                    "adapters": [],
+                    "data_plane": {},
+                    "relay": false,
+                    "transports": []
+                  },
+                  "properties": {
+                    "adapters": {
+                      "default": [],
+                      "items": {
+                        "properties": {
+                          "kind": {
+                            "enum": [
+                              "strom",
+                              "nmos",
+                              "mxl_domain",
+                              "mxl_k8s",
+                              "mcm",
+                              "vendor",
+                              "custom"
+                            ],
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "name",
+                          "kind"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "data_plane": {
+                      "additionalProperties": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "properties": {
+                              "host": {
+                                "type": "string"
+                              },
+                              "reachability": {
+                                "default": "dialable",
+                                "description": "Whether peers can open a connection to an address, or the node behind it can\n only dial out. Planning reads this to decide which end of a link listens.",
+                                "oneOf": [
+                                  {
+                                    "const": "dialable",
+                                    "description": "Peers can connect to this address.",
+                                    "type": "string"
+                                  },
+                                  {
+                                    "const": "outbound_only",
+                                    "description": "Behind NAT or a firewall: this node must initiate every connection.",
+                                    "type": "string"
+                                  }
+                                ]
+                              },
+                              "signalling": {
+                                "additionalProperties": false,
+                                "default": {},
+                                "description": "Base URLs a node serves WHIP and WHEP signalling at, per WebRTC transport.\n A transport with no base is not offered for hosting at that address.",
+                                "properties": {
+                                  "whep": {
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  },
+                                  "whip": {
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  }
+                                },
+                                "type": "object"
+                              }
+                            },
+                            "required": [
+                              "host"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      },
+                      "default": {},
+                      "description": "Data-plane addresses this node advertises, keyed by alias. The\n [`DEFAULT_DATA_PLANE_ALIAS`] entry serves node-referenced endpoints\n that pin no network.",
+                      "type": "object"
+                    },
+                    "devices": {
+                      "description": "Devices the node can capture from or display on.",
+                      "items": {
+                        "description": "The node's own capture or display device, where media starts or ends.",
+                        "enum": [
+                          "capture",
+                          "display"
+                        ],
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "port_range": {
+                      "description": "Inclusive port range the controller may assign from for this node's\n hops. A soft contract: bind failures surface as [`HopState::Failed`].",
+                      "properties": {
+                        "end": {
+                          "format": "uint16",
+                          "maximum": 65535,
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "start": {
+                          "format": "uint16",
+                          "maximum": 65535,
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "start",
+                        "end"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "relay": {
+                      "default": false,
+                      "description": "Whether this node may carry transit for streams that neither terminate\n nor originate on it — the pool the planner draws a relay from when two\n endpoints cannot dial each other.",
+                      "type": "boolean"
+                    },
+                    "transports": {
+                      "default": [],
+                      "description": "Link transports this node offers, with the roles it can take.",
+                      "items": {
+                        "anyOf": [
+                          {
+                            "description": "A transport that carries media between two nodes.",
+                            "oneOf": [
+                              {
+                                "enum": [
+                                  "srt"
+                                ],
+                                "type": "string"
+                              },
+                              {
+                                "const": "whip",
+                                "description": "WebRTC ingest. The `Connect` end pushes media to the `Listen` end's\n signalling URL.",
+                                "type": "string"
+                              },
+                              {
+                                "const": "whep",
+                                "description": "WebRTC playback. The `Connect` end pulls media from the `Listen` end's\n signalling URL.",
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          {
+                            "properties": {
+                              "name": {
+                                "description": "A transport that carries media between two nodes.",
+                                "oneOf": [
+                                  {
+                                    "enum": [
+                                      "srt"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  {
+                                    "const": "whip",
+                                    "description": "WebRTC ingest. The `Connect` end pushes media to the `Listen` end's\n signalling URL.",
+                                    "type": "string"
+                                  },
+                                  {
+                                    "const": "whep",
+                                    "description": "WebRTC playback. The `Connect` end pulls media from the `Listen` end's\n signalling URL.",
+                                    "type": "string"
+                                  }
+                                ]
+                              },
+                              "roles": {
+                                "default": [
+                                  "listen",
+                                  "connect"
+                                ],
+                                "items": {
+                                  "description": "Which end of a link a socket is: `Listen` hosts and `Connect` dials.",
+                                  "enum": [
+                                    "listen",
+                                    "connect"
+                                  ],
+                                  "type": "string"
+                                },
+                                "minItems": 1,
+                                "type": "array"
+                              }
+                            },
+                            "required": [
+                              "name"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                },
+                "endpoint": {
+                  "type": "string"
+                },
+                "id": {
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "unknown",
+                    "ready",
+                    "degraded",
+                    "offline"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "endpoint",
+                "status"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "title": "ObservedState",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "title": "open-weave southbound API",
+    "version": "v4"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/v4/endpoints": {
+      "get": {
+        "operationId": "listEndpoints",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EndpointList"
+                }
+              }
+            },
+            "description": "Discovered endpoints"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Authentication failed"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Controller unavailable"
+          }
+        }
+      }
+    },
+    "/v4/nodes": {
+      "get": {
+        "operationId": "listNodes",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeList"
+                }
+              }
+            },
+            "description": "Registered nodes"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Authentication failed"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Controller unavailable"
+          }
+        }
+      }
+    },
+    "/v4/nodes/register": {
+      "post": {
+        "operationId": "registerNode",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NodeRegistration"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeAccepted"
+                }
+              }
+            },
+            "description": "Node accepted"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Invalid registration"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Authentication failed"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Incompatible protocol version"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Persistence failed"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Controller unavailable"
+          }
+        }
+      }
+    },
+    "/v4/nodes/{node_id}/desired": {
+      "get": {
+        "operationId": "getDesiredHops",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "maxLength": 63,
+              "minLength": 1,
+              "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredHopList"
+                }
+              }
+            },
+            "description": "Desired hops"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Invalid node id"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Authentication failed"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Controller unavailable"
+          }
+        }
+      }
+    },
+    "/v4/nodes/{node_id}/heartbeat": {
+      "post": {
+        "operationId": "heartbeatNode",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "maxLength": 63,
+              "minLength": 1,
+              "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NodeHeartbeat"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeAccepted"
+                }
+              }
+            },
+            "description": "Heartbeat accepted"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Invalid heartbeat"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Authentication failed"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Node not found"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Controller unavailable"
+          }
+        }
+      }
+    },
+    "/v4/state": {
+      "get": {
+        "operationId": "getObservedState",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObservedState"
+                }
+              }
+            },
+            "description": "Observed state"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Authentication failed"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Controller unavailable"
+          }
+        }
+      }
+    }
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ]
+}

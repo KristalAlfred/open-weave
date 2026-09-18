@@ -17,6 +17,12 @@ fmt:
 fmt-check:
     cargo fmt --all --check
 
+contracts:
+    cargo run -p weave-core --bin generate-contracts
+
+contracts-check:
+    cargo test -p weave-core contracts::tests
+
 lint:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 

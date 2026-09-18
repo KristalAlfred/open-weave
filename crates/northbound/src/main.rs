@@ -15,8 +15,9 @@ use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Guard, Token, require_bearer};
 use weave_core::{
-    API_PREFIX, ApiError, ApiErrorCode, StreamDefinition, ValidationIssue, resource_id_issue,
-    validate_resource_id, validate_stream,
+    API_PREFIX, ApiError, ApiErrorCode, ROUTE_STATUS, ROUTE_STREAM, ROUTE_STREAM_ENDPOINTS,
+    ROUTE_STREAMS, StreamDefinition, ValidationIssue, resource_id_issue, validate_resource_id,
+    validate_stream,
 };
 
 const DEFAULT_ADDR: &str = "127.0.0.1:9080";
@@ -82,10 +83,10 @@ async fn main() -> Result<()> {
 /// controller, where the embedded dashboard reads the same rollup.
 fn router(state: AppState, guard: Guard) -> Router {
     let operator = Router::new()
-        .route("/streams", get(list_streams).post(submit_stream))
-        .route("/streams/{name}", axum::routing::delete(delete_stream))
-        .route("/streams/{name}/endpoints", get(get_endpoints))
-        .route("/status", get(get_status))
+        .route(ROUTE_STREAMS, get(list_streams).post(submit_stream))
+        .route(ROUTE_STREAM, axum::routing::delete(delete_stream))
+        .route(ROUTE_STREAM_ENDPOINTS, get(get_endpoints))
+        .route(ROUTE_STATUS, get(get_status))
         .fallback(api_route_not_found)
         .method_not_allowed_fallback(api_method_not_allowed)
         .layer(axum::middleware::from_fn_with_state(guard, require_bearer));

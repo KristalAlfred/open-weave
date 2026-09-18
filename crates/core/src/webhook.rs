@@ -6,12 +6,13 @@
 
 use std::fmt;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{NodeCapabilities, NodeDescriptor, NodeStatus};
 
 /// One lifecycle event. The whole JSON body of a delivery.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Event {
     /// Stable across retries of one delivery, so a receiver can deduplicate.
     pub event_id: String,
@@ -21,7 +22,7 @@ pub struct Event {
     pub node: NodeSummary,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum EventType {
     #[serde(rename = "node.registered")]
     NodeRegistered,
@@ -61,7 +62,7 @@ impl fmt::Display for EventType {
 ///
 /// A [`crate::NodeRegistration`] also carries `endpoints` and `hop_status`.
 /// Those describe hops rather than the node, and are not part of this contract.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct NodeSummary {
     pub id: String,
     pub status: NodeStatus,

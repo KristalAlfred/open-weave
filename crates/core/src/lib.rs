@@ -2,15 +2,20 @@
 
 pub mod api;
 pub mod auth;
+pub mod contracts;
 pub mod media;
 pub mod validation;
 pub mod webhook;
 
 use std::{collections::BTreeMap, ops::Deref};
 
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
-pub use api::{ApiError, ApiErrorCode};
+pub use api::{
+    AcceptedState, ApiError, ApiErrorCode, NodeAccepted, RunningStatus, StartingState,
+    StartingStatus, StatusResponse, StreamAccepted, StreamStatus,
+};
 pub use media::{
     AudioCodec, AudioConstraint, AudioFormat, ChromaSubsampling, Container, FormatConstraint,
     Framerate, MediaFormat, Mismatch, VideoCodec, VideoConstraint, VideoFormat,
@@ -35,6 +40,16 @@ pub const DEFAULT_DATA_PLANE_ALIAS: &str = "default";
 /// load balancers address directly, and the controller's `/`, `/ui`, and `/view` —
 /// the dashboard ships inside the controller binary and versions with it.
 pub const API_PREFIX: &str = "/v4";
+pub const ROUTE_ENDPOINTS: &str = "/endpoints";
+pub const ROUTE_NODES: &str = "/nodes";
+pub const ROUTE_NODE_DESIRED: &str = "/nodes/{node_id}/desired";
+pub const ROUTE_NODE_HEARTBEAT: &str = "/nodes/{node_id}/heartbeat";
+pub const ROUTE_NODE_REGISTER: &str = "/nodes/register";
+pub const ROUTE_STATE: &str = "/state";
+pub const ROUTE_STATUS: &str = "/status";
+pub const ROUTE_STREAM: &str = "/streams/{name}";
+pub const ROUTE_STREAM_ENDPOINTS: &str = "/streams/{name}/endpoints";
+pub const ROUTE_STREAMS: &str = "/streams";
 
 /// Wire-protocol version an adapter declares when it registers.
 ///
@@ -56,13 +71,18 @@ pub fn protocol_compatible(version: u32) -> bool {
 }
 
 /// Operator intent: one source streamed to one or more destinations over a transport.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StreamDefinition {
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
     pub name: String,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     pub source: StreamTransport,
+    #[schemars(length(min = 1))]
     pub destinations: Vec<StreamTransport>,
 }
 
@@ -74,7 +94,7 @@ fn default_enabled() -> bool {
 pub const DEVICE_TRANSPORT: &str = "device";
 
 /// Transport carrying a stream endpoint. Externally tagged by transport name.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)]
 pub enum StreamTransport {
@@ -116,9 +136,13 @@ impl StreamTransport {
 
 /// An endpoint that is nothing but a node: the node itself produces or consumes
 /// the media, so there is no address, latency, or format to declare.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NodeEndpoint {
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
     pub node: String,
     /// Data-plane alias resolved against the node's declared address map.
     /// Absent means [`DEFAULT_DATA_PLANE_ALIAS`].
@@ -126,12 +150,16 @@ pub struct NodeEndpoint {
     pub network: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SrtEndpoint {
     /// Registered node id hosting this endpoint. Mutually exclusive with
     /// [`SrtEndpoint::remote`]; exactly one must be set (enforced at validation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
     pub node: Option<String>,
     /// External SRT listener this endpoint dials out to. Destinations only;
     /// mutually exclusive with [`SrtEndpoint::node`].
@@ -142,6 +170,10 @@ pub struct SrtEndpoint {
     /// choose itself; it still inserts a relay of its own when a link needs one
     /// and none is pinned.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(inner(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    ))]
     pub via: Vec<String>,
     /// Data-plane alias resolved against the node's declared address map.
     /// Absent means [`DEFAULT_DATA_PLANE_ALIAS`].
@@ -164,7 +196,7 @@ pub struct SrtEndpoint {
 
 /// An external SRT listener a stream dials out to. Placed by no node: the sender
 /// simply gains a caller egress to this address.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteAddr {
     pub host: String,
@@ -217,7 +249,7 @@ pub fn is_managed_hop_id(name: &str) -> bool {
 }
 
 /// An ordered chain of hops (upstream→downstream) realising one stream.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Path {
     pub stream: String,
     #[serde(default = "default_enabled")]
@@ -228,7 +260,7 @@ pub struct Path {
 
 /// One provisioning unit placed on a single node: one ingress socket fanned out
 /// to one or more egress sockets (a sender tees to every destination).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DesiredHop {
     pub id: String,
     pub node_id: String,
@@ -238,7 +270,7 @@ pub struct DesiredHop {
 }
 
 /// One identified output branch of a desired hop.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DesiredEgress {
     pub branch_id: String,
     #[serde(flatten)]
@@ -253,7 +285,7 @@ impl Deref for DesiredEgress {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HopRole {
     Sender,
@@ -272,6 +304,20 @@ pub enum SocketSpec {
     Whep(SignallingSocket),
     /// The node's own device, where the media starts or ends.
     Device(DeviceKind),
+}
+
+impl JsonSchema for SocketSpec {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SocketSpec".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "::SocketSpec").into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        generator.subschema_for::<SocketRepr>()
+    }
 }
 
 impl SocketSpec {
@@ -404,7 +450,7 @@ impl SignallingSocket {
 
 /// Flat wire form of a [`SocketSpec`]: a `transport` and `role` naming the
 /// variant, plus the fields that variant carries.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SocketRepr {
     transport: SocketTransport,
@@ -421,7 +467,7 @@ struct SocketRepr {
     params: Option<SrtParams>,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum SocketTransport {
     Srt,
@@ -430,7 +476,7 @@ enum SocketTransport {
     Device,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum SocketEnd {
     Listen,
@@ -635,7 +681,7 @@ impl<'de> Deserialize<'de> for SocketSpec {
 }
 
 /// Which end of a link a socket is: `Listen` hosts and `Connect` dials.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SocketRole {
     Listen,
@@ -654,7 +700,7 @@ impl SocketRole {
 }
 
 /// A transport that carries media between two nodes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
     Srt,
@@ -714,7 +760,7 @@ impl SignallingTransport {
 }
 
 /// The node's own capture or display device, where media starts or ends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceKind {
     Capture,
@@ -738,14 +784,14 @@ impl std::fmt::Display for DeviceKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 pub struct SrtParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency: Option<u32>,
 }
 
 /// Node-reported realisation status for one desired hop.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct HopStatus {
     pub id: String,
     pub node_id: String,
@@ -756,7 +802,7 @@ pub struct HopStatus {
 }
 
 /// Observed condition, address, and statistics for one socket.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SocketStatus {
     #[serde(default)]
     pub condition: LinkCondition,
@@ -767,7 +813,7 @@ pub struct SocketStatus {
 }
 
 /// Observed status for one identified egress branch.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct EgressStatus {
     pub branch_id: String,
     #[serde(flatten)]
@@ -810,7 +856,7 @@ impl HopStatus {
 
 /// Control-plane lifecycle of a hop's provisioning. Runtime link health is
 /// reported separately per socket via [`LinkCondition`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HopState {
     Pending,
@@ -819,7 +865,7 @@ pub enum HopState {
 }
 
 /// Observed condition of one socket on a hop, independent of control-plane lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LinkCondition {
     /// No connection; the socket is a listener patiently waiting. Healthy.
@@ -845,7 +891,7 @@ pub struct HopConditions {
 }
 
 /// End-to-end status of a path, derived from its hops' conditions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PathStatus {
     /// The path is disabled.
@@ -911,14 +957,14 @@ pub fn roll_up_path(enabled: bool, hops: &[Option<HopConditions>]) -> PathStatus
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ResolvedAddr {
     pub host: String,
     pub port: u16,
 }
 
 /// Socket-level SRT stats mirrored from Strom's `srt-stats` payload.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
 pub struct LinkStats {
     #[serde(default)]
     pub connections: usize,
@@ -934,8 +980,12 @@ pub struct LinkStats {
     pub packets_received_retransmitted: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct NodeDescriptor {
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
     pub id: String,
     pub endpoint: String,
     pub status: NodeStatus,
@@ -943,7 +993,7 @@ pub struct NodeDescriptor {
     pub capabilities: NodeCapabilities,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 pub struct NodeCapabilities {
     #[serde(default)]
     pub adapters: Vec<AdapterDescriptor>,
@@ -1010,6 +1060,34 @@ pub struct DataPlaneAddr {
     pub signalling: Signalling,
 }
 
+#[derive(JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)]
+enum DataPlaneAddrSchema {
+    Host(String),
+    Full {
+        host: String,
+        #[serde(default)]
+        reachability: Reachability,
+        #[serde(default)]
+        signalling: Signalling,
+    },
+}
+
+impl JsonSchema for DataPlaneAddr {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "DataPlaneAddr".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "::DataPlaneAddr").into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        generator.subschema_for::<DataPlaneAddrSchema>()
+    }
+}
+
 impl DataPlaneAddr {
     /// An address peers can dial — the shorthand form's meaning.
     #[must_use]
@@ -1066,7 +1144,7 @@ impl<'de> Deserialize<'de> for DataPlaneAddr {
 
 /// Base URLs a node serves WHIP and WHEP signalling at, per WebRTC transport.
 /// A transport with no base is not offered for hosting at that address.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Signalling {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1101,7 +1179,7 @@ impl Signalling {
 
 /// Whether peers can open a connection to an address, or the node behind it can
 /// only dial out. Planning reads this to decide which end of a link listens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Reachability {
     /// Peers can connect to this address.
@@ -1113,7 +1191,7 @@ pub enum Reachability {
 
 /// Inclusive `[start, end]` range of ports a node offers for controller-side
 /// assignment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PortRange {
     pub start: u16,
     pub end: u16,
@@ -1129,9 +1207,13 @@ impl PortRange {
 
 /// Static configuration a node loads at startup and self-registers from.
 /// Shared across adapters; adapter-specific sections wrap this type.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
     pub id: String,
     pub southbound_url: String,
     /// Bearer token presented to southbound. Falls back to
@@ -1230,13 +1312,13 @@ pub enum ConfigError {
     InvalidPortRange { start: u16, end: u16 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AdapterDescriptor {
     pub name: String,
     pub kind: AdapterKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AdapterKind {
     Strom,
@@ -1257,6 +1339,32 @@ pub enum AdapterKind {
 pub struct TransportOffer {
     pub name: Transport,
     pub roles: RoleSet,
+}
+
+#[derive(JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)]
+enum TransportOfferSchema {
+    Name(Transport),
+    Full {
+        name: Transport,
+        #[serde(default = "RoleSet::both")]
+        roles: RoleSet,
+    },
+}
+
+impl JsonSchema for TransportOffer {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "TransportOffer".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "::TransportOffer").into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        generator.subschema_for::<TransportOfferSchema>()
+    }
 }
 
 impl TransportOffer {
@@ -1312,6 +1420,22 @@ impl<'de> Deserialize<'de> for TransportOffer {
 pub struct RoleSet {
     listen: bool,
     connect: bool,
+}
+
+impl JsonSchema for RoleSet {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "RoleSet".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "::RoleSet").into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let mut schema = generator.subschema_for::<Vec<SocketRole>>();
+        schema.insert("minItems".to_string(), 1.into());
+        schema
+    }
 }
 
 impl RoleSet {
@@ -1387,6 +1511,20 @@ pub struct DeviceSet {
     display: bool,
 }
 
+impl JsonSchema for DeviceSet {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "DeviceSet".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "::DeviceSet").into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        generator.subschema_for::<Vec<DeviceKind>>()
+    }
+}
+
 impl DeviceSet {
     #[must_use]
     pub fn contains(self, kind: DeviceKind) -> bool {
@@ -1444,10 +1582,14 @@ impl<'de> Deserialize<'de> for DeviceSet {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct EndpointDescriptor {
     pub id: String,
     pub label: String,
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
     pub node_id: Option<String>,
     pub kind: EndpointKind,
     /// Transport labels an adapter recognised on this endpoint, such as
@@ -1458,7 +1600,7 @@ pub struct EndpointDescriptor {
     pub metadata: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EndpointKind {
     Source,
@@ -1469,7 +1611,7 @@ pub enum EndpointKind {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct NodeRegistration {
     /// Southbound protocol version the registering adapter speaks. Absent means
     /// an adapter predating the handshake, which reads as `0` and is rejected —
@@ -1483,8 +1625,12 @@ pub struct NodeRegistration {
     pub hop_status: Vec<HopStatus>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct NodeHeartbeat {
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
     pub node_id: String,
     pub status: NodeStatus,
     #[serde(default)]
@@ -1493,7 +1639,7 @@ pub struct NodeHeartbeat {
     pub hop_status: Vec<HopStatus>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ObservedState {
     #[serde(default)]
     pub nodes: Vec<NodeDescriptor>,
@@ -1503,13 +1649,29 @@ pub struct ObservedState {
     pub hops: Vec<HopStatus>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ReconcileReport {
     pub status: ReconcileStatus,
     pub summary: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StreamEndpoints {
+    pub ingress: Option<EndpointAddr>,
+    pub outputs: Vec<Option<EndpointAddr>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointAddr {
+    pub node: String,
+    pub host: String,
+    pub port: u16,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReconcileStatus {
     Idle,
@@ -1518,7 +1680,7 @@ pub enum ReconcileStatus {
     Degraded,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeStatus {
     Unknown,

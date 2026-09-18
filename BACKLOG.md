@@ -101,3 +101,5 @@ Listed so they are not picked up by accident.
   above.
 - Keep `cargo test --workspace` and `cargo clippy --workspace --all-targets`
   clean; both pass as of this file being written.
+- Regenerate `contracts/` when a versioned route or wire type changes. Contract
+  drift is a test failure, not a documentation follow-up.

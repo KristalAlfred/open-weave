@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "code": {
+      "enum": [
+        "invalid_request",
+        "invalid_json",
+        "unauthorized",
+        "route_not_found",
+        "method_not_allowed",
+        "stream_not_found",
+        "node_not_found",
+        "stream_not_ready",
+        "incompatible_protocol_version",
+        "persistence_failed",
+        "controller_unreachable",
+        "encoding_failed"
+      ],
+      "type": "string"
+    },
+    "details": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "field": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "field",
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "message": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "code",
+    "message"
+  ],
+  "title": "ApiError",
+  "type": "object"
+}

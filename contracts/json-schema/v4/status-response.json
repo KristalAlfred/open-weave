@@ -1,0 +1,189 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "anyOf": [
+    {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": [
+            "starting"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": [
+            "idle",
+            "converging",
+            "converged",
+            "degraded"
+          ],
+          "type": "string"
+        },
+        "streams": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "endpoints": {
+                "additionalProperties": false,
+                "properties": {
+                  "ingress": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "host": {
+                        "type": "string"
+                      },
+                      "node": {
+                        "type": "string"
+                      },
+                      "port": {
+                        "format": "uint16",
+                        "maximum": 65535,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "url": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "node",
+                      "host",
+                      "port",
+                      "url"
+                    ],
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "outputs": {
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "host": {
+                          "type": "string"
+                        },
+                        "node": {
+                          "type": "string"
+                        },
+                        "port": {
+                          "format": "uint16",
+                          "maximum": 65535,
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "url": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "node",
+                        "host",
+                        "port",
+                        "url"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "outputs"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "name": {
+                "maxLength": 63,
+                "minLength": 1,
+                "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                "type": "string"
+              },
+              "nodes": {
+                "items": {
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "description": "End-to-end status of a path, derived from its hops' conditions.",
+                "oneOf": [
+                  {
+                    "const": "idle",
+                    "description": "The path is disabled.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "failed",
+                    "description": "At least one hop failed to provision.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "pending",
+                    "description": "A hop is still provisioning or has not reported yet.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "awaiting_input",
+                    "description": "Provisioned end to end, but no media is entering at the source.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "degraded",
+                    "description": "Media is entering at the source but not flowing all the way through.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "flowing",
+                    "description": "Media is flowing across every hop.",
+                    "type": "string"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "status",
+              "nodes"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "summary",
+        "streams"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "StatusResponse"
+}

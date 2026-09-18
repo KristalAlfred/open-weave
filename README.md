@@ -279,6 +279,23 @@ fields. Validation failures also carry all known field issues in `details`:
 Clients branch on `code`, not `message`. Field detail codes are stable within
 the URL major. `details` is absent when the error has no field context.
 
+### Machine-readable contracts
+
+Generated OpenAPI 3.1 documents for the northbound and southbound surfaces are
+in `contracts/openapi/`. JSON Schema 2020-12 documents for their request and
+response payloads are in `contracts/json-schema/v4/`. They are generated from
+the Rust wire types. Resource-id patterns, required destination lists, non-empty
+format constraints, unknown-field rejection, and enum values are present in the
+schemas. Rules that depend on where a shared endpoint type appears, such as
+source-only `format`, remain authoritative in the shared validator and return
+field details at runtime.
+
+Run `just contracts` after changing a route or wire type. Contract drift tests
+compare every committed artifact with a fresh generation, and the route paths
+come from the same constants used by the servers. `/health` and the controller
+dashboard routes are not in OpenAPI because they are outside the versioned
+contracts.
+
 ### Resource identifiers
 
 Stream and node ids are 1–63 characters and match

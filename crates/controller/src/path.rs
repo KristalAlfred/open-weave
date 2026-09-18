@@ -2,12 +2,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde::Serialize;
 use weave_core::{
-    DEFAULT_DATA_PLANE_ALIAS, DataPlaneAddr, DesiredEgress, DesiredHop, DeviceKind, HOP_ID_PREFIX,
-    HopConditions, HopRole, HopStatus, NodeDescriptor, NodeStatus, Path, PathStatus, PortRange,
-    RemoteAddr, SocketRole, SocketSpec, SrtSocket, StreamDefinition, StreamTransport, Transport,
-    roll_up_path,
+    DEFAULT_DATA_PLANE_ALIAS, DataPlaneAddr, DesiredEgress, DesiredHop, DeviceKind, EndpointAddr,
+    HOP_ID_PREFIX, HopConditions, HopRole, HopStatus, NodeDescriptor, NodeStatus, Path, PathStatus,
+    PortRange, RemoteAddr, SocketRole, SocketSpec, SrtSocket, StreamDefinition, StreamEndpoints,
+    StreamTransport, Transport, roll_up_path,
 };
 
 const DEFAULT_SRC_LATENCY: u32 = 200;
@@ -789,22 +788,6 @@ fn find_node<'a>(nodes: &'a [NodeDescriptor], id: &str) -> Option<&'a NodeDescri
 /// A `device` end has nothing to dial, so it reads `null`: the ingress when the
 /// source is a device, and the output at that destination's index otherwise.
 /// Outputs keep manifest order, so index `i` is always destination `i`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct StreamEndpoints {
-    pub ingress: Option<EndpointAddr>,
-    pub outputs: Vec<Option<EndpointAddr>>,
-}
-
-/// One resolved data-plane socket: the node hosting it plus its dialable address.
-/// A remote (external) output carries an empty `node`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EndpointAddr {
-    pub node: String,
-    pub host: String,
-    pub port: u16,
-    pub url: String,
-}
-
 /// Resolve the concrete `srt://` addresses of a placed stream: the source node's
 /// ingress socket a producer dials, and each destination's consumer socket.
 ///

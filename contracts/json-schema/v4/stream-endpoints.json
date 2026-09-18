@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "ingress": {
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "node": {
+          "type": "string"
+        },
+        "port": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "node",
+        "host",
+        "port",
+        "url"
+      ],
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "outputs": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "host": {
+            "type": "string"
+          },
+          "node": {
+            "type": "string"
+          },
+          "port": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "node",
+          "host",
+          "port",
+          "url"
+        ],
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "outputs"
+  ],
+  "title": "StreamEndpoints",
+  "type": "object"
+}
