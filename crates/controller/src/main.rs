@@ -3,6 +3,7 @@
 //! southbound HTTP surfaces, and reconciles desired streams into per-node desired
 //! hops on a fixed interval, entirely from in-memory state.
 
+mod desired;
 mod path;
 mod store;
 mod webhook;
@@ -92,7 +93,7 @@ struct AppState {
     nodes: Arc<RwLock<BTreeMap<String, NodeRegistration>>>,
     last_seen: Arc<RwLock<BTreeMap<String, Instant>>>,
     node_ttl: Duration,
-    desired: Arc<RwLock<BTreeMap<String, Vec<DesiredHop>>>>,
+    desired: Arc<RwLock<BTreeMap<String, desired::DesiredSnapshot>>>,
     view: Arc<RwLock<ControllerView>>,
     /// `None` when no receiver is configured; every emit site is then a no-op.
     webhooks: Option<Arc<webhook::Emitter>>,
@@ -418,7 +419,11 @@ async fn reconcile_tick(state: &AppState) {
         "reconcile tick"
     );
 
-    *state.desired.write().await = outcome.desired_by_node;
+    let desired = desired::snapshots(outcome.desired_by_node);
+    for (node_id, snapshot) in &desired {
+        tracing::debug!(%node_id, revision = %snapshot.revision, hops = snapshot.hops.len(), "desired snapshot");
+    }
+    *state.desired.write().await = desired;
     let mut view = state.view.write().await;
     stamp_condition_transition_times(&mut outcome.streams, &view.streams, &now_rfc3339());
     view.report = Some(outcome.report);
@@ -1600,7 +1605,7 @@ async fn get_desired(State(state): State<AppState>, Path(node_id): Path<String>)
             .read()
             .await
             .get(&node_id)
-            .cloned()
+            .map(|snapshot| snapshot.hops.clone())
             .unwrap_or_default(),
     )
     .into_response()
