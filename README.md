@@ -322,6 +322,14 @@ Strom flow names. Invalid persisted stream definitions stop controller startup
 and name the failing field. Stored node registrations are caches, so invalid
 ones are dropped; a node must re-register with a valid id.
 
+### Desired-state revisions
+
+The controller stores a generation and an opaque revision with each stream.
+Creating a stream starts generation 1. Reapplying the same definition preserves
+both values; changing it increments the generation and assigns a new revision.
+Deleting and recreating a name starts generation 1 again but does not reuse the
+old revision. The `/v4` API does not expose these values yet.
+
 ## Authentication
 
 Each API surface is protected by one shared bearer token, supplied through the

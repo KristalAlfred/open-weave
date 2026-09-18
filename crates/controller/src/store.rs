@@ -7,6 +7,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use weave_core::{NodeRegistration, StreamDefinition, protocol_compatible};
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredStream {
+    pub spec: StreamDefinition,
+    pub generation: u64,
+    pub revision: u64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("connecting to database")]
@@ -15,14 +22,23 @@ pub enum StoreError {
     Query(#[source] sqlx::Error),
     #[error("decoding stored json")]
     Decode(#[source] sqlx::Error),
+    #[error("stored {field} must be positive, got {value}")]
+    InvalidCounter { field: &'static str, value: i64 },
+}
+
+fn positive_counter(value: i64, field: &'static str) -> Result<u64, StoreError> {
+    if value <= 0 {
+        return Err(StoreError::InvalidCounter { field, value });
+    }
+    Ok(value as u64)
 }
 
 /// Durable state access. Streams and node registrations are written through on
 /// mutation and hydrated into memory on boot; nothing else is persisted.
 #[async_trait]
 pub trait StateStore: Send + Sync {
-    async fn load_streams(&self) -> Result<Vec<StreamDefinition>, StoreError>;
-    async fn upsert_stream(&self, stream: &StreamDefinition) -> Result<(), StoreError>;
+    async fn load_streams(&self) -> Result<Vec<StoredStream>, StoreError>;
+    async fn upsert_stream(&self, stream: &StreamDefinition) -> Result<StoredStream, StoreError>;
     async fn delete_stream(&self, name: &str) -> Result<(), StoreError>;
     async fn load_nodes(&self) -> Result<Vec<NodeRegistration>, StoreError>;
     async fn upsert_node(&self, registration: &NodeRegistration) -> Result<(), StoreError>;
@@ -107,6 +123,36 @@ impl PgStore {
         .execute(&self.pool)
         .await
         .map_err(StoreError::Query)?;
+        sqlx::query("CREATE SEQUENCE IF NOT EXISTS stream_revision_seq")
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Query)?;
+        sqlx::query("ALTER TABLE streams ADD COLUMN IF NOT EXISTS generation BIGINT")
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Query)?;
+        sqlx::query("ALTER TABLE streams ADD COLUMN IF NOT EXISTS revision BIGINT")
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Query)?;
+        sqlx::query("UPDATE streams SET generation = 1 WHERE generation IS NULL")
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Query)?;
+        sqlx::query(
+            "UPDATE streams SET revision = nextval('stream_revision_seq') WHERE revision IS NULL",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(StoreError::Query)?;
+        sqlx::query("ALTER TABLE streams ALTER COLUMN generation SET NOT NULL")
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Query)?;
+        sqlx::query("ALTER TABLE streams ALTER COLUMN revision SET NOT NULL")
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Query)?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS nodes (id TEXT PRIMARY KEY, registration JSONB NOT NULL)",
         )
@@ -119,32 +165,69 @@ impl PgStore {
 
 #[async_trait]
 impl StateStore for PgStore {
-    async fn load_streams(&self) -> Result<Vec<StreamDefinition>, StoreError> {
+    async fn load_streams(&self) -> Result<Vec<StoredStream>, StoreError> {
         use sqlx::Row;
-        let rows = sqlx::query("SELECT definition FROM streams")
+        let rows = sqlx::query("SELECT definition, generation, revision FROM streams")
             .fetch_all(&self.pool)
             .await
             .map_err(StoreError::Query)?;
         rows.into_iter()
             .map(|row| {
-                row.try_get::<sqlx::types::Json<StreamDefinition>, _>("definition")
-                    .map(|json| json.0)
-                    .map_err(StoreError::Decode)
+                Ok(StoredStream {
+                    spec: row
+                        .try_get::<sqlx::types::Json<StreamDefinition>, _>("definition")
+                        .map_err(StoreError::Decode)?
+                        .0,
+                    generation: positive_counter(
+                        row.try_get::<i64, _>("generation")
+                            .map_err(StoreError::Decode)?,
+                        "generation",
+                    )?,
+                    revision: positive_counter(
+                        row.try_get::<i64, _>("revision")
+                            .map_err(StoreError::Decode)?,
+                        "revision",
+                    )?,
+                })
             })
             .collect()
     }
 
-    async fn upsert_stream(&self, stream: &StreamDefinition) -> Result<(), StoreError> {
-        sqlx::query(
-            "INSERT INTO streams (name, definition) VALUES ($1, $2)
-             ON CONFLICT (name) DO UPDATE SET definition = EXCLUDED.definition",
+    async fn upsert_stream(&self, stream: &StreamDefinition) -> Result<StoredStream, StoreError> {
+        use sqlx::Row;
+        let row = sqlx::query(
+            "INSERT INTO streams (name, definition, generation, revision)
+             VALUES ($1, $2, 1, nextval('stream_revision_seq'))
+             ON CONFLICT (name) DO UPDATE SET
+               definition = EXCLUDED.definition,
+               generation = CASE
+                 WHEN streams.definition = EXCLUDED.definition THEN streams.generation
+                 ELSE streams.generation + 1
+               END,
+               revision = CASE
+                 WHEN streams.definition = EXCLUDED.definition THEN streams.revision
+                 ELSE EXCLUDED.revision
+               END
+             RETURNING generation, revision",
         )
         .bind(&stream.name)
         .bind(sqlx::types::Json(stream))
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(StoreError::Query)?;
-        Ok(())
+        Ok(StoredStream {
+            spec: stream.clone(),
+            generation: positive_counter(
+                row.try_get::<i64, _>("generation")
+                    .map_err(StoreError::Decode)?,
+                "generation",
+            )?,
+            revision: positive_counter(
+                row.try_get::<i64, _>("revision")
+                    .map_err(StoreError::Decode)?,
+                "revision",
+            )?,
+        })
     }
 
     async fn delete_stream(&self, name: &str) -> Result<(), StoreError> {
@@ -199,7 +282,8 @@ pub struct MemStore {
 
 #[derive(Default)]
 struct MemInner {
-    streams: std::collections::BTreeMap<String, StreamDefinition>,
+    streams: std::collections::BTreeMap<String, StoredStream>,
+    next_revision: u64,
     nodes: std::collections::BTreeMap<String, NodeRegistration>,
     #[cfg(test)]
     upsert_stream_calls: usize,
@@ -239,18 +323,32 @@ impl MemStore {
 
 #[async_trait]
 impl StateStore for MemStore {
-    async fn load_streams(&self) -> Result<Vec<StreamDefinition>, StoreError> {
+    async fn load_streams(&self) -> Result<Vec<StoredStream>, StoreError> {
         Ok(self.lock().streams.values().cloned().collect())
     }
 
-    async fn upsert_stream(&self, stream: &StreamDefinition) -> Result<(), StoreError> {
+    async fn upsert_stream(&self, stream: &StreamDefinition) -> Result<StoredStream, StoreError> {
         let mut inner = self.lock();
         #[cfg(test)]
         {
             inner.upsert_stream_calls += 1;
         }
-        inner.streams.insert(stream.name.clone(), stream.clone());
-        Ok(())
+        if let Some(stored) = inner.streams.get(&stream.name)
+            && stored.spec == *stream
+        {
+            return Ok(stored.clone());
+        }
+        inner.next_revision += 1;
+        let stored = StoredStream {
+            spec: stream.clone(),
+            generation: inner
+                .streams
+                .get(&stream.name)
+                .map_or(1, |stored| stored.generation + 1),
+            revision: inner.next_revision,
+        };
+        inner.streams.insert(stream.name.clone(), stored.clone());
+        Ok(stored)
     }
 
     async fn delete_stream(&self, name: &str) -> Result<(), StoreError> {
@@ -409,19 +507,42 @@ mod tests {
     #[tokio::test]
     async fn memstore_streams_round_trip_and_delete() {
         let store = MemStore::new();
-        store.upsert_stream(&stream("basic")).await.unwrap();
+        let created = store.upsert_stream(&stream("basic")).await.unwrap();
         store.upsert_stream(&stream("other")).await.unwrap();
 
         let loaded = store.load_streams().await.unwrap();
         assert_eq!(loaded.len(), 2);
-        assert!(loaded.iter().any(|s| s.name == "basic"));
+        assert!(loaded.iter().any(|s| s.spec.name == "basic"));
+        assert_eq!(created.generation, 1);
+        assert!(created.revision > 0);
 
         store.delete_stream("basic").await.unwrap();
         let loaded = store.load_streams().await.unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].name, "other");
+        assert_eq!(loaded[0].spec.name, "other");
         assert_eq!(store.upsert_stream_calls(), 2);
         assert_eq!(store.delete_stream_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn memstore_tracks_semantic_generations_and_unique_revisions() {
+        let store = MemStore::new();
+        let original = stream("basic");
+        let created = store.upsert_stream(&original).await.unwrap();
+        let unchanged = store.upsert_stream(&original).await.unwrap();
+        assert_eq!(unchanged.generation, created.generation);
+        assert_eq!(unchanged.revision, created.revision);
+
+        let mut updated = original.clone();
+        updated.enabled = false;
+        let changed = store.upsert_stream(&updated).await.unwrap();
+        assert_eq!(changed.generation, created.generation + 1);
+        assert!(changed.revision > created.revision);
+
+        store.delete_stream("basic").await.unwrap();
+        let recreated = store.upsert_stream(&original).await.unwrap();
+        assert_eq!(recreated.generation, 1);
+        assert!(recreated.revision > changed.revision);
     }
 
     #[tokio::test]
@@ -455,7 +576,7 @@ mod tests {
                 .await
                 .expect("load streams")
                 .iter()
-                .any(|s| s.name == "basic")
+                .any(|s| s.spec.name == "basic")
         );
 
         store
@@ -478,7 +599,7 @@ mod tests {
                 .await
                 .expect("load streams")
                 .iter()
-                .any(|s| s.name == "basic")
+                .any(|s| s.spec.name == "basic")
         );
     }
 }

@@ -105,3 +105,6 @@ Listed so they are not picked up by accident.
   drift is a test failure, not a documentation follow-up.
 - Keep stream planning side-effect free and allocate against the full candidate
   stream set. A one-stream preview can otherwise promise ports apply will not use.
+- Preserve stream generations on semantic no-op applies and never reuse opaque
+  revisions after delete and recreate. Generation describes the current spec;
+  revision is mutation identity and must prevent ABA during conditional writes.

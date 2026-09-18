@@ -39,7 +39,7 @@ use weave_core::{
 };
 
 use path::{PortAllocator, derive_path, path_status, stream_endpoints};
-use store::{MemStore, PgStore, StateStore};
+use store::{MemStore, PgStore, StateStore, StoredStream};
 
 #[derive(Debug, Parser)]
 #[command(name = "weave-controller", version, about = "open-weave reconciler")]
@@ -82,7 +82,7 @@ struct ControllerView {
 #[derive(Clone)]
 struct AppState {
     store: Arc<dyn StateStore>,
-    streams: Arc<RwLock<BTreeMap<String, StreamDefinition>>>,
+    streams: Arc<RwLock<BTreeMap<String, StoredStream>>>,
     nodes: Arc<RwLock<BTreeMap<String, NodeRegistration>>>,
     last_seen: Arc<RwLock<BTreeMap<String, Instant>>>,
     node_ttl: Duration,
@@ -100,10 +100,10 @@ impl AppState {
     ) -> Result<Self> {
         let loaded_streams = store.load_streams().await.context("hydrating streams")?;
         for stream in &loaded_streams {
-            if let Some(issue) = validate_stream(stream).into_iter().next() {
+            if let Some(issue) = validate_stream(&stream.spec).into_iter().next() {
                 anyhow::bail!(
                     "stored stream {:?} is invalid at {}: {}",
-                    stream.name,
+                    stream.spec.name,
                     issue.field,
                     issue.message
                 );
@@ -111,7 +111,7 @@ impl AppState {
         }
         let streams = loaded_streams
             .into_iter()
-            .map(|stream| (stream.name.clone(), stream))
+            .map(|stream| (stream.spec.name.clone(), stream))
             .collect();
         let nodes = store
             .load_nodes()
@@ -348,7 +348,13 @@ async fn main() -> Result<()> {
 }
 
 async fn reconcile_tick(state: &AppState) {
-    let streams: Vec<StreamDefinition> = state.streams.read().await.values().cloned().collect();
+    let streams: Vec<StreamDefinition> = state
+        .streams
+        .read()
+        .await
+        .values()
+        .map(|stream| stream.spec.clone())
+        .collect();
     let (observed, went_offline) = {
         let mut nodes = state.nodes.write().await;
         let last_seen = state.last_seen.read().await;
@@ -612,7 +618,15 @@ async fn ui() -> axum::response::Html<&'static str> {
 // --- stream registry (northbound surface) ---
 
 async fn list_streams(State(state): State<AppState>) -> Json<Vec<StreamDefinition>> {
-    Json(state.streams.read().await.values().cloned().collect())
+    Json(
+        state
+            .streams
+            .read()
+            .await
+            .values()
+            .map(|stream| stream.spec.clone())
+            .collect(),
+    )
 }
 
 async fn get_stream(State(state): State<AppState>, Path(name): Path<String>) -> Response {
@@ -623,7 +637,7 @@ async fn get_stream(State(state): State<AppState>, Path(name): Path<String>) -> 
         );
     }
     match state.streams.read().await.get(&name).cloned() {
-        Some(stream) => Json(stream).into_response(),
+        Some(stream) => Json(stream.spec).into_response(),
         None => error(
             StatusCode::NOT_FOUND,
             ApiErrorCode::StreamNotFound,
@@ -647,15 +661,18 @@ async fn submit_stream(
     let name = stream.name.clone();
     {
         let mut streams = state.streams.write().await;
-        if let Err(err) = state.store.upsert_stream(&stream).await {
-            tracing::error!(%err, %name, "persisting stream failed");
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiErrorCode::PersistenceFailed,
-                "failed to persist stream",
-            );
-        }
-        streams.insert(name.clone(), stream);
+        let stored = match state.store.upsert_stream(&stream).await {
+            Ok(stored) => stored,
+            Err(err) => {
+                tracing::error!(%err, %name, "persisting stream failed");
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ApiErrorCode::PersistenceFailed,
+                    "failed to persist stream",
+                );
+            }
+        };
+        streams.insert(name.clone(), stored);
     }
     tracing::info!(%name, "stream accepted");
     (
@@ -681,7 +698,13 @@ async fn plan_stream(
         return invalid_request("stream validation failed", issues);
     }
 
-    let mut streams = state.streams.read().await.clone();
+    let mut streams: BTreeMap<String, StreamDefinition> = state
+        .streams
+        .read()
+        .await
+        .iter()
+        .map(|(name, stream)| (name.clone(), stream.spec.clone()))
+        .collect();
     streams.insert(stream.name.clone(), stream.clone());
     let nodes = state.nodes.read().await;
     let mut observed = observed_state(&nodes);
@@ -1302,6 +1325,14 @@ mod tests {
         }
     }
 
+    fn stored_stream(spec: StreamDefinition) -> StoredStream {
+        StoredStream {
+            spec,
+            generation: 1,
+            revision: 1,
+        }
+    }
+
     async fn send(
         app: &Router,
         method: &str,
@@ -1362,7 +1393,7 @@ mod tests {
             1,
             "stream was written through the store"
         );
-        assert_eq!(mem.load_streams().await.unwrap(), vec![stream("basic")]);
+        assert_eq!(mem.load_streams().await.unwrap()[0].spec, stream("basic"));
     }
 
     #[tokio::test]
@@ -1872,7 +1903,11 @@ mod tests {
             node: "browser-a1b2".to_string(),
             network: None,
         });
-        state.streams.write().await.insert(cam.name.clone(), cam);
+        state
+            .streams
+            .write()
+            .await
+            .insert(cam.name.clone(), stored_stream(cam));
 
         reconcile_tick(&state).await;
 
@@ -1917,7 +1952,7 @@ mod tests {
                 .streams
                 .write()
                 .await
-                .insert("basic".to_string(), stream("basic"));
+                .insert("basic".to_string(), stored_stream(stream("basic")));
         }
 
         reconcile_tick(&state).await;
@@ -1977,7 +2012,7 @@ mod tests {
                 .streams
                 .write()
                 .await
-                .insert("basic".to_string(), definition);
+                .insert("basic".to_string(), stored_stream(definition));
             let now = Instant::now();
             let mut seen = state.last_seen.write().await;
             seen.insert("strom-node-1".to_string(), now);
@@ -2396,7 +2431,7 @@ mod tests {
                 .streams
                 .write()
                 .await
-                .insert("basic".to_string(), stream("basic"));
+                .insert("basic".to_string(), stored_stream(stream("basic")));
             let now = Instant::now();
             let mut seen = state.last_seen.write().await;
             seen.insert("strom-node-1".to_string(), now - Duration::from_secs(60));
