@@ -140,6 +140,17 @@ pub fn northbound_openapi() -> Value {
                 }
             },
             format!("{API_PREFIX}{ROUTE_STREAM}"): {
+                "get": {
+                    "operationId": "getStream",
+                    "parameters": [path_parameter("name")],
+                    "responses": {
+                        "200": response("Desired stream", Some(schema_ref("StreamDefinition"))),
+                        "400": error_response("Invalid stream name"),
+                        "401": error_response("Authentication failed"),
+                        "404": error_response("Stream not found"),
+                        "502": error_response("Controller unavailable")
+                    }
+                },
                 "delete": {
                     "operationId": "deleteStream",
                     "parameters": [path_parameter("name")],
@@ -302,6 +313,15 @@ mod tests {
         assert_eq!(south["openapi"], "3.1.0");
         assert_eq!(north["security"][0]["bearerAuth"], json!([]));
         assert_eq!(south["security"][0]["bearerAuth"], json!([]));
+        assert_eq!(
+            north["paths"]["/v4/streams/{name}"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["delete", "get"]
+        );
 
         let north_paths: BTreeMap<_, _> = north["paths"].as_object().unwrap().iter().collect();
         assert_eq!(

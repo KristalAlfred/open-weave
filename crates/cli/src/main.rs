@@ -61,6 +61,11 @@ enum Command {
 enum GetResource {
     /// List desired streams.
     Streams,
+    /// Get one desired stream.
+    Stream {
+        /// Name of the stream to get.
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -91,6 +96,7 @@ async fn main() -> Result<()> {
         Command::Apply { file } => apply(&url, token.as_ref(), &file).await,
         Command::Get { resource } => match resource {
             GetResource::Streams => get_streams(&url, token.as_ref()).await,
+            GetResource::Stream { name } => get_stream(&url, token.as_ref(), &name).await,
         },
         Command::Delete { resource } => match resource {
             DeleteResource::Stream { name } => delete_stream(&url, token.as_ref(), &name).await,
@@ -174,6 +180,36 @@ async fn get_streams(url: &str, token: Option<&Token>) -> Result<()> {
         .context("decoding streams")?;
 
     println!("{}", serde_json::to_string_pretty(&streams)?);
+    Ok(())
+}
+
+async fn get_stream(url: &str, token: Option<&Token>, name: &str) -> Result<()> {
+    if let Err(error) = validate_resource_id(name) {
+        bail!("invalid stream name: {error}");
+    }
+    let response = authorized(
+        reqwest::Client::new().get(api_url(url, &format!("/streams/{name}"))),
+        token,
+    )
+    .send()
+    .await
+    .context("fetching stream")?;
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        bail!("no stream named {name}: {body}");
+    }
+    if !status.is_success() {
+        let hint = if status == reqwest::StatusCode::UNAUTHORIZED {
+            unauthorized_hint(token)
+        } else {
+            ""
+        };
+        bail!("northbound stream request failed: {status}: {body}{hint}");
+    }
+    let stream: StreamDefinition = serde_json::from_str(&body).context("decoding stream")?;
+    println!("{}", serde_json::to_string_pretty(&stream)?);
     Ok(())
 }
 
@@ -344,6 +380,80 @@ destinations:
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{addr}"), seen)
+    }
+
+    async fn stub_stream(stream: StreamDefinition) -> (String, Arc<Mutex<Option<String>>>) {
+        async fn record(
+            State((seen, stream)): State<(Arc<Mutex<Option<String>>>, StreamDefinition)>,
+            request: Request<Body>,
+        ) -> axum::Json<StreamDefinition> {
+            let authorization = request
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            *seen.lock().unwrap() = Some(format!(
+                "{} {} {authorization}",
+                request.method(),
+                request.uri().path()
+            ));
+            axum::Json(stream)
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .fallback(record)
+            .with_state((Arc::clone(&seen), stream));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    #[tokio::test]
+    async fn get_stream_calls_the_versioned_route_with_auth() {
+        let token = Token::new("cli-test-token").unwrap();
+        let stream = StreamDefinition {
+            name: "cam1-to-studio".to_string(),
+            enabled: true,
+            source: StreamTransport::Srt(SrtEndpoint {
+                node: Some("strom-node-1".to_string()),
+                remote: None,
+                via: Vec::new(),
+                network: None,
+                latency: None,
+                format: None,
+                accepts: None,
+            }),
+            destinations: vec![StreamTransport::Srt(SrtEndpoint {
+                node: Some("strom-node-2".to_string()),
+                remote: None,
+                via: Vec::new(),
+                network: None,
+                latency: None,
+                format: None,
+                accepts: None,
+            })],
+        };
+        let (url, seen) = stub_stream(stream).await;
+
+        get_stream(&url, Some(&token), "cam1-to-studio")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some("GET /v4/streams/cam1-to-studio Bearer cli-test-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_stream_rejects_an_unsafe_name_locally() {
+        let error = get_stream("not a URL", None, "foo?ignored")
+            .await
+            .expect_err("unsafe name must be rejected locally");
+        assert!(error.to_string().starts_with("invalid stream name:"));
     }
 
     #[tokio::test]

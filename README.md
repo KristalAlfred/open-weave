@@ -119,6 +119,10 @@ response payloads, and error shapes. Any breaking change to either surface moves
 the prefix. Additive fields may ship within a major when clients can ignore them.
 There is no separate northbound payload version to miss.
 
+`GET /v4/streams` lists desired streams. `GET /v4/streams/{name}` returns one
+desired stream or `404 stream_not_found`. The same resource path accepts
+`DELETE`; applying remains `POST /v4/streams`.
+
 The adapter contract is the one that matters most: operators attach their own
 media nodes, including third-party adapters open-weave does not ship, and those
 bind to `/v4` southbound.

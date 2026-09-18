@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
 fn router(state: AppState, guard: Guard) -> Router {
     let operator = Router::new()
         .route(ROUTE_STREAMS, get(list_streams).post(submit_stream))
-        .route(ROUTE_STREAM, axum::routing::delete(delete_stream))
+        .route(ROUTE_STREAM, get(get_stream).delete(delete_stream))
         .route(ROUTE_STREAM_ENDPOINTS, get(get_endpoints))
         .route(ROUTE_STATUS, get(get_status))
         .fallback(api_route_not_found)
@@ -119,6 +119,22 @@ async fn api_method_not_allowed() -> Response {
 
 async fn list_streams(State(state): State<AppState>) -> Response {
     proxy(&state, reqwest::Method::GET, "/streams", None).await
+}
+
+async fn get_stream(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    if let Err(reason) = validate_resource_id(&name) {
+        return invalid_request(
+            "stream name is invalid",
+            vec![resource_id_issue("name", "stream name", reason)],
+        );
+    }
+    proxy(
+        &state,
+        reqwest::Method::GET,
+        &format!("/streams/{name}"),
+        None,
+    )
+    .await
 }
 
 async fn submit_stream(
@@ -482,6 +498,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_stream_forwards_method_and_path() {
+        let (url, captured) = stub_controller(StatusCode::OK).await;
+        let app = open_app(url);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v4/streams/basic")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let seen = captured.lock().unwrap().clone().expect("forwarded");
+        assert_eq!(seen.method, "GET");
+        assert_eq!(seen.path, "/v4/streams/basic");
+    }
+
+    #[tokio::test]
     async fn endpoints_forwards_path_and_passes_status_through() {
         let (url, captured) = stub_controller(StatusCode::SERVICE_UNAVAILABLE).await;
         let app = open_app(url);
@@ -665,6 +702,7 @@ mod tests {
         let app = open_app(url);
 
         for (method, uri) in [
+            ("GET", "/v4/streams/foo%3Fignored"),
             ("DELETE", "/v4/streams/foo%3Fignored"),
             ("GET", "/v4/streams/foo%3Fignored/endpoints"),
         ] {
@@ -694,21 +732,25 @@ mod tests {
         for (method, uri) in [
             ("GET", "/streams"),
             ("POST", "/streams"),
+            ("GET", "/streams/basic"),
             ("DELETE", "/streams/basic"),
             ("GET", "/streams/basic/endpoints"),
             ("GET", "/status"),
             ("GET", "/v1/streams"),
             ("POST", "/v1/streams"),
+            ("GET", "/v1/streams/basic"),
             ("DELETE", "/v1/streams/basic"),
             ("GET", "/v1/streams/basic/endpoints"),
             ("GET", "/v1/status"),
             ("GET", "/v2/streams"),
             ("POST", "/v2/streams"),
+            ("GET", "/v2/streams/basic"),
             ("DELETE", "/v2/streams/basic"),
             ("GET", "/v2/streams/basic/endpoints"),
             ("GET", "/v2/status"),
             ("GET", "/v3/streams"),
             ("POST", "/v3/streams"),
+            ("GET", "/v3/streams/basic"),
             ("DELETE", "/v3/streams/basic"),
             ("GET", "/v3/streams/basic/endpoints"),
             ("GET", "/v3/status"),
@@ -763,6 +805,7 @@ mod tests {
                     "/v4/streams",
                     Body::from(serde_json::to_vec(&sample_stream()).unwrap()),
                 ),
+                ("GET", "/v4/streams/basic", Body::empty()),
                 ("DELETE", "/v4/streams/basic", Body::empty()),
                 ("GET", "/v4/streams/basic/endpoints", Body::empty()),
                 ("GET", "/v4/status", Body::empty()),

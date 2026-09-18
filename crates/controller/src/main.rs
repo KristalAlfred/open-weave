@@ -433,7 +433,7 @@ fn observed_state(nodes: &BTreeMap<String, NodeRegistration>) -> ObservedState {
 fn router(state: AppState, north: Guard, south: Guard) -> Router {
     let streams = Router::new()
         .route(ROUTE_STREAMS, get(list_streams).post(submit_stream))
-        .route(ROUTE_STREAM, axum::routing::delete(delete_stream))
+        .route(ROUTE_STREAM, get(get_stream).delete(delete_stream))
         .route(ROUTE_STREAM_ENDPOINTS, get(get_endpoints))
         .layer(axum::middleware::from_fn_with_state(north, require_bearer));
 
@@ -612,6 +612,23 @@ async fn ui() -> axum::response::Html<&'static str> {
 
 async fn list_streams(State(state): State<AppState>) -> Json<Vec<StreamDefinition>> {
     Json(state.streams.read().await.values().cloned().collect())
+}
+
+async fn get_stream(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    if let Err(reason) = validate_resource_id(&name) {
+        return invalid_request(
+            "stream name is invalid",
+            vec![resource_id_issue("name", "stream name", reason)],
+        );
+    }
+    match state.streams.read().await.get(&name).cloned() {
+        Some(stream) => Json(stream).into_response(),
+        None => error(
+            StatusCode::NOT_FOUND,
+            ApiErrorCode::StreamNotFound,
+            "stream not found",
+        ),
+    }
 }
 
 async fn submit_stream(
@@ -1280,6 +1297,17 @@ mod tests {
         let listed: Vec<StreamDefinition> = serde_json::from_value(body).unwrap();
         assert_eq!(listed, vec![stream("basic")]);
 
+        let (status, body) = send(&app, "GET", "/v4/streams/basic", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_value::<StreamDefinition>(body).unwrap(),
+            stream("basic")
+        );
+
+        let (status, body) = send(&app, "GET", "/v4/streams/missing", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "stream_not_found");
+
         assert_eq!(
             mem.upsert_stream_calls(),
             1,
@@ -1400,6 +1428,7 @@ mod tests {
         let app = open_router(state);
 
         for (method, uri, body) in [
+            ("GET", "/v4/streams/foo%3Fignored", None),
             ("DELETE", "/v4/streams/foo%3Fignored", None),
             ("GET", "/v4/streams/foo%3Fignored/endpoints", None),
             (
@@ -2240,9 +2269,10 @@ mod tests {
         (response.status(), challenge)
     }
 
-    const NORTH_ROUTES: [(&str, &str); 4] = [
+    const NORTH_ROUTES: [(&str, &str); 5] = [
         ("GET", "/v4/streams"),
         ("POST", "/v4/streams"),
+        ("GET", "/v4/streams/basic"),
         ("DELETE", "/v4/streams/basic"),
         ("GET", "/v4/streams/basic/endpoints"),
     ];
