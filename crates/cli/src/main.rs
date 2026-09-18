@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use reqwest::RequestBuilder;
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Token};
-use weave_core::{API_V1, StreamDefinition};
+use weave_core::{API_PREFIX, StreamDefinition};
 
 #[derive(Parser)]
 #[command(name = "weave", version, about = "open-weave control plane CLI")]
@@ -216,9 +216,9 @@ fn nodes() -> Result<()> {
 }
 
 /// Build a northbound API URL from a contract-relative `path`, inserting the
-/// version prefix so the literal lives only in [`weave_core::API_V1`].
+/// version prefix so the literal lives only in [`weave_core::API_PREFIX`].
 fn api_url(base: &str, path: &str) -> String {
-    format!("{}{}{path}", base.trim_end_matches('/'), API_V1)
+    format!("{}{}{path}", base.trim_end_matches('/'), API_PREFIX)
 }
 
 #[cfg(test)]
@@ -282,11 +282,11 @@ destinations:
     fn api_url_inserts_the_version_prefix_once() {
         assert_eq!(
             api_url("http://127.0.0.1:9080", "/streams"),
-            "http://127.0.0.1:9080/v1/streams"
+            "http://127.0.0.1:9080/v2/streams"
         );
         assert_eq!(
             api_url("http://127.0.0.1:9080/", "/streams"),
-            "http://127.0.0.1:9080/v1/streams",
+            "http://127.0.0.1:9080/v2/streams",
             "a trailing slash on the base does not double up"
         );
     }
@@ -353,7 +353,7 @@ destinations:
             .expect("204 deletes the stream");
         assert_eq!(
             seen.lock().unwrap().as_deref(),
-            Some("DELETE /v1/streams/cam1-to-studio Bearer cli-test-token")
+            Some("DELETE /v2/streams/cam1-to-studio Bearer cli-test-token")
         );
 
         let (url, _seen) = stub_northbound(StatusCode::NOT_FOUND).await;

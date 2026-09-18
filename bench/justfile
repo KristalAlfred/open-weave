@@ -9,9 +9,9 @@ strom2  := "http://localhost:28081"
 strom3  := "http://localhost:28082"
 page_dir := source_directory() / ".." / "nodes" / "browser"
 
-# Version prefix carrying both control-plane contracts, matching weave_core::API_V1.
+# Version prefix carrying both control-plane contracts, matching weave_core::API_PREFIX.
 # `/health` and the controller dashboard (`/`, `/ui`, `/view`) sit outside it.
-v       := "/v1"
+v       := "/v2"
 
 # Bearer tokens per API surface. Defaults match docker-compose.yml so the bench
 # needs no exports; override by exporting either variable. `/health` and the
