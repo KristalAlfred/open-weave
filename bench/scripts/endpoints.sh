@@ -41,9 +41,9 @@ case "$role" in
   *) usage ;;
 esac
 
-# The operator contract lives under /v3 (weave_core::API_PREFIX); only /health and
+# The operator contract lives under /v4 (weave_core::API_PREFIX); only /health and
 # the controller's dashboard routes sit outside it.
-url="$ctrl/v3/streams/$stream/endpoints"
+url="$ctrl/v4/streams/$stream/endpoints"
 
 for _ in $(seq 1 "$attempts"); do
   body="$(curl -s -o - -w '\n%{http_code}' "${auth[@]}" "$url" 2>/dev/null || true)"

@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
@@ -14,7 +14,10 @@ use axum::{
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Guard, Token, require_bearer};
-use weave_core::{API_PREFIX, StreamDefinition, validate_resource_id, validate_stream};
+use weave_core::{
+    API_PREFIX, ApiError, ApiErrorCode, StreamDefinition, ValidationIssue, resource_id_issue,
+    validate_resource_id, validate_stream,
+};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:9080";
 const DEFAULT_CONTROLLER_URL: &str = "http://127.0.0.1:8082";
@@ -83,6 +86,8 @@ fn router(state: AppState, guard: Guard) -> Router {
         .route("/streams/{name}", axum::routing::delete(delete_stream))
         .route("/streams/{name}/endpoints", get(get_endpoints))
         .route("/status", get(get_status))
+        .fallback(api_route_not_found)
+        .method_not_allowed_fallback(api_method_not_allowed)
         .layer(axum::middleware::from_fn_with_state(guard, require_bearer));
 
     Router::new()
@@ -95,23 +100,48 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
+async fn api_route_not_found() -> Response {
+    error(
+        StatusCode::NOT_FOUND,
+        ApiErrorCode::RouteNotFound,
+        "API route not found",
+    )
+}
+
+async fn api_method_not_allowed() -> Response {
+    error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        ApiErrorCode::MethodNotAllowed,
+        "method not allowed",
+    )
+}
+
 async fn list_streams(State(state): State<AppState>) -> Response {
     proxy(&state, reqwest::Method::GET, "/streams", None).await
 }
 
 async fn submit_stream(
     State(state): State<AppState>,
-    Json(stream): Json<StreamDefinition>,
+    payload: Result<Json<StreamDefinition>, JsonRejection>,
 ) -> Response {
-    if let Some(issue) = validate_stream(&stream).into_iter().next() {
-        return error(StatusCode::BAD_REQUEST, &issue.message);
+    let Json(stream) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return invalid_json(rejection),
+    };
+    let issues = validate_stream(&stream);
+    if !issues.is_empty() {
+        return invalid_request("stream validation failed", issues);
     }
 
     let body = match serde_json::to_vec(&stream) {
         Ok(body) => body,
         Err(err) => {
             tracing::error!(%err, "serializing validated stream failed");
-            return error(StatusCode::INTERNAL_SERVER_ERROR, "failed to encode stream");
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiErrorCode::EncodingFailed,
+                "failed to encode stream",
+            );
         }
     };
     proxy(&state, reqwest::Method::POST, "/streams", Some(body.into())).await
@@ -119,7 +149,10 @@ async fn submit_stream(
 
 async fn delete_stream(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     if let Err(reason) = validate_resource_id(&name) {
-        return error(StatusCode::BAD_REQUEST, &format!("stream name {reason}"));
+        return invalid_request(
+            "stream name is invalid",
+            vec![resource_id_issue("name", "stream name", reason)],
+        );
     }
     proxy(
         &state,
@@ -132,7 +165,10 @@ async fn delete_stream(State(state): State<AppState>, Path(name): Path<String>) 
 
 async fn get_endpoints(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     if let Err(reason) = validate_resource_id(&name) {
-        return error(StatusCode::BAD_REQUEST, &format!("stream name {reason}"));
+        return invalid_request(
+            "stream name is invalid",
+            vec![resource_id_issue("name", "stream name", reason)],
+        );
     }
     proxy(
         &state,
@@ -147,8 +183,26 @@ async fn get_status(State(state): State<AppState>) -> Response {
     proxy(&state, reqwest::Method::GET, "/status", None).await
 }
 
-fn error(status: StatusCode, message: &str) -> Response {
-    (status, Json(json!({ "error": message }))).into_response()
+fn error(status: StatusCode, code: ApiErrorCode, message: &str) -> Response {
+    ApiError::new(code, message).response(status)
+}
+
+fn invalid_request(message: &str, details: Vec<ValidationIssue>) -> Response {
+    ApiError::with_details(ApiErrorCode::InvalidRequest, message, details)
+        .response(StatusCode::BAD_REQUEST)
+}
+
+fn invalid_json(rejection: JsonRejection) -> Response {
+    ApiError::with_details(
+        ApiErrorCode::InvalidJson,
+        "request body is not valid for this endpoint",
+        vec![ValidationIssue::new(
+            "body",
+            "invalid_json",
+            rejection.body_text(),
+        )],
+    )
+    .response(StatusCode::BAD_REQUEST)
 }
 
 /// Forward a request to the controller, passing its status and body back
@@ -177,7 +231,11 @@ async fn proxy(
         Ok(response) => relay(response).await,
         Err(err) => {
             tracing::warn!(%err, %url, "proxying to controller failed");
-            error(StatusCode::BAD_GATEWAY, "controller unreachable")
+            error(
+                StatusCode::BAD_GATEWAY,
+                ApiErrorCode::ControllerUnreachable,
+                "controller unreachable",
+            )
         }
     }
 }
@@ -320,7 +378,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v3/streams")
+                    .uri("/v4/streams")
                     .header("content-type", "application/json")
                     .body(Body::from(payload.to_string()))
                     .unwrap(),
@@ -348,7 +406,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v3/streams")
+                    .uri("/v4/streams")
                     .header("content-type", "application/json")
                     .body(Body::from(payload.to_string()))
                     .unwrap(),
@@ -356,10 +414,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            body_json(response).await["error"],
-            "node id must contain only lowercase ASCII letters, digits, or hyphens, and must start and end with a letter or digit"
-        );
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "invalid_request");
+        assert_eq!(body["message"], "stream validation failed");
+        assert_eq!(body["details"][0]["field"], "destinations[0].device.node");
         assert!(
             captured.lock().unwrap().is_none(),
             "rejected at the boundary"
@@ -375,7 +433,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v3/streams")
+                    .uri("/v4/streams")
                     .header("content-type", "application/json")
                     .body(Body::from(serde_json::to_vec(&sample_stream()).unwrap()))
                     .unwrap(),
@@ -391,7 +449,7 @@ mod tests {
             .clone()
             .expect("controller saw a request");
         assert_eq!(seen.method, "POST");
-        assert_eq!(seen.path, "/v3/streams");
+        assert_eq!(seen.path, "/v4/streams");
         let forwarded: StreamDefinition = serde_json::from_slice(&seen.body).unwrap();
         assert_eq!(forwarded, sample_stream());
     }
@@ -405,7 +463,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri("/v3/streams/basic")
+                    .uri("/v4/streams/basic")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -419,7 +477,7 @@ mod tests {
             .clone()
             .expect("controller saw a request");
         assert_eq!(seen.method, "DELETE");
-        assert_eq!(seen.path, "/v3/streams/basic");
+        assert_eq!(seen.path, "/v4/streams/basic");
     }
 
     #[tokio::test]
@@ -430,7 +488,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v3/streams/basic/endpoints")
+                    .uri("/v4/streams/basic/endpoints")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -445,7 +503,7 @@ mod tests {
             .clone()
             .expect("controller saw a request");
         assert_eq!(seen.method, "GET");
-        assert_eq!(seen.path, "/v3/streams/basic/endpoints");
+        assert_eq!(seen.path, "/v4/streams/basic/endpoints");
     }
 
     #[tokio::test]
@@ -456,7 +514,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v3/status")
+                    .uri("/v4/status")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -470,7 +528,7 @@ mod tests {
             .clone()
             .expect("controller saw a request");
         assert_eq!(seen.method, "GET");
-        assert_eq!(seen.path, "/v3/status");
+        assert_eq!(seen.path, "/v4/status");
     }
 
     #[tokio::test]
@@ -481,7 +539,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v3/streams")
+                    .uri("/v4/streams")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -508,7 +566,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v3/streams")
+                    .uri("/v4/streams")
                     .header("content-type", "application/json")
                     .body(Body::from(serde_json::to_vec(&stream).unwrap()))
                     .unwrap(),
@@ -516,14 +574,88 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            body_json(response).await["error"],
-            "endpoint must set either node or remote, not both"
-        );
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "invalid_request");
+        assert_eq!(body["details"][0]["field"], "destinations[0].srt");
+        assert_eq!(body["details"][0]["code"], "mutually_exclusive");
         assert!(
             captured.lock().unwrap().is_none(),
             "invalid stream never reaches the controller"
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_json_has_a_structured_error_and_is_not_proxied() {
+        let (url, captured) = stub_controller(StatusCode::ACCEPTED).await;
+        let response = open_app(url)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v4/streams")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "invalid_json");
+        assert_eq!(body["details"][0]["field"], "body");
+        assert!(captured.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn authentication_errors_use_the_shared_envelope() {
+        let (url, _captured) = stub_controller(StatusCode::OK).await;
+        let response = guarded_app(url)
+            .oneshot(
+                Request::builder()
+                    .uri("/v4/streams")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(response).await["code"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn route_and_method_errors_use_the_shared_envelope() {
+        let (url, _captured) = stub_controller(StatusCode::OK).await;
+        let app = open_app(url);
+
+        for (method, uri, expected_status, expected_code) in [
+            (
+                "GET",
+                "/v4/no-such-route",
+                StatusCode::NOT_FOUND,
+                "route_not_found",
+            ),
+            (
+                "PUT",
+                "/v4/streams",
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(body_json(response).await["code"], expected_code);
+        }
     }
 
     #[tokio::test]
@@ -532,8 +664,8 @@ mod tests {
         let app = open_app(url);
 
         for (method, uri) in [
-            ("DELETE", "/v3/streams/foo%3Fignored"),
-            ("GET", "/v3/streams/foo%3Fignored/endpoints"),
+            ("DELETE", "/v4/streams/foo%3Fignored"),
+            ("GET", "/v4/streams/foo%3Fignored/endpoints"),
         ] {
             let response = app
                 .clone()
@@ -574,6 +706,11 @@ mod tests {
             ("DELETE", "/v2/streams/basic"),
             ("GET", "/v2/streams/basic/endpoints"),
             ("GET", "/v2/status"),
+            ("GET", "/v3/streams"),
+            ("POST", "/v3/streams"),
+            ("DELETE", "/v3/streams/basic"),
+            ("GET", "/v3/streams/basic/endpoints"),
+            ("GET", "/v3/status"),
         ] {
             let response = app
                 .clone()
@@ -619,15 +756,15 @@ mod tests {
             let app = guarded_app(url);
 
             for (method, uri, body) in [
-                ("GET", "/v3/streams", Body::empty()),
+                ("GET", "/v4/streams", Body::empty()),
                 (
                     "POST",
-                    "/v3/streams",
+                    "/v4/streams",
                     Body::from(serde_json::to_vec(&sample_stream()).unwrap()),
                 ),
-                ("DELETE", "/v3/streams/basic", Body::empty()),
-                ("GET", "/v3/streams/basic/endpoints", Body::empty()),
-                ("GET", "/v3/status", Body::empty()),
+                ("DELETE", "/v4/streams/basic", Body::empty()),
+                ("GET", "/v4/streams/basic/endpoints", Body::empty()),
+                ("GET", "/v4/status", Body::empty()),
             ] {
                 let mut request = Request::builder()
                     .method(method)
@@ -665,7 +802,7 @@ mod tests {
         let response = guarded_app(url)
             .oneshot(
                 Request::builder()
-                    .uri("/v3/streams")
+                    .uri("/v4/streams")
                     .header("authorization", format!("Bearer {TOKEN}"))
                     .body(Body::empty())
                     .unwrap(),

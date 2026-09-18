@@ -285,11 +285,11 @@ destinations:
     fn api_url_inserts_the_version_prefix_once() {
         assert_eq!(
             api_url("http://127.0.0.1:9080", "/streams"),
-            "http://127.0.0.1:9080/v3/streams"
+            "http://127.0.0.1:9080/v4/streams"
         );
         assert_eq!(
             api_url("http://127.0.0.1:9080/", "/streams"),
-            "http://127.0.0.1:9080/v3/streams",
+            "http://127.0.0.1:9080/v4/streams",
             "a trailing slash on the base does not double up"
         );
     }
@@ -356,7 +356,7 @@ destinations:
             .expect("204 deletes the stream");
         assert_eq!(
             seen.lock().unwrap().as_deref(),
-            Some("DELETE /v3/streams/cam1-to-studio Bearer cli-test-token")
+            Some("DELETE /v4/streams/cam1-to-studio Bearer cli-test-token")
         );
 
         let (url, _seen) = stub_northbound(StatusCode::NOT_FOUND).await;

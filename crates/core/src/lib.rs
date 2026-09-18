@@ -1,5 +1,6 @@
 //! Shared domain types for open-weave.
 
+pub mod api;
 pub mod auth;
 pub mod media;
 pub mod validation;
@@ -9,12 +10,14 @@ use std::{collections::BTreeMap, ops::Deref};
 
 use serde::{Deserialize, Serialize};
 
+pub use api::{ApiError, ApiErrorCode};
 pub use media::{
     AudioCodec, AudioConstraint, AudioFormat, ChromaSubsampling, Container, FormatConstraint,
     Framerate, MediaFormat, Mismatch, VideoCodec, VideoConstraint, VideoFormat,
 };
 pub use validation::{
-    RESOURCE_ID_MAX_LEN, ResourceIdError, ValidationIssue, validate_resource_id, validate_stream,
+    RESOURCE_ID_MAX_LEN, ResourceIdError, ValidationIssue, resource_id_issue, validate_resource_id,
+    validate_stream,
 };
 
 /// Conventional data-plane alias resolved when a manifest pins no network.
@@ -31,7 +34,7 @@ pub const DEFAULT_DATA_PLANE_ALIAS: &str = "default";
 /// Outside it: `/health` on every service, which healthchecks and
 /// load balancers address directly, and the controller's `/`, `/ui`, and `/view` —
 /// the dashboard ships inside the controller binary and versions with it.
-pub const API_PREFIX: &str = "/v3";
+pub const API_PREFIX: &str = "/v4";
 
 /// Wire-protocol version an adapter declares when it registers.
 ///

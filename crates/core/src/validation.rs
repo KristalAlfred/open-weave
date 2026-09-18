@@ -39,6 +39,7 @@ fn is_alphanumeric(byte: u8) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValidationIssue {
     pub field: String,
     pub code: String,
@@ -46,13 +47,26 @@ pub struct ValidationIssue {
 }
 
 impl ValidationIssue {
-    fn new(field: impl Into<String>, code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn new(
+        field: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             field: field.into(),
             code: code.into(),
             message: message.into(),
         }
     }
+}
+
+#[must_use]
+pub fn resource_id_issue(field: &str, label: &str, error: ResourceIdError) -> ValidationIssue {
+    let code = match error {
+        ResourceIdError::InvalidLength => "invalid_length",
+        ResourceIdError::InvalidCharacters => "invalid_characters",
+    };
+    ValidationIssue::new(field, code, format!("{label} {error}"))
 }
 
 #[must_use]
@@ -176,15 +190,7 @@ fn validate_via(
 
 fn validate_id(value: &str, field: &str, label: &str, issues: &mut Vec<ValidationIssue>) {
     if let Err(error) = validate_resource_id(value) {
-        let code = match error {
-            ResourceIdError::InvalidLength => "invalid_length",
-            ResourceIdError::InvalidCharacters => "invalid_characters",
-        };
-        issues.push(ValidationIssue::new(
-            field,
-            code,
-            format!("{label} {error}"),
-        ));
+        issues.push(resource_id_issue(field, label, error));
     }
 }
 

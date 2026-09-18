@@ -40,7 +40,7 @@ and apply it. Southbound must allow the page's origin
 (`WEAVE_SOUTHBOUND_CORS_ORIGIN`, see the root README).
 
 `check.mjs` drives the page with Playwright and a fake camera and waits for the
-node to appear in `GET /v3/nodes`:
+node to appear in `GET /v4/nodes`:
 
 ```sh
 pnpm install

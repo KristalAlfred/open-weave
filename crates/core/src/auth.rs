@@ -152,15 +152,14 @@ pub enum AuthError {
 
 #[cfg(feature = "server")]
 mod middleware {
+    use super::Guard;
+    use crate::{ApiError, ApiErrorCode};
     use axum::{
         extract::{Request, State},
         http::{HeaderValue, StatusCode, header},
         middleware::Next,
         response::{IntoResponse, Response},
     };
-    use serde_json::json;
-
-    use super::Guard;
 
     /// axum middleware enforcing a [`Guard`] over the routes it is layered onto.
     ///
@@ -197,7 +196,10 @@ mod middleware {
         (
             StatusCode::UNAUTHORIZED,
             [(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"))],
-            axum::Json(json!({ "error": "missing or invalid bearer token" })),
+            axum::Json(ApiError::new(
+                ApiErrorCode::Unauthorized,
+                "missing or invalid bearer token",
+            )),
         )
             .into_response()
     }
