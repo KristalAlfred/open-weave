@@ -151,6 +151,13 @@ The set write and all member writes commit together. An identical apply returns
 ETag. An empty `streams` list is accepted only with `prune: true`; the empty set
 remains addressable for later conditional writes.
 
+`weave apply-set OWNER -f FILE` applies this contract from YAML. The file is a
+strict object with a required `streams` list and optional `prune` boolean, which
+defaults to `false`; unknown fields are rejected. The CLI reads the set first,
+then creates with `If-None-Match: *` or updates with its current ETag. It does not
+retry a stale write or adopt a name outside the set. See
+`examples/stream-set.yaml`, or run `just apply-set OWNER`.
+
 `POST /v6/stream-plans` accepts the same stream definition as apply and changes
 no state. It validates the definition, plans it alongside the current desired
 streams against the current nodes, and returns `placed`, `unplaced`, or
@@ -759,12 +766,12 @@ weave get streams
 weave get stream NAME
 weave get stream-sets
 weave get stream-set OWNER
+weave apply-set OWNER -f examples/stream-set.yaml
 weave -o yaml get status
 weave -o json get stream NAME
 ```
 
-`get endpoints STREAM` returns the resolved addresses for that stream. The
-stream-set commands above are reads; the CLI does not apply stream sets.
+`get endpoints STREAM` returns the resolved addresses for that stream.
 
 ## License
 

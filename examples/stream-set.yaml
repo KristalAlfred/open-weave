@@ -1,0 +1,11 @@
+streams:
+  - name: cam1-to-studio
+    enabled: true
+    source:
+      srt:
+        node: strom-node-1
+        latency: 200
+    destinations:
+      - srt:
+          node: strom-node-2
+prune: false

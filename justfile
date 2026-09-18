@@ -47,6 +47,9 @@ cli *ARGS:
 apply FILE="examples/stream.yaml":
     cargo run -p weave-cli -- apply -f {{FILE}}
 
+apply-set OWNER FILE="examples/stream-set.yaml":
+    cargo run -p weave-cli -- apply-set {{OWNER}} -f {{FILE}}
+
 plan FILE="examples/stream.yaml":
     cargo run -p weave-cli -- plan -f {{FILE}}
 

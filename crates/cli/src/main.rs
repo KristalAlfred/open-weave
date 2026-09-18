@@ -11,7 +11,7 @@ use weave_core::auth::{self, Token};
 use weave_core::{
     API_PREFIX, ApiError, NodeDescriptor, PathStatus, PlanStatus, ReconcileStatus, StatusResponse,
     StreamAccepted, StreamDefinition, StreamEndpoints, StreamPlan, StreamResource,
-    StreamSetResource, validate_resource_id,
+    StreamSetAccepted, StreamSetAction, StreamSetApply, StreamSetResource, validate_resource_id,
 };
 
 #[derive(Parser)]
@@ -55,6 +55,14 @@ enum Command {
     /// Apply a stream definition (YAML) as desired state.
     Apply {
         /// Path to the stream YAML file.
+        #[arg(short = 'f', long = "file")]
+        file: PathBuf,
+    },
+    /// Atomically apply a stream ownership set (YAML) as desired state.
+    ApplySet {
+        /// Owner of the stream set.
+        owner: String,
+        /// Path to the stream-set YAML file.
         #[arg(short = 'f', long = "file")]
         file: PathBuf,
     },
@@ -130,6 +138,9 @@ async fn main() -> Result<()> {
 
     match command {
         Command::Apply { file } => apply(&url, token.as_ref(), &file, output).await,
+        Command::ApplySet { owner, file } => {
+            apply_set(&url, token.as_ref(), &owner, &file, output).await
+        }
         Command::Plan { file } => plan(&url, token.as_ref(), &file, output).await,
         Command::Get { resource } => match resource {
             GetResource::Streams => get_streams(&url, token.as_ref(), output).await,
@@ -400,6 +411,37 @@ fn render_stream_set(stream_set: &StreamSetResource) -> String {
     )
 }
 
+fn render_stream_set_accepted(accepted: &StreamSetAccepted) -> String {
+    let mut rows = accepted
+        .streams
+        .iter()
+        .map(|stream| {
+            let action = match stream.action {
+                StreamSetAction::Created => "created",
+                StreamSetAction::Updated => "updated",
+                StreamSetAction::Unchanged => "unchanged",
+            };
+            vec![
+                stream.name.clone(),
+                action.to_string(),
+                stream.generation.to_string(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.extend(
+        accepted
+            .pruned
+            .iter()
+            .map(|name| vec![name.clone(), "pruned".to_string(), "-".to_string()]),
+    );
+    format!(
+        "OWNER: {}\nCHANGED: {}\n\n{}",
+        accepted.owner,
+        accepted.changed,
+        table(&["NAME", "ACTION", "GENERATION"], rows)
+    )
+}
+
 fn render_plan(plan: &StreamPlan) -> String {
     let status = match plan.status {
         PlanStatus::Disabled => "disabled",
@@ -453,6 +495,13 @@ fn parse_stream(yaml: &str) -> Result<StreamDefinition> {
         yaml,
     ))
     .context("parsing stream YAML")
+}
+
+fn parse_stream_set(yaml: &str) -> Result<StreamSetApply> {
+    serde_norway::with::singleton_map_recursive::deserialize(serde_norway::Deserializer::from_str(
+        yaml,
+    ))
+    .context("parsing stream-set YAML")
 }
 
 async fn apply(url: &str, token: Option<&Token>, file: &Path, output: OutputFormat) -> Result<()> {
@@ -514,6 +563,69 @@ fn read_stream(file: &Path) -> Result<StreamDefinition> {
     let text =
         std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
     parse_stream(&text).with_context(|| format!("parsing stream from {}", file.display()))
+}
+
+fn read_stream_set(file: &Path) -> Result<StreamSetApply> {
+    let text =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    parse_stream_set(&text).with_context(|| format!("parsing stream set from {}", file.display()))
+}
+
+async fn apply_set(
+    url: &str,
+    token: Option<&Token>,
+    owner: &str,
+    file: &Path,
+    output: OutputFormat,
+) -> Result<()> {
+    let apply = read_stream_set(file)?;
+    apply_stream_set(url, token, owner, &apply, output).await
+}
+
+async fn apply_stream_set(
+    url: &str,
+    token: Option<&Token>,
+    owner: &str,
+    apply: &StreamSetApply,
+    output: OutputFormat,
+) -> Result<()> {
+    if let Err(error) = validate_resource_id(owner) {
+        bail!("invalid stream-set owner: {error}");
+    }
+    let client = reqwest::Client::new();
+    let existing = lookup_stream_set(&client, url, token, owner).await?;
+    let request = authorized(
+        client.put(api_url(url, &format!("/stream-sets/{owner}"))),
+        token,
+    )
+    .json(apply);
+    let request = match existing {
+        Some(existing) => request.header(IF_MATCH, existing.etag),
+        None => request.header(IF_NONE_MATCH, "*"),
+    };
+    let response = request
+        .send()
+        .await
+        .context("putting stream set to northbound")?;
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let hint = if status == reqwest::StatusCode::UNAUTHORIZED {
+            unauthorized_hint(token)
+        } else {
+            ""
+        };
+        bail!(
+            "northbound rejected stream set: {status}: {}{hint}",
+            error_detail(&body)
+        );
+    }
+
+    let accepted: StreamSetAccepted =
+        serde_json::from_str(&body).context("decoding accepted stream set")?;
+    let human = render_stream_set_accepted(&accepted);
+    emit(output, serde_json::to_value(&accepted)?, human)
 }
 
 async fn plan(url: &str, token: Option<&Token>, file: &Path, output: OutputFormat) -> Result<()> {
@@ -709,6 +821,10 @@ struct StreamLookup {
     etag: HeaderValue,
 }
 
+struct StreamSetLookup {
+    etag: HeaderValue,
+}
+
 async fn lookup_stream(
     client: &reqwest::Client,
     url: &str,
@@ -742,6 +858,42 @@ async fn lookup_stream(
     Ok(Some(StreamLookup { resource, etag }))
 }
 
+async fn lookup_stream_set(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&Token>,
+    owner: &str,
+) -> Result<Option<StreamSetLookup>> {
+    let response = authorized(
+        client.get(api_url(url, &format!("/stream-sets/{owner}"))),
+        token,
+    )
+    .send()
+    .await
+    .context("fetching stream set")?;
+
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let etag = response.headers().get(ETAG).cloned();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let hint = if status == reqwest::StatusCode::UNAUTHORIZED {
+            unauthorized_hint(token)
+        } else {
+            ""
+        };
+        bail!(
+            "northbound stream-set request failed: {status}: {}{hint}",
+            error_detail(&body)
+        );
+    }
+    let etag = etag.context("northbound stream-set response is missing its ETag")?;
+    serde_json::from_str::<StreamSetResource>(&body).context("decoding stream set")?;
+    Ok(Some(StreamSetLookup { etag }))
+}
+
 /// Build a northbound API URL from a contract-relative `path`, inserting the
 /// version prefix so the literal lives only in [`weave_core::API_PREFIX`].
 fn api_url(base: &str, path: &str) -> String {
@@ -752,13 +904,15 @@ fn api_url(base: &str, path: &str) -> String {
 mod tests {
     use super::*;
     use axum::Router;
-    use axum::body::Body;
+    use axum::body::{Body, Bytes};
     use axum::extract::State;
     use axum::http::{Request, StatusCode};
     use axum::response::{IntoResponse, Response};
     use serde_json::Value;
     use std::sync::{Arc, Mutex};
-    use weave_core::{ApiErrorCode, SrtEndpoint, StreamAccepted, StreamTransport};
+    use weave_core::{
+        ApiErrorCode, SrtEndpoint, StreamAccepted, StreamSetMemberResult, StreamTransport,
+    };
 
     #[test]
     fn parses_fanout_yaml_with_defaults_and_srt_tag() {
@@ -888,6 +1042,41 @@ destinations:
         let cli = Cli::try_parse_from(["weave", "get", "streams", "--output", "json"]).unwrap();
         assert_eq!(cli.output, OutputFormat::Json);
         assert!(Cli::try_parse_from(["weave", "nodes"]).is_err());
+    }
+
+    #[test]
+    fn parses_apply_set_command_and_strict_yaml() {
+        let cli = Cli::try_parse_from([
+            "weave",
+            "apply-set",
+            "studio-a",
+            "-f",
+            "streams.yaml",
+            "--output",
+            "json",
+        ])
+        .unwrap();
+        assert_eq!(cli.output, OutputFormat::Json);
+        let Command::ApplySet { owner, file } = cli.command else {
+            panic!("expected apply-set command");
+        };
+        assert_eq!(owner, "studio-a");
+        assert_eq!(file, PathBuf::from("streams.yaml"));
+
+        let yaml = r#"
+streams:
+  - name: cam1-to-studio
+    source:
+      srt: { node: strom-node-1 }
+    destinations:
+      - srt: { node: strom-node-2 }
+"#;
+        let apply = parse_stream_set(yaml).unwrap();
+        assert!(!apply.prune);
+        assert_eq!(apply.streams, vec![sample_stream()]);
+
+        let invalid = format!("{yaml}unknown: true\n");
+        assert!(parse_stream_set(&invalid).is_err());
     }
 
     #[test]
@@ -1082,6 +1271,116 @@ destinations:
             resource,
             mutation_status,
             include_etag,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    #[derive(Clone)]
+    struct StreamSetStub {
+        seen: Arc<Mutex<Vec<String>>>,
+        existing: bool,
+        mutation_status: StatusCode,
+    }
+
+    async fn stub_stream_set(
+        existing: bool,
+        mutation_status: StatusCode,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        async fn record(
+            State(state): State<StreamSetStub>,
+            method: axum::http::Method,
+            uri: axum::http::Uri,
+            headers: axum::http::HeaderMap,
+            body: Bytes,
+        ) -> Response {
+            let if_match = headers
+                .get(axum::http::header::IF_MATCH)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("-");
+            let if_none_match = headers
+                .get(axum::http::header::IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("-");
+            let body_summary = if method == axum::http::Method::PUT {
+                let apply: StreamSetApply = serde_json::from_slice(&body).unwrap();
+                format!("{} {}", apply.streams.len(), apply.prune)
+            } else {
+                "- -".to_string()
+            };
+            state.seen.lock().unwrap().push(format!(
+                "{method} {} {if_match} {if_none_match} {body_summary}",
+                uri.path()
+            ));
+
+            if method == axum::http::Method::GET {
+                if !state.existing {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        axum::Json(ApiError::new(
+                            ApiErrorCode::StreamSetNotFound,
+                            "stream set not found",
+                        )),
+                    )
+                        .into_response();
+                }
+                let mut response = axum::Json(StreamSetResource {
+                    owner: "studio-a".to_string(),
+                    streams: vec![StreamResource {
+                        generation: 7,
+                        owner: Some("studio-a".to_string()),
+                        spec: sample_stream(),
+                    }],
+                })
+                .into_response();
+                response.headers_mut().insert(
+                    axum::http::header::ETAG,
+                    axum::http::HeaderValue::from_static("\"set-revision-7\""),
+                );
+                return response;
+            }
+
+            if state.mutation_status.is_success() {
+                return (
+                    state.mutation_status,
+                    axum::Json(StreamSetAccepted {
+                        status: weave_core::AcceptedState::Accepted,
+                        owner: "studio-a".to_string(),
+                        changed: true,
+                        streams: vec![StreamSetMemberResult {
+                            name: "cam1-to-studio".to_string(),
+                            generation: if state.existing { 8 } else { 1 },
+                            action: if state.existing {
+                                StreamSetAction::Updated
+                            } else {
+                                StreamSetAction::Created
+                            },
+                        }],
+                        pruned: Vec::new(),
+                    }),
+                )
+                    .into_response();
+            }
+
+            let code = if state.mutation_status == StatusCode::CONFLICT {
+                ApiErrorCode::OwnershipConflict
+            } else {
+                ApiErrorCode::PreconditionFailed
+            };
+            (
+                state.mutation_status,
+                axum::Json(ApiError::new(code, "stream-set mutation failed")),
+            )
+                .into_response()
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().fallback(record).with_state(StreamSetStub {
+            seen: Arc::clone(&seen),
+            existing,
+            mutation_status,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1322,6 +1621,106 @@ destinations:
         assert_eq!(
             seen.lock().unwrap().as_slice(),
             ["GET /v6/streams/cam1-to-studio Bearer cli-test-token - -"]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_set_creates_with_one_conditional_put() {
+        let apply = StreamSetApply {
+            streams: vec![sample_stream()],
+            prune: true,
+        };
+        let (url, seen) = stub_stream_set(false, StatusCode::ACCEPTED).await;
+
+        apply_stream_set(&url, None, "studio-a", &apply, OutputFormat::Json)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [
+                "GET /v6/stream-sets/studio-a - - - -",
+                "PUT /v6/stream-sets/studio-a - * 1 true"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_set_updates_with_the_set_etag() {
+        let apply = StreamSetApply {
+            streams: vec![sample_stream()],
+            prune: false,
+        };
+        let (url, seen) = stub_stream_set(true, StatusCode::ACCEPTED).await;
+
+        apply_stream_set(&url, None, "studio-a", &apply, OutputFormat::Human)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [
+                "GET /v6/stream-sets/studio-a - - - -",
+                "PUT /v6/stream-sets/studio-a \"set-revision-7\" - 1 false"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_set_surfaces_conflicts_without_retrying() {
+        let apply = StreamSetApply {
+            streams: vec![sample_stream()],
+            prune: false,
+        };
+
+        for (status, code) in [
+            (StatusCode::CONFLICT, "ownership_conflict"),
+            (StatusCode::PRECONDITION_FAILED, "precondition_failed"),
+        ] {
+            let (url, seen) = stub_stream_set(true, status).await;
+            let error = apply_stream_set(&url, None, "studio-a", &apply, OutputFormat::Json)
+                .await
+                .expect_err("conflicting set apply must fail");
+            assert!(error.to_string().contains(&format!("[{code}]")), "{error}");
+            assert_eq!(seen.lock().unwrap().len(), 2, "apply-set must not retry");
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_set_rejects_an_unsafe_owner_locally() {
+        let apply = StreamSetApply {
+            streams: Vec::new(),
+            prune: true,
+        };
+        let error = apply_stream_set(
+            "not a URL",
+            None,
+            "foo?ignored",
+            &apply,
+            OutputFormat::Human,
+        )
+        .await
+        .expect_err("unsafe owner must be rejected locally");
+        assert!(error.to_string().starts_with("invalid stream-set owner:"));
+    }
+
+    #[test]
+    fn human_apply_set_output_lists_member_actions_and_prunes() {
+        let accepted = StreamSetAccepted {
+            status: weave_core::AcceptedState::Accepted,
+            owner: "studio-a".to_string(),
+            changed: true,
+            streams: vec![StreamSetMemberResult {
+                name: "cam1-to-studio".to_string(),
+                generation: 2,
+                action: StreamSetAction::Updated,
+            }],
+            pruned: vec!["old-feed".to_string()],
+        };
+
+        assert_eq!(
+            render_stream_set_accepted(&accepted),
+            "OWNER: studio-a\nCHANGED: true\n\nNAME            ACTION   GENERATION\ncam1-to-studio  updated  2\nold-feed        pruned   -"
         );
     }
 
