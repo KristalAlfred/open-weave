@@ -32,6 +32,70 @@
           "items": {
             "additionalProperties": false,
             "properties": {
+              "conditions": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    },
+                    "last_transition_time": {
+                      "format": "date-time",
+                      "type": "string"
+                    },
+                    "reason": {
+                      "enum": [
+                        "placed",
+                        "disabled",
+                        "placement_failed",
+                        "nodes_available",
+                        "node_missing",
+                        "node_offline",
+                        "hops_ready",
+                        "hops_pending",
+                        "hop_failed",
+                        "format_compatible",
+                        "format_unknown",
+                        "format_mismatch",
+                        "media_flowing",
+                        "awaiting_input",
+                        "media_degraded",
+                        "media_failed",
+                        "media_idle",
+                        "not_ready"
+                      ],
+                      "type": "string"
+                    },
+                    "status": {
+                      "enum": [
+                        "true",
+                        "false",
+                        "unknown"
+                      ],
+                      "type": "string"
+                    },
+                    "type": {
+                      "enum": [
+                        "placement_ready",
+                        "nodes_available",
+                        "hops_ready",
+                        "format_compatible",
+                        "media_flowing"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "status",
+                    "reason",
+                    "detail",
+                    "last_transition_time"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
               "endpoints": {
                 "additionalProperties": false,
                 "properties": {
@@ -107,6 +171,11 @@
                   "null"
                 ]
               },
+              "generation": {
+                "format": "uint64",
+                "minimum": 1,
+                "type": "integer"
+              },
               "name": {
                 "maxLength": 63,
                 "minLength": 1,
@@ -122,9 +191,11 @@
                 },
                 "type": "array"
               },
-              "reason": {
+              "observed_generation": {
+                "format": "uint64",
+                "minimum": 1,
                 "type": [
-                  "string",
+                  "integer",
                   "null"
                 ]
               },
@@ -166,8 +237,10 @@
             },
             "required": [
               "name",
+              "generation",
               "status",
-              "nodes"
+              "nodes",
+              "conditions"
             ],
             "type": "object"
           },

@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 
 pub use api::{
     AcceptedState, ApiError, ApiErrorCode, NodeAccepted, PlanStatus, RunningStatus, StartingState,
-    StartingStatus, StatusResponse, StreamAccepted, StreamPlan, StreamStatus,
+    StartingStatus, StatusResponse, StreamAccepted, StreamCondition, StreamConditionReason,
+    StreamConditionStatus, StreamConditionType, StreamPlan, StreamResource, StreamStatus,
 };
 pub use media::{
     AudioCodec, AudioConstraint, AudioFormat, ChromaSubsampling, Container, FormatConstraint,
@@ -39,7 +40,7 @@ pub const DEFAULT_DATA_PLANE_ALIAS: &str = "default";
 /// Outside it: `/health` on every service, which healthchecks and
 /// load balancers address directly, and the controller's `/`, `/ui`, and `/view` —
 /// the dashboard ships inside the controller binary and versions with it.
-pub const API_PREFIX: &str = "/v4";
+pub const API_PREFIX: &str = "/v5";
 pub const ROUTE_ENDPOINTS: &str = "/endpoints";
 pub const ROUTE_NODES: &str = "/nodes";
 pub const ROUTE_NODE_DESIRED: &str = "/nodes/{node_id}/desired";

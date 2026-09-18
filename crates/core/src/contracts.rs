@@ -6,7 +6,7 @@ use crate::{
     NodeHeartbeat, NodeRegistration, ObservedState, ROUTE_ENDPOINTS, ROUTE_NODE_DESIRED,
     ROUTE_NODE_HEARTBEAT, ROUTE_NODE_REGISTER, ROUTE_NODES, ROUTE_STATE, ROUTE_STATUS,
     ROUTE_STREAM, ROUTE_STREAM_ENDPOINTS, ROUTE_STREAM_PLANS, ROUTE_STREAMS, StatusResponse,
-    StreamAccepted, StreamDefinition, StreamEndpoints, StreamPlan,
+    StreamAccepted, StreamDefinition, StreamEndpoints, StreamPlan, StreamResource,
 };
 
 pub struct ContractArtifact {
@@ -17,19 +17,20 @@ pub struct ContractArtifact {
 #[must_use]
 pub fn artifacts() -> Vec<ContractArtifact> {
     vec![
-        artifact("contracts/openapi/northbound-v4.json", northbound_openapi()),
-        artifact("contracts/openapi/southbound-v4.json", southbound_openapi()),
-        schema_artifact::<ApiError>("contracts/json-schema/v4/api-error.json"),
-        schema_artifact::<StatusResponse>("contracts/json-schema/v4/status-response.json"),
-        schema_artifact::<StreamAccepted>("contracts/json-schema/v4/stream-accepted.json"),
-        schema_artifact::<StreamDefinition>("contracts/json-schema/v4/stream-definition.json"),
-        schema_artifact::<StreamEndpoints>("contracts/json-schema/v4/stream-endpoints.json"),
-        schema_artifact::<StreamPlan>("contracts/json-schema/v4/stream-plan.json"),
-        schema_artifact::<NodeAccepted>("contracts/json-schema/v4/node-accepted.json"),
-        schema_artifact::<NodeHeartbeat>("contracts/json-schema/v4/node-heartbeat.json"),
-        schema_artifact::<NodeRegistration>("contracts/json-schema/v4/node-registration.json"),
-        schema_artifact::<ObservedState>("contracts/json-schema/v4/observed-state.json"),
-        schema_artifact::<Vec<DesiredHop>>("contracts/json-schema/v4/desired-hops.json"),
+        artifact("contracts/openapi/northbound-v5.json", northbound_openapi()),
+        artifact("contracts/openapi/southbound-v5.json", southbound_openapi()),
+        schema_artifact::<ApiError>("contracts/json-schema/v5/api-error.json"),
+        schema_artifact::<StatusResponse>("contracts/json-schema/v5/status-response.json"),
+        schema_artifact::<StreamAccepted>("contracts/json-schema/v5/stream-accepted.json"),
+        schema_artifact::<StreamDefinition>("contracts/json-schema/v5/stream-definition.json"),
+        schema_artifact::<StreamEndpoints>("contracts/json-schema/v5/stream-endpoints.json"),
+        schema_artifact::<StreamPlan>("contracts/json-schema/v5/stream-plan.json"),
+        schema_artifact::<StreamResource>("contracts/json-schema/v5/stream-resource.json"),
+        schema_artifact::<NodeAccepted>("contracts/json-schema/v5/node-accepted.json"),
+        schema_artifact::<NodeHeartbeat>("contracts/json-schema/v5/node-heartbeat.json"),
+        schema_artifact::<NodeRegistration>("contracts/json-schema/v5/node-registration.json"),
+        schema_artifact::<ObservedState>("contracts/json-schema/v5/observed-state.json"),
+        schema_artifact::<Vec<DesiredHop>>("contracts/json-schema/v5/desired-hops.json"),
     ]
 }
 
@@ -78,6 +79,19 @@ fn response(description: &str, schema: Option<Value>) -> Value {
     }
 }
 
+fn response_with_etag(description: &str, schema: Value) -> Value {
+    json!({
+        "description": description,
+        "headers": {
+            "ETag": {
+                "description": "Opaque stream revision for conditional mutations",
+                "schema": { "type": "string" }
+            }
+        },
+        "content": json_content(schema)
+    })
+}
+
 fn request_body(schema_name: &str) -> Value {
     json!({
         "required": true,
@@ -96,6 +110,16 @@ fn path_parameter(name: &str) -> Value {
             "maxLength": 63,
             "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
         }
+    })
+}
+
+fn header_parameter(name: &str, description: &str, required: bool) -> Value {
+    json!({
+        "name": name,
+        "in": "header",
+        "description": description,
+        "required": required,
+        "schema": { "type": "string" }
     })
 }
 
@@ -130,11 +154,26 @@ pub fn northbound_openapi() -> Value {
                 },
                 "post": {
                     "operationId": "applyStream",
+                    "description": "Exactly one of If-Match or If-None-Match is required",
+                    "parameters": [
+                        header_parameter(
+                            "If-Match",
+                            "Current ETag when replacing an existing stream",
+                            false,
+                        ),
+                        header_parameter(
+                            "If-None-Match",
+                            "Use * when creating a stream that must not already exist",
+                            false,
+                        )
+                    ],
                     "requestBody": request_body("StreamDefinition"),
                     "responses": {
-                        "202": response("Stream accepted", Some(schema_ref("StreamAccepted"))),
+                        "202": response_with_etag("Stream accepted", schema_ref("StreamAccepted")),
                         "400": error_response("Invalid stream"),
                         "401": error_response("Authentication failed"),
+                        "412": error_response("Revision precondition failed"),
+                        "428": error_response("A revision precondition is required"),
                         "500": error_response("Persistence or encoding failed"),
                         "502": error_response("Controller unavailable")
                     }
@@ -145,7 +184,7 @@ pub fn northbound_openapi() -> Value {
                     "operationId": "getStream",
                     "parameters": [path_parameter("name")],
                     "responses": {
-                        "200": response("Desired stream", Some(schema_ref("StreamDefinition"))),
+                        "200": response_with_etag("Desired stream", schema_ref("StreamResource")),
                         "400": error_response("Invalid stream name"),
                         "401": error_response("Authentication failed"),
                         "404": error_response("Stream not found"),
@@ -154,12 +193,20 @@ pub fn northbound_openapi() -> Value {
                 },
                 "delete": {
                     "operationId": "deleteStream",
-                    "parameters": [path_parameter("name")],
+                    "parameters": [
+                        path_parameter("name"),
+                        header_parameter(
+                            "If-Match",
+                            "Current ETag of the stream to delete",
+                            true,
+                        )
+                    ],
                     "responses": {
                         "204": response("Stream deleted", None),
                         "400": error_response("Invalid stream name"),
                         "401": error_response("Authentication failed"),
-                        "404": error_response("Stream not found"),
+                        "412": error_response("Revision precondition failed"),
+                        "428": error_response("A revision precondition is required"),
                         "500": error_response("Persistence failed"),
                         "502": error_response("Controller unavailable")
                     }
@@ -210,7 +257,8 @@ pub fn northbound_openapi() -> Value {
             ("StreamDefinition", schema::<StreamDefinition>()),
             ("StreamEndpoints", schema::<StreamEndpoints>()),
             ("StreamPlan", schema::<StreamPlan>()),
-            ("StreamList", schema::<Vec<StreamDefinition>>()),
+            ("StreamResource", schema::<StreamResource>()),
+            ("StreamList", schema::<Vec<StreamResource>>()),
         ]),
     )
 }
@@ -329,7 +377,7 @@ mod tests {
         assert_eq!(north["security"][0]["bearerAuth"], json!([]));
         assert_eq!(south["security"][0]["bearerAuth"], json!([]));
         assert_eq!(
-            north["paths"]["/v4/streams/{name}"]
+            north["paths"]["/v5/streams/{name}"]
                 .as_object()
                 .unwrap()
                 .keys()
@@ -342,11 +390,11 @@ mod tests {
         assert_eq!(
             north_paths.keys().copied().collect::<Vec<_>>(),
             [
-                "/v4/status",
-                "/v4/stream-plans",
-                "/v4/streams",
-                "/v4/streams/{name}",
-                "/v4/streams/{name}/endpoints"
+                "/v5/status",
+                "/v5/stream-plans",
+                "/v5/streams",
+                "/v5/streams/{name}",
+                "/v5/streams/{name}/endpoints"
             ]
         );
 
@@ -354,12 +402,12 @@ mod tests {
         assert_eq!(
             south_paths.keys().copied().collect::<Vec<_>>(),
             [
-                "/v4/endpoints",
-                "/v4/nodes",
-                "/v4/nodes/register",
-                "/v4/nodes/{node_id}/desired",
-                "/v4/nodes/{node_id}/heartbeat",
-                "/v4/state"
+                "/v5/endpoints",
+                "/v5/nodes",
+                "/v5/nodes/register",
+                "/v5/nodes/{node_id}/desired",
+                "/v5/nodes/{node_id}/heartbeat",
+                "/v5/state"
             ]
         );
     }
@@ -369,5 +417,31 @@ mod tests {
         let schema = serde_json::to_string(&schema::<StreamDefinition>()).unwrap();
         assert!(schema.contains("maxLength"));
         assert!(schema.contains("^[a-z0-9]"));
+    }
+
+    #[test]
+    fn northbound_contract_exposes_resource_revisions() {
+        let document = northbound_openapi();
+        let apply = &document["paths"]["/v5/streams"]["post"];
+        let stream = &document["paths"]["/v5/streams/{name}"];
+
+        assert_eq!(
+            stream["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/StreamResource"
+        );
+        assert!(stream["get"]["responses"]["200"]["headers"]["ETag"].is_object());
+        assert!(apply["responses"]["202"]["headers"]["ETag"].is_object());
+        assert!(apply["responses"]["412"].is_object());
+        assert!(apply["responses"]["428"].is_object());
+        assert_eq!(stream["delete"]["parameters"][1]["name"], "If-Match");
+        assert_eq!(stream["delete"]["parameters"][1]["required"], true);
+    }
+
+    #[test]
+    fn condition_transition_time_is_an_rfc3339_schema_string() {
+        let schema = serde_json::to_value(schema::<StatusResponse>()).unwrap();
+        let rendered = serde_json::to_string(&schema).unwrap();
+        assert!(rendered.contains("last_transition_time"));
+        assert!(rendered.contains("date-time"));
     }
 }

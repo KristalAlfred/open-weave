@@ -5,9 +5,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use reqwest::RequestBuilder;
+use reqwest::header::{ETAG, HeaderValue, IF_MATCH, IF_NONE_MATCH};
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Token};
-use weave_core::{API_PREFIX, ApiError, StreamDefinition, StreamPlan, validate_resource_id};
+use weave_core::{
+    API_PREFIX, ApiError, StreamDefinition, StreamPlan, StreamResource, validate_resource_id,
+};
 
 #[derive(Parser)]
 #[command(name = "weave", version, about = "open-weave control plane CLI")]
@@ -135,7 +138,11 @@ fn error_detail(body: &str) -> String {
     let Ok(error) = serde_json::from_str::<ApiError>(body) else {
         return body.to_string();
     };
-    let mut detail = error.message;
+    let code = serde_json::to_string(&error.code)
+        .unwrap_or_else(|_| "\"unknown\"".to_string())
+        .trim_matches('"')
+        .to_string();
+    let mut detail = format!("[{code}] {}", error.message);
     for issue in error.details {
         detail.push_str(&format!(
             "\n{} [{}]: {}",
@@ -154,9 +161,22 @@ fn parse_stream(yaml: &str) -> Result<StreamDefinition> {
 
 async fn apply(url: &str, token: Option<&Token>, file: &Path) -> Result<()> {
     let stream = read_stream(file)?;
+    apply_stream(url, token, &stream).await
+}
 
-    let response = authorized(reqwest::Client::new().post(api_url(url, "/streams")), token)
-        .json(&stream)
+async fn apply_stream(url: &str, token: Option<&Token>, stream: &StreamDefinition) -> Result<()> {
+    if let Err(error) = validate_resource_id(&stream.name) {
+        bail!("invalid stream name: {error}");
+    }
+    let client = reqwest::Client::new();
+    let existing = lookup_stream(&client, url, token, &stream.name).await?;
+
+    let request = authorized(client.post(api_url(url, "/streams")), token).json(&stream);
+    let request = match existing {
+        Some(existing) => request.header(IF_MATCH, existing.etag),
+        None => request.header(IF_NONE_MATCH, "*"),
+    };
+    let response = request
         .send()
         .await
         .context("posting stream to northbound")?;
@@ -235,7 +255,7 @@ async fn get_streams(url: &str, token: Option<&Token>) -> Result<()> {
     let streams = response
         .error_for_status()
         .context("northbound streams request failed")?
-        .json::<Vec<StreamDefinition>>()
+        .json::<Vec<StreamResource>>()
         .await
         .context("decoding streams")?;
 
@@ -247,29 +267,11 @@ async fn get_stream(url: &str, token: Option<&Token>, name: &str) -> Result<()> 
     if let Err(error) = validate_resource_id(name) {
         bail!("invalid stream name: {error}");
     }
-    let response = authorized(
-        reqwest::Client::new().get(api_url(url, &format!("/streams/{name}"))),
-        token,
-    )
-    .send()
-    .await
-    .context("fetching stream")?;
-
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if status == reqwest::StatusCode::NOT_FOUND {
-        bail!("no stream named {name}: {body}");
-    }
-    if !status.is_success() {
-        let hint = if status == reqwest::StatusCode::UNAUTHORIZED {
-            unauthorized_hint(token)
-        } else {
-            ""
-        };
-        bail!("northbound stream request failed: {status}: {body}{hint}");
-    }
-    let stream: StreamDefinition = serde_json::from_str(&body).context("decoding stream")?;
-    println!("{}", serde_json::to_string_pretty(&stream)?);
+    let client = reqwest::Client::new();
+    let Some(stream) = lookup_stream(&client, url, token, name).await? else {
+        bail!("no stream named {name}");
+    };
+    println!("{}", serde_json::to_string_pretty(&stream.resource)?);
     Ok(())
 }
 
@@ -277,10 +279,15 @@ async fn delete_stream(url: &str, token: Option<&Token>, name: &str) -> Result<(
     if let Err(error) = validate_resource_id(name) {
         bail!("invalid stream name: {error}");
     }
+    let client = reqwest::Client::new();
+    let Some(existing) = lookup_stream(&client, url, token, name).await? else {
+        bail!("no stream named {name}");
+    };
     let response = authorized(
-        reqwest::Client::new().delete(api_url(url, &format!("/streams/{name}"))),
+        client.delete(api_url(url, &format!("/streams/{name}"))),
         token,
     )
+    .header(IF_MATCH, existing.etag)
     .send()
     .await
     .context("deleting stream on northbound")?;
@@ -301,12 +308,53 @@ async fn delete_stream(url: &str, token: Option<&Token>, name: &str) -> Result<(
         } else {
             ""
         };
-        bail!("northbound rejected delete: {status}: {body}{hint}");
+        bail!(
+            "northbound rejected delete: {status}: {}{hint}",
+            error_detail(&body)
+        );
     }
 
     tracing::info!(%name, %status, "stream deleted");
     println!("deleted stream {name}");
     Ok(())
+}
+
+struct StreamLookup {
+    resource: StreamResource,
+    etag: HeaderValue,
+}
+
+async fn lookup_stream(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&Token>,
+    name: &str,
+) -> Result<Option<StreamLookup>> {
+    let response = authorized(client.get(api_url(url, &format!("/streams/{name}"))), token)
+        .send()
+        .await
+        .context("fetching stream")?;
+
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let etag = response.headers().get(ETAG).cloned();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let hint = if status == reqwest::StatusCode::UNAUTHORIZED {
+            unauthorized_hint(token)
+        } else {
+            ""
+        };
+        bail!(
+            "northbound stream request failed: {status}: {}{hint}",
+            error_detail(&body)
+        );
+    }
+    let etag = etag.context("northbound stream response is missing its ETag")?;
+    let resource = serde_json::from_str(&body).context("decoding stream resource")?;
+    Ok(Some(StreamLookup { resource, etag }))
 }
 
 fn nodes() -> Result<()> {
@@ -327,8 +375,9 @@ mod tests {
     use axum::body::Body;
     use axum::extract::State;
     use axum::http::{Request, StatusCode};
+    use axum::response::{IntoResponse, Response};
     use std::sync::{Arc, Mutex};
-    use weave_core::{SrtEndpoint, StreamTransport};
+    use weave_core::{ApiErrorCode, SrtEndpoint, StreamAccepted, StreamTransport};
 
     #[test]
     fn parses_fanout_yaml_with_defaults_and_srt_tag() {
@@ -392,7 +441,21 @@ destinations:
 
         assert_eq!(
             error_detail(&body),
-            "stream validation failed\nname [invalid_characters]: stream name is invalid"
+            "[invalid_request] stream validation failed\nname [invalid_characters]: stream name is invalid"
+        );
+    }
+
+    #[test]
+    fn structured_precondition_errors_keep_their_stable_code() {
+        let body = serde_json::json!({
+            "code": "precondition_required",
+            "message": "If-Match or If-None-Match is required"
+        })
+        .to_string();
+
+        assert_eq!(
+            error_detail(&body),
+            "[precondition_required] If-Match or If-None-Match is required"
         );
     }
 
@@ -400,11 +463,11 @@ destinations:
     fn api_url_inserts_the_version_prefix_once() {
         assert_eq!(
             api_url("http://127.0.0.1:9080", "/streams"),
-            "http://127.0.0.1:9080/v4/streams"
+            "http://127.0.0.1:9080/v5/streams"
         );
         assert_eq!(
             api_url("http://127.0.0.1:9080/", "/streams"),
-            "http://127.0.0.1:9080/v4/streams",
+            "http://127.0.0.1:9080/v5/streams",
             "a trailing slash on the base does not double up"
         );
     }
@@ -430,60 +493,135 @@ destinations:
         assert_eq!(json["destinations"][0]["srt"]["node"], "strom-node-2");
     }
 
-    /// A stub northbound on a real socket, recording the request line and
-    /// authorization of the last request and answering with a canned status.
-    async fn stub_northbound(status: StatusCode) -> (String, Arc<Mutex<Option<String>>>) {
-        async fn record(
-            State((seen, status)): State<(Arc<Mutex<Option<String>>>, StatusCode)>,
-            request: Request<Body>,
-        ) -> StatusCode {
-            let authorization = request
-                .headers()
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            *seen.lock().unwrap() = Some(format!(
-                "{} {} {authorization}",
-                request.method(),
-                request.uri().path()
-            ));
-            status
+    fn sample_stream() -> StreamDefinition {
+        StreamDefinition {
+            name: "cam1-to-studio".to_string(),
+            enabled: true,
+            source: StreamTransport::Srt(SrtEndpoint {
+                node: Some("strom-node-1".to_string()),
+                remote: None,
+                via: Vec::new(),
+                network: None,
+                latency: None,
+                format: None,
+                accepts: None,
+            }),
+            destinations: vec![StreamTransport::Srt(SrtEndpoint {
+                node: Some("strom-node-2".to_string()),
+                remote: None,
+                via: Vec::new(),
+                network: None,
+                latency: None,
+                format: None,
+                accepts: None,
+            })],
         }
-
-        let seen = Arc::new(Mutex::new(None));
-        let app = Router::new()
-            .fallback(record)
-            .with_state((Arc::clone(&seen), status));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("http://{addr}"), seen)
     }
 
-    async fn stub_stream(stream: StreamDefinition) -> (String, Arc<Mutex<Option<String>>>) {
-        async fn record(
-            State((seen, stream)): State<(Arc<Mutex<Option<String>>>, StreamDefinition)>,
-            request: Request<Body>,
-        ) -> axum::Json<StreamDefinition> {
+    #[derive(Clone)]
+    struct ResourceStub {
+        seen: Arc<Mutex<Vec<String>>>,
+        resource: Option<StreamResource>,
+        mutation_status: StatusCode,
+        include_etag: bool,
+    }
+
+    async fn stub_resource(
+        resource: Option<StreamResource>,
+        mutation_status: StatusCode,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        start_resource_stub(resource, mutation_status, true).await
+    }
+
+    async fn start_resource_stub(
+        resource: Option<StreamResource>,
+        mutation_status: StatusCode,
+        include_etag: bool,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        async fn record(State(state): State<ResourceStub>, request: Request<Body>) -> Response {
             let authorization = request
                 .headers()
                 .get(axum::http::header::AUTHORIZATION)
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or("")
                 .to_string();
-            *seen.lock().unwrap() = Some(format!(
-                "{} {} {authorization}",
+            let if_match = request
+                .headers()
+                .get(axum::http::header::IF_MATCH)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("-");
+            let if_none_match = request
+                .headers()
+                .get(axum::http::header::IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("-");
+            state.seen.lock().unwrap().push(format!(
+                "{} {} {authorization} {if_match} {if_none_match}",
                 request.method(),
                 request.uri().path()
             ));
-            axum::Json(stream)
+
+            if request.method() == axum::http::Method::GET {
+                return match &state.resource {
+                    Some(resource) => {
+                        let mut response = axum::Json(resource).into_response();
+                        if state.include_etag {
+                            response.headers_mut().insert(
+                                axum::http::header::ETAG,
+                                axum::http::HeaderValue::from_static("\"revision-7\""),
+                            );
+                        }
+                        response
+                    }
+                    None => (
+                        StatusCode::NOT_FOUND,
+                        axum::Json(ApiError::new(
+                            ApiErrorCode::StreamNotFound,
+                            "stream not found",
+                        )),
+                    )
+                        .into_response(),
+                };
+            }
+
+            if state.mutation_status.is_success() {
+                if request.method() == axum::http::Method::DELETE {
+                    return StatusCode::NO_CONTENT.into_response();
+                }
+                return (
+                    state.mutation_status,
+                    axum::Json(StreamAccepted {
+                        status: weave_core::AcceptedState::Accepted,
+                        name: "cam1-to-studio".to_string(),
+                        generation: state
+                            .resource
+                            .as_ref()
+                            .map_or(1, |resource| resource.generation + 1),
+                        changed: true,
+                    }),
+                )
+                    .into_response();
+            }
+
+            let code = if state.mutation_status == StatusCode::PRECONDITION_REQUIRED {
+                ApiErrorCode::PreconditionRequired
+            } else {
+                ApiErrorCode::PreconditionFailed
+            };
+            (
+                state.mutation_status,
+                axum::Json(ApiError::new(code, "stream revision precondition failed")),
+            )
+                .into_response()
         }
 
-        let seen = Arc::new(Mutex::new(None));
-        let app = Router::new()
-            .fallback(record)
-            .with_state((Arc::clone(&seen), stream));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().fallback(record).with_state(ResourceStub {
+            seen: Arc::clone(&seen),
+            resource,
+            mutation_status,
+            include_etag,
+        });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -557,45 +695,118 @@ destinations:
 
         assert_eq!(
             seen.lock().unwrap().as_deref(),
-            Some("POST /v4/stream-plans Bearer cli-test-token preview")
+            Some("POST /v5/stream-plans Bearer cli-test-token preview")
         );
     }
 
     #[tokio::test]
     async fn get_stream_calls_the_versioned_route_with_auth() {
         let token = Token::new("cli-test-token").unwrap();
-        let stream = StreamDefinition {
-            name: "cam1-to-studio".to_string(),
-            enabled: true,
-            source: StreamTransport::Srt(SrtEndpoint {
-                node: Some("strom-node-1".to_string()),
-                remote: None,
-                via: Vec::new(),
-                network: None,
-                latency: None,
-                format: None,
-                accepts: None,
-            }),
-            destinations: vec![StreamTransport::Srt(SrtEndpoint {
-                node: Some("strom-node-2".to_string()),
-                remote: None,
-                via: Vec::new(),
-                network: None,
-                latency: None,
-                format: None,
-                accepts: None,
-            })],
+        let resource = StreamResource {
+            generation: 7,
+            spec: sample_stream(),
         };
-        let (url, seen) = stub_stream(stream).await;
+        let (url, seen) = stub_resource(Some(resource), StatusCode::ACCEPTED).await;
 
         get_stream(&url, Some(&token), "cam1-to-studio")
             .await
             .unwrap();
 
         assert_eq!(
-            seen.lock().unwrap().as_deref(),
-            Some("GET /v4/streams/cam1-to-studio Bearer cli-test-token")
+            seen.lock().unwrap().as_slice(),
+            ["GET /v5/streams/cam1-to-studio Bearer cli-test-token - -"]
         );
+    }
+
+    #[tokio::test]
+    async fn apply_creates_with_if_none_match_after_a_missing_lookup() {
+        let token = Token::new("cli-test-token").unwrap();
+        let (url, seen) = stub_resource(None, StatusCode::ACCEPTED).await;
+
+        apply_stream(&url, Some(&token), &sample_stream())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [
+                "GET /v5/streams/cam1-to-studio Bearer cli-test-token - -",
+                "POST /v5/streams Bearer cli-test-token - *"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_updates_once_with_the_revision_it_read() {
+        let token = Token::new("cli-test-token").unwrap();
+        let resource = StreamResource {
+            generation: 7,
+            spec: sample_stream(),
+        };
+        let (url, seen) = stub_resource(Some(resource), StatusCode::ACCEPTED).await;
+
+        apply_stream(&url, Some(&token), &sample_stream())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [
+                "GET /v5/streams/cam1-to-studio Bearer cli-test-token - -",
+                "POST /v5/streams Bearer cli-test-token \"revision-7\" -"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_surfaces_a_structured_conflict_without_retrying() {
+        let resource = StreamResource {
+            generation: 7,
+            spec: sample_stream(),
+        };
+        let (url, seen) = stub_resource(Some(resource), StatusCode::PRECONDITION_FAILED).await;
+
+        let error = apply_stream(&url, None, &sample_stream())
+            .await
+            .expect_err("a stale revision must fail");
+
+        assert!(
+            error.to_string().contains("[precondition_failed]"),
+            "{error}"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 2, "apply must not retry 412");
+    }
+
+    #[tokio::test]
+    async fn apply_refuses_to_update_without_the_get_etag() {
+        let resource = StreamResource {
+            generation: 7,
+            spec: sample_stream(),
+        };
+        let (url, seen) = start_resource_stub(Some(resource), StatusCode::ACCEPTED, false).await;
+
+        let error = apply_stream(&url, None, &sample_stream())
+            .await
+            .expect_err("an update needs the revision ETag");
+
+        assert!(error.to_string().contains("missing its ETag"), "{error}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lookup_decodes_the_resource_generation() {
+        let resource = StreamResource {
+            generation: 23,
+            spec: sample_stream(),
+        };
+        let (url, _seen) = stub_resource(Some(resource), StatusCode::ACCEPTED).await;
+
+        let found = lookup_stream(&reqwest::Client::new(), &url, None, "cam1-to-studio")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found.resource.generation, 23);
     }
 
     #[tokio::test]
@@ -610,16 +821,23 @@ destinations:
     async fn delete_calls_the_versioned_route_and_reports_an_unknown_stream() {
         let token = Token::new("cli-test-token").unwrap();
 
-        let (url, seen) = stub_northbound(StatusCode::NO_CONTENT).await;
+        let resource = StreamResource {
+            generation: 7,
+            spec: sample_stream(),
+        };
+        let (url, seen) = stub_resource(Some(resource), StatusCode::NO_CONTENT).await;
         delete_stream(&url, Some(&token), "cam1-to-studio")
             .await
             .expect("204 deletes the stream");
         assert_eq!(
-            seen.lock().unwrap().as_deref(),
-            Some("DELETE /v4/streams/cam1-to-studio Bearer cli-test-token")
+            seen.lock().unwrap().as_slice(),
+            [
+                "GET /v5/streams/cam1-to-studio Bearer cli-test-token - -",
+                "DELETE /v5/streams/cam1-to-studio Bearer cli-test-token \"revision-7\" -"
+            ]
         );
 
-        let (url, _seen) = stub_northbound(StatusCode::NOT_FOUND).await;
+        let (url, _seen) = stub_resource(None, StatusCode::NO_CONTENT).await;
         let err = delete_stream(&url, Some(&token), "missing")
             .await
             .expect_err("404 is an error");

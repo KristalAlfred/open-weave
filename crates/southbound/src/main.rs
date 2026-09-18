@@ -366,7 +366,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("OPTIONS")
-                    .uri("/v4/nodes/register")
+                    .uri("/v5/nodes/register")
                     .header("origin", PAGE)
                     .header("access-control-request-method", "POST")
                     .header(
@@ -405,7 +405,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v4/nodes/browser-a1b2/desired")
+                    .uri("/v5/nodes/browser-a1b2/desired")
                     .header("origin", PAGE)
                     .header("authorization", format!("Bearer {TOKEN}"))
                     .body(Body::empty())
@@ -426,7 +426,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v4/nodes/browser-a1b2/desired")
+                    .uri("/v5/nodes/browser-a1b2/desired")
                     .header("origin", "http://evil.example")
                     .header("authorization", format!("Bearer {TOKEN}"))
                     .body(Body::empty())
@@ -450,7 +450,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v4/nodes")
+                    .uri("/v5/nodes")
                     .header("origin", "http://localhost:3000")
                     .header("authorization", format!("Bearer {TOKEN}"))
                     .body(Body::empty())
@@ -474,7 +474,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("OPTIONS")
-                    .uri("/v4/nodes/register")
+                    .uri("/v5/nodes/register")
                     .header("origin", PAGE)
                     .header("access-control-request-method", "POST")
                     .body(Body::empty())
@@ -493,7 +493,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v4/nodes")
+                    .uri("/v5/nodes")
                     .header("origin", PAGE)
                     .header("authorization", format!("Bearer {TOKEN}"))
                     .body(Body::empty())
@@ -528,7 +528,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v4/nodes/register")
+                    .uri("/v5/nodes/register")
                     .header("content-type", "application/json")
                     .body(Body::from(serde_json::to_vec(&payload).unwrap()))
                     .unwrap(),
@@ -543,7 +543,7 @@ mod tests {
             .clone()
             .expect("controller saw a request");
         assert_eq!(seen.method, "POST");
-        assert_eq!(seen.path, "/v4/nodes/register");
+        assert_eq!(seen.path, "/v5/nodes/register");
         let forwarded: Value = serde_json::from_slice(&seen.body).unwrap();
         assert_eq!(forwarded, payload);
     }
@@ -557,7 +557,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v4/nodes/strom-node-1/heartbeat")
+                    .uri("/v5/nodes/strom-node-1/heartbeat")
                     .header("content-type", "application/json")
                     .body(Body::from(json!({ "node_id": "strom-node-1" }).to_string()))
                     .unwrap(),
@@ -572,7 +572,7 @@ mod tests {
             .clone()
             .expect("controller saw a request");
         assert_eq!(seen.method, "POST");
-        assert_eq!(seen.path, "/v4/nodes/strom-node-1/heartbeat");
+        assert_eq!(seen.path, "/v5/nodes/strom-node-1/heartbeat");
     }
 
     #[tokio::test]
@@ -583,7 +583,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v4/nodes/strom-node-1/desired")
+                    .uri("/v5/nodes/strom-node-1/desired")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -597,7 +597,7 @@ mod tests {
             .clone()
             .expect("controller saw a request");
         assert_eq!(seen.method, "GET");
-        assert_eq!(seen.path, "/v4/nodes/strom-node-1/desired");
+        assert_eq!(seen.path, "/v5/nodes/strom-node-1/desired");
     }
 
     #[tokio::test]
@@ -606,7 +606,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v4/state")
+                    .uri("/v5/state")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -621,8 +621,8 @@ mod tests {
         let app = open_app(url);
 
         for (method, uri) in [
-            ("POST", "/v4/nodes/foo%3Fignored/heartbeat"),
-            ("GET", "/v4/nodes/foo%3Fignored/desired"),
+            ("POST", "/v5/nodes/foo%3Fignored/heartbeat"),
+            ("GET", "/v5/nodes/foo%3Fignored/desired"),
         ] {
             let response = app
                 .clone()
@@ -649,13 +649,13 @@ mod tests {
         for (method, uri, expected_status, expected_code) in [
             (
                 "GET",
-                "/v4/no-such-route",
+                "/v5/no-such-route",
                 StatusCode::NOT_FOUND,
                 "route_not_found",
             ),
             (
                 "PUT",
-                "/v4/nodes",
+                "/v5/nodes",
                 StatusCode::METHOD_NOT_ALLOWED,
                 "method_not_allowed",
             ),
@@ -707,6 +707,12 @@ mod tests {
             ("GET", "/v3/nodes"),
             ("GET", "/v3/endpoints"),
             ("GET", "/v3/state"),
+            ("POST", "/v4/nodes/register"),
+            ("GET", "/v4/nodes/strom-node-1/desired"),
+            ("POST", "/v4/nodes/strom-node-1/heartbeat"),
+            ("GET", "/v4/nodes"),
+            ("GET", "/v4/endpoints"),
+            ("GET", "/v4/state"),
         ] {
             let response = app
                 .clone()
@@ -752,12 +758,12 @@ mod tests {
             let app = guarded_app(url);
 
             for (method, uri) in [
-                ("POST", "/v4/nodes/register"),
-                ("GET", "/v4/nodes/strom-node-1/desired"),
-                ("POST", "/v4/nodes/strom-node-1/heartbeat"),
-                ("GET", "/v4/nodes"),
-                ("GET", "/v4/endpoints"),
-                ("GET", "/v4/state"),
+                ("POST", "/v5/nodes/register"),
+                ("GET", "/v5/nodes/strom-node-1/desired"),
+                ("POST", "/v5/nodes/strom-node-1/heartbeat"),
+                ("GET", "/v5/nodes"),
+                ("GET", "/v5/endpoints"),
+                ("GET", "/v5/state"),
             ] {
                 let mut request = Request::builder()
                     .method(method)
@@ -795,7 +801,7 @@ mod tests {
         let response = guarded_app(url)
             .oneshot(
                 Request::builder()
-                    .uri("/v4/nodes/strom-node-1/desired")
+                    .uri("/v5/nodes/strom-node-1/desired")
                     .header("authorization", format!("Bearer {TOKEN}"))
                     .body(Body::empty())
                     .unwrap(),

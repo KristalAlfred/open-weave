@@ -2,6 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
+    "changed": {
+      "type": "boolean"
+    },
+    "generation": {
+      "format": "uint64",
+      "minimum": 1,
+      "type": "integer"
+    },
     "name": {
       "maxLength": 63,
       "minLength": 1,
@@ -17,7 +25,9 @@
   },
   "required": [
     "status",
-    "name"
+    "name",
+    "generation",
+    "changed"
   ],
   "title": "StreamAccepted",
   "type": "object"

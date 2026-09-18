@@ -1,7 +1,9 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{DesiredHop, PathStatus, ReconcileStatus, StreamEndpoints, ValidationIssue};
+use crate::{
+    DesiredHop, PathStatus, ReconcileStatus, StreamDefinition, StreamEndpoints, ValidationIssue,
+};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
@@ -38,16 +40,80 @@ pub struct StreamStatus {
         regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
     )]
     pub name: String,
+    #[schemars(range(min = 1))]
+    pub generation: u64,
+    #[schemars(range(min = 1))]
+    pub observed_generation: Option<u64>,
     pub status: PathStatus,
     #[schemars(inner(
         length(min = 1, max = 63),
         regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
     ))]
     pub nodes: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    pub conditions: Vec<StreamCondition>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoints: Option<StreamEndpoints>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StreamCondition {
+    #[serde(rename = "type")]
+    pub condition_type: StreamConditionType,
+    pub status: StreamConditionStatus,
+    pub reason: StreamConditionReason,
+    pub detail: String,
+    #[schemars(extend("format" = "date-time"))]
+    pub last_transition_time: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamConditionType {
+    PlacementReady,
+    NodesAvailable,
+    HopsReady,
+    FormatCompatible,
+    MediaFlowing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamConditionStatus {
+    True,
+    False,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamConditionReason {
+    Placed,
+    Disabled,
+    PlacementFailed,
+    NodesAvailable,
+    NodeMissing,
+    NodeOffline,
+    HopsReady,
+    HopsPending,
+    HopFailed,
+    FormatCompatible,
+    FormatUnknown,
+    FormatMismatch,
+    MediaFlowing,
+    AwaitingInput,
+    MediaDegraded,
+    MediaFailed,
+    MediaIdle,
+    NotReady,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StreamResource {
+    #[schemars(range(min = 1))]
+    pub generation: u64,
+    pub spec: StreamDefinition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -59,6 +125,9 @@ pub struct StreamAccepted {
         regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
     )]
     pub name: String,
+    #[schemars(range(min = 1))]
+    pub generation: u64,
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -118,6 +187,8 @@ pub enum ApiErrorCode {
     StreamNotFound,
     NodeNotFound,
     StreamNotReady,
+    PreconditionRequired,
+    PreconditionFailed,
     IncompatibleProtocolVersion,
     PersistenceFailed,
     ControllerUnreachable,
@@ -196,5 +267,27 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(detailed["details"][0]["field"], "name");
+    }
+
+    #[test]
+    fn stream_condition_uses_stable_wire_names() {
+        let condition = StreamCondition {
+            condition_type: StreamConditionType::MediaFlowing,
+            status: StreamConditionStatus::False,
+            reason: StreamConditionReason::AwaitingInput,
+            detail: "source has not reported media".to_string(),
+            last_transition_time: "2026-09-18T09:30:00Z".to_string(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(condition).unwrap(),
+            serde_json::json!({
+                "type": "media_flowing",
+                "status": "false",
+                "reason": "awaiting_input",
+                "detail": "source has not reported media",
+                "last_transition_time": "2026-09-18T09:30:00Z"
+            })
+        );
     }
 }

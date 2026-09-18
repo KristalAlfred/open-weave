@@ -12,6 +12,8 @@
         "stream_not_found",
         "node_not_found",
         "stream_not_ready",
+        "precondition_required",
+        "precondition_failed",
         "incompatible_protocol_version",
         "persistence_failed",
         "controller_unreachable",

@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::{Path, State, rejection::JsonRejection},
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -34,12 +34,13 @@ use weave_core::{
     ROUTE_NODE_HEARTBEAT, ROUTE_NODE_REGISTER, ROUTE_NODES, ROUTE_STATE, ROUTE_STATUS,
     ROUTE_STREAM, ROUTE_STREAM_ENDPOINTS, ROUTE_STREAM_PLANS, ROUTE_STREAMS, ReconcileReport,
     ReconcileStatus, RunningStatus, StartingState, StartingStatus, StatusResponse, StreamAccepted,
-    StreamDefinition, StreamEndpoints, StreamPlan, StreamStatus, ValidationIssue,
+    StreamCondition, StreamConditionReason, StreamConditionStatus, StreamConditionType,
+    StreamDefinition, StreamEndpoints, StreamPlan, StreamResource, StreamStatus, ValidationIssue,
     protocol_compatible, resource_id_issue, validate_resource_id, validate_stream,
 };
 
-use path::{PortAllocator, derive_path, path_status, stream_endpoints};
-use store::{MemStore, PgStore, StateStore, StoredStream};
+use path::{PlacementError, PortAllocator, derive_path, path_status, stream_endpoints};
+use store::{MemStore, PgStore, StateStore, StoreError, StoredStream};
 
 #[derive(Debug, Parser)]
 #[command(name = "weave-controller", version, about = "open-weave reconciler")]
@@ -348,13 +349,8 @@ async fn main() -> Result<()> {
 }
 
 async fn reconcile_tick(state: &AppState) {
-    let streams: Vec<StreamDefinition> = state
-        .streams
-        .read()
-        .await
-        .values()
-        .map(|stream| stream.spec.clone())
-        .collect();
+    let streams = state.streams.read().await;
+    let definitions = streams.values().map(|stream| stream.spec.clone()).collect();
     let (observed, went_offline) = {
         let mut nodes = state.nodes.write().await;
         let last_seen = state.last_seen.read().await;
@@ -369,7 +365,14 @@ async fn reconcile_tick(state: &AppState) {
     for node in went_offline {
         state.emit(EventType::NodeOffline, node);
     }
-    let outcome = reconcile(streams, &observed);
+    let mut outcome = reconcile(definitions, &observed);
+    for status in &mut outcome.streams {
+        let stored = streams
+            .get(&status.name)
+            .expect("reconcile returns every submitted stream");
+        status.generation = stored.generation;
+        status.observed_generation = Some(stored.generation);
+    }
 
     for stream in &outcome.streams {
         tracing::info!(stream = %stream.name, status = ?stream.status, "stream status");
@@ -382,10 +385,89 @@ async fn reconcile_tick(state: &AppState) {
 
     *state.desired.write().await = outcome.desired_by_node;
     let mut view = state.view.write().await;
+    stamp_condition_transition_times(&mut outcome.streams, &view.streams, &now_rfc3339());
     view.report = Some(outcome.report);
     view.streams = outcome.streams;
     view.endpoints = outcome.endpoints;
     view.hops = outcome.hops_by_stream;
+}
+
+fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
+fn stamp_condition_transition_times(
+    current: &mut [StreamStatus],
+    previous: &[StreamStatus],
+    now: &str,
+) {
+    for stream in current {
+        let previous = previous
+            .iter()
+            .find(|candidate| candidate.name == stream.name);
+        for condition in &mut stream.conditions {
+            condition.last_transition_time = previous
+                .and_then(|stream| {
+                    stream.conditions.iter().find(|candidate| {
+                        candidate.condition_type == condition.condition_type
+                            && candidate.status == condition.status
+                    })
+                })
+                .map_or_else(
+                    || now.to_string(),
+                    |condition| condition.last_transition_time.clone(),
+                );
+        }
+    }
+}
+
+async fn update_pending_generation(state: &AppState, stored: &StoredStream) {
+    let mut view = state.view.write().await;
+    if let Some(status) = view
+        .streams
+        .iter_mut()
+        .find(|status| status.name == stored.spec.name)
+    {
+        status.generation = stored.generation;
+        return;
+    }
+    let now = now_rfc3339();
+    let conditions = [
+        StreamConditionType::PlacementReady,
+        StreamConditionType::NodesAvailable,
+        StreamConditionType::HopsReady,
+        StreamConditionType::FormatCompatible,
+        StreamConditionType::MediaFlowing,
+    ]
+    .into_iter()
+    .map(|condition_type| StreamCondition {
+        condition_type,
+        status: StreamConditionStatus::Unknown,
+        reason: StreamConditionReason::NotReady,
+        detail: "the controller has not reconciled this generation".to_string(),
+        last_transition_time: now.clone(),
+    })
+    .collect();
+    view.streams.push(StreamStatus {
+        name: stored.spec.name.clone(),
+        generation: stored.generation,
+        observed_generation: None,
+        status: PathStatus::Pending,
+        nodes: Vec::new(),
+        conditions,
+        endpoints: None,
+    });
+    view.streams
+        .sort_by(|left, right| left.name.cmp(&right.name));
+}
+
+async fn remove_stream_view(state: &AppState, name: &str) {
+    let mut view = state.view.write().await;
+    view.streams.retain(|status| status.name != name);
+    view.endpoints.remove(name);
+    view.hops.remove(name);
 }
 
 /// Mark nodes whose last heartbeat is older than `ttl` as [`NodeStatus::Offline`],
@@ -431,7 +513,7 @@ fn observed_state(nodes: &BTreeMap<String, NodeRegistration>) -> ObservedState {
 /// directly, and the dashboard (`/`, `/ui`, `/view`), which ships inside this
 /// binary. `/view` carries no stability guarantee.
 ///
-/// The dashboard is unauthenticated, as is the `/v4/status` rollup it shares its
+/// The dashboard is unauthenticated, as is the `/v5/status` rollup it shares its
 /// data with: both are browser-reachable, and a bearer token cannot travel with a
 /// page load without a cookie/session mechanism or a reverse proxy.
 /// They expose topology and allocated ports, so **the controller port must not be
@@ -556,7 +638,11 @@ async fn get_view(State(state): State<AppState>) -> Json<SystemView> {
         .map(|stream| StreamView {
             name: stream.name.clone(),
             status: stream.status,
-            reason: stream.reason.clone(),
+            reason: stream
+                .conditions
+                .iter()
+                .find(|condition| condition.status == StreamConditionStatus::False)
+                .map(|condition| condition.detail.clone()),
             nodes: stream.nodes.clone(),
             endpoints: stream.endpoints.clone(),
             hops: view
@@ -617,14 +703,107 @@ async fn ui() -> axum::response::Html<&'static str> {
 
 // --- stream registry (northbound surface) ---
 
-async fn list_streams(State(state): State<AppState>) -> Json<Vec<StreamDefinition>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamWritePrecondition {
+    Absent,
+    Revision(u64),
+}
+
+struct RequestError {
+    status: StatusCode,
+    code: ApiErrorCode,
+    message: &'static str,
+}
+
+impl RequestError {
+    fn response(self) -> Response {
+        error(self.status, self.code, self.message)
+    }
+}
+
+fn stream_resource(stream: &StoredStream) -> StreamResource {
+    StreamResource {
+        generation: stream.generation,
+        spec: stream.spec.clone(),
+    }
+}
+
+fn revision_etag(revision: u64) -> HeaderValue {
+    HeaderValue::from_str(&format!("\"revision-{revision}\""))
+        .expect("numeric revision always forms a valid ETag")
+}
+
+fn with_etag(mut response: Response, revision: u64) -> Response {
+    response
+        .headers_mut()
+        .insert(header::ETAG, revision_etag(revision));
+    response
+}
+
+fn parse_revision(value: &HeaderValue) -> Option<u64> {
+    value
+        .to_str()
+        .ok()?
+        .strip_prefix("\"revision-")?
+        .strip_suffix('"')?
+        .parse()
+        .ok()
+}
+
+fn required_revision(headers: &HeaderMap) -> Result<u64, RequestError> {
+    let Some(value) = headers.get(header::IF_MATCH) else {
+        return Err(RequestError {
+            status: StatusCode::PRECONDITION_REQUIRED,
+            code: ApiErrorCode::PreconditionRequired,
+            message: "If-Match is required",
+        });
+    };
+    parse_revision(value).ok_or(RequestError {
+        status: StatusCode::BAD_REQUEST,
+        code: ApiErrorCode::InvalidRequest,
+        message: "If-Match must contain one current stream ETag",
+    })
+}
+
+fn stream_write_precondition(headers: &HeaderMap) -> Result<StreamWritePrecondition, RequestError> {
+    match (
+        headers.get(header::IF_MATCH),
+        headers.get(header::IF_NONE_MATCH),
+    ) {
+        (None, None) => Err(RequestError {
+            status: StatusCode::PRECONDITION_REQUIRED,
+            code: ApiErrorCode::PreconditionRequired,
+            message: "If-Match or If-None-Match is required",
+        }),
+        (Some(_), Some(_)) => Err(RequestError {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::InvalidRequest,
+            message: "send either If-Match or If-None-Match, not both",
+        }),
+        (Some(value), None) => parse_revision(value)
+            .map(StreamWritePrecondition::Revision)
+            .ok_or(RequestError {
+                status: StatusCode::BAD_REQUEST,
+                code: ApiErrorCode::InvalidRequest,
+                message: "If-Match must contain one current stream ETag",
+            }),
+        (None, Some(value)) if value == "*" => Ok(StreamWritePrecondition::Absent),
+        (None, Some(_)) => Err(RequestError {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::InvalidRequest,
+            message: "If-None-Match must be * when creating a stream",
+        }),
+    }
+}
+
+async fn list_streams(State(state): State<AppState>) -> Json<Vec<StreamResource>> {
     Json(
         state
             .streams
             .read()
             .await
             .values()
-            .map(|stream| stream.spec.clone())
+            .map(stream_resource)
             .collect(),
     )
 }
@@ -637,7 +816,10 @@ async fn get_stream(State(state): State<AppState>, Path(name): Path<String>) -> 
         );
     }
     match state.streams.read().await.get(&name).cloned() {
-        Some(stream) => Json(stream.spec).into_response(),
+        Some(stream) => with_etag(
+            Json(stream_resource(&stream)).into_response(),
+            stream.revision,
+        ),
         None => error(
             StatusCode::NOT_FOUND,
             ApiErrorCode::StreamNotFound,
@@ -648,6 +830,7 @@ async fn get_stream(State(state): State<AppState>, Path(name): Path<String>) -> 
 
 async fn submit_stream(
     State(state): State<AppState>,
+    headers: HeaderMap,
     payload: Result<Json<StreamDefinition>, JsonRejection>,
 ) -> Response {
     let Json(stream) = match payload {
@@ -658,11 +841,31 @@ async fn submit_stream(
     if !issues.is_empty() {
         return invalid_request("stream validation failed", issues);
     }
+    let precondition = match stream_write_precondition(&headers) {
+        Ok(precondition) => precondition,
+        Err(error) => return error.response(),
+    };
     let name = stream.name.clone();
-    {
+    let (stored, changed) = {
         let mut streams = state.streams.write().await;
-        let stored = match state.store.upsert_stream(&stream).await {
+        let changed = streams
+            .get(&name)
+            .is_none_or(|current| current.spec != stream);
+        let result = match precondition {
+            StreamWritePrecondition::Absent => state.store.create_stream(&stream).await,
+            StreamWritePrecondition::Revision(revision) => {
+                state.store.update_stream(&stream, revision).await
+            }
+        };
+        let stored = match result {
             Ok(stored) => stored,
+            Err(StoreError::PreconditionFailed) => {
+                return error(
+                    StatusCode::PRECONDITION_FAILED,
+                    ApiErrorCode::PreconditionFailed,
+                    "stream changed or the requested create name already exists",
+                );
+            }
             Err(err) => {
                 tracing::error!(%err, %name, "persisting stream failed");
                 return error(
@@ -672,17 +875,24 @@ async fn submit_stream(
                 );
             }
         };
-        streams.insert(name.clone(), stored);
-    }
+        streams.insert(name.clone(), stored.clone());
+        (stored, changed)
+    };
+    update_pending_generation(&state, &stored).await;
     tracing::info!(%name, "stream accepted");
-    (
-        StatusCode::ACCEPTED,
-        Json(StreamAccepted {
-            status: AcceptedState::Accepted,
-            name,
-        }),
+    with_etag(
+        (
+            StatusCode::ACCEPTED,
+            Json(StreamAccepted {
+                status: AcceptedState::Accepted,
+                name,
+                generation: stored.generation,
+                changed,
+            }),
+        )
+            .into_response(),
+        stored.revision,
     )
-        .into_response()
 }
 
 async fn plan_stream(
@@ -734,35 +944,58 @@ async fn plan_stream(
         nodes: planned.nodes,
         hops,
         endpoints: planned.endpoints,
-        reason: planned.reason,
+        reason: (status == PlanStatus::Unplaced)
+            .then(|| {
+                planned
+                    .conditions
+                    .iter()
+                    .find(|condition| {
+                        condition.condition_type == StreamConditionType::PlacementReady
+                    })
+                    .map(|condition| condition.detail.clone())
+            })
+            .flatten(),
     })
     .into_response()
 }
 
-async fn delete_stream(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+async fn delete_stream(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     if let Err(reason) = validate_resource_id(&name) {
         return invalid_request(
             "stream name is invalid",
             vec![resource_id_issue("name", "stream name", reason)],
         );
     }
+    let revision = match required_revision(&headers) {
+        Ok(revision) => revision,
+        Err(error) => return error.response(),
+    };
     let mut streams = state.streams.write().await;
-    if !streams.contains_key(&name) {
-        return error(
-            StatusCode::NOT_FOUND,
-            ApiErrorCode::StreamNotFound,
-            "stream not found",
-        );
-    }
-    if let Err(err) = state.store.delete_stream(&name).await {
-        tracing::error!(%err, %name, "deleting stream failed");
-        return error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ApiErrorCode::PersistenceFailed,
-            "failed to delete stream",
-        );
+    match state.store.delete_stream(&name, revision).await {
+        Ok(()) => {}
+        Err(StoreError::PreconditionFailed) => {
+            return error(
+                StatusCode::PRECONDITION_FAILED,
+                ApiErrorCode::PreconditionFailed,
+                "stream changed or no longer exists",
+            );
+        }
+        Err(err) => {
+            tracing::error!(%err, %name, "deleting stream failed");
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiErrorCode::PersistenceFailed,
+                "failed to delete stream",
+            );
+        }
     }
     streams.remove(&name);
+    drop(streams);
+    remove_stream_view(&state, &name).await;
     tracing::info!(%name, "stream deleted");
     StatusCode::NO_CONTENT.into_response()
 }
@@ -1078,6 +1311,219 @@ fn format_conflict_reason(stream: &StreamDefinition) -> Option<String> {
     )
 }
 
+fn stream_condition(
+    condition_type: StreamConditionType,
+    status: StreamConditionStatus,
+    reason: StreamConditionReason,
+    detail: impl Into<String>,
+) -> StreamCondition {
+    StreamCondition {
+        condition_type,
+        status,
+        reason,
+        detail: detail.into(),
+        last_transition_time: String::new(),
+    }
+}
+
+fn format_condition(stream: &StreamDefinition) -> StreamCondition {
+    let source_declared = matches!(
+        &stream.source,
+        weave_core::StreamTransport::Srt(endpoint) if endpoint.format.is_some()
+    );
+    let constrained = stream.destinations.iter().any(|destination| {
+        matches!(
+            destination,
+            weave_core::StreamTransport::Srt(endpoint) if endpoint.accepts.is_some()
+        )
+    });
+    if !source_declared || !constrained {
+        return stream_condition(
+            StreamConditionType::FormatCompatible,
+            StreamConditionStatus::Unknown,
+            StreamConditionReason::FormatUnknown,
+            "source format or destination constraints are not declared",
+        );
+    }
+    match format_conflict_reason(stream) {
+        Some(detail) => stream_condition(
+            StreamConditionType::FormatCompatible,
+            StreamConditionStatus::False,
+            StreamConditionReason::FormatMismatch,
+            detail,
+        ),
+        None => stream_condition(
+            StreamConditionType::FormatCompatible,
+            StreamConditionStatus::True,
+            StreamConditionReason::FormatCompatible,
+            "declared formats are compatible",
+        ),
+    }
+}
+
+fn media_condition(status: PathStatus) -> StreamCondition {
+    let (condition_status, reason, detail) = match status {
+        PathStatus::Idle => (
+            StreamConditionStatus::False,
+            StreamConditionReason::MediaIdle,
+            "stream is disabled",
+        ),
+        PathStatus::Failed => (
+            StreamConditionStatus::False,
+            StreamConditionReason::MediaFailed,
+            "a hop failed",
+        ),
+        PathStatus::Pending => (
+            StreamConditionStatus::Unknown,
+            StreamConditionReason::NotReady,
+            "media status is not known until the path is ready",
+        ),
+        PathStatus::AwaitingInput => (
+            StreamConditionStatus::False,
+            StreamConditionReason::AwaitingInput,
+            "the source is not providing media",
+        ),
+        PathStatus::Degraded => (
+            StreamConditionStatus::False,
+            StreamConditionReason::MediaDegraded,
+            "media is not flowing across every branch",
+        ),
+        PathStatus::Flowing => (
+            StreamConditionStatus::True,
+            StreamConditionReason::MediaFlowing,
+            "media is flowing across every branch",
+        ),
+    };
+    stream_condition(
+        StreamConditionType::MediaFlowing,
+        condition_status,
+        reason,
+        detail,
+    )
+}
+
+fn disabled_conditions(stream: &StreamDefinition) -> Vec<StreamCondition> {
+    vec![
+        stream_condition(
+            StreamConditionType::PlacementReady,
+            StreamConditionStatus::False,
+            StreamConditionReason::Disabled,
+            "stream is disabled",
+        ),
+        stream_condition(
+            StreamConditionType::NodesAvailable,
+            StreamConditionStatus::Unknown,
+            StreamConditionReason::Disabled,
+            "stream is disabled",
+        ),
+        stream_condition(
+            StreamConditionType::HopsReady,
+            StreamConditionStatus::Unknown,
+            StreamConditionReason::Disabled,
+            "stream is disabled",
+        ),
+        format_condition(stream),
+        media_condition(PathStatus::Idle),
+    ]
+}
+
+fn placement_failed_conditions(
+    stream: &StreamDefinition,
+    error: &PlacementError,
+) -> Vec<StreamCondition> {
+    let detail = error.to_string();
+    let (node_status, node_reason) = if matches!(error, PlacementError::NodeNotRegistered { .. }) {
+        (
+            StreamConditionStatus::False,
+            StreamConditionReason::NodeMissing,
+        )
+    } else {
+        (
+            StreamConditionStatus::Unknown,
+            StreamConditionReason::NotReady,
+        )
+    };
+    vec![
+        stream_condition(
+            StreamConditionType::PlacementReady,
+            StreamConditionStatus::False,
+            StreamConditionReason::PlacementFailed,
+            detail.clone(),
+        ),
+        stream_condition(
+            StreamConditionType::NodesAvailable,
+            node_status,
+            node_reason,
+            detail,
+        ),
+        stream_condition(
+            StreamConditionType::HopsReady,
+            StreamConditionStatus::Unknown,
+            StreamConditionReason::NotReady,
+            "no desired hops exist until placement succeeds",
+        ),
+        format_condition(stream),
+        media_condition(PathStatus::Pending),
+    ]
+}
+
+fn placed_conditions(
+    stream: &StreamDefinition,
+    path_status: PathStatus,
+    offline_node: Option<&str>,
+) -> Vec<StreamCondition> {
+    let nodes = match offline_node {
+        Some(node) => stream_condition(
+            StreamConditionType::NodesAvailable,
+            StreamConditionStatus::False,
+            StreamConditionReason::NodeOffline,
+            format!("node {node} is offline"),
+        ),
+        None => stream_condition(
+            StreamConditionType::NodesAvailable,
+            StreamConditionStatus::True,
+            StreamConditionReason::NodesAvailable,
+            "every placed node is available",
+        ),
+    };
+    let hops = match path_status {
+        PathStatus::Pending => stream_condition(
+            StreamConditionType::HopsReady,
+            StreamConditionStatus::False,
+            StreamConditionReason::HopsPending,
+            "one or more desired hops have not reported ready",
+        ),
+        PathStatus::Failed => stream_condition(
+            StreamConditionType::HopsReady,
+            StreamConditionStatus::False,
+            StreamConditionReason::HopFailed,
+            "one or more desired hops failed",
+        ),
+        _ => stream_condition(
+            StreamConditionType::HopsReady,
+            StreamConditionStatus::True,
+            StreamConditionReason::HopsReady,
+            "every desired hop is provisioned",
+        ),
+    };
+    vec![
+        stream_condition(
+            StreamConditionType::PlacementReady,
+            StreamConditionStatus::True,
+            StreamConditionReason::Placed,
+            "the stream has a complete path",
+        ),
+        nodes,
+        hops,
+        format_condition(stream),
+        media_condition(if offline_node.is_some() {
+            PathStatus::Degraded
+        } else {
+            path_status
+        }),
+    ]
+}
+
 /// Compute per-node desired hops, endpoints, and an aggregate report from the
 /// current stream and node state. Pure: no IO, deterministic for a given input.
 fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> ReconcileOutcome {
@@ -1111,9 +1557,11 @@ fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> Re
         if !stream.enabled {
             stream_statuses.push(StreamStatus {
                 name: stream.name.clone(),
+                generation: 0,
+                observed_generation: None,
                 status: PathStatus::Idle,
                 nodes: Vec::new(),
-                reason: None,
+                conditions: disabled_conditions(stream),
                 endpoints: None,
             });
             continue;
@@ -1133,16 +1581,15 @@ fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> Re
                         .or_default()
                         .push(hop.clone());
                 }
-                // A lost node outranks a format conflict: the path carries nothing
-                // at all, whereas a conflicted path still delivers — just media
-                // the endpoint cannot use. Both are reported as Degraded, so the
-                // reason is what tells them apart.
-                let (status, reason) = match nodes.iter().find(|id| offline.contains(id.as_str())) {
-                    Some(id) => (PathStatus::Degraded, Some(format!("node {id} lost"))),
-                    None => match format_conflict_reason(stream) {
-                        Some(reason) => (PathStatus::Degraded, Some(reason)),
-                        None => (path_status(&path, &observed.hops), None),
-                    },
+                let path_status = path_status(&path, &observed.hops);
+                let offline_node = nodes
+                    .iter()
+                    .find(|id| offline.contains(id.as_str()))
+                    .cloned();
+                let status = if offline_node.is_some() || format_conflict_reason(stream).is_some() {
+                    PathStatus::Degraded
+                } else {
+                    path_status
                 };
                 let endpoints = match stream_endpoints(stream, &path, &observed.nodes) {
                     Ok(endpoints) => {
@@ -1156,9 +1603,11 @@ fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> Re
                 };
                 stream_statuses.push(StreamStatus {
                     name: stream.name.clone(),
+                    generation: 0,
+                    observed_generation: None,
                     status,
                     nodes,
-                    reason,
+                    conditions: placed_conditions(stream, path_status, offline_node.as_deref()),
                     endpoints,
                 });
                 status
@@ -1167,9 +1616,11 @@ fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> Re
                 tracing::warn!(stream = %stream.name, %error, "cannot place stream; retrying next tick");
                 stream_statuses.push(StreamStatus {
                     name: stream.name.clone(),
+                    generation: 0,
+                    observed_generation: None,
                     status: PathStatus::Pending,
                     nodes: Vec::new(),
-                    reason: Some(error.to_string()),
+                    conditions: placement_failed_conditions(stream, &error),
                     endpoints: None,
                 });
                 PathStatus::Pending
@@ -1339,10 +1790,17 @@ mod tests {
         uri: &str,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
-        let request = Request::builder()
+        let mut request = Request::builder()
             .method(method)
             .uri(uri)
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        if method == "POST" && uri == "/v5/streams" {
+            request = request.header("if-none-match", "*");
+        }
+        if method == "DELETE" && uri.starts_with("/v5/streams/") {
+            request = request.header("if-match", "\"revision-1\"");
+        }
+        let request = request
             .body(body.map_or(Body::empty(), |v| {
                 Body::from(serde_json::to_vec(&v).unwrap())
             }))
@@ -1358,6 +1816,51 @@ mod tests {
         (status, value)
     }
 
+    async fn send_with_headers(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, HeaderMap, Value) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                request
+                    .body(body.map_or(Body::empty(), |value| {
+                        Body::from(serde_json::to_vec(&value).unwrap())
+                    }))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, headers, value)
+    }
+
+    fn response_etag(headers: &HeaderMap) -> String {
+        headers
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
     #[tokio::test]
     async fn post_stream_then_get_returns_it_and_writes_through() {
         let (state, mem) = mem_state();
@@ -1366,25 +1869,29 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v4/streams",
+            "/v5/streams",
             Some(serde_json::to_value(stream("basic")).unwrap()),
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
 
-        let (status, body) = send(&app, "GET", "/v4/streams", None).await;
+        let (status, body) = send(&app, "GET", "/v5/streams", None).await;
         assert_eq!(status, StatusCode::OK);
-        let listed: Vec<StreamDefinition> = serde_json::from_value(body).unwrap();
-        assert_eq!(listed, vec![stream("basic")]);
+        let listed: Vec<StreamResource> = serde_json::from_value(body).unwrap();
+        assert_eq!(listed[0].generation, 1);
+        assert_eq!(listed[0].spec, stream("basic"));
 
-        let (status, body) = send(&app, "GET", "/v4/streams/basic", None).await;
+        let (status, body) = send(&app, "GET", "/v5/streams/basic", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            serde_json::from_value::<StreamDefinition>(body).unwrap(),
-            stream("basic")
+            serde_json::from_value::<StreamResource>(body).unwrap(),
+            StreamResource {
+                generation: 1,
+                spec: stream("basic")
+            }
         );
 
-        let (status, body) = send(&app, "GET", "/v4/streams/missing", None).await;
+        let (status, body) = send(&app, "GET", "/v5/streams/missing", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["code"], "stream_not_found");
 
@@ -1394,6 +1901,191 @@ mod tests {
             "stream was written through the store"
         );
         assert_eq!(mem.load_streams().await.unwrap()[0].spec, stream("basic"));
+    }
+
+    #[tokio::test]
+    async fn stream_writes_require_and_enforce_etag_preconditions() {
+        let (state, _mem) = mem_state();
+        let app = open_router(state);
+        let original = stream("basic");
+
+        let (status, _, body) = send_with_headers(
+            &app,
+            "POST",
+            "/v5/streams",
+            Some(serde_json::to_value(&original).unwrap()),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(body["code"], "precondition_required");
+
+        let (status, headers, body) = send_with_headers(
+            &app,
+            "POST",
+            "/v5/streams",
+            Some(serde_json::to_value(&original).unwrap()),
+            &[("if-none-match", "*")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let first_etag = response_etag(&headers);
+        let accepted: StreamAccepted = serde_json::from_value(body).unwrap();
+        assert_eq!(accepted.generation, 1);
+        assert!(accepted.changed);
+
+        let (status, headers, body) = send_with_headers(
+            &app,
+            "POST",
+            "/v5/streams",
+            Some(serde_json::to_value(&original).unwrap()),
+            &[("if-match", &first_etag)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(response_etag(&headers), first_etag);
+        let accepted: StreamAccepted = serde_json::from_value(body).unwrap();
+        assert_eq!(accepted.generation, 1);
+        assert!(!accepted.changed);
+
+        let mut changed = original.clone();
+        changed.enabled = false;
+        let (status, headers, body) = send_with_headers(
+            &app,
+            "POST",
+            "/v5/streams",
+            Some(serde_json::to_value(&changed).unwrap()),
+            &[("if-match", &first_etag)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let second_etag = response_etag(&headers);
+        assert_ne!(second_etag, first_etag);
+        let accepted: StreamAccepted = serde_json::from_value(body).unwrap();
+        assert_eq!(accepted.generation, 2);
+        assert!(accepted.changed);
+
+        let (status, _, body) = send_with_headers(
+            &app,
+            "POST",
+            "/v5/streams",
+            Some(serde_json::to_value(&original).unwrap()),
+            &[("if-match", &first_etag)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(body["code"], "precondition_failed");
+
+        let (status, headers, body) =
+            send_with_headers(&app, "GET", "/v5/streams/basic", None, &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response_etag(&headers), second_etag);
+        let resource: StreamResource = serde_json::from_value(body).unwrap();
+        assert_eq!(resource.generation, 2);
+        assert_eq!(resource.spec, changed);
+    }
+
+    #[tokio::test]
+    async fn status_distinguishes_current_and_observed_generations() {
+        let (state, _mem) = mem_state();
+        let app = open_router(state.clone());
+        let definition = stream("basic");
+        let (_, headers, _) = send_with_headers(
+            &app,
+            "POST",
+            "/v5/streams",
+            Some(serde_json::to_value(&definition).unwrap()),
+            &[("if-none-match", "*")],
+        )
+        .await;
+        let etag = response_etag(&headers);
+        reconcile_tick(&state).await;
+        {
+            let view = state.view.read().await;
+            assert_eq!(view.streams[0].generation, 1);
+            assert_eq!(view.streams[0].observed_generation, Some(1));
+            assert_eq!(view.streams[0].conditions.len(), 5);
+            assert!(
+                view.streams[0]
+                    .conditions
+                    .iter()
+                    .all(|condition| !condition.last_transition_time.is_empty())
+            );
+            for condition in &view.streams[0].conditions {
+                time::OffsetDateTime::parse(
+                    &condition.last_transition_time,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .unwrap();
+            }
+        }
+
+        let mut changed = definition;
+        changed.enabled = false;
+        let (status, _, _) = send_with_headers(
+            &app,
+            "POST",
+            "/v5/streams",
+            Some(serde_json::to_value(&changed).unwrap()),
+            &[("if-match", &etag)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        {
+            let view = state.view.read().await;
+            assert_eq!(view.streams[0].generation, 2);
+            assert_eq!(view.streams[0].observed_generation, Some(1));
+        }
+
+        reconcile_tick(&state).await;
+        let view = state.view.read().await;
+        assert_eq!(view.streams[0].generation, 2);
+        assert_eq!(view.streams[0].observed_generation, Some(2));
+        assert_eq!(
+            view.streams[0].conditions[0].reason,
+            StreamConditionReason::Disabled
+        );
+    }
+
+    #[test]
+    fn condition_transition_time_changes_only_when_status_changes() {
+        let mut previous = StreamStatus {
+            name: "basic".to_string(),
+            generation: 1,
+            observed_generation: Some(1),
+            status: PathStatus::Pending,
+            nodes: Vec::new(),
+            conditions: vec![stream_condition(
+                StreamConditionType::PlacementReady,
+                StreamConditionStatus::False,
+                StreamConditionReason::PlacementFailed,
+                "missing node",
+            )],
+            endpoints: None,
+        };
+        previous.conditions[0].last_transition_time = "2026-09-18T10:00:00Z".to_string();
+        let mut current = previous.clone();
+        current.conditions[0].reason = StreamConditionReason::Disabled;
+        stamp_condition_transition_times(
+            std::slice::from_mut(&mut current),
+            std::slice::from_ref(&previous),
+            "2026-09-18T10:01:00Z",
+        );
+        assert_eq!(
+            current.conditions[0].last_transition_time,
+            "2026-09-18T10:00:00Z"
+        );
+
+        current.conditions[0].status = StreamConditionStatus::True;
+        stamp_condition_transition_times(
+            std::slice::from_mut(&mut current),
+            std::slice::from_ref(&previous),
+            "2026-09-18T10:02:00Z",
+        );
+        assert_eq!(
+            current.conditions[0].last_transition_time,
+            "2026-09-18T10:02:00Z"
+        );
     }
 
     #[tokio::test]
@@ -1412,7 +2104,7 @@ mod tests {
         let (status, body) = send(
             &app,
             "POST",
-            "/v4/streams",
+            "/v5/streams",
             Some(serde_json::to_value(&invalid).unwrap()),
         )
         .await;
@@ -1426,7 +2118,7 @@ mod tests {
         let (status, body) = send(
             &app,
             "POST",
-            "/v4/stream-plans",
+            "/v5/stream-plans",
             Some(serde_json::to_value(invalid).unwrap()),
         )
         .await;
@@ -1434,8 +2126,8 @@ mod tests {
         assert_eq!(body["code"], "invalid_request");
         assert_eq!(mem.upsert_stream_calls(), 0);
 
-        let (_, body) = send(&app, "GET", "/v4/streams", None).await;
-        let listed: Vec<StreamDefinition> = serde_json::from_value(body).unwrap();
+        let (_, body) = send(&app, "GET", "/v5/streams", None).await;
+        let listed: Vec<StreamResource> = serde_json::from_value(body).unwrap();
         assert!(listed.is_empty());
     }
 
@@ -1450,7 +2142,7 @@ mod tests {
             let (status, _) = send(
                 &app,
                 "POST",
-                "/v4/nodes/register",
+                "/v5/nodes/register",
                 Some(serde_json::to_value(registration).unwrap()),
             )
             .await;
@@ -1460,7 +2152,7 @@ mod tests {
         let (status, body) = send(
             &app,
             "POST",
-            "/v4/stream-plans",
+            "/v5/stream-plans",
             Some(serde_json::to_value(stream("preview")).unwrap()),
         )
         .await;
@@ -1485,7 +2177,7 @@ mod tests {
         let (status, body) = send(
             &app,
             "POST",
-            "/v4/stream-plans",
+            "/v5/stream-plans",
             Some(serde_json::to_value(stream("unplaced")).unwrap()),
         )
         .await;
@@ -1500,7 +2192,7 @@ mod tests {
         let (status, body) = send(
             &app,
             "POST",
-            "/v4/stream-plans",
+            "/v5/stream-plans",
             Some(serde_json::to_value(disabled).unwrap()),
         )
         .await;
@@ -1527,7 +2219,7 @@ mod tests {
             send(
                 &app,
                 "POST",
-                "/v4/nodes/register",
+                "/v5/nodes/register",
                 Some(serde_json::to_value(registration).unwrap()),
             )
             .await;
@@ -1535,7 +2227,7 @@ mod tests {
         send(
             &app,
             "POST",
-            "/v4/streams",
+            "/v5/streams",
             Some(serde_json::to_value(stream("existing")).unwrap()),
         )
         .await;
@@ -1543,7 +2235,7 @@ mod tests {
         let (status, body) = send(
             &app,
             "POST",
-            "/v4/stream-plans",
+            "/v5/stream-plans",
             Some(serde_json::to_value(stream("preview")).unwrap()),
         )
         .await;
@@ -1553,9 +2245,9 @@ mod tests {
         assert_eq!(plan.status, PlanStatus::Unplaced);
         assert!(plan.reason.unwrap().contains("no free port"));
         assert_eq!(mem.upsert_stream_calls(), 1, "plan did not write a stream");
-        let (_, body) = send(&app, "GET", "/v4/streams", None).await;
-        let streams: Vec<StreamDefinition> = serde_json::from_value(body).unwrap();
-        assert_eq!(streams, [stream("existing")]);
+        let (_, body) = send(&app, "GET", "/v5/streams", None).await;
+        let streams: Vec<StreamResource> = serde_json::from_value(body).unwrap();
+        assert_eq!(streams[0].spec, stream("existing"));
     }
 
     #[tokio::test]
@@ -1563,7 +2255,7 @@ mod tests {
         let (state, mem) = mem_state();
         let request = Request::builder()
             .method("POST")
-            .uri("/v4/streams")
+            .uri("/v5/streams")
             .header("content-type", "application/json")
             .body(Body::from("{"))
             .unwrap();
@@ -1582,7 +2274,7 @@ mod tests {
         let mem = Arc::new(MemStore::new());
         let mut invalid = stream("broken");
         invalid.destinations.clear();
-        mem.upsert_stream(&invalid).await.unwrap();
+        mem.create_stream(&invalid).await.unwrap();
 
         let error = AppState::hydrate(mem, Duration::from_secs(15), None)
             .await
@@ -1616,20 +2308,24 @@ mod tests {
         send(
             &app,
             "POST",
-            "/v4/streams",
+            "/v5/streams",
             Some(serde_json::to_value(stream("basic")).unwrap()),
         )
         .await;
-        let (status, _) = send(&app, "DELETE", "/v4/streams/basic", None).await;
+        let (status, _) = send(&app, "DELETE", "/v5/streams/basic", None).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert_eq!(mem.delete_stream_calls(), 1);
 
-        let (_, body) = send(&app, "GET", "/v4/streams", None).await;
-        let listed: Vec<StreamDefinition> = serde_json::from_value(body).unwrap();
+        let (_, body) = send(&app, "GET", "/v5/streams", None).await;
+        let listed: Vec<StreamResource> = serde_json::from_value(body).unwrap();
         assert!(listed.is_empty());
 
-        let (status, _) = send(&app, "DELETE", "/v4/streams/basic", None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "second delete is a miss");
+        let (status, _) = send(&app, "DELETE", "/v5/streams/basic", None).await;
+        assert_eq!(
+            status,
+            StatusCode::PRECONDITION_FAILED,
+            "second delete fails its revision precondition"
+        );
     }
 
     #[tokio::test]
@@ -1638,15 +2334,15 @@ mod tests {
         let app = open_router(state);
 
         for (method, uri, body) in [
-            ("GET", "/v4/streams/foo%3Fignored", None),
-            ("DELETE", "/v4/streams/foo%3Fignored", None),
-            ("GET", "/v4/streams/foo%3Fignored/endpoints", None),
+            ("GET", "/v5/streams/foo%3Fignored", None),
+            ("DELETE", "/v5/streams/foo%3Fignored", None),
+            ("GET", "/v5/streams/foo%3Fignored/endpoints", None),
             (
                 "POST",
-                "/v4/nodes/foo%3Fignored/heartbeat",
+                "/v5/nodes/foo%3Fignored/heartbeat",
                 Some(json!({ "node_id": "foo?ignored", "status": "ready" })),
             ),
-            ("GET", "/v4/nodes/foo%3Fignored/desired", None),
+            ("GET", "/v5/nodes/foo%3Fignored/desired", None),
         ] {
             let (status, _) = send(&app, method, uri, body).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}");
@@ -1663,7 +2359,7 @@ mod tests {
         send(
             &app,
             "POST",
-            "/v4/nodes/register",
+            "/v5/nodes/register",
             Some(serde_json::to_value(node_registration("strom-node-1", "172.26.0.10")).unwrap()),
         )
         .await;
@@ -1678,7 +2374,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v4/nodes/strom-node-1/heartbeat",
+            "/v5/nodes/strom-node-1/heartbeat",
             Some(serde_json::to_value(&heartbeat).unwrap()),
         )
         .await;
@@ -1689,7 +2385,7 @@ mod tests {
             "heartbeat must not write through to the store"
         );
 
-        let (_, body) = send(&app, "GET", "/v4/state", None).await;
+        let (_, body) = send(&app, "GET", "/v5/state", None).await;
         let observed: ObservedState = serde_json::from_value(body).unwrap();
         assert_eq!(observed.nodes[0].status, NodeStatus::Degraded);
     }
@@ -1708,7 +2404,7 @@ mod tests {
             let (status, body) = send(
                 &app,
                 "POST",
-                "/v4/nodes/register",
+                "/v5/nodes/register",
                 Some(serde_json::to_value(&registration).unwrap()),
             )
             .await;
@@ -1727,7 +2423,7 @@ mod tests {
             0,
             "a rejected node is never persisted"
         );
-        let (_, body) = send(&app, "GET", "/v4/nodes", None).await;
+        let (_, body) = send(&app, "GET", "/v5/nodes", None).await;
         assert_eq!(body, json!([]), "a rejected node is never registered");
     }
 
@@ -1740,7 +2436,7 @@ mod tests {
         let (status, body) = send(
             &app,
             "POST",
-            "/v4/nodes/register",
+            "/v5/nodes/register",
             Some(serde_json::to_value(&registration).unwrap()),
         )
         .await;
@@ -1750,7 +2446,7 @@ mod tests {
         assert_eq!(body["details"][0]["field"], "node.id");
         assert_eq!(body["details"][0]["code"], "invalid_characters");
         assert_eq!(mem.upsert_node_calls(), 0);
-        let (_, body) = send(&app, "GET", "/v4/nodes", None).await;
+        let (_, body) = send(&app, "GET", "/v5/nodes", None).await;
         assert_eq!(body, json!([]));
 
         let mut registration = node_registration("node-one", "172.26.0.10");
@@ -1765,7 +2461,7 @@ mod tests {
         let (status, body) = send(
             &app,
             "POST",
-            "/v4/nodes/register",
+            "/v5/nodes/register",
             Some(serde_json::to_value(&registration).unwrap()),
         )
         .await;
@@ -1796,7 +2492,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v4/nodes/register",
+            "/v5/nodes/register",
             Some(serde_json::to_value(&registration).unwrap()),
         )
         .await;
@@ -1807,7 +2503,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v4/nodes/register",
+            "/v5/nodes/register",
             Some(serde_json::to_value(&registration).unwrap()),
         )
         .await;
@@ -1822,7 +2518,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v4/nodes/strom-node-1/heartbeat",
+            "/v5/nodes/strom-node-1/heartbeat",
             Some(serde_json::to_value(&heartbeat).unwrap()),
         )
         .await;
@@ -1868,7 +2564,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v4/nodes/register",
+            "/v5/nodes/register",
             Some(serde_json::to_value(&browser).unwrap()),
         )
         .await;
@@ -1893,7 +2589,7 @@ mod tests {
         send(
             &app,
             "POST",
-            "/v4/nodes/register",
+            "/v5/nodes/register",
             Some(serde_json::to_value(&strom).unwrap()),
         )
         .await;
@@ -1911,12 +2607,12 @@ mod tests {
 
         reconcile_tick(&state).await;
 
-        let (_, body) = send(&app, "GET", "/v4/nodes", None).await;
+        let (_, body) = send(&app, "GET", "/v5/nodes", None).await;
         let nodes: Vec<NodeDescriptor> = serde_json::from_value(body).unwrap();
         let page = nodes.iter().find(|n| n.id == "browser-a1b2").unwrap();
         assert_eq!(page.endpoint, "browser://browser-a1b2");
 
-        let (status, body) = send(&app, "GET", "/v4/nodes/browser-a1b2/desired", None).await;
+        let (status, body) = send(&app, "GET", "/v5/nodes/browser-a1b2/desired", None).await;
         assert_eq!(status, StatusCode::OK);
         let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
         assert_eq!(hops.len(), 1);
@@ -1958,13 +2654,13 @@ mod tests {
         reconcile_tick(&state).await;
 
         let app = open_router(state);
-        let (status, body) = send(&app, "GET", "/v4/nodes/strom-node-1/desired", None).await;
+        let (status, body) = send(&app, "GET", "/v5/nodes/strom-node-1/desired", None).await;
         assert_eq!(status, StatusCode::OK);
         let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
         assert_eq!(hops.len(), 1, "sender hop placed on node 1");
         assert_eq!(hops[0].id, "weave-basic-sender");
 
-        let (_, body) = send(&app, "GET", "/v4/nodes/strom-node-2/desired", None).await;
+        let (_, body) = send(&app, "GET", "/v5/nodes/strom-node-2/desired", None).await;
         let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
         assert_eq!(hops.len(), 1, "receiver hop placed on node 2");
         assert_eq!(hops[0].id, "weave-basic-receiver-0");
@@ -1977,17 +2673,19 @@ mod tests {
             let mut view = state.view.write().await;
             view.streams = vec![StreamStatus {
                 name: "basic".to_string(),
+                generation: 1,
+                observed_generation: None,
                 status: PathStatus::Pending,
                 nodes: Vec::new(),
-                reason: None,
+                conditions: Vec::new(),
                 endpoints: None,
             }];
         }
         let app = open_router(state);
-        let (status, _) = send(&app, "GET", "/v4/streams/basic/endpoints", None).await;
+        let (status, _) = send(&app, "GET", "/v5/streams/basic/endpoints", None).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
-        let (status, _) = send(&app, "GET", "/v4/streams/nope/endpoints", None).await;
+        let (status, _) = send(&app, "GET", "/v5/streams/nope/endpoints", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -2221,7 +2919,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v4/nodes/register",
+            "/v5/nodes/register",
             Some(serde_json::to_value(node_registration("guest-1", "172.26.0.10")).unwrap()),
         )
         .await;
@@ -2279,7 +2977,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v4/nodes/guest-1/heartbeat",
+            "/v5/nodes/guest-1/heartbeat",
             Some(json!({ "node_id": "guest-1", "status": "ready" })),
         )
         .await;
@@ -2303,7 +3001,7 @@ mod tests {
         send(
             &app,
             "POST",
-            "/v4/nodes/guest-1/heartbeat",
+            "/v5/nodes/guest-1/heartbeat",
             Some(json!({ "node_id": "guest-1", "status": "ready" })),
         )
         .await;
@@ -2328,7 +3026,7 @@ mod tests {
             send(
                 &app,
                 "POST",
-                "/v4/nodes/register",
+                "/v5/nodes/register",
                 Some(serde_json::to_value(node_registration("guest-1", "172.26.0.10")).unwrap()),
             ),
         )
@@ -2353,11 +3051,40 @@ mod tests {
         nodes.get_mut("strom-node-1").unwrap().node.status = NodeStatus::Offline;
         let observed = observed_state(&nodes);
 
-        let outcome = reconcile(vec![stream("basic")], &observed);
+        let mut definition = stream("basic");
+        let weave_core::StreamTransport::Srt(source) = &mut definition.source else {
+            unreachable!()
+        };
+        source.format = Some(weave_core::MediaFormat {
+            container: weave_core::Container::MpegTs,
+            video: None,
+            audio: None,
+        });
+        let weave_core::StreamTransport::Srt(destination) = &mut definition.destinations[0] else {
+            unreachable!()
+        };
+        destination.accepts = Some(weave_core::FormatConstraint {
+            container: Some(vec![weave_core::Container::Rtp]),
+            ..Default::default()
+        });
+        let outcome = reconcile(vec![definition], &observed);
 
         let basic = outcome.streams.iter().find(|s| s.name == "basic").unwrap();
         assert_eq!(basic.status, PathStatus::Degraded);
-        assert_eq!(basic.reason.as_deref(), Some("node strom-node-1 lost"));
+        let nodes = basic
+            .conditions
+            .iter()
+            .find(|condition| condition.condition_type == StreamConditionType::NodesAvailable)
+            .unwrap();
+        assert_eq!(nodes.reason, StreamConditionReason::NodeOffline);
+        assert_eq!(nodes.detail, "node strom-node-1 is offline");
+        let format = basic
+            .conditions
+            .iter()
+            .find(|condition| condition.condition_type == StreamConditionType::FormatCompatible)
+            .unwrap();
+        assert_eq!(format.status, StreamConditionStatus::False);
+        assert_eq!(format.reason, StreamConditionReason::FormatMismatch);
         assert!(
             !outcome.desired_by_node["strom-node-1"].is_empty(),
             "desired hops for the offline node are still computed"
@@ -2376,10 +3103,13 @@ mod tests {
 
         let basic = outcome.streams.iter().find(|s| s.name == "basic").unwrap();
         assert_eq!(basic.status, PathStatus::Pending);
-        assert_eq!(
-            basic.reason.as_deref(),
-            Some("node strom-node-2 is not registered")
-        );
+        let placement = basic
+            .conditions
+            .iter()
+            .find(|condition| condition.condition_type == StreamConditionType::PlacementReady)
+            .unwrap();
+        assert_eq!(placement.reason, StreamConditionReason::PlacementFailed);
+        assert_eq!(placement.detail, "node strom-node-2 is not registered");
     }
 
     #[test]
@@ -2411,7 +3141,10 @@ mod tests {
         assert!(basic.nodes.contains(&"relay-b".to_string()));
         assert!(!basic.nodes.contains(&"relay-a".to_string()));
         assert_ne!(basic.status, PathStatus::Degraded);
-        assert_eq!(basic.reason, None);
+        assert!(basic.conditions.iter().all(|condition| {
+            condition.condition_type != StreamConditionType::NodesAvailable
+                || condition.status == StreamConditionStatus::True
+        }));
     }
 
     #[tokio::test]
@@ -2441,13 +3174,13 @@ mod tests {
         reconcile_tick(&state).await;
 
         let app = open_router(state);
-        let (status, body) = send(&app, "GET", "/v4/nodes", None).await;
+        let (status, body) = send(&app, "GET", "/v5/nodes", None).await;
         assert_eq!(status, StatusCode::OK);
         let nodes: Vec<NodeDescriptor> = serde_json::from_value(body).unwrap();
         let node1 = nodes.iter().find(|n| n.id == "strom-node-1").unwrap();
         assert_eq!(node1.status, NodeStatus::Offline);
 
-        let (status, body) = send(&app, "GET", "/v4/nodes/strom-node-1/desired", None).await;
+        let (status, body) = send(&app, "GET", "/v5/nodes/strom-node-1/desired", None).await;
         assert_eq!(status, StatusCode::OK);
         let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
         assert!(
@@ -2484,21 +3217,21 @@ mod tests {
     }
 
     const NORTH_ROUTES: [(&str, &str); 6] = [
-        ("GET", "/v4/streams"),
-        ("POST", "/v4/streams"),
-        ("POST", "/v4/stream-plans"),
-        ("GET", "/v4/streams/basic"),
-        ("DELETE", "/v4/streams/basic"),
-        ("GET", "/v4/streams/basic/endpoints"),
+        ("GET", "/v5/streams"),
+        ("POST", "/v5/streams"),
+        ("POST", "/v5/stream-plans"),
+        ("GET", "/v5/streams/basic"),
+        ("DELETE", "/v5/streams/basic"),
+        ("GET", "/v5/streams/basic/endpoints"),
     ];
 
     const SOUTH_ROUTES: [(&str, &str); 6] = [
-        ("GET", "/v4/nodes"),
-        ("POST", "/v4/nodes/register"),
-        ("POST", "/v4/nodes/strom-node-1/heartbeat"),
-        ("GET", "/v4/nodes/strom-node-1/desired"),
-        ("GET", "/v4/endpoints"),
-        ("GET", "/v4/state"),
+        ("GET", "/v5/nodes"),
+        ("POST", "/v5/nodes/register"),
+        ("POST", "/v5/nodes/strom-node-1/heartbeat"),
+        ("GET", "/v5/nodes/strom-node-1/desired"),
+        ("GET", "/v5/endpoints"),
+        ("GET", "/v5/state"),
     ];
 
     /// Unversioned and retired-major paths are gone: this is a clean break, not
@@ -2518,7 +3251,7 @@ mod tests {
         }
         let (status, _) = send(&app, "GET", "/status", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        for retired_prefix in ["/v1", "/v2", "/v3"] {
+        for retired_prefix in ["/v1", "/v2", "/v3", "/v4"] {
             for (method, uri) in NORTH_ROUTES.iter().chain(&SOUTH_ROUTES) {
                 let retired = uri.replacen(API_PREFIX, retired_prefix, 1);
                 let (status, _) = send(&app, method, &retired, None).await;
@@ -2535,7 +3268,7 @@ mod tests {
     async fn dashboard_and_health_stay_open() {
         let (state, _mem) = mem_state();
         let app = guarded_router(state);
-        for uri in ["/", "/ui", "/health", "/view", "/v4/status"] {
+        for uri in ["/", "/ui", "/health", "/view", "/v5/status"] {
             let (status, _) = send_auth(&app, "GET", uri, None).await;
             assert_eq!(status, StatusCode::OK, "{uri} must not require a token");
         }
@@ -2597,7 +3330,7 @@ mod tests {
         let (status, _) = send_auth(
             &app,
             "GET",
-            "/v4/streams",
+            "/v5/streams",
             Some(&format!("Bearer {NORTH_TOKEN}")),
         )
         .await;
@@ -2606,7 +3339,7 @@ mod tests {
         let (status, _) = send_auth(
             &app,
             "GET",
-            "/v4/state",
+            "/v5/state",
             Some(&format!("Bearer {SOUTH_TOKEN}")),
         )
         .await;

@@ -94,7 +94,7 @@ console.log(`page open as ${nodeId}`);
 const deadline = Date.now() + 30_000;
 let seen = false;
 while (Date.now() < deadline) {
-  const response = await fetch(`${southbound}/v4/nodes`, {
+  const response = await fetch(`${southbound}/v5/nodes`, {
     headers: token ? { authorization: `Bearer ${token}` } : {},
   }).catch(() => null);
   if (response && response.ok) {
@@ -107,7 +107,7 @@ while (Date.now() < deadline) {
   await new Promise(resolve => setTimeout(resolve, 1000));
 }
 if (!seen) {
-  console.error(`${nodeId} did not appear in ${southbound}/v4/nodes within 30s`);
+  console.error(`${nodeId} did not appear in ${southbound}/v5/nodes within 30s`);
   await browser.close();
   process.exit(1);
 }
