@@ -49,7 +49,7 @@ not start without one.
 
 | Crate | What it is |
 |---|---|
-| `crates/core` (`weave-core`) | Shared domain types, `API_PREFIX`, `PROTOCOL_VERSION`, auth middleware |
+| `crates/core` (`weave-core`) | Shared domain types, `PROTOCOL_VERSION`, auth middleware |
 | `crates/cli` (`weave`) | Operator CLI |
 | `crates/northbound` | Operator-facing desired-state API |
 | `crates/controller` | Reconciler, sole owner of state, dashboard |
@@ -66,11 +66,10 @@ docker-compose stack of real Strom instances behind per-node `netem` routers.
   proxies that call into it. The controller answers no request by calling out;
   its one outbound call is the node lifecycle webhook, which is fire-and-forget
   and off unless `WEAVE_WEBHOOK_URL` is set.
-- **Version mismatches are refused, not smoothed over.** `API_PREFIX` moves for
-  any breaking HTTP contract change. `PROTOCOL_VERSION` additionally marks the
-  southbound adapter protocol. A registration carrying the wrong version gets
-  `409` and is not recorded. There are no back-compat aliases and no deprecation
-  window at `0.1.0`.
+- **Protocol mismatches are refused, not smoothed over.** `PROTOCOL_VERSION`
+  marks the southbound adapter protocol. A registration carrying the wrong
+  version gets `409` and is not recorded. HTTP routes are unversioned before a
+  stable release, with no back-compat aliases or deprecation window at `0.1.0`.
 - **Formats are declared, not discovered.** An absent `format` means unknown,
   not wrong, and nothing is inferred from it. A `format` is fixated; an
   `accepts` is a constraint set. A mismatch is reported on the stream and the

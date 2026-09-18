@@ -42,9 +42,9 @@ that is easy to break while fixing it.
   deregistration route, and the controller's node TTL only changes a status:
   `mark_offline` sets the entry to `Offline` after `WEAVE_NODE_TTL_SECS` (15s by
   default) and nothing ever removes it (`crates/controller/src/main.rs`), so the
-  node stays in `GET /v6/nodes` and `/v6/status` as `offline`. Each browser
+  node stays in `GET /nodes` and `/status` as `offline`. Each browser
   page start without `--node` picks a fresh id, and one bench run left three
-  stale `browser-…` nodes beside `browser-bench` (`7 node(s)` in `/v6/status`).
+  stale `browser-…` nodes beside `browser-bench` (`7 node(s)` in `/status`).
   Done: a node that has not heartbeated for some interval leaves the listing, or
   a node can deregister itself. Easy to break: dropping an entry replans every
   stream placed on it. `pick_relay` skips `Offline` nodes and a pinned relay
@@ -101,7 +101,7 @@ Listed so they are not picked up by accident.
   above.
 - Keep `cargo test --workspace` and `cargo clippy --workspace --all-targets`
   clean; both pass as of this file being written.
-- Regenerate `contracts/` when a versioned route or wire type changes. Contract
+- Regenerate `contracts/` when an API route or wire type changes. Contract
   drift is a test failure, not a documentation follow-up.
 - Keep stream planning side-effect free and allocate against the full candidate
   stream set. A one-stream preview can otherwise promise ports apply will not use.

@@ -6159,11 +6159,11 @@
   },
   "info": {
     "title": "open-weave northbound API",
-    "version": "v6"
+    "version": "0.1.0"
   },
   "openapi": "3.1.0",
   "paths": {
-    "/v6/nodes": {
+    "/nodes": {
       "get": {
         "operationId": "listNodes",
         "responses": {
@@ -6200,7 +6200,7 @@
         }
       }
     },
-    "/v6/status": {
+    "/status": {
       "get": {
         "operationId": "getStatus",
         "responses": {
@@ -6237,7 +6237,7 @@
         }
       }
     },
-    "/v6/stream-plans": {
+    "/stream-plans": {
       "post": {
         "operationId": "planStream",
         "requestBody": {
@@ -6304,7 +6304,7 @@
         }
       }
     },
-    "/v6/stream-sets": {
+    "/stream-sets": {
       "get": {
         "operationId": "listStreamSets",
         "responses": {
@@ -6341,7 +6341,7 @@
         }
       }
     },
-    "/v6/stream-sets/{owner}": {
+    "/stream-sets/{owner}": {
       "get": {
         "operationId": "getStreamSet",
         "parameters": [
@@ -6554,7 +6554,7 @@
         }
       }
     },
-    "/v6/streams": {
+    "/streams": {
       "get": {
         "operationId": "listStreams",
         "responses": {
@@ -6715,7 +6715,7 @@
         }
       }
     },
-    "/v6/streams/{name}": {
+    "/streams/{name}": {
       "delete": {
         "operationId": "deleteStream",
         "parameters": [
@@ -6893,7 +6893,7 @@
         }
       }
     },
-    "/v6/streams/{name}/endpoints": {
+    "/streams/{name}/endpoints": {
       "get": {
         "operationId": "getStreamEndpoints",
         "parameters": [

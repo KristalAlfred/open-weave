@@ -3,7 +3,6 @@
 // Must equal weave_core::PROTOCOL_VERSION; check.mjs reads this line and
 // compares it with the constant in crates/core.
 const PROTOCOL_VERSION = 3;
-const API_PREFIX = "/v6";
 const HEARTBEAT_MS = 5000;
 const POLL_MS = 2000;
 const STALL_POLLS = 3;
@@ -58,7 +57,7 @@ async function southbound(method, path, body) {
   const headers = {};
   if (config.token) headers.authorization = `Bearer ${config.token}`;
   if (body !== undefined) headers["content-type"] = "application/json";
-  return fetch(`${config.southbound}${API_PREFIX}${path}`, {
+  return fetch(`${config.southbound}${path}`, {
     method,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),

@@ -40,7 +40,7 @@ and apply it. Southbound must allow the page's origin
 (`WEAVE_SOUTHBOUND_CORS_ORIGIN`, see the root README).
 
 `check.mjs` drives the page with Playwright and a fake camera and waits for the
-node to appear in `GET /v6/nodes`:
+node to appear in `GET /nodes`:
 
 ```sh
 pnpm install
@@ -54,8 +54,8 @@ passes `media=video`; `--node ID` passes `node=ID`. The script launches
 Playwright's full Chromium (`channel: "chromium"`), because the headless shell
 never answers `getUserMedia` for the fake devices.
 
-The page carries its own copies of `weave_core::API_PREFIX`,
-`weave_core::PROTOCOL_VERSION`, and `weave_core::DEVICE_TRANSPORT`, so
+The page carries its own copies of `weave_core::PROTOCOL_VERSION` and
+`weave_core::DEVICE_TRANSPORT`, so
 `check.mjs` compares them with the Rust
 source before it launches anything and refuses to run when they disagree. It
 also checks that hop status retains the ingress and every identified egress.

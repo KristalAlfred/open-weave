@@ -9,7 +9,7 @@ use reqwest::header::{ETAG, HeaderValue, IF_MATCH, IF_NONE_MATCH};
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Token};
 use weave_core::{
-    API_PREFIX, ApiError, NodeDescriptor, PathStatus, PlanStatus, ReconcileStatus, StatusResponse,
+    ApiError, NodeDescriptor, PathStatus, PlanStatus, ReconcileStatus, StatusResponse,
     StreamAccepted, StreamDefinition, StreamEndpoints, StreamPlan, StreamResource,
     StreamSetAccepted, StreamSetAction, StreamSetApply, StreamSetResource, validate_resource_id,
 };
@@ -894,10 +894,8 @@ async fn lookup_stream_set(
     Ok(Some(StreamSetLookup { etag }))
 }
 
-/// Build a northbound API URL from a contract-relative `path`, inserting the
-/// version prefix so the literal lives only in [`weave_core::API_PREFIX`].
 fn api_url(base: &str, path: &str) -> String {
-    format!("{}{}{path}", base.trim_end_matches('/'), API_PREFIX)
+    format!("{}{path}", base.trim_end_matches('/'))
 }
 
 #[cfg(test)]
@@ -995,14 +993,14 @@ destinations:
     }
 
     #[test]
-    fn api_url_inserts_the_version_prefix_once() {
+    fn api_url_joins_the_base_and_route_once() {
         assert_eq!(
             api_url("http://127.0.0.1:9080", "/streams"),
-            "http://127.0.0.1:9080/v6/streams"
+            "http://127.0.0.1:9080/streams"
         );
         assert_eq!(
             api_url("http://127.0.0.1:9080/", "/streams"),
-            "http://127.0.0.1:9080/v6/streams",
+            "http://127.0.0.1:9080/streams",
             "a trailing slash on the base does not double up"
         );
     }
@@ -1459,11 +1457,11 @@ destinations:
     }
 
     #[tokio::test]
-    async fn read_commands_call_their_versioned_routes_with_auth() {
+    async fn read_commands_call_their_routes_with_auth() {
         let token = Token::new("cli-test-token").unwrap();
         let cases = [
             (
-                "/v6/nodes",
+                "/nodes",
                 serde_json::json!([{
                     "id": "strom-node-1",
                     "endpoint": "http://strom-node-1:8091",
@@ -1472,18 +1470,18 @@ destinations:
                 "nodes",
             ),
             (
-                "/v6/status",
+                "/status",
                 serde_json::json!({ "status": "starting" }),
                 "status",
             ),
             (
-                "/v6/streams/cam1-to-studio/endpoints",
+                "/streams/cam1-to-studio/endpoints",
                 serde_json::json!({ "ingress": null, "outputs": [null] }),
                 "endpoints",
             ),
-            ("/v6/stream-sets", serde_json::json!([]), "stream-sets"),
+            ("/stream-sets", serde_json::json!([]), "stream-sets"),
             (
-                "/v6/stream-sets/studio-a",
+                "/stream-sets/studio-a",
                 serde_json::json!({ "owner": "studio-a", "streams": [] }),
                 "stream-set",
             ),
@@ -1568,7 +1566,7 @@ destinations:
     }
 
     #[tokio::test]
-    async fn plan_calls_the_versioned_route_with_auth_and_body() {
+    async fn plan_calls_the_route_with_auth_and_body() {
         let token = Token::new("cli-test-token").unwrap();
         let stream = StreamDefinition {
             name: "preview".to_string(),
@@ -1600,12 +1598,12 @@ destinations:
 
         assert_eq!(
             seen.lock().unwrap().as_deref(),
-            Some("POST /v6/stream-plans Bearer cli-test-token preview")
+            Some("POST /stream-plans Bearer cli-test-token preview")
         );
     }
 
     #[tokio::test]
-    async fn get_stream_calls_the_versioned_route_with_auth() {
+    async fn get_stream_calls_the_route_with_auth() {
         let token = Token::new("cli-test-token").unwrap();
         let resource = StreamResource {
             generation: 7,
@@ -1620,7 +1618,7 @@ destinations:
 
         assert_eq!(
             seen.lock().unwrap().as_slice(),
-            ["GET /v6/streams/cam1-to-studio Bearer cli-test-token - -"]
+            ["GET /streams/cam1-to-studio Bearer cli-test-token - -"]
         );
     }
 
@@ -1639,8 +1637,8 @@ destinations:
         assert_eq!(
             seen.lock().unwrap().as_slice(),
             [
-                "GET /v6/stream-sets/studio-a - - - -",
-                "PUT /v6/stream-sets/studio-a - * 1 true"
+                "GET /stream-sets/studio-a - - - -",
+                "PUT /stream-sets/studio-a - * 1 true"
             ]
         );
     }
@@ -1660,8 +1658,8 @@ destinations:
         assert_eq!(
             seen.lock().unwrap().as_slice(),
             [
-                "GET /v6/stream-sets/studio-a - - - -",
-                "PUT /v6/stream-sets/studio-a \"set-revision-7\" - 1 false"
+                "GET /stream-sets/studio-a - - - -",
+                "PUT /stream-sets/studio-a \"set-revision-7\" - 1 false"
             ]
         );
     }
@@ -1736,8 +1734,8 @@ destinations:
         assert_eq!(
             seen.lock().unwrap().as_slice(),
             [
-                "GET /v6/streams/cam1-to-studio Bearer cli-test-token - -",
-                "POST /v6/streams Bearer cli-test-token - *"
+                "GET /streams/cam1-to-studio Bearer cli-test-token - -",
+                "POST /streams Bearer cli-test-token - *"
             ]
         );
     }
@@ -1759,8 +1757,8 @@ destinations:
         assert_eq!(
             seen.lock().unwrap().as_slice(),
             [
-                "GET /v6/streams/cam1-to-studio Bearer cli-test-token - -",
-                "POST /v6/streams Bearer cli-test-token \"revision-7\" -"
+                "GET /streams/cam1-to-studio Bearer cli-test-token - -",
+                "POST /streams Bearer cli-test-token \"revision-7\" -"
             ]
         );
     }
@@ -1828,7 +1826,7 @@ destinations:
     }
 
     #[tokio::test]
-    async fn delete_calls_the_versioned_route_and_reports_an_unknown_stream() {
+    async fn delete_calls_the_route_and_reports_an_unknown_stream() {
         let token = Token::new("cli-test-token").unwrap();
 
         let resource = StreamResource {
@@ -1843,8 +1841,8 @@ destinations:
         assert_eq!(
             seen.lock().unwrap().as_slice(),
             [
-                "GET /v6/streams/cam1-to-studio Bearer cli-test-token - -",
-                "DELETE /v6/streams/cam1-to-studio Bearer cli-test-token \"revision-7\" -"
+                "GET /streams/cam1-to-studio Bearer cli-test-token - -",
+                "DELETE /streams/cam1-to-studio Bearer cli-test-token \"revision-7\" -"
             ]
         );
 

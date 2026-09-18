@@ -8,7 +8,7 @@
 //!
 //! Delivery is at-least-once: a receiver that answers late still gets a retry,
 //! and events are lost on a controller restart. A consumer reconciles against
-//! southbound `GET /v6/nodes` rather than treating the stream as complete.
+//! southbound `GET /nodes` rather than treating the stream as complete.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;

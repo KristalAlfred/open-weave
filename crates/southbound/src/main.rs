@@ -16,7 +16,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Guard, Token, require_bearer};
 use weave_core::{
-    API_PREFIX, ApiError, ApiErrorCode, ROUTE_ENDPOINTS, ROUTE_NODE_DESIRED, ROUTE_NODE_HEARTBEAT,
+    ApiError, ApiErrorCode, ROUTE_ENDPOINTS, ROUTE_NODE_DESIRED, ROUTE_NODE_HEARTBEAT,
     ROUTE_NODE_REGISTER, ROUTE_NODES, ROUTE_STATE, resource_id_issue, validate_resource_id,
 };
 
@@ -90,14 +90,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// The adapter contract is served under [`API_PREFIX`] — third-party adapters bind to
-/// it, so it is the surface that must stay stable within a version. `/health`
-/// stays unversioned and open for compose healthchecks and load balancers.
+/// `/health` stays open for compose healthchecks and load balancers.
 /// Everything else — registration, heartbeats, and the desired-state and topology
 /// reads — requires the southbound bearer token.
 ///
-/// A browser-hosted node calls this contract from a web page, so the versioned
-/// routes optionally carry CORS headers. The layer sits outside the bearer
+/// A browser-hosted node calls this contract from a web page, so API routes
+/// optionally carry CORS headers. The layer sits outside the bearer
 /// check: a preflight carries no `Authorization` header and must be answered
 /// before it, not refused by it.
 fn router(state: AppState, guard: Guard, cors: Option<CorsLayer>) -> Router {
@@ -117,7 +115,7 @@ fn router(state: AppState, guard: Guard, cors: Option<CorsLayer>) -> Router {
 
     Router::new()
         .route("/health", get(health))
-        .nest(API_PREFIX, nodes)
+        .merge(nodes)
         .with_state(state)
 }
 
@@ -199,18 +197,14 @@ async fn get_desired(State(state): State<AppState>, Path(node_id): Path<String>)
 }
 
 /// Forward a request to the controller, passing its status and body back
-/// faithfully. `path` is contract-relative: [`API_PREFIX`] is applied here, so the
-/// handlers name the same paths this service serves.
+/// faithfully. Handlers name the same paths this service serves.
 async fn proxy(
     state: &AppState,
     method: reqwest::Method,
     path: &str,
     body: Option<Bytes>,
 ) -> Response {
-    let url = format!(
-        "{}{API_PREFIX}{path}",
-        state.controller_url.trim_end_matches('/')
-    );
+    let url = format!("{}{path}", state.controller_url.trim_end_matches('/'));
     let mut request = state.http.request(method, &url);
     if let Some(token) = &state.token {
         request = request.header(reqwest::header::AUTHORIZATION, token.header_value());
@@ -366,7 +360,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("OPTIONS")
-                    .uri("/v6/nodes/register")
+                    .uri("/nodes/register")
                     .header("origin", PAGE)
                     .header("access-control-request-method", "POST")
                     .header(
@@ -405,7 +399,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v6/nodes/browser-a1b2/desired")
+                    .uri("/nodes/browser-a1b2/desired")
                     .header("origin", PAGE)
                     .header("authorization", format!("Bearer {TOKEN}"))
                     .body(Body::empty())
@@ -426,7 +420,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v6/nodes/browser-a1b2/desired")
+                    .uri("/nodes/browser-a1b2/desired")
                     .header("origin", "http://evil.example")
                     .header("authorization", format!("Bearer {TOKEN}"))
                     .body(Body::empty())
@@ -450,7 +444,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v6/nodes")
+                    .uri("/nodes")
                     .header("origin", "http://localhost:3000")
                     .header("authorization", format!("Bearer {TOKEN}"))
                     .body(Body::empty())
@@ -474,7 +468,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("OPTIONS")
-                    .uri("/v6/nodes/register")
+                    .uri("/nodes/register")
                     .header("origin", PAGE)
                     .header("access-control-request-method", "POST")
                     .body(Body::empty())
@@ -493,7 +487,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v6/nodes")
+                    .uri("/nodes")
                     .header("origin", PAGE)
                     .header("authorization", format!("Bearer {TOKEN}"))
                     .body(Body::empty())
@@ -528,7 +522,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v6/nodes/register")
+                    .uri("/nodes/register")
                     .header("content-type", "application/json")
                     .body(Body::from(serde_json::to_vec(&payload).unwrap()))
                     .unwrap(),
@@ -543,7 +537,7 @@ mod tests {
             .clone()
             .expect("controller saw a request");
         assert_eq!(seen.method, "POST");
-        assert_eq!(seen.path, "/v6/nodes/register");
+        assert_eq!(seen.path, "/nodes/register");
         let forwarded: Value = serde_json::from_slice(&seen.body).unwrap();
         assert_eq!(forwarded, payload);
     }
@@ -557,7 +551,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v6/nodes/strom-node-1/heartbeat")
+                    .uri("/nodes/strom-node-1/heartbeat")
                     .header("content-type", "application/json")
                     .body(Body::from(json!({ "node_id": "strom-node-1" }).to_string()))
                     .unwrap(),
@@ -572,7 +566,7 @@ mod tests {
             .clone()
             .expect("controller saw a request");
         assert_eq!(seen.method, "POST");
-        assert_eq!(seen.path, "/v6/nodes/strom-node-1/heartbeat");
+        assert_eq!(seen.path, "/nodes/strom-node-1/heartbeat");
     }
 
     #[tokio::test]
@@ -583,7 +577,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v6/nodes/strom-node-1/desired")
+                    .uri("/nodes/strom-node-1/desired")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -597,7 +591,7 @@ mod tests {
             .clone()
             .expect("controller saw a request");
         assert_eq!(seen.method, "GET");
-        assert_eq!(seen.path, "/v6/nodes/strom-node-1/desired");
+        assert_eq!(seen.path, "/nodes/strom-node-1/desired");
     }
 
     #[tokio::test]
@@ -606,7 +600,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v6/state")
+                    .uri("/state")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -621,8 +615,8 @@ mod tests {
         let app = open_app(url);
 
         for (method, uri) in [
-            ("POST", "/v6/nodes/foo%3Fignored/heartbeat"),
-            ("GET", "/v6/nodes/foo%3Fignored/desired"),
+            ("POST", "/nodes/foo%3Fignored/heartbeat"),
+            ("GET", "/nodes/foo%3Fignored/desired"),
         ] {
             let response = app
                 .clone()
@@ -649,13 +643,13 @@ mod tests {
         for (method, uri, expected_status, expected_code) in [
             (
                 "GET",
-                "/v6/no-such-route",
+                "/no-such-route",
                 StatusCode::NOT_FOUND,
                 "route_not_found",
             ),
             (
                 "PUT",
-                "/v6/nodes",
+                "/nodes",
                 StatusCode::METHOD_NOT_ALLOWED,
                 "method_not_allowed",
             ),
@@ -676,19 +670,13 @@ mod tests {
         }
     }
 
-    /// Unversioned and retired paths are gone: this is a clean break, not an alias.
+    /// Version-prefixed paths are not aliases for the current contract.
     #[tokio::test]
     async fn retired_node_paths_are_not_served() {
         let (url, captured) = stub_controller(StatusCode::OK).await;
         let app = open_app(url);
 
         for (method, uri) in [
-            ("POST", "/nodes/register"),
-            ("GET", "/nodes/strom-node-1/desired"),
-            ("POST", "/nodes/strom-node-1/heartbeat"),
-            ("GET", "/nodes"),
-            ("GET", "/endpoints"),
-            ("GET", "/state"),
             ("POST", "/v1/nodes/register"),
             ("GET", "/v1/nodes/strom-node-1/desired"),
             ("POST", "/v1/nodes/strom-node-1/heartbeat"),
@@ -719,6 +707,12 @@ mod tests {
             ("GET", "/v5/nodes"),
             ("GET", "/v5/endpoints"),
             ("GET", "/v5/state"),
+            ("POST", "/v6/nodes/register"),
+            ("GET", "/v6/nodes/strom-node-1/desired"),
+            ("POST", "/v6/nodes/strom-node-1/heartbeat"),
+            ("GET", "/v6/nodes"),
+            ("GET", "/v6/endpoints"),
+            ("GET", "/v6/state"),
         ] {
             let response = app
                 .clone()
@@ -764,12 +758,12 @@ mod tests {
             let app = guarded_app(url);
 
             for (method, uri) in [
-                ("POST", "/v6/nodes/register"),
-                ("GET", "/v6/nodes/strom-node-1/desired"),
-                ("POST", "/v6/nodes/strom-node-1/heartbeat"),
-                ("GET", "/v6/nodes"),
-                ("GET", "/v6/endpoints"),
-                ("GET", "/v6/state"),
+                ("POST", "/nodes/register"),
+                ("GET", "/nodes/strom-node-1/desired"),
+                ("POST", "/nodes/strom-node-1/heartbeat"),
+                ("GET", "/nodes"),
+                ("GET", "/endpoints"),
+                ("GET", "/state"),
             ] {
                 let mut request = Request::builder()
                     .method(method)
@@ -807,7 +801,7 @@ mod tests {
         let response = guarded_app(url)
             .oneshot(
                 Request::builder()
-                    .uri("/v6/nodes/strom-node-1/desired")
+                    .uri("/nodes/strom-node-1/desired")
                     .header("authorization", format!("Bearer {TOKEN}"))
                     .body(Body::empty())
                     .unwrap(),

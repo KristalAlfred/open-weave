@@ -94,7 +94,7 @@ console.log(`page open as ${nodeId}`);
 const deadline = Date.now() + 30_000;
 let seen = false;
 while (Date.now() < deadline) {
-  const response = await fetch(`${southbound}/v6/nodes`, {
+  const response = await fetch(`${southbound}/nodes`, {
     headers: token ? { authorization: `Bearer ${token}` } : {},
   }).catch(() => null);
   if (response && response.ok) {
@@ -107,7 +107,7 @@ while (Date.now() < deadline) {
   await new Promise(resolve => setTimeout(resolve, 1000));
 }
 if (!seen) {
-  console.error(`${nodeId} did not appear in ${southbound}/v6/nodes within 30s`);
+  console.error(`${nodeId} did not appear in ${southbound}/nodes within 30s`);
   await browser.close();
   process.exit(1);
 }
@@ -151,11 +151,6 @@ async function checkDeclaredConstants(required) {
       what: "protocol version",
       page: [/^const PROTOCOL_VERSION = (\d+);$/m, "const PROTOCOL_VERSION = <n>;"],
       core: [/^pub const PROTOCOL_VERSION: u32 = (\d+);$/m, "pub const PROTOCOL_VERSION: u32 = <n>;"],
-    },
-    {
-      what: "API prefix",
-      page: [/^const API_PREFIX = "([^"]+)";$/m, 'const API_PREFIX = "<path>";'],
-      core: [/^pub const API_PREFIX: &str = "([^"]+)";$/m, 'pub const API_PREFIX: &str = "<path>";'],
     },
     {
       what: "device transport",

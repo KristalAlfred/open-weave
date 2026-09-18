@@ -1981,11 +1981,11 @@
   },
   "info": {
     "title": "open-weave southbound API",
-    "version": "v6"
+    "version": "0.1.0"
   },
   "openapi": "3.1.0",
   "paths": {
-    "/v6/endpoints": {
+    "/endpoints": {
       "get": {
         "operationId": "listEndpoints",
         "responses": {
@@ -2022,7 +2022,7 @@
         }
       }
     },
-    "/v6/nodes": {
+    "/nodes": {
       "get": {
         "operationId": "listNodes",
         "responses": {
@@ -2059,7 +2059,7 @@
         }
       }
     },
-    "/v6/nodes/register": {
+    "/nodes/register": {
       "post": {
         "operationId": "registerNode",
         "requestBody": {
@@ -2136,7 +2136,7 @@
         }
       }
     },
-    "/v6/nodes/{node_id}/desired": {
+    "/nodes/{node_id}/desired": {
       "get": {
         "operationId": "getDesiredHops",
         "parameters": [
@@ -2196,7 +2196,7 @@
         }
       }
     },
-    "/v6/nodes/{node_id}/heartbeat": {
+    "/nodes/{node_id}/heartbeat": {
       "post": {
         "operationId": "heartbeatNode",
         "parameters": [
@@ -2276,7 +2276,7 @@
         }
       }
     },
-    "/v6/state": {
+    "/state": {
       "get": {
         "operationId": "getObservedState",
         "responses": {

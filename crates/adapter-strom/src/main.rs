@@ -16,11 +16,10 @@ use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Token};
 use weave_core::{
-    API_PREFIX, AdapterDescriptor, AdapterKind, DEFAULT_DATA_PLANE_ALIAS, DataPlaneAddr,
-    DesiredHop, DeviceSet, EgressStatus, EndpointDescriptor, EndpointKind, HopStatus,
-    LinkCondition, LinkStats, NodeCapabilities, NodeDescriptor, NodeHeartbeat, NodeRegistration,
-    NodeStatus, PROTOCOL_VERSION, SignallingTransport, SocketRole, SocketSpec, SocketStatus,
-    Transport,
+    AdapterDescriptor, AdapterKind, DEFAULT_DATA_PLANE_ALIAS, DataPlaneAddr, DesiredHop, DeviceSet,
+    EgressStatus, EndpointDescriptor, EndpointKind, HopStatus, LinkCondition, LinkStats,
+    NodeCapabilities, NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus,
+    PROTOCOL_VERSION, SignallingTransport, SocketRole, SocketSpec, SocketStatus, Transport,
 };
 use weave_strom::{
     FlowSpec, FlowStats, StromClient, StromError, StromFlow, flow_spec_from_hop, parse_flow_stats,
@@ -103,8 +102,6 @@ async fn main() -> Result<()> {
 /// presented on every request. Bundling them keeps the token from having to be
 /// threaded through the sync loop alongside the client.
 ///
-/// Call sites name contract-relative paths; [`API_PREFIX`] is applied in
-/// [`Southbound::join`], so the version prefix appears once.
 struct Southbound {
     http: Client,
     url: String,
@@ -137,7 +134,7 @@ impl Southbound {
     }
 
     fn join(&self, path: &str) -> String {
-        format!("{}{API_PREFIX}{path}", self.url.trim_end_matches('/'))
+        format!("{}{path}", self.url.trim_end_matches('/'))
     }
 }
 

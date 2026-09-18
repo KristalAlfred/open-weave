@@ -30,18 +30,6 @@ pub use validation::{
 /// Conventional data-plane alias resolved when a manifest pins no network.
 pub const DEFAULT_DATA_PLANE_ALIAS: &str = "default";
 
-/// Path prefix for the current control-plane HTTP contract. Servers nest their
-/// routes behind it and clients build their paths from it, so the literal exists
-/// once for the whole workspace. It changes for a breaking route, request,
-/// response, or error-shape change.
-///
-/// The operator (northbound) and adapter (southbound) contracts share one prefix:
-/// they are two halves of the same control plane and move to the next major together.
-///
-/// Outside it: `/health` on every service, which healthchecks and
-/// load balancers address directly, and the controller's `/`, `/ui`, and `/view` —
-/// the dashboard ships inside the controller binary and versions with it.
-pub const API_PREFIX: &str = "/v6";
 pub const ROUTE_ENDPOINTS: &str = "/endpoints";
 pub const ROUTE_NODES: &str = "/nodes";
 pub const ROUTE_NODE_DESIRED: &str = "/nodes/{node_id}/desired";
@@ -58,10 +46,8 @@ pub const ROUTE_STREAMS: &str = "/streams";
 
 /// Wire-protocol version an adapter declares when it registers.
 ///
-/// [`API_PREFIX`] tells an adapter *where* to send a request; this tells the
-/// controller *what* the adapter on the other end speaks, so a stale adapter is
-/// rejected at registration instead of being served desired state it cannot
-/// realise. This additionally changes when southbound behavior or payload
+/// A stale adapter is rejected at registration instead of being served desired
+/// state it cannot realise. This changes when southbound behavior or payload
 /// semantics become incompatible.
 pub const PROTOCOL_VERSION: u32 = 3;
 

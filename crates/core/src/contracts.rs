@@ -2,12 +2,12 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    API_PREFIX, ApiError, DesiredHop, EndpointDescriptor, NodeAccepted, NodeDescriptor,
-    NodeHeartbeat, NodeRegistration, ObservedState, ROUTE_ENDPOINTS, ROUTE_NODE_DESIRED,
-    ROUTE_NODE_HEARTBEAT, ROUTE_NODE_REGISTER, ROUTE_NODES, ROUTE_STATE, ROUTE_STATUS,
-    ROUTE_STREAM, ROUTE_STREAM_ENDPOINTS, ROUTE_STREAM_PLANS, ROUTE_STREAM_SET, ROUTE_STREAM_SETS,
-    ROUTE_STREAMS, StatusResponse, StreamAccepted, StreamDefinition, StreamEndpoints, StreamPlan,
-    StreamResource, StreamSetAccepted, StreamSetApply, StreamSetResource,
+    ApiError, DesiredHop, EndpointDescriptor, NodeAccepted, NodeDescriptor, NodeHeartbeat,
+    NodeRegistration, ObservedState, ROUTE_ENDPOINTS, ROUTE_NODE_DESIRED, ROUTE_NODE_HEARTBEAT,
+    ROUTE_NODE_REGISTER, ROUTE_NODES, ROUTE_STATE, ROUTE_STATUS, ROUTE_STREAM,
+    ROUTE_STREAM_ENDPOINTS, ROUTE_STREAM_PLANS, ROUTE_STREAM_SET, ROUTE_STREAM_SETS, ROUTE_STREAMS,
+    StatusResponse, StreamAccepted, StreamDefinition, StreamEndpoints, StreamPlan, StreamResource,
+    StreamSetAccepted, StreamSetApply, StreamSetResource,
 };
 
 pub struct ContractArtifact {
@@ -18,23 +18,23 @@ pub struct ContractArtifact {
 #[must_use]
 pub fn artifacts() -> Vec<ContractArtifact> {
     vec![
-        artifact("contracts/openapi/northbound-v6.json", northbound_openapi()),
-        artifact("contracts/openapi/southbound-v6.json", southbound_openapi()),
-        schema_artifact::<ApiError>("contracts/json-schema/v6/api-error.json"),
-        schema_artifact::<StatusResponse>("contracts/json-schema/v6/status-response.json"),
-        schema_artifact::<StreamAccepted>("contracts/json-schema/v6/stream-accepted.json"),
-        schema_artifact::<StreamDefinition>("contracts/json-schema/v6/stream-definition.json"),
-        schema_artifact::<StreamEndpoints>("contracts/json-schema/v6/stream-endpoints.json"),
-        schema_artifact::<StreamPlan>("contracts/json-schema/v6/stream-plan.json"),
-        schema_artifact::<StreamResource>("contracts/json-schema/v6/stream-resource.json"),
-        schema_artifact::<StreamSetAccepted>("contracts/json-schema/v6/stream-set-accepted.json"),
-        schema_artifact::<StreamSetApply>("contracts/json-schema/v6/stream-set-apply.json"),
-        schema_artifact::<StreamSetResource>("contracts/json-schema/v6/stream-set-resource.json"),
-        schema_artifact::<NodeAccepted>("contracts/json-schema/v6/node-accepted.json"),
-        schema_artifact::<NodeHeartbeat>("contracts/json-schema/v6/node-heartbeat.json"),
-        schema_artifact::<NodeRegistration>("contracts/json-schema/v6/node-registration.json"),
-        schema_artifact::<ObservedState>("contracts/json-schema/v6/observed-state.json"),
-        schema_artifact::<Vec<DesiredHop>>("contracts/json-schema/v6/desired-hops.json"),
+        artifact("contracts/openapi/northbound.json", northbound_openapi()),
+        artifact("contracts/openapi/southbound.json", southbound_openapi()),
+        schema_artifact::<ApiError>("contracts/json-schema/api-error.json"),
+        schema_artifact::<StatusResponse>("contracts/json-schema/status-response.json"),
+        schema_artifact::<StreamAccepted>("contracts/json-schema/stream-accepted.json"),
+        schema_artifact::<StreamDefinition>("contracts/json-schema/stream-definition.json"),
+        schema_artifact::<StreamEndpoints>("contracts/json-schema/stream-endpoints.json"),
+        schema_artifact::<StreamPlan>("contracts/json-schema/stream-plan.json"),
+        schema_artifact::<StreamResource>("contracts/json-schema/stream-resource.json"),
+        schema_artifact::<StreamSetAccepted>("contracts/json-schema/stream-set-accepted.json"),
+        schema_artifact::<StreamSetApply>("contracts/json-schema/stream-set-apply.json"),
+        schema_artifact::<StreamSetResource>("contracts/json-schema/stream-set-resource.json"),
+        schema_artifact::<NodeAccepted>("contracts/json-schema/node-accepted.json"),
+        schema_artifact::<NodeHeartbeat>("contracts/json-schema/node-heartbeat.json"),
+        schema_artifact::<NodeRegistration>("contracts/json-schema/node-registration.json"),
+        schema_artifact::<ObservedState>("contracts/json-schema/observed-state.json"),
+        schema_artifact::<Vec<DesiredHop>>("contracts/json-schema/desired-hops.json"),
     ]
 }
 
@@ -134,7 +134,7 @@ fn error_response(description: &str) -> Value {
 fn common_document(title: &str, paths: Value, components: Value) -> Value {
     json!({
         "openapi": "3.1.0",
-        "info": { "title": title, "version": &API_PREFIX[1..] },
+        "info": { "title": title, "version": env!("CARGO_PKG_VERSION") },
         "paths": paths,
         "components": components,
         "security": [{ "bearerAuth": [] }]
@@ -147,7 +147,7 @@ pub fn northbound_openapi() -> Value {
     common_document(
         "open-weave northbound API",
         json!({
-            format!("{API_PREFIX}{ROUTE_NODES}"): {
+            ROUTE_NODES: {
                 "get": {
                     "operationId": "listNodes",
                     "responses": {
@@ -157,7 +157,7 @@ pub fn northbound_openapi() -> Value {
                     }
                 }
             },
-            format!("{API_PREFIX}{ROUTE_STREAMS}"): {
+            ROUTE_STREAMS: {
                 "get": {
                     "operationId": "listStreams",
                     "responses": {
@@ -194,7 +194,7 @@ pub fn northbound_openapi() -> Value {
                     }
                 }
             },
-            format!("{API_PREFIX}{ROUTE_STREAM}"): {
+            ROUTE_STREAM: {
                 "get": {
                     "operationId": "getStream",
                     "parameters": [path_parameter("name")],
@@ -228,7 +228,7 @@ pub fn northbound_openapi() -> Value {
                     }
                 }
             },
-            format!("{API_PREFIX}{ROUTE_STREAM_ENDPOINTS}"): {
+            ROUTE_STREAM_ENDPOINTS: {
                 "get": {
                     "operationId": "getStreamEndpoints",
                     "parameters": [path_parameter("name")],
@@ -242,7 +242,7 @@ pub fn northbound_openapi() -> Value {
                     }
                 }
             },
-            format!("{API_PREFIX}{ROUTE_STREAM_SETS}"): {
+            ROUTE_STREAM_SETS: {
                 "get": {
                     "operationId": "listStreamSets",
                     "responses": {
@@ -252,7 +252,7 @@ pub fn northbound_openapi() -> Value {
                     }
                 }
             },
-            format!("{API_PREFIX}{ROUTE_STREAM_SET}"): {
+            ROUTE_STREAM_SET: {
                 "get": {
                     "operationId": "getStreamSet",
                     "parameters": [path_parameter("owner")],
@@ -293,7 +293,7 @@ pub fn northbound_openapi() -> Value {
                     }
                 }
             },
-            format!("{API_PREFIX}{ROUTE_STREAM_PLANS}"): {
+            ROUTE_STREAM_PLANS: {
                 "post": {
                     "operationId": "planStream",
                     "requestBody": request_body("StreamDefinition"),
@@ -306,7 +306,7 @@ pub fn northbound_openapi() -> Value {
                     }
                 }
             },
-            format!("{API_PREFIX}{ROUTE_STATUS}"): {
+            ROUTE_STATUS: {
                 "get": {
                     "operationId": "getStatus",
                     "responses": {
@@ -341,7 +341,7 @@ pub fn southbound_openapi() -> Value {
     common_document(
         "open-weave southbound API",
         json!({
-            format!("{API_PREFIX}{ROUTE_NODES}"): {
+            ROUTE_NODES: {
                 "get": {
                     "operationId": "listNodes",
                     "responses": {
@@ -351,7 +351,7 @@ pub fn southbound_openapi() -> Value {
                     }
                 }
             },
-            format!("{API_PREFIX}{ROUTE_NODE_REGISTER}"): {
+            ROUTE_NODE_REGISTER: {
                 "post": {
                     "operationId": "registerNode",
                     "requestBody": request_body("NodeRegistration"),
@@ -365,7 +365,7 @@ pub fn southbound_openapi() -> Value {
                     }
                 }
             },
-            format!("{API_PREFIX}{ROUTE_NODE_HEARTBEAT}"): {
+            ROUTE_NODE_HEARTBEAT: {
                 "post": {
                     "operationId": "heartbeatNode",
                     "parameters": [path_parameter("node_id")],
@@ -379,7 +379,7 @@ pub fn southbound_openapi() -> Value {
                     }
                 }
             },
-            format!("{API_PREFIX}{ROUTE_NODE_DESIRED}"): {
+            ROUTE_NODE_DESIRED: {
                 "get": {
                     "operationId": "getDesiredHops",
                     "parameters": [path_parameter("node_id")],
@@ -391,7 +391,7 @@ pub fn southbound_openapi() -> Value {
                     }
                 }
             },
-            format!("{API_PREFIX}{ROUTE_ENDPOINTS}"): {
+            ROUTE_ENDPOINTS: {
                 "get": {
                     "operationId": "listEndpoints",
                     "responses": {
@@ -401,7 +401,7 @@ pub fn southbound_openapi() -> Value {
                     }
                 }
             },
-            format!("{API_PREFIX}{ROUTE_STATE}"): {
+            ROUTE_STATE: {
                 "get": {
                     "operationId": "getObservedState",
                     "responses": {
@@ -441,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn openapi_documents_cover_the_versioned_routes() {
+    fn openapi_documents_cover_the_api_routes() {
         let north = northbound_openapi();
         let south = southbound_openapi();
         assert_eq!(north["openapi"], "3.1.0");
@@ -449,7 +449,7 @@ mod tests {
         assert_eq!(north["security"][0]["bearerAuth"], json!([]));
         assert_eq!(south["security"][0]["bearerAuth"], json!([]));
         assert_eq!(
-            north["paths"]["/v6/streams/{name}"]
+            north["paths"]["/streams/{name}"]
                 .as_object()
                 .unwrap()
                 .keys()
@@ -462,14 +462,14 @@ mod tests {
         assert_eq!(
             north_paths.keys().copied().collect::<Vec<_>>(),
             [
-                "/v6/nodes",
-                "/v6/status",
-                "/v6/stream-plans",
-                "/v6/stream-sets",
-                "/v6/stream-sets/{owner}",
-                "/v6/streams",
-                "/v6/streams/{name}",
-                "/v6/streams/{name}/endpoints"
+                "/nodes",
+                "/status",
+                "/stream-plans",
+                "/stream-sets",
+                "/stream-sets/{owner}",
+                "/streams",
+                "/streams/{name}",
+                "/streams/{name}/endpoints"
             ]
         );
 
@@ -477,12 +477,12 @@ mod tests {
         assert_eq!(
             south_paths.keys().copied().collect::<Vec<_>>(),
             [
-                "/v6/endpoints",
-                "/v6/nodes",
-                "/v6/nodes/register",
-                "/v6/nodes/{node_id}/desired",
-                "/v6/nodes/{node_id}/heartbeat",
-                "/v6/state"
+                "/endpoints",
+                "/nodes",
+                "/nodes/register",
+                "/nodes/{node_id}/desired",
+                "/nodes/{node_id}/heartbeat",
+                "/state"
             ]
         );
     }
@@ -497,7 +497,7 @@ mod tests {
     #[test]
     fn northbound_contract_exposes_node_inventory() {
         let document = northbound_openapi();
-        let nodes = &document["paths"]["/v6/nodes"]["get"];
+        let nodes = &document["paths"]["/nodes"]["get"];
 
         assert_eq!(nodes["operationId"], "listNodes");
         assert_eq!(
@@ -512,8 +512,8 @@ mod tests {
     #[test]
     fn northbound_contract_exposes_resource_revisions() {
         let document = northbound_openapi();
-        let apply = &document["paths"]["/v6/streams"]["post"];
-        let stream = &document["paths"]["/v6/streams/{name}"];
+        let apply = &document["paths"]["/streams"]["post"];
+        let stream = &document["paths"]["/streams/{name}"];
 
         assert_eq!(
             stream["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
@@ -530,8 +530,8 @@ mod tests {
     #[test]
     fn northbound_contract_exposes_atomic_stream_sets() {
         let document = northbound_openapi();
-        let sets = &document["paths"]["/v6/stream-sets"];
-        let set = &document["paths"]["/v6/stream-sets/{owner}"];
+        let sets = &document["paths"]["/stream-sets"];
+        let set = &document["paths"]["/stream-sets/{owner}"];
 
         assert!(sets["get"].is_object());
         assert_eq!(set["get"]["parameters"][0]["name"], "owner");
