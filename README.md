@@ -243,6 +243,18 @@ fan-out is `flowing` only when every hop ingress and every egress branch is
 flowing. Reordering destinations changes their ids because destinations do not
 yet have user-supplied identities.
 
+### Manifest validation
+
+The controller is the authority for stream validation. Northbound runs the same
+shared validator to give early feedback, but a client that posts directly to the
+controller cannot bypass the rules. Invalid submissions return `400` and are not
+stored. If persisted desired state no longer passes the current contract, the
+controller refuses to start and names the stream, field, and validation error.
+
+Validation collects field-addressed issues internally. The current HTTP error
+shape returns the first message; structured error details are tracked separately.
+Top-level and endpoint payloads reject unknown fields.
+
 ## Authentication
 
 Each API surface is protected by one shared bearer token, supplied through the

@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod media;
+pub mod validation;
 pub mod webhook;
 
 use std::{collections::BTreeMap, ops::Deref};
@@ -12,6 +13,7 @@ pub use media::{
     AudioCodec, AudioConstraint, AudioFormat, ChromaSubsampling, Container, FormatConstraint,
     Framerate, MediaFormat, Mismatch, VideoCodec, VideoConstraint, VideoFormat,
 };
+pub use validation::{ValidationIssue, validate_stream};
 
 /// Conventional data-plane alias resolved when a manifest pins no network.
 pub const DEFAULT_DATA_PLANE_ALIAS: &str = "default";
@@ -22,7 +24,7 @@ pub const DEFAULT_DATA_PLANE_ALIAS: &str = "default";
 /// response, or error-shape change.
 ///
 /// The operator (northbound) and adapter (southbound) contracts share one prefix:
-/// they are two halves of the same control plane and move to a `/v2` together.
+/// they are two halves of the same control plane and move to the next major together.
 ///
 /// Outside it: `/health` on every service, which healthchecks and
 /// load balancers address directly, and the controller's `/`, `/ui`, and `/view` —
@@ -50,6 +52,7 @@ pub fn protocol_compatible(version: u32) -> bool {
 
 /// Operator intent: one source streamed to one or more destinations over a transport.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StreamDefinition {
     pub name: String,
     #[serde(default = "default_enabled")]

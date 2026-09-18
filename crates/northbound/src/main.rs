@@ -14,7 +14,7 @@ use axum::{
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Guard, Token, require_bearer};
-use weave_core::{API_PREFIX, FormatConstraint, SrtEndpoint, StreamDefinition, StreamTransport};
+use weave_core::{API_PREFIX, StreamDefinition, validate_stream};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:9080";
 const DEFAULT_CONTROLLER_URL: &str = "http://127.0.0.1:8082";
@@ -103,22 +103,8 @@ async fn submit_stream(
     State(state): State<AppState>,
     Json(stream): Json<StreamDefinition>,
 ) -> Response {
-    if stream.name.trim().is_empty() {
-        return error(StatusCode::BAD_REQUEST, "stream name must not be empty");
-    }
-    if stream.destinations.is_empty() {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "stream must have at least one destination",
-        );
-    }
-    if let Err(message) = validate_transport(&stream.source, true) {
-        return error(StatusCode::BAD_REQUEST, message);
-    }
-    for dest in &stream.destinations {
-        if let Err(message) = validate_transport(dest, false) {
-            return error(StatusCode::BAD_REQUEST, message);
-        }
+    if let Some(issue) = validate_stream(&stream).into_iter().next() {
+        return error(StatusCode::BAD_REQUEST, &issue.message);
     }
 
     let body = match serde_json::to_vec(&stream) {
@@ -157,96 +143,6 @@ async fn get_status(State(state): State<AppState>) -> Response {
 
 fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
-}
-
-/// A `device` endpoint is a node and nothing else, so its only invariant is a
-/// usable node id; the fields an SRT endpoint carries are rejected by serde.
-fn validate_transport(endpoint: &StreamTransport, is_source: bool) -> Result<(), &'static str> {
-    match endpoint {
-        StreamTransport::Srt(endpoint) => validate_endpoint(endpoint, is_source),
-        StreamTransport::Device(endpoint) if endpoint.node.trim().is_empty() => {
-            Err("device node must not be empty")
-        }
-        StreamTransport::Device(_) => Ok(()),
-    }
-}
-
-/// Enforce node-XOR-remote on an endpoint: exactly one of `node`/`remote` must be
-/// set, a present node must be non-empty, a present remote must name a host, and a
-/// source may not be remote. `via` names transit for a destination only, so a
-/// source may not pin it and its entries must be usable node ids.
-fn validate_endpoint(endpoint: &SrtEndpoint, is_source: bool) -> Result<(), &'static str> {
-    validate_via(endpoint, is_source)?;
-    validate_format(endpoint, is_source)?;
-    match (&endpoint.node, &endpoint.remote) {
-        (Some(_), Some(_)) => Err("endpoint must set either node or remote, not both"),
-        (None, None) => Err("endpoint must set either node or remote"),
-        (Some(node), None) if node.trim().is_empty() => Err("node must not be empty"),
-        (Some(_), None) => Ok(()),
-        (None, Some(_)) if is_source => Err("source must be a node, not a remote endpoint"),
-        (None, Some(remote)) if remote.host.trim().is_empty() => {
-            Err("remote host must not be empty")
-        }
-        (None, Some(_)) => Ok(()),
-    }
-}
-
-fn validate_via(endpoint: &SrtEndpoint, is_source: bool) -> Result<(), &'static str> {
-    if endpoint.via.is_empty() {
-        return Ok(());
-    }
-    if is_source {
-        return Err("via belongs on a destination, not the source");
-    }
-    if endpoint.via.iter().any(|node| node.trim().is_empty()) {
-        return Err("via must not contain an empty node id");
-    }
-    // A relay appearing twice would place two bridges on one node for the same
-    // destination, which is never what a pin means.
-    let mut seen = std::collections::HashSet::new();
-    if !endpoint.via.iter().all(|node| seen.insert(node.as_str())) {
-        return Err("via must not repeat a node");
-    }
-    Ok(())
-}
-
-/// `format` describes what arrives, so it belongs to the source; `accepts`
-/// describes what an endpoint tolerates, so it belongs to a destination. An
-/// empty accepted list would reject every format, which is never what an
-/// operator means to write, so it is refused rather than left to surface later
-/// as an unexplainable mismatch.
-fn validate_format(endpoint: &SrtEndpoint, is_source: bool) -> Result<(), &'static str> {
-    if is_source && endpoint.accepts.is_some() {
-        return Err("accepts belongs on a destination, not the source");
-    }
-    if !is_source && endpoint.format.is_some() {
-        return Err("format belongs on the source, not a destination");
-    }
-    match &endpoint.accepts {
-        Some(accepts) if has_empty_value_set(accepts) => {
-            Err("accepts must not contain an empty list of values")
-        }
-        _ => Ok(()),
-    }
-}
-
-fn has_empty_value_set(accepts: &FormatConstraint) -> bool {
-    fn empty<T>(values: &Option<Vec<T>>) -> bool {
-        values.as_ref().is_some_and(Vec::is_empty)
-    }
-
-    let video = accepts.video.clone().unwrap_or_default();
-    let audio = accepts.audio.clone().unwrap_or_default();
-
-    empty(&accepts.container)
-        || empty(&video.codec)
-        || empty(&video.width)
-        || empty(&video.height)
-        || empty(&video.framerate)
-        || empty(&video.chroma_subsampling)
-        || empty(&audio.codec)
-        || empty(&audio.sample_rate)
-        || empty(&audio.channels)
 }
 
 /// Forward a request to the controller, passing its status and body back
@@ -305,7 +201,7 @@ mod tests {
     use http_body_util::BodyExt;
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
-    use weave_core::RemoteAddr;
+    use weave_core::{RemoteAddr, SrtEndpoint, StreamTransport};
 
     const TOKEN: &str = "northbound-test-token";
 
@@ -614,78 +510,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await["error"],
+            "endpoint must set either node or remote, not both"
+        );
         assert!(
             captured.lock().unwrap().is_none(),
             "invalid stream never reaches the controller"
-        );
-    }
-
-    #[test]
-    fn via_is_accepted_on_a_destination_and_refused_on_a_source() {
-        let mut dest = node_ref("strom-node-2");
-        dest.via = vec!["edge-relay".to_string()];
-        assert_eq!(validate_endpoint(&dest, false), Ok(()));
-        assert_eq!(
-            validate_endpoint(&dest, true),
-            Err("via belongs on a destination, not the source")
-        );
-    }
-
-    #[test]
-    fn format_belongs_to_the_source_and_accepts_to_a_destination() {
-        let mut source = node_ref("strom-node-1");
-        source.format = Some(weave_core::MediaFormat {
-            container: weave_core::Container::MpegTs,
-            video: None,
-            audio: None,
-        });
-        assert_eq!(validate_endpoint(&source, true), Ok(()));
-        assert_eq!(
-            validate_endpoint(&source, false),
-            Err("format belongs on the source, not a destination")
-        );
-
-        let mut dest = node_ref("strom-node-2");
-        dest.accepts = Some(FormatConstraint::default());
-        assert_eq!(validate_endpoint(&dest, false), Ok(()));
-        assert_eq!(
-            validate_endpoint(&dest, true),
-            Err("accepts belongs on a destination, not the source")
-        );
-    }
-
-    #[test]
-    fn an_empty_accepted_list_is_rejected() {
-        // `sample_rate: []` accepts nothing at all, so every stream into this
-        // destination would conflict for a reason the operator never intended.
-        let mut dest = node_ref("strom-node-2");
-        dest.accepts = Some(FormatConstraint {
-            audio: Some(weave_core::AudioConstraint {
-                sample_rate: Some(Vec::new()),
-                ..weave_core::AudioConstraint::default()
-            }),
-            ..FormatConstraint::default()
-        });
-        assert_eq!(
-            validate_endpoint(&dest, false),
-            Err("accepts must not contain an empty list of values")
-        );
-    }
-
-    #[test]
-    fn via_rejects_blank_and_repeated_entries() {
-        let mut blank = node_ref("strom-node-2");
-        blank.via = vec!["  ".to_string()];
-        assert_eq!(
-            validate_endpoint(&blank, false),
-            Err("via must not contain an empty node id")
-        );
-
-        let mut repeated = node_ref("strom-node-2");
-        repeated.via = vec!["edge-relay".to_string(), "edge-relay".to_string()];
-        assert_eq!(
-            validate_endpoint(&repeated, false),
-            Err("via must not repeat a node")
         );
     }
 

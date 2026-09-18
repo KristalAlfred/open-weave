@@ -30,7 +30,7 @@ use weave_core::webhook::{EventType, NodeSummary};
 use weave_core::{
     API_PREFIX, DesiredHop, EndpointDescriptor, HopStatus, NodeDescriptor, NodeHeartbeat,
     NodeRegistration, NodeStatus, ObservedState, PROTOCOL_VERSION, PathStatus, ReconcileReport,
-    ReconcileStatus, StreamDefinition, protocol_compatible,
+    ReconcileStatus, StreamDefinition, protocol_compatible, validate_stream,
 };
 
 use path::{PortAllocator, StreamEndpoints, derive_path, path_status, stream_endpoints};
@@ -93,10 +93,18 @@ impl AppState {
         node_ttl: Duration,
         webhooks: Option<Arc<webhook::Emitter>>,
     ) -> Result<Self> {
-        let streams = store
-            .load_streams()
-            .await
-            .context("hydrating streams")?
+        let loaded_streams = store.load_streams().await.context("hydrating streams")?;
+        for stream in &loaded_streams {
+            if let Some(issue) = validate_stream(stream).into_iter().next() {
+                anyhow::bail!(
+                    "stored stream {:?} is invalid at {}: {}",
+                    stream.name,
+                    issue.field,
+                    issue.message
+                );
+            }
+        }
+        let streams = loaded_streams
             .into_iter()
             .map(|stream| (stream.name.clone(), stream))
             .collect();
@@ -584,8 +592,8 @@ async fn submit_stream(
     State(state): State<AppState>,
     Json(stream): Json<StreamDefinition>,
 ) -> Response {
-    if stream.name.trim().is_empty() {
-        return error(StatusCode::BAD_REQUEST, "stream name must not be empty");
+    if let Some(issue) = validate_stream(&stream).into_iter().next() {
+        return error(StatusCode::BAD_REQUEST, &issue.message);
     }
     let name = stream.name.clone();
     {
@@ -1122,6 +1130,57 @@ mod tests {
             "stream was written through the store"
         );
         assert_eq!(mem.load_streams().await.unwrap(), vec![stream("basic")]);
+    }
+
+    #[tokio::test]
+    async fn invalid_stream_is_rejected_before_persistence() {
+        let (state, mem) = mem_state();
+        let app = open_router(state);
+        let mut invalid = stream("invalid");
+        let StreamTransport::Srt(destination) = &mut invalid.destinations[0] else {
+            unreachable!()
+        };
+        destination.remote = Some(weave_core::RemoteAddr {
+            host: "example.test".to_string(),
+            port: 9000,
+        });
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v2/streams",
+            Some(serde_json::to_value(invalid).unwrap()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"],
+            "endpoint must set either node or remote, not both"
+        );
+        assert_eq!(mem.upsert_stream_calls(), 0);
+
+        let (_, body) = send(&app, "GET", "/v2/streams", None).await;
+        let listed: Vec<StreamDefinition> = serde_json::from_value(body).unwrap();
+        assert!(listed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hydration_refuses_invalid_persisted_streams() {
+        let mem = Arc::new(MemStore::new());
+        let mut invalid = stream("broken");
+        invalid.destinations.clear();
+        mem.upsert_stream(&invalid).await.unwrap();
+
+        let error = AppState::hydrate(mem, Duration::from_secs(15), None)
+            .await
+            .err()
+            .expect("invalid stored stream must prevent startup");
+
+        assert_eq!(
+            error.to_string(),
+            "stored stream \"broken\" is invalid at destinations: stream must have at least one destination"
+        );
     }
 
     #[tokio::test]
