@@ -121,13 +121,17 @@ fn shape(spec: &SocketSpec) -> Shape {
 /// shape: one flow carries one egress shape.
 fn sole_egress(hop: &DesiredHop) -> Result<&SocketSpec, MappingError> {
     let first = hop.egresses.first().ok_or(MappingError::NoEgress)?;
-    match hop.egresses.iter().find(|e| shape(e) != shape(first)) {
+    match hop
+        .egresses
+        .iter()
+        .find(|egress| shape(&egress.socket) != shape(&first.socket))
+    {
         Some(other) => Err(MappingError::MixedEgress {
             ingress: hop.ingress.to_string(),
-            first: first.to_string(),
-            second: other.to_string(),
+            first: first.socket.to_string(),
+            second: other.socket.to_string(),
         }),
-        None => Ok(first),
+        None => Ok(&first.socket),
     }
 }
 
@@ -137,7 +141,7 @@ fn srt_relay_flow(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
     let mut sinks = hop
         .egresses
         .iter()
-        .map(|egress| srt_socket(egress).map(sink_props))
+        .map(|egress| srt_socket(&egress.socket).map(sink_props))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(if sinks.len() == 1 {
@@ -326,8 +330,11 @@ fn whip_to_srt_flow(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
     for (i, (egress, (video, audio))) in hop.egresses.iter().zip(branches).enumerate() {
         let id = format!("srt_out_{i}");
         let y = 200.0 + (i as f64) * 150.0;
-        spec.blocks
-            .push(mpegtssrt_output_block(&id, srt_socket(egress)?, [800.0, y]));
+        spec.blocks.push(mpegtssrt_output_block(
+            &id,
+            srt_socket(&egress.socket)?,
+            [800.0, y],
+        ));
         spec.links.push(link(&video, &format!("{id}:video_in")));
         spec.links.push(link(&audio, &format!("{id}:audio_in_0")));
     }
@@ -350,7 +357,7 @@ fn srt_to_whep_flow(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
         let y = 200.0 + (i as f64) * 150.0;
         spec.blocks.push(whep_output_block(
             &id,
-            signalling_socket(egress)?,
+            signalling_socket(&egress.socket)?,
             [800.0, y],
         ));
         spec.links.push(link(&video, &format!("{id}:video_in")));
@@ -509,8 +516,16 @@ fn tee_srt_flow(
 mod tests {
     use super::*;
     use weave_core::{
-        DeviceKind, HopRole, SignallingSocket, SignallingTransport, SocketRole, SrtParams,
+        DesiredEgress, DeviceKind, HopRole, SignallingSocket, SignallingTransport, SocketRole,
+        SrtParams,
     };
+
+    fn egress(branch_id: &str, socket: SocketSpec) -> DesiredEgress {
+        DesiredEgress {
+            branch_id: branch_id.to_string(),
+            socket,
+        }
+    }
 
     fn demo_ingress_hop(id: &str) -> DesiredHop {
         DesiredHop {
@@ -518,7 +533,10 @@ mod tests {
             node_id: "strom-node-1".to_string(),
             role: HopRole::Sender,
             ingress: SocketSpec::srt_listen(7001, 200),
-            egresses: vec![SocketSpec::srt_connect("172.31.0.10", 7002, 1000)],
+            egresses: vec![egress(
+                "destination-0",
+                SocketSpec::srt_connect("172.31.0.10", 7002, 1000),
+            )],
         }
     }
 
@@ -528,7 +546,7 @@ mod tests {
             node_id: "strom-node-2".to_string(),
             role: HopRole::Receiver,
             ingress: SocketSpec::srt_listen(7002, 1000),
-            egresses: vec![SocketSpec::srt_listen(7003, 200)],
+            egresses: vec![egress("destination-0", SocketSpec::srt_listen(7003, 200))],
         }
     }
 
@@ -556,8 +574,10 @@ mod tests {
 
     fn demo_tee_hop(id: &str) -> DesiredHop {
         let mut hop = demo_ingress_hop(id);
-        hop.egresses
-            .push(SocketSpec::srt_connect("172.31.0.20", 7002, 1000));
+        hop.egresses.push(egress(
+            "destination-1",
+            SocketSpec::srt_connect("172.31.0.20", 7002, 1000),
+        ));
         hop
     }
 
@@ -598,11 +618,14 @@ mod tests {
         );
 
         let mut pushed = demo_ingress_hop("x");
-        pushed.egresses = vec![SocketSpec::signalling(
-            SignallingTransport::Whip,
-            SocketRole::Connect,
-            "http://172.26.0.10:8080/whip",
-            "x",
+        pushed.egresses = vec![egress(
+            "destination-0",
+            SocketSpec::signalling(
+                SignallingTransport::Whip,
+                SocketRole::Connect,
+                "http://172.26.0.10:8080/whip",
+                "x",
+            ),
         )];
         let error = flow_spec_from_hop(&pushed).expect_err("Strom cannot push WHIP out");
         assert_eq!(
@@ -673,7 +696,7 @@ mod tests {
             node_id: "strom-node-2".to_string(),
             role: HopRole::Receiver,
             ingress: whip_socket(SocketRole::Listen, "weave-alice-cam-receiver-0"),
-            egresses: vec![SocketSpec::srt_listen(7003, 200)],
+            egresses: vec![egress("destination-0", SocketSpec::srt_listen(7003, 200))],
         }
     }
 
@@ -685,9 +708,9 @@ mod tests {
             node_id: "strom-node-2".to_string(),
             role: HopRole::Sender,
             ingress: SocketSpec::srt_listen(7001, 200),
-            egresses: vec![whep_socket(
-                SocketRole::Listen,
-                "weave-alice-return-receiver-0",
+            egresses: vec![egress(
+                "destination-0",
+                whep_socket(SocketRole::Listen, "weave-alice-return-receiver-0"),
             )],
         }
     }
@@ -738,7 +761,10 @@ mod tests {
     #[test]
     fn a_hop_with_webrtc_on_both_sides_is_refused() {
         let mut hop = whip_gateway_hop();
-        hop.egresses = vec![whep_socket(SocketRole::Listen, "weave-relayed-receiver-0")];
+        hop.egresses = vec![egress(
+            "destination-0",
+            whep_socket(SocketRole::Listen, "weave-relayed-receiver-0"),
+        )];
         let error = flow_spec_from_hop(&hop).expect_err("no SRT side to read progress from");
         assert_eq!(
             error.to_string(),
@@ -751,9 +777,9 @@ mod tests {
     #[test]
     fn whep_fanout_tees_decoded_video_and_audio_through_queues() {
         let mut hop = whep_gateway_hop();
-        hop.egresses.push(whep_socket(
-            SocketRole::Listen,
-            "weave-alice-return-receiver-1",
+        hop.egresses.push(egress(
+            "destination-1",
+            whep_socket(SocketRole::Listen, "weave-alice-return-receiver-1"),
         ));
         let spec = flow_spec_from_hop(&hop).expect("map");
 
@@ -788,8 +814,10 @@ mod tests {
     #[test]
     fn mixed_egress_transports_are_an_error() {
         let mut hop = whep_gateway_hop();
-        hop.egresses
-            .push(SocketSpec::srt_connect("172.26.0.10", 7002, 1000));
+        hop.egresses.push(egress(
+            "destination-1",
+            SocketSpec::srt_connect("172.26.0.10", 7002, 1000),
+        ));
         let error = flow_spec_from_hop(&hop).expect_err("one flow carries one egress shape");
         assert_eq!(
             error.to_string(),
@@ -814,7 +842,7 @@ mod tests {
             port: 7001,
             params: SrtParams::default(),
         });
-        hop.egresses[0] = SocketSpec::Srt(SrtSocket::Connect {
+        hop.egresses[0].socket = SocketSpec::Srt(SrtSocket::Connect {
             host: "172.31.0.10".to_string(),
             port: 7002,
             params: SrtParams::default(),

@@ -2,7 +2,7 @@
 
 // Must equal weave_core::PROTOCOL_VERSION; check.mjs reads this line and
 // compares it with the constant in crates/core.
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
 const API_V1 = "/v1";
 const HEARTBEAT_MS = 5000;
 const POLL_MS = 2000;
@@ -206,11 +206,18 @@ function socketName(socket) {
 
 class Hop {
   static from(spec) {
+    if (spec.egresses.length !== 1) {
+      const branches = spec.egresses.map(egress => egress.branch_id).join(", ") || "none";
+      return new UnsupportedHop(
+        spec,
+        `this node supports one egress per hop, not ${spec.egresses.length} (${branches})`,
+      );
+    }
     const egress = spec.egresses[0];
-    if (spec.ingress.transport === DEVICE_TRANSPORT && egress && egress.transport === "whip") {
+    if (spec.ingress.transport === DEVICE_TRANSPORT && egress.transport === "whip") {
       return new SenderHop(spec);
     }
-    if (spec.ingress.transport === "whep" && egress && egress.transport === DEVICE_TRANSPORT) {
+    if (spec.ingress.transport === "whep" && egress.transport === DEVICE_TRANSPORT) {
       return new ReceiverHop(spec);
     }
     return new UnsupportedHop(spec);
@@ -334,8 +341,7 @@ class Hop {
     this.progress.observe(this.sending ? totals.bytesSent : totals.bytesReceived);
     this.stats = {
       connections: this.connected ? 1 : 0,
-      ingress_rate_mbps: this.sending ? 0 : this.progress.rateMbps,
-      egress_rate_mbps: this.sending ? this.progress.rateMbps : 0,
+      rate_mbps: this.progress.rateMbps,
       packets_sent_lost: totals.sentLost,
       packets_retransmitted: totals.retransmittedSent,
       packets_received_lost: totals.packetsLost,
@@ -344,14 +350,22 @@ class Hop {
   }
 
   status() {
+    const ingress = { condition: this.ingressCondition() };
+    const egresses = this.spec.egresses.map((egress, index) => ({
+      branch_id: egress.branch_id,
+      condition: this.egressCondition(egress, index),
+    }));
+    if (this.stats) {
+      if (this.sending && egresses[0]) egresses[0].stats = this.stats;
+      else ingress.stats = this.stats;
+    }
     const status = {
       id: this.spec.id,
       node_id: nodeId,
       state: this.state(),
-      ingress: this.ingressCondition(),
-      egress: this.egressCondition(),
+      ingress,
+      egresses,
     };
-    if (this.stats) status.stats = this.stats;
     return status;
   }
 }
@@ -438,8 +452,15 @@ class ReceiverHop extends Hop {
 }
 
 class UnsupportedHop extends Hop {
+  constructor(spec, reason = null) {
+    super(spec);
+    this.reason = reason;
+  }
+
   async start() {
-    this.error = `this node realises device→whip and whep→device only, not ${socketName(this.spec.ingress)}→${socketName(this.spec.egresses[0])}`;
+    const egresses = this.spec.egresses.map(socketName).join(", ") || "nothing";
+    const unsupported = `this node realises device→whip and whep→device only, not ${socketName(this.spec.ingress)}→${egresses}`;
+    this.error = this.reason || unsupported;
     log(`${this.spec.id}: ${this.error}`);
     render();
   }
@@ -547,16 +568,24 @@ function render() {
     row.append(
       el("span", "id", hop.spec.id),
       el("span", `pill ${status.state}`, status.state),
-      el("span", "cond", `${hop.spec.ingress.transport} ${status.ingress}`),
-      el("span", "arrow", "→"),
-      el("span", "cond", `${(hop.spec.egresses[0] || {}).transport || "?"} ${status.egress}`),
+      el("span", "cond", `${hop.spec.ingress.transport} ${status.ingress.condition}`),
     );
+    for (const [index, egress] of hop.spec.egresses.entries()) {
+      row.append(
+        el("span", "arrow", "→"),
+        el(
+          "span",
+          "cond",
+          `${egress.transport} ${status.egresses[index].condition} (${egress.branch_id})`,
+        ),
+      );
+    }
     if (hop.stream) {
       row.append(el("span", "cond", hop.stream.getTracks().map(t => t.kind).join("+")));
     }
-    if (status.stats) {
-      const rate = hop.sending ? status.stats.egress_rate_mbps : status.stats.ingress_rate_mbps;
-      row.append(el("span", "rate", `${rate.toFixed(2)} Mb/s`));
+    const stats = hop.sending ? status.egresses[0]?.stats : status.ingress.stats;
+    if (stats) {
+      row.append(el("span", "rate", `${stats.rate_mbps.toFixed(2)} Mb/s`));
       if (hop.codecs && hop.codecs.length) row.append(el("span", "rate", hop.codecs.join(" ")));
     }
     if (hop.error) row.append(el("span", "err", hop.error));

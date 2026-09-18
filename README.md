@@ -141,7 +141,7 @@ notice a stale adapter. So `POST /v1/nodes/register` also carries a
 `protocol_version` field, which adapters set from `weave_core::PROTOCOL_VERSION`:
 
 ```json
-{ "protocol_version": 2, "node": { "id": "strom-node-1", "...": "..." } }
+{ "protocol_version": 3, "node": { "id": "strom-node-1", "...": "..." } }
 ```
 
 The controller accepts only the version it speaks. Anything else — including an
@@ -154,7 +154,7 @@ naming the node id:
   "error": "incompatible southbound protocol version",
   "node_id": "strom-node-1",
   "reported_protocol_version": 1,
-  "supported_protocol_version": 2
+  "supported_protocol_version": 3
 }
 ```
 
@@ -163,9 +163,78 @@ serve correctly is worse than none. `weave-adapter-strom` treats the `409` as
 fatal and exits — retrying never converges — so a version mismatch surfaces as a
 stopped container with a clear reason instead of a node that looks alive.
 `API_V1` moves when the routes change; `PROTOCOL_VERSION` moves when the payloads
-behind them do. It is `2`: node capabilities changed shape when WebRTC transports
-arrived, so an adapter built against `1` is refused rather than served hops whose
-sockets it cannot read.
+behind them do. It is `3`: desired egresses and their observed status now carry
+branch identities, and socket status and statistics are reported per branch. An
+adapter built against `2` is refused rather than allowed to hide every fan-out
+destination after the first.
+
+### Hop status and fan-out
+
+Every egress in desired state carries a branch id derived from its destination's
+manifest index. The same id follows that destination through sender, bridge, and
+receiver hops:
+
+```json
+{
+  "id": "weave-cam1-to-studio-sender",
+  "node_id": "strom-node-1",
+  "role": "sender",
+  "ingress": { "transport": "srt", "role": "listen", "port": 20000 },
+  "egresses": [
+    {
+      "branch_id": "destination-0",
+      "transport": "srt",
+      "role": "connect",
+      "host": "172.27.0.10",
+      "port": 20000
+    },
+    {
+      "branch_id": "destination-1",
+      "transport": "srt",
+      "role": "connect",
+      "host": "203.0.113.7",
+      "port": 20001
+    }
+  ]
+}
+```
+
+An adapter reports ingress separately and one status entry for every desired
+branch. Branch order is not significant; `branch_id` is the join key. Missing,
+duplicate, or unknown branch ids make the hop report incomplete, so it remains
+`pending` instead of allowing one healthy destination to hide another:
+
+```json
+{
+  "id": "weave-cam1-to-studio-sender",
+  "node_id": "strom-node-1",
+  "state": "provisioned",
+  "ingress": {
+    "condition": "flowing",
+    "resolved": { "host": "172.26.0.10", "port": 20000 },
+    "stats": { "connections": 1, "rate_mbps": 8.1 }
+  },
+  "egresses": [
+    {
+      "branch_id": "destination-0",
+      "condition": "flowing",
+      "resolved": { "host": "172.27.0.10", "port": 20000 },
+      "stats": { "connections": 1, "rate_mbps": 8.0 }
+    },
+    {
+      "branch_id": "destination-1",
+      "condition": "connecting",
+      "resolved": { "host": "203.0.113.7", "port": 20001 },
+      "stats": { "connections": 0, "rate_mbps": 0.0 }
+    }
+  ]
+}
+```
+
+The second branch keeps this stream `degraded` once its source is flowing. A
+fan-out is `flowing` only when every hop ingress and every egress branch is
+flowing. Reordering destinations changes their ids because destinations do not
+yet have user-supplied identities.
 
 ## Authentication
 

@@ -164,6 +164,7 @@ async function checkDeclaredConstants(required) {
 
   const pageSource = await read(pagePath);
   if (pageSource === null) fail(`cannot read ${pagePath}`);
+  checkHopStatusContract(pageSource, pagePath);
   const coreSource = await read(corePath);
 
   for (const check of DRIFT_CHECKS) {
@@ -180,6 +181,31 @@ async function checkDeclaredConstants(required) {
     }
     console.log(`${check.what} \`${page}\` matches ${corePath}`);
   }
+}
+
+function checkHopStatusContract(source, path) {
+  if (!/spec\.egresses\.length !== 1/.test(source)) {
+    fail(`${path} does not reject unsupported multi-egress hops`);
+  }
+  const status = /\n  status\(\) \{([\s\S]*?)\n  \}\n\}/.exec(source)?.[1];
+  if (!status) fail(`${path} does not define Hop.status()`);
+
+  for (const [pattern, field] of [
+    [/const ingress = \{ condition:/, "an ingress status object"],
+    [/this\.spec\.egresses\.map/, "one status per desired egress"],
+    [/branch_id: egress\.branch_id/, "each desired branch id"],
+    [/\begresses,/, "the egresses status array"],
+  ]) {
+    if (!pattern.test(status)) fail(`${path} Hop.status() does not report ${field}`);
+  }
+  if (/\begress:/.test(status)) fail(`${path} Hop.status() still reports one lossy egress`);
+  if (!/rate_mbps: this\.progress\.rateMbps/.test(source)) {
+    fail(`${path} does not report socket-level rate_mbps`);
+  }
+  if (/\b(?:ingress|egress)_rate_mbps:/.test(source)) {
+    fail(`${path} still reports hop-level directional rates`);
+  }
+  console.log("browser hop status reports ingress and every identified egress branch");
 }
 
 function read(path) {

@@ -1,7 +1,8 @@
 # Fan-out demonstrating node-referenced addressing: destinations name their node
 # instead of a raw IP. The first uses the node's default data-plane address; the
 # second pins the `wan` alias. The controller resolves both at planning time and
-# assigns ports from each node's declared range.
+# assigns ports from each node's declared range. Their desired and observed hop
+# egresses are identified as destination-0 and destination-1.
 name: cam1-to-studio
 enabled: true
 source:

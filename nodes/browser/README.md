@@ -27,6 +27,12 @@ desired hops every 2 s. It realises two hop shapes and nothing else:
   the controller planned.
 - `whep connect → device`: a WHEP stream played in a `<video>` on the page.
 
+Each desired egress carries a branch id. Heartbeats report condition and stats
+per branch, so one failed destination cannot be hidden by another. The browser
+node currently supports one egress per hop. It reports a multi-egress hop as
+failed and includes every desired branch in the hop status rather than using
+only the first one.
+
 The page shows manifests naming its node id; copy one, change the Strom node,
 and apply it. Southbound must allow the page's origin
 (`WEAVE_SOUTHBOUND_CORS_ORIGIN`, see the root README).
@@ -48,8 +54,9 @@ never answers `getUserMedia` for the fake devices.
 
 The page carries its own copies of `weave_core::PROTOCOL_VERSION` and
 `weave_core::DEVICE_TRANSPORT`, so `check.mjs` compares them with the Rust
-source before it launches anything and refuses to run when they disagree.
-`just browser-check` (`check.mjs --check-only`) runs that comparison alone,
-needing only `node`: no browser, no southbound, no `pnpm install`; `just test`
-runs it too. Away from the repo — the bench mounts this directory alone — the
-Rust source is out of reach and the driver says so and carries on.
+source before it launches anything and refuses to run when they disagree. It
+also checks that hop status retains the ingress and every identified egress.
+`just browser-check` (`check.mjs --check-only`) runs those checks alone, needing
+only `node`: no browser, no southbound, no `pnpm install`; `just test` runs it
+too. Away from the repo — the bench mounts this directory alone — the Rust
+source is out of reach and the driver says so and carries on.

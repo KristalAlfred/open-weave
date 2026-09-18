@@ -225,10 +225,12 @@ function renderNodes(nodes) {
   }));
 }
 
-function rate(stats) {
-  if (!stats) return null;
+function rate(hop) {
+  const down = hop.ingress_stats && hop.ingress_stats.rate_mbps;
+  const up = hop.egresses.reduce((sum, egress) => sum + ((egress.stats && egress.stats.rate_mbps) || 0), 0);
+  if (down == null && !hop.egresses.some(egress => egress.stats)) return null;
   const fmt = v => (v >= 10 ? v.toFixed(0) : v.toFixed(1));
-  const el = h("span", "rate", `↓${fmt(stats.ingress_rate_mbps)} ↑${fmt(stats.egress_rate_mbps)} Mb/s`);
+  const el = h("span", "rate", `↓${fmt(down || 0)} ↑${fmt(up)} Mb/s`);
   el.title = "ingress / egress rate";
   return el;
 }
@@ -243,13 +245,16 @@ function hopChip(hop) {
     h("span", "on", `@ ${hop.node}`),
   );
   if (reported) {
-    chip.append(h("span", "conds",
-      dot(hop.ingress_condition, `ingress: ${hop.ingress_condition}`),
-      h("span", "sep", "→"),
-      dot(hop.egress_condition, `egress: ${hop.egress_condition}`),
-    ));
+    const conditions = h("span", "conds", dot(hop.ingress_condition, `ingress: ${hop.ingress_condition}`));
+    for (const egress of hop.egresses) {
+      conditions.append(
+        h("span", "sep", "→"),
+        dot(egress.condition || "unreported", `${egress.branch_id}: ${egress.condition || "unreported"}`),
+      );
+    }
+    chip.append(conditions);
     if (hop.state === "failed") chip.append(h("span", "flag", "failed"));
-    const rateEl = rate(hop.stats);
+    const rateEl = rate(hop);
     if (rateEl) chip.append(rateEl);
   } else {
     chip.append(dot("unreported", "not reported by the node yet"));

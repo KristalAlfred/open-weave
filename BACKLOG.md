@@ -5,6 +5,14 @@ that is easy to break while fixing it.
 
 ## Open
 
+- **A browser capture cannot fan out.** The capability model has no fan-out
+  limit, so the planner may put several destinations on one browser sender hop,
+  but `nodes/browser/node.js` owns one peer connection and accepts exactly one
+  egress. It reports the hop `failed` and includes every branch in status rather
+  than silently realising the first one. Done: the browser owns one peer and
+  progress tracker per branch, or capabilities let it declare a limit the
+  planner enforces. Easy to break: every desired branch must remain visible in
+  status even when the hop shape is unsupported.
 - **`browser-cam` carries audio and no video.** Strom's `whip_input` sets
   `video-codecs = ["H264"]` (`backend/src/blocks/builtin/whip.rs` in Strom) and
   the bench's Playwright Chromium on arm64 has no H264 encoder, so the session

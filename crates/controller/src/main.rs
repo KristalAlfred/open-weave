@@ -182,13 +182,24 @@ struct HopView {
     node: String,
     role: weave_core::HopRole,
     ingress: SocketView,
-    egresses: Vec<SocketView>,
+    egresses: Vec<EgressView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<weave_core::HopState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ingress_condition: Option<weave_core::LinkCondition>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    egress_condition: Option<weave_core::LinkCondition>,
+    ingress_stats: Option<weave_core::LinkStats>,
+}
+
+#[derive(Debug, Serialize)]
+struct EgressView {
+    branch_id: String,
+    #[serde(flatten)]
+    socket: SocketView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    condition: Option<weave_core::LinkCondition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved: Option<weave_core::ResolvedAddr>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stats: Option<weave_core::LinkStats>,
 }
@@ -521,11 +532,29 @@ async fn get_view(State(state): State<AppState>) -> Json<SystemView> {
                         node: hop.node_id.clone(),
                         role: hop.role,
                         ingress: SocketView::from(&hop.ingress),
-                        egresses: hop.egresses.iter().map(SocketView::from).collect(),
+                        egresses: hop
+                            .egresses
+                            .iter()
+                            .map(|egress| {
+                                let observed = status.and_then(|status| {
+                                    status
+                                        .egresses
+                                        .iter()
+                                        .find(|reported| reported.branch_id == egress.branch_id)
+                                });
+                                EgressView {
+                                    branch_id: egress.branch_id.clone(),
+                                    socket: SocketView::from(&egress.socket),
+                                    condition: observed.map(|reported| reported.status.condition),
+                                    resolved: observed
+                                        .and_then(|reported| reported.status.resolved.clone()),
+                                    stats: observed.and_then(|reported| reported.status.stats),
+                                }
+                            })
+                            .collect(),
                         state: status.map(|s| s.state),
-                        ingress_condition: status.map(|s| s.ingress),
-                        egress_condition: status.map(|s| s.egress),
-                        stats: status.and_then(|s| s.stats),
+                        ingress_condition: status.map(|s| s.ingress.condition),
+                        ingress_stats: status.and_then(|s| s.ingress.stats),
                     }
                 })
                 .collect(),
@@ -671,6 +700,16 @@ async fn register_node(
         )
             .into_response();
     }
+    if registration
+        .hop_status
+        .iter()
+        .any(|status| status.node_id != node_id)
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "hop status node id does not match registration node id",
+        );
+    }
 
     let summary = NodeSummary::from(&registration.node);
     {
@@ -706,6 +745,16 @@ async fn node_heartbeat(
 ) -> Response {
     if node_id != heartbeat.node_id {
         return error(StatusCode::BAD_REQUEST, "node id mismatch");
+    }
+    if heartbeat
+        .hop_status
+        .iter()
+        .any(|status| status.node_id != node_id)
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "hop status node id does not match heartbeat node id",
+        );
     }
     let mut nodes = state.nodes.write().await;
     let Some(registration) = nodes.get_mut(&node_id) else {
@@ -1172,6 +1221,60 @@ mod tests {
         assert_eq!(body, json!([]), "a rejected node is never registered");
     }
 
+    #[tokio::test]
+    async fn node_cannot_report_another_nodes_hop_status() {
+        let (state, mem) = mem_state();
+        let app = open_router(state);
+        let status_for = |node_id: &str| weave_core::HopStatus {
+            id: "weave-basic-sender".to_string(),
+            node_id: node_id.to_string(),
+            state: weave_core::HopState::Provisioned,
+            ingress: weave_core::SocketStatus {
+                condition: weave_core::LinkCondition::Flowing,
+                resolved: None,
+                stats: None,
+            },
+            egresses: Vec::new(),
+        };
+
+        let mut registration = node_registration("strom-node-1", "172.26.0.10");
+        registration.hop_status = vec![status_for("strom-node-2")];
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/v1/nodes/register",
+            Some(serde_json::to_value(&registration).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(mem.upsert_node_calls(), 0);
+
+        registration.hop_status.clear();
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/v1/nodes/register",
+            Some(serde_json::to_value(&registration).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let heartbeat = NodeHeartbeat {
+            node_id: "strom-node-1".to_string(),
+            status: NodeStatus::Ready,
+            endpoints: Vec::new(),
+            hop_status: vec![status_for("strom-node-2")],
+        };
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/v1/nodes/strom-node-1/heartbeat",
+            Some(serde_json::to_value(&heartbeat).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
     /// A browser node registers with a `browser://<id>` endpoint. The field is
     /// opaque here: the controller stores it, makes no outbound call to any node
     /// (it has no HTTP client at all), and serves the node's desired hops for the
@@ -1268,7 +1371,7 @@ mod tests {
             hops[0].ingress
         );
         assert!(
-            matches!(hops[0].egresses[0], weave_core::SocketSpec::Whip(_)),
+            matches!(hops[0].egresses[0].socket, weave_core::SocketSpec::Whip(_)),
             "the page pushes to the Strom's ingest: {:?}",
             hops[0].egresses[0]
         );
@@ -1343,11 +1446,15 @@ mod tests {
                 "strom-node-2".to_string(),
                 node_registration("strom-node-2", "172.27.0.10"),
             );
+            let mut definition = stream("basic");
+            definition
+                .destinations
+                .push(definition.destinations[0].clone());
             state
                 .streams
                 .write()
                 .await
-                .insert("basic".to_string(), stream("basic"));
+                .insert("basic".to_string(), definition);
             let now = Instant::now();
             let mut seen = state.last_seen.write().await;
             seen.insert("strom-node-1".to_string(), now);
@@ -1367,14 +1474,41 @@ mod tests {
             id: "weave-basic-sender".to_string(),
             node_id: "strom-node-1".to_string(),
             state: weave_core::HopState::Provisioned,
-            ingress: weave_core::LinkCondition::Flowing,
-            egress: weave_core::LinkCondition::Connected,
-            resolved_ingress: None,
-            resolved_egress: None,
-            stats: Some(weave_core::LinkStats {
-                ingress_rate_mbps: 3.2,
-                ..weave_core::LinkStats::default()
-            }),
+            ingress: weave_core::SocketStatus {
+                condition: weave_core::LinkCondition::Flowing,
+                resolved: None,
+                stats: Some(weave_core::LinkStats {
+                    rate_mbps: 3.2,
+                    ..weave_core::LinkStats::default()
+                }),
+            },
+            egresses: vec![
+                weave_core::EgressStatus {
+                    branch_id: "destination-0".to_string(),
+                    status: weave_core::SocketStatus {
+                        condition: weave_core::LinkCondition::Flowing,
+                        resolved: None,
+                        stats: Some(weave_core::LinkStats {
+                            rate_mbps: 3.1,
+                            ..weave_core::LinkStats::default()
+                        }),
+                    },
+                },
+                weave_core::EgressStatus {
+                    branch_id: "destination-1".to_string(),
+                    status: weave_core::SocketStatus {
+                        condition: weave_core::LinkCondition::Connecting,
+                        resolved: Some(weave_core::ResolvedAddr {
+                            host: "172.27.0.10".to_string(),
+                            port: 7555,
+                        }),
+                        stats: Some(weave_core::LinkStats {
+                            rate_mbps: 0.0,
+                            ..weave_core::LinkStats::default()
+                        }),
+                    },
+                },
+            ],
         }];
 
         let app = open_router(state);
@@ -1388,18 +1522,23 @@ mod tests {
         let basic = &body["streams"][0];
         assert_eq!(basic["name"], "basic");
         let hops = basic["hops"].as_array().unwrap();
-        assert_eq!(hops.len(), 2, "sender + receiver");
+        assert_eq!(hops.len(), 3, "sender + two receivers");
 
         let sender = &hops[0];
         assert_eq!(sender["id"], "weave-basic-sender");
         assert_eq!(sender["node"], "strom-node-1");
         assert_eq!(sender["state"], "provisioned");
         assert_eq!(sender["ingress_condition"], "flowing");
-        assert_eq!(sender["egress_condition"], "connected");
-        assert_eq!(sender["stats"]["ingress_rate_mbps"], 3.2);
+        assert_eq!(sender["ingress_stats"]["rate_mbps"], 3.2);
         assert_eq!(sender["ingress"]["mode"], "listen");
+        assert_eq!(sender["egresses"][0]["branch_id"], "destination-0");
+        assert_eq!(sender["egresses"][0]["condition"], "flowing");
+        assert_eq!(sender["egresses"][0]["stats"]["rate_mbps"], 3.1);
         assert_eq!(sender["egresses"][0]["mode"], "connect");
         assert_eq!(sender["egresses"][0]["host"], "172.27.0.10");
+        assert_eq!(sender["egresses"][1]["branch_id"], "destination-1");
+        assert_eq!(sender["egresses"][1]["condition"], "connecting");
+        assert_eq!(sender["egresses"][1]["resolved"]["port"], 7555);
 
         let receiver = &hops[1];
         assert_eq!(receiver["node"], "strom-node-2");

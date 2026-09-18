@@ -37,7 +37,7 @@ struct HopProgress {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Side {
     Ingress,
-    Egress,
+    Egress(usize),
 }
 
 /// In-memory byte-progress tracker keyed by hop id and side. Byte progress
@@ -196,7 +196,7 @@ fn flow_endpoint_ids(flow: &StromFlow) -> Vec<String> {
 }
 
 fn hop_sockets(hop: &DesiredHop) -> impl Iterator<Item = &SocketSpec> {
-    std::iter::once(&hop.ingress).chain(hop.egresses.iter())
+    std::iter::once(&hop.ingress).chain(hop.egresses.iter().map(|egress| &egress.socket))
 }
 
 fn hop_srt_endpoints(hop: &DesiredHop) -> Vec<(String, u16)> {
@@ -307,7 +307,7 @@ pub fn resolved_addr(spec: &SocketSpec, data_plane_host: Option<&str>) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weave_core::{HopRole, SignallingTransport};
+    use weave_core::{DesiredEgress, HopRole, SignallingTransport};
 
     fn hop(id: &str) -> DesiredHop {
         DesiredHop {
@@ -315,7 +315,10 @@ mod tests {
             node_id: "strom-node-1".to_string(),
             role: HopRole::Sender,
             ingress: SocketSpec::srt_listen(7001, 200),
-            egresses: vec![SocketSpec::srt_connect("10.0.0.2", 7002, 1000)],
+            egresses: vec![DesiredEgress {
+                branch_id: "destination-0".to_string(),
+                socket: SocketSpec::srt_connect("10.0.0.2", 7002, 1000),
+            }],
         }
     }
 
@@ -610,7 +613,7 @@ mod tests {
     fn retain_drops_undesired_hops() {
         let mut tracker = StallTracker::default();
         tracker.observe("weave-a", Side::Ingress, flowing(1000));
-        tracker.observe("weave-a", Side::Egress, flowing(1000));
+        tracker.observe("weave-a", Side::Egress(0), flowing(1000));
         tracker.observe("weave-b", Side::Ingress, flowing(1000));
         let desired: HashSet<&str> = ["weave-a"].into_iter().collect();
         tracker.retain(&desired);
@@ -622,7 +625,7 @@ mod tests {
         assert!(
             tracker
                 .hops
-                .contains_key(&("weave-a".to_string(), Side::Egress))
+                .contains_key(&("weave-a".to_string(), Side::Egress(0)))
         );
         assert!(
             !tracker
@@ -634,23 +637,35 @@ mod tests {
     #[test]
     fn advanced_reads_only_the_most_recent_poll() {
         let mut tracker = StallTracker::default();
-        assert!(!tracker.advanced("weave-a", Side::Egress), "never seen");
-        tracker.observe("weave-a", Side::Egress, flowing(1000));
+        assert!(!tracker.advanced("weave-a", Side::Egress(0)), "never seen");
+        tracker.observe("weave-a", Side::Egress(0), flowing(1000));
         assert!(
-            !tracker.advanced("weave-a", Side::Egress),
+            !tracker.advanced("weave-a", Side::Egress(0)),
             "a baseline is not progress"
         );
-        tracker.observe("weave-a", Side::Egress, flowing(2000));
-        assert!(tracker.advanced("weave-a", Side::Egress));
-        tracker.observe("weave-a", Side::Egress, flowing(2000));
+        tracker.observe("weave-a", Side::Egress(0), flowing(2000));
+        assert!(tracker.advanced("weave-a", Side::Egress(0)));
+        tracker.observe("weave-a", Side::Egress(0), flowing(2000));
         assert!(
-            !tracker.advanced("weave-a", Side::Egress),
+            !tracker.advanced("weave-a", Side::Egress(0)),
             "frozen this poll"
         );
         assert!(
             !tracker.advanced("weave-a", Side::Ingress),
             "sides are independent"
         );
+    }
+
+    #[test]
+    fn egress_branches_track_progress_independently() {
+        let mut tracker = StallTracker::default();
+        tracker.observe("weave-a", Side::Egress(0), flowing(1000));
+        tracker.observe("weave-a", Side::Egress(1), flowing(1000));
+        tracker.observe("weave-a", Side::Egress(0), flowing(2000));
+        tracker.observe("weave-a", Side::Egress(1), flowing(1000));
+
+        assert!(tracker.advanced("weave-a", Side::Egress(0)));
+        assert!(!tracker.advanced("weave-a", Side::Egress(1)));
     }
 
     #[test]
@@ -697,7 +712,10 @@ mod tests {
                 "http://172.27.0.10:8080/whip",
                 "weave-alice-cam-receiver-0",
             ),
-            egresses: vec![SocketSpec::srt_listen(7003, 200)],
+            egresses: vec![DesiredEgress {
+                branch_id: "destination-0".to_string(),
+                socket: SocketSpec::srt_listen(7003, 200),
+            }],
         }
     }
 

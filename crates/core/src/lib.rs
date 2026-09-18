@@ -4,7 +4,7 @@ pub mod auth;
 pub mod media;
 pub mod webhook;
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, ops::Deref};
 
 use serde::{Deserialize, Serialize};
 
@@ -35,7 +35,7 @@ pub const API_V1: &str = "/v1";
 /// rejected at registration instead of being served desired state it cannot
 /// realise. The prefix moves when the routes change; this moves when the
 /// payloads behind them do.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Whether the controller can serve an adapter declaring protocol `version`.
 ///
@@ -225,7 +225,23 @@ pub struct DesiredHop {
     pub node_id: String,
     pub role: HopRole,
     pub ingress: SocketSpec,
-    pub egresses: Vec<SocketSpec>,
+    pub egresses: Vec<DesiredEgress>,
+}
+
+/// One identified output branch of a desired hop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesiredEgress {
+    pub branch_id: String,
+    #[serde(flatten)]
+    pub socket: SocketSpec,
+}
+
+impl Deref for DesiredEgress {
+    type Target = SocketSpec;
+
+    fn deref(&self) -> &Self::Target {
+        &self.socket
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -725,27 +741,61 @@ pub struct HopStatus {
     pub id: String,
     pub node_id: String,
     pub state: HopState,
+    pub ingress: SocketStatus,
     #[serde(default)]
-    pub ingress: LinkCondition,
+    pub egresses: Vec<EgressStatus>,
+}
+
+/// Observed condition, address, and statistics for one socket.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SocketStatus {
     #[serde(default)]
-    pub egress: LinkCondition,
+    pub condition: LinkCondition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolved_ingress: Option<ResolvedAddr>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolved_egress: Option<ResolvedAddr>,
+    pub resolved: Option<ResolvedAddr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<LinkStats>,
 }
 
+/// Observed status for one identified egress branch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EgressStatus {
+    pub branch_id: String,
+    #[serde(flatten)]
+    pub status: SocketStatus,
+}
+
 impl HopStatus {
-    /// The lifecycle + per-socket conditions consumed by [`roll_up_path`].
+    /// The lifecycle and socket conditions consumed by [`roll_up_path`].
+    ///
+    /// A status describes `desired` only when it reports each desired branch
+    /// exactly once and no others.
     #[must_use]
-    pub fn conditions(&self) -> HopConditions {
-        HopConditions {
-            state: self.state,
-            ingress: self.ingress,
-            egress: self.egress,
+    pub fn conditions(&self, desired: &DesiredHop) -> Option<HopConditions> {
+        let mut observed = BTreeMap::new();
+        for egress in &self.egresses {
+            if observed
+                .insert(&egress.branch_id, egress.status.condition)
+                .is_some()
+            {
+                return None;
+            }
         }
+
+        let egresses = desired
+            .egresses
+            .iter()
+            .map(|egress| observed.remove(&egress.branch_id))
+            .collect::<Option<Vec<_>>>()?;
+        if !observed.is_empty() {
+            return None;
+        }
+
+        Some(HopConditions {
+            state: self.state,
+            ingress: self.ingress.condition,
+            egresses,
+        })
     }
 }
 
@@ -777,12 +827,12 @@ pub enum LinkCondition {
     Stalled,
 }
 
-/// Lifecycle plus both socket conditions of one hop — the unit rolled up per path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Lifecycle plus every socket condition of one hop — the unit rolled up per path.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HopConditions {
     pub state: HopState,
     pub ingress: LinkCondition,
-    pub egress: LinkCondition,
+    pub egresses: Vec<LinkCondition>,
 }
 
 /// End-to-end status of a path, derived from its hops' conditions.
@@ -817,34 +867,34 @@ pub fn roll_up_path(enabled: bool, hops: &[Option<HopConditions>]) -> PathStatus
     }
     if hops
         .iter()
-        .any(|hop| hop.is_some_and(|h| h.state == HopState::Failed))
+        .any(|hop| hop.as_ref().is_some_and(|h| h.state == HopState::Failed))
     {
         return PathStatus::Failed;
     }
     if hops
         .iter()
-        .any(|hop| hop.is_none_or(|h| h.state == HopState::Pending))
+        .any(|hop| hop.as_ref().is_none_or(|h| h.state == HopState::Pending))
     {
         return PathStatus::Pending;
     }
-    if hops
-        .iter()
-        .flatten()
-        .any(|h| h.ingress == LinkCondition::Stalled || h.egress == LinkCondition::Stalled)
-    {
+    if hops.iter().flatten().any(|h| {
+        h.ingress == LinkCondition::Stalled || h.egresses.contains(&LinkCondition::Stalled)
+    }) {
         return PathStatus::Degraded;
     }
 
-    let source_flowing =
-        hops.first().and_then(|hop| hop.map(|h| h.ingress)) == Some(LinkCondition::Flowing);
+    let source_flowing = hops.first().and_then(|hop| hop.as_ref().map(|h| h.ingress))
+        == Some(LinkCondition::Flowing);
     if !source_flowing {
         return PathStatus::AwaitingInput;
     }
 
-    let all_flowing = hops
-        .iter()
-        .flatten()
-        .all(|h| h.ingress == LinkCondition::Flowing && h.egress == LinkCondition::Flowing);
+    let all_flowing = hops.iter().flatten().all(|h| {
+        h.ingress == LinkCondition::Flowing
+            && h.egresses
+                .iter()
+                .all(|condition| *condition == LinkCondition::Flowing)
+    });
     if all_flowing {
         PathStatus::Flowing
     } else {
@@ -858,15 +908,13 @@ pub struct ResolvedAddr {
     pub port: u16,
 }
 
-/// Link-level SRT stats mirrored from Strom's `srt-stats` payload.
+/// Socket-level SRT stats mirrored from Strom's `srt-stats` payload.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub struct LinkStats {
     #[serde(default)]
     pub connections: usize,
     #[serde(default)]
-    pub ingress_rate_mbps: f64,
-    #[serde(default)]
-    pub egress_rate_mbps: f64,
+    pub rate_mbps: f64,
     #[serde(default)]
     pub packets_sent_lost: i64,
     #[serde(default)]
@@ -1534,7 +1582,10 @@ mod tests {
             node_id: "strom-node-1".to_string(),
             role: HopRole::Sender,
             ingress: SocketSpec::srt_listen(7001, 200),
-            egresses: vec![SocketSpec::srt_connect("172.31.0.10", 7002, 1000)],
+            egresses: vec![DesiredEgress {
+                branch_id: "destination-0".to_string(),
+                socket: SocketSpec::srt_connect("172.31.0.10", 7002, 1000),
+            }],
         }
     }
 
@@ -1560,12 +1611,16 @@ mod tests {
     #[test]
     fn hop_with_multiple_egresses_round_trips() {
         let mut hop = sample_hop();
-        hop.egresses
-            .push(SocketSpec::srt_connect("172.31.0.10", 7003, 1000));
+        hop.egresses.push(DesiredEgress {
+            branch_id: "destination-1".to_string(),
+            socket: SocketSpec::srt_connect("172.31.0.10", 7003, 1000),
+        });
         assert_eq!(hop.egresses.len(), 2);
 
-        let round_trip: DesiredHop =
-            serde_json::from_str(&serde_json::to_string(&hop).unwrap()).unwrap();
+        let value = serde_json::to_value(&hop).unwrap();
+        assert_eq!(value["egresses"][1]["branch_id"], "destination-1");
+        assert_eq!(value["egresses"][1]["transport"], "srt");
+        let round_trip: DesiredHop = serde_json::from_value(value).unwrap();
         assert_eq!(hop, round_trip);
     }
 
@@ -1583,18 +1638,26 @@ mod tests {
             id: "weave-contribution-sender".to_string(),
             node_id: "strom-node-1".to_string(),
             state: HopState::Provisioned,
-            ingress: LinkCondition::Flowing,
-            egress: LinkCondition::Connected,
-            resolved_ingress: Some(ResolvedAddr {
-                host: "0.0.0.0".to_string(),
-                port: 7001,
-            }),
-            resolved_egress: None,
-            stats: Some(LinkStats {
-                connections: 1,
-                ingress_rate_mbps: 4.5,
-                ..LinkStats::default()
-            }),
+            ingress: SocketStatus {
+                condition: LinkCondition::Flowing,
+                resolved: Some(ResolvedAddr {
+                    host: "0.0.0.0".to_string(),
+                    port: 7001,
+                }),
+                stats: Some(LinkStats {
+                    connections: 1,
+                    rate_mbps: 4.5,
+                    ..LinkStats::default()
+                }),
+            },
+            egresses: vec![EgressStatus {
+                branch_id: "destination-0".to_string(),
+                status: SocketStatus {
+                    condition: LinkCondition::Connected,
+                    resolved: None,
+                    stats: None,
+                },
+            }],
         };
         let round_trip: HopStatus =
             serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
@@ -1647,7 +1710,7 @@ mod tests {
         Some(HopConditions {
             state,
             ingress,
-            egress,
+            egresses: vec![egress],
         })
     }
 
@@ -1777,25 +1840,94 @@ mod tests {
     }
 
     #[test]
-    fn hop_status_conditions_extracts_state_and_link_conditions() {
+    fn rollup_checks_every_fanout_branch() {
+        let hops = [Some(HopConditions {
+            state: HopState::Provisioned,
+            ingress: LinkCondition::Flowing,
+            egresses: vec![LinkCondition::Flowing, LinkCondition::Connecting],
+        })];
+        assert_eq!(roll_up_path(true, &hops), PathStatus::Degraded);
+    }
+
+    #[test]
+    fn hop_status_conditions_match_desired_branches_by_id() {
+        let mut desired = sample_hop();
+        desired.egresses.push(DesiredEgress {
+            branch_id: "destination-1".to_string(),
+            socket: SocketSpec::srt_connect("172.31.0.11", 7003, 1000),
+        });
         let status = HopStatus {
             id: "weave-a".to_string(),
             node_id: "n1".to_string(),
             state: HopState::Provisioned,
-            ingress: LinkCondition::Flowing,
-            egress: LinkCondition::Connected,
-            resolved_ingress: None,
-            resolved_egress: None,
-            stats: None,
+            ingress: SocketStatus {
+                condition: LinkCondition::Flowing,
+                resolved: None,
+                stats: None,
+            },
+            egresses: vec![
+                EgressStatus {
+                    branch_id: "destination-1".to_string(),
+                    status: SocketStatus {
+                        condition: LinkCondition::Connected,
+                        resolved: None,
+                        stats: None,
+                    },
+                },
+                EgressStatus {
+                    branch_id: "destination-0".to_string(),
+                    status: SocketStatus {
+                        condition: LinkCondition::Flowing,
+                        resolved: None,
+                        stats: None,
+                    },
+                },
+            ],
         };
         assert_eq!(
-            status.conditions(),
-            HopConditions {
+            status.conditions(&desired),
+            Some(HopConditions {
                 state: HopState::Provisioned,
                 ingress: LinkCondition::Flowing,
-                egress: LinkCondition::Connected,
-            }
+                egresses: vec![LinkCondition::Flowing, LinkCondition::Connected],
+            })
         );
+    }
+
+    #[test]
+    fn hop_status_conditions_reject_missing_duplicate_and_extra_branches() {
+        let desired = sample_hop();
+        let socket = SocketStatus {
+            condition: LinkCondition::Flowing,
+            resolved: None,
+            stats: None,
+        };
+        let mut status = HopStatus {
+            id: desired.id.clone(),
+            node_id: desired.node_id.clone(),
+            state: HopState::Provisioned,
+            ingress: socket.clone(),
+            egresses: Vec::new(),
+        };
+        assert_eq!(status.conditions(&desired), None);
+
+        status.egresses = vec![
+            EgressStatus {
+                branch_id: "destination-0".to_string(),
+                status: socket.clone(),
+            },
+            EgressStatus {
+                branch_id: "destination-0".to_string(),
+                status: socket.clone(),
+            },
+        ];
+        assert_eq!(status.conditions(&desired), None);
+
+        status.egresses = vec![EgressStatus {
+            branch_id: "destination-1".to_string(),
+            status: socket,
+        }];
+        assert_eq!(status.conditions(&desired), None);
     }
 
     #[test]

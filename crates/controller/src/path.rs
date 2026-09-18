@@ -4,9 +4,10 @@ use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 use weave_core::{
-    DEFAULT_DATA_PLANE_ALIAS, DataPlaneAddr, DesiredHop, DeviceKind, HOP_ID_PREFIX, HopConditions,
-    HopRole, HopStatus, NodeDescriptor, NodeStatus, Path, PathStatus, PortRange, RemoteAddr,
-    SocketRole, SocketSpec, SrtSocket, StreamDefinition, StreamTransport, Transport, roll_up_path,
+    DEFAULT_DATA_PLANE_ALIAS, DataPlaneAddr, DesiredEgress, DesiredHop, DeviceKind, HOP_ID_PREFIX,
+    HopConditions, HopRole, HopStatus, NodeDescriptor, NodeStatus, Path, PathStatus, PortRange,
+    RemoteAddr, SocketRole, SocketSpec, SrtSocket, StreamDefinition, StreamTransport, Transport,
+    roll_up_path,
 };
 
 const DEFAULT_SRC_LATENCY: u32 = 200;
@@ -184,7 +185,7 @@ impl PortAllocator {
 /// receiver on its destination's `node`, and a bridge on every node the
 /// destination relays through. Addresses resolve at planning time from the
 /// station's data-plane alias, and every port is claimed from `ports`, the
-/// per-tick collision-aware allocator. A hop's reported `resolved_ingress` is
+/// per-tick collision-aware allocator. A hop's reported ingress address is
 /// observability only and never rewrites a planned socket.
 ///
 /// Each link's transport and direction come from both ends' declared
@@ -231,6 +232,7 @@ pub fn derive_path(
     let mut downstream = Vec::new();
 
     for (index, dest) in stream.destinations.iter().enumerate() {
+        let branch_id = format!("destination-{index}");
         let dest = read_endpoint(dest)?;
         let latency = dest.latency.unwrap_or(DEFAULT_SINK_LATENCY);
 
@@ -246,7 +248,7 @@ pub fn derive_path(
 
         for bridge in &chain.bridges {
             let (up_socket, hop) = plan_hop(&upstream, bridge, latency, nodes, ports)?;
-            push_egress(&mut sender_egresses, &mut hops, up_socket);
+            push_egress(&mut sender_egresses, &mut hops, &branch_id, up_socket);
             hops.push(hop);
             upstream = LinkEnd {
                 station: &bridge.station,
@@ -259,20 +261,24 @@ pub fn derive_path(
             // and no hop is placed for it.
             ChainTerminal::Remote(remote) => {
                 let socket = SocketSpec::srt_connect(remote.host.clone(), remote.port, latency);
-                push_egress(&mut sender_egresses, &mut hops, socket);
+                push_egress(&mut sender_egresses, &mut hops, &branch_id, socket);
             }
             // The chain ends on a receiver hop, whose remaining egress is the
             // socket the consumer dials or the device the media ends on.
             ChainTerminal::Receiver(receiver) => {
                 let (up_socket, mut hop) = plan_hop(&upstream, receiver, latency, nodes, ports)?;
-                push_egress(&mut sender_egresses, &mut hops, up_socket);
-                hop.egresses.push(match dest.terminal {
+                push_egress(&mut sender_egresses, &mut hops, &branch_id, up_socket);
+                let socket = match dest.terminal {
                     Terminal::Srt => {
                         let key = consumer_key(&receiver.id);
                         let port = claim_port(&hop.node_id, &key, nodes, ports)?;
                         SocketSpec::srt_listen(port, RECV_CONSUMER_LATENCY)
                     }
                     Terminal::Device => device_socket(&hop.node_id, DeviceKind::Display, nodes)?,
+                };
+                hop.egresses.push(DesiredEgress {
+                    branch_id: branch_id.clone(),
+                    socket,
                 });
                 hops.push(hop);
             }
@@ -329,13 +335,18 @@ fn plan_hop(
 /// Attach a link's upstream socket to the hop it leaves from: the sender when the
 /// chain is still empty, otherwise the chain's last hop.
 fn push_egress(
-    sender_egresses: &mut Vec<SocketSpec>,
+    sender_egresses: &mut Vec<DesiredEgress>,
     chain: &mut [DesiredHop],
+    branch_id: &str,
     socket: SocketSpec,
 ) {
+    let egress = DesiredEgress {
+        branch_id: branch_id.to_string(),
+        socket,
+    };
     match chain.last_mut() {
-        Some(hop) => hop.egresses.push(socket),
-        None => sender_egresses.push(socket),
+        Some(hop) => hop.egresses.push(egress),
+        None => sender_egresses.push(egress),
     }
 }
 
@@ -667,8 +678,8 @@ pub fn path_status(path: &Path, observed: &[HopStatus]) -> PathStatus {
         .map(|hop| {
             observed
                 .iter()
-                .find(|status| status.id == hop.id)
-                .map(HopStatus::conditions)
+                .find(|status| status.id == hop.id && status.node_id == hop.node_id)
+                .and_then(|status| status.conditions(hop))
         })
         .collect();
     roll_up_path(path.enabled, &conditions)
@@ -910,9 +921,9 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use weave_core::{
-        HopState, LinkCondition, NodeCapabilities, NodeEndpoint, NodeStatus, PortRange,
-        Reachability, ResolvedAddr, RoleSet, Signalling, SignallingTransport, SocketRole,
-        SrtEndpoint, SrtSocket, TransportOffer,
+        EgressStatus, HopState, LinkCondition, NodeCapabilities, NodeEndpoint, NodeStatus,
+        PortRange, Reachability, ResolvedAddr, RoleSet, Signalling, SignallingTransport,
+        SocketRole, SocketStatus, SrtEndpoint, SrtSocket, TransportOffer,
     };
 
     /// The SRT socket a spec carries, for tests asserting on an address.
@@ -1285,7 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn sender_egress_uses_planned_delivery_when_no_resolved_ingress() {
+    fn sender_egress_uses_planned_delivery_without_a_reported_ingress_address() {
         let path = derive(&contribution(), &nodes()).expect("derive");
         assert_eq!(host(&path.hops[0].egresses[0]), Some("172.27.0.10"));
         assert_eq!(
@@ -1295,7 +1306,7 @@ mod tests {
     }
 
     #[test]
-    fn sender_egress_ignores_reported_resolved_ingress_even_for_wan() {
+    fn sender_egress_ignores_a_reported_ingress_address_even_for_wan() {
         let mut stream = contribution();
         let StreamTransport::Srt(dest) = &mut stream.destinations[0] else {
             unreachable!("fixture endpoint is srt");
@@ -1308,20 +1319,28 @@ mod tests {
             &[("default", "172.27.0.10"), ("wan", "203.0.113.7")],
         );
 
-        // A concrete resolved_ingress reporting the default host must not rewrite
+        // A reported ingress address on the default host must not rewrite
         // the wan-aliased planned delivery.
         let observed = vec![HopStatus {
             id: receiver_hop_id("contribution", 0),
             node_id: "strom-node-2".to_string(),
             state: HopState::Provisioned,
-            ingress: LinkCondition::Idle,
-            egress: LinkCondition::Idle,
-            resolved_ingress: Some(ResolvedAddr {
-                host: "172.27.0.10".to_string(),
-                port: 9002,
-            }),
-            resolved_egress: None,
-            stats: None,
+            ingress: SocketStatus {
+                condition: LinkCondition::Idle,
+                resolved: Some(ResolvedAddr {
+                    host: "172.27.0.10".to_string(),
+                    port: 9002,
+                }),
+                stats: None,
+            },
+            egresses: vec![EgressStatus {
+                branch_id: "destination-0".to_string(),
+                status: SocketStatus {
+                    condition: LinkCondition::Idle,
+                    resolved: None,
+                    stats: None,
+                },
+            }],
         }];
 
         let path =
@@ -1448,6 +1467,8 @@ mod tests {
         assert_eq!(sender.role, HopRole::Sender);
         assert_eq!(sender.node_id, "strom-node-1");
         assert_eq!(sender.egresses.len(), 2, "one egress per destination");
+        assert_eq!(sender.egresses[0].branch_id, "destination-0");
+        assert_eq!(sender.egresses[1].branch_id, "destination-1");
         assert_eq!(host(&sender.egresses[0]), Some("172.27.0.10"));
         assert_eq!(host(&sender.egresses[1]), Some("172.26.0.10"));
 
@@ -1455,6 +1476,7 @@ mod tests {
         assert_eq!(receiver0.id, "weave-fanout-receiver-0");
         assert_eq!(receiver0.role, HopRole::Receiver);
         assert_eq!(receiver0.node_id, "strom-node-2");
+        assert_eq!(receiver0.egresses[0].branch_id, "destination-0");
 
         let receiver1 = &path.hops[2];
         assert_eq!(receiver1.id, "weave-fanout-receiver-1");
@@ -1463,6 +1485,46 @@ mod tests {
             receiver1.node_id, "strom-node-1",
             "second destination is co-located with the source node"
         );
+        assert_eq!(receiver1.egresses[0].branch_id, "destination-1");
+    }
+
+    #[test]
+    fn fanout_status_checks_every_branch_and_the_reporting_node() {
+        let path = derive(&fanout(), &nodes()).expect("derive");
+        let mut observed: Vec<HopStatus> = path
+            .hops
+            .iter()
+            .map(|hop| HopStatus {
+                id: hop.id.clone(),
+                node_id: hop.node_id.clone(),
+                state: HopState::Provisioned,
+                ingress: SocketStatus {
+                    condition: LinkCondition::Flowing,
+                    resolved: None,
+                    stats: None,
+                },
+                egresses: hop
+                    .egresses
+                    .iter()
+                    .map(|egress| EgressStatus {
+                        branch_id: egress.branch_id.clone(),
+                        status: SocketStatus {
+                            condition: LinkCondition::Flowing,
+                            resolved: None,
+                            stats: None,
+                        },
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        assert_eq!(path_status(&path, &observed), PathStatus::Flowing);
+        observed[0].egresses[1].status.condition = LinkCondition::Connecting;
+        assert_eq!(path_status(&path, &observed), PathStatus::Degraded);
+
+        observed[0].egresses[1].status.condition = LinkCondition::Flowing;
+        observed[0].node_id = "wrong-node".to_string();
+        assert_eq!(path_status(&path, &observed), PathStatus::Pending);
     }
 
     #[test]
@@ -2091,14 +2153,16 @@ mod tests {
             SocketSpec::Device(DeviceKind::Capture),
             "the media starts at the camera"
         );
+        assert_eq!(sender.egresses.len(), 1);
+        assert_eq!(sender.egresses[0].branch_id, "destination-0");
         assert_eq!(
-            sender.egresses,
-            vec![SocketSpec::signalling(
+            sender.egresses[0].socket,
+            SocketSpec::signalling(
                 SignallingTransport::Whip,
                 SocketRole::Connect,
                 "http://172.27.0.10:8080/ingest",
                 "weave-alice-cam-receiver-0",
-            )]
+            )
         );
 
         let receiver = &path.hops[1];
@@ -2127,9 +2191,9 @@ mod tests {
         let sender = &path.hops[0];
         assert_eq!(sender.node_id, "strom-node-2");
         assert_eq!(srt(&sender.ingress).role(), SocketRole::Listen);
+        assert_eq!(sender.egresses.len(), 1);
         assert_eq!(
-            sender.egresses,
-            vec![signalled],
+            sender.egresses[0].socket, signalled,
             "Strom hosts the playback the browser pulls"
         );
 
@@ -2144,9 +2208,10 @@ mod tests {
                 "weave-alice-return-receiver-0",
             )
         );
+        assert_eq!(receiver.egresses.len(), 1);
         assert_eq!(
-            receiver.egresses,
-            vec![SocketSpec::Device(DeviceKind::Display)],
+            receiver.egresses[0].socket,
+            SocketSpec::Device(DeviceKind::Display),
             "the media ends on the screen"
         );
 
@@ -2251,7 +2316,10 @@ mod tests {
             webrtc_node("strom-node-2", "172.27.0.10"),
         ];
         let path = derive(&contribution(), &pair).expect("derive");
-        assert!(matches!(path.hops[0].egresses[0], SocketSpec::Srt(_)));
+        assert!(matches!(
+            path.hops[0].egresses[0].socket,
+            SocketSpec::Srt(_)
+        ));
         assert!(matches!(path.hops[1].ingress, SocketSpec::Srt(_)));
         assert_eq!(
             path,
@@ -2311,23 +2379,25 @@ mod tests {
                 "weave-alice-cam-bridge-0-0",
             )
         );
+        assert_eq!(bridge.egresses.len(), 1);
         assert_eq!(
-            bridge.egresses,
-            vec![SocketSpec::signalling(
+            bridge.egresses[0].socket,
+            SocketSpec::signalling(
                 SignallingTransport::Whep,
                 SocketRole::Listen,
                 "http://172.26.0.10:8080/playback",
                 "weave-alice-cam-receiver-0",
-            )]
+            )
         );
+        assert_eq!(path.hops[0].egresses.len(), 1);
         assert_eq!(
-            path.hops[0].egresses,
-            vec![SocketSpec::signalling(
+            path.hops[0].egresses[0].socket,
+            SocketSpec::signalling(
                 SignallingTransport::Whip,
                 SocketRole::Connect,
                 "http://172.26.0.10:8080/ingest",
                 "weave-alice-cam-bridge-0-0",
-            )],
+            ),
             "the camera pushes into the relay's ingest"
         );
         assert_eq!(
@@ -2340,9 +2410,10 @@ mod tests {
             ),
             "the far browser pulls it back out"
         );
+        assert_eq!(path.hops[2].egresses.len(), 1);
         assert_eq!(
-            path.hops[2].egresses,
-            vec![SocketSpec::Device(DeviceKind::Display)]
+            path.hops[2].egresses[0].socket,
+            SocketSpec::Device(DeviceKind::Display)
         );
     }
 
@@ -2439,7 +2510,7 @@ mod tests {
     fn endpoints_name_a_consumer_socket_that_is_not_an_srt_listener() {
         let stream = contribution();
         let mut path = derive(&stream, &nodes()).expect("derive");
-        path.hops[1].egresses[0] = SocketSpec::Device(DeviceKind::Display);
+        path.hops[1].egresses[0].socket = SocketSpec::Device(DeviceKind::Display);
         let error = stream_endpoints(&stream, &path, &nodes()).unwrap_err();
         assert_eq!(
             error,
@@ -2453,7 +2524,7 @@ mod tests {
             "hop weave-contribution-receiver-0 carries a display device socket where an SRT listener is needed"
         );
 
-        path.hops[1].egresses[0] = SocketSpec::srt_connect("198.51.100.5", 9000, 200);
+        path.hops[1].egresses[0].socket = SocketSpec::srt_connect("198.51.100.5", 9000, 200);
         let error = stream_endpoints(&stream, &path, &nodes()).unwrap_err();
         assert_eq!(
             error.to_string(),

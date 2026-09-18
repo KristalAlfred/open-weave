@@ -17,9 +17,9 @@ use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Token};
 use weave_core::{
     API_V1, AdapterDescriptor, AdapterKind, DEFAULT_DATA_PLANE_ALIAS, DataPlaneAddr, DesiredHop,
-    DeviceSet, EndpointDescriptor, EndpointKind, HopStatus, LinkCondition, LinkStats,
+    DeviceSet, EgressStatus, EndpointDescriptor, EndpointKind, HopStatus, LinkCondition, LinkStats,
     NodeCapabilities, NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus,
-    PROTOCOL_VERSION, SignallingTransport, SocketRole, SocketSpec, Transport,
+    PROTOCOL_VERSION, SignallingTransport, SocketRole, SocketSpec, SocketStatus, Transport,
 };
 use weave_strom::{
     FlowSpec, FlowStats, StromClient, StromError, StromFlow, flow_spec_from_hop, parse_flow_stats,
@@ -380,10 +380,6 @@ async fn hop_statuses(
         let ingress = stats.as_ref().and_then(FlowStats::ingress);
         let (ingress_connected, ingress_rate) =
             ingress.map_or((false, 0.0), |e| (e.connected, e.rate_mbps));
-        let egress_stats = stats.as_ref().and_then(FlowStats::egress);
-        let (egress_connected, egress_rate) =
-            egress_stats.map_or((false, 0.0), |e| (e.connected, e.rate_mbps));
-
         let running = flow.is_some_and(|f| f.running);
         let gst_paused = flow.and_then(|f| f.gst_state.as_deref()) == Some("Paused");
         let ingress_stalled = tracker.observe(
@@ -395,54 +391,83 @@ async fn hop_statuses(
                 gst_paused,
             },
         );
-        let egress_stalled = tracker.observe(
-            &hop.id,
-            Side::Egress,
-            SideObservation {
-                bytes: egress_stats.map(|e| e.bytes_sent),
-                running,
-                gst_paused,
-            },
-        );
+        let mut egress_stalled = Vec::with_capacity(hop.egresses.len());
+        for (index, _) in hop.egresses.iter().enumerate() {
+            let branch_stats = stats.as_ref().and_then(|stats| stats.egress_at(index));
+            egress_stalled.push(tracker.observe(
+                &hop.id,
+                Side::Egress(index),
+                SideObservation {
+                    bytes: branch_stats.map(|stats| stats.bytes_sent),
+                    running,
+                    gst_paused,
+                },
+            ));
+        }
         let playing = running && !gst_paused;
-        let webrtc = |role, srt_side: Side, srt_side_stalled| {
-            webrtc_condition(
-                role,
-                playing,
-                tracker.advanced(&hop.id, srt_side),
-                srt_side_stalled,
-            )
-        };
+        let any_egress_advanced = hop
+            .egresses
+            .iter()
+            .enumerate()
+            .any(|(index, _)| tracker.advanced(&hop.id, Side::Egress(index)));
+        let all_egresses_stalled =
+            !egress_stalled.is_empty() && egress_stalled.iter().all(|stalled| *stalled);
 
-        let egress = hop.egresses.first();
         statuses.push(HopStatus {
             id: hop.id.clone(),
             node_id: hop.node_id.clone(),
             state: hop_state(flow, failed.contains(&hop.id)),
-            ingress: match &hop.ingress {
-                SocketSpec::Srt(socket) => socket_condition(
-                    socket.role(),
-                    ingress_connected,
-                    ingress_rate,
-                    ingress_stalled,
-                ),
-                SocketSpec::Whip(socket) | SocketSpec::Whep(socket) => {
-                    webrtc(socket.role, Side::Egress, egress_stalled)
-                }
-                SocketSpec::Device(_) => LinkCondition::Idle,
+            ingress: SocketStatus {
+                condition: match &hop.ingress {
+                    SocketSpec::Srt(socket) => socket_condition(
+                        socket.role(),
+                        ingress_connected,
+                        ingress_rate,
+                        ingress_stalled,
+                    ),
+                    SocketSpec::Whip(socket) | SocketSpec::Whep(socket) => webrtc_condition(
+                        socket.role,
+                        playing,
+                        any_egress_advanced,
+                        all_egresses_stalled,
+                    ),
+                    SocketSpec::Device(_) => LinkCondition::Idle,
+                },
+                resolved: resolved_addr(&hop.ingress, data_plane_host),
+                stats: ingress.map(LinkStats::from),
             },
-            egress: match egress {
-                Some(SocketSpec::Srt(socket)) => {
-                    socket_condition(socket.role(), egress_connected, egress_rate, false)
-                }
-                Some(SocketSpec::Whip(socket) | SocketSpec::Whep(socket)) => {
-                    webrtc(socket.role, Side::Ingress, ingress_stalled)
-                }
-                Some(SocketSpec::Device(_)) | None => LinkCondition::Idle,
-            },
-            resolved_ingress: resolved_addr(&hop.ingress, data_plane_host),
-            resolved_egress: egress.and_then(|e| resolved_addr(e, data_plane_host)),
-            stats: stats.map(LinkStats::from),
+            egresses: hop
+                .egresses
+                .iter()
+                .enumerate()
+                .map(|(index, egress)| {
+                    let branch_stats = stats.as_ref().and_then(|stats| stats.egress_at(index));
+                    EgressStatus {
+                        branch_id: egress.branch_id.clone(),
+                        status: SocketStatus {
+                            condition: match &egress.socket {
+                                SocketSpec::Srt(socket) => socket_condition(
+                                    socket.role(),
+                                    branch_stats.is_some_and(|stats| stats.connected),
+                                    branch_stats.map_or(0.0, |stats| stats.rate_mbps),
+                                    egress_stalled[index],
+                                ),
+                                SocketSpec::Whip(socket) | SocketSpec::Whep(socket) => {
+                                    webrtc_condition(
+                                        socket.role,
+                                        playing,
+                                        tracker.advanced(&hop.id, Side::Ingress),
+                                        ingress_stalled,
+                                    )
+                                }
+                                SocketSpec::Device(_) => LinkCondition::Idle,
+                            },
+                            resolved: resolved_addr(&egress.socket, data_plane_host),
+                            stats: branch_stats.map(LinkStats::from),
+                        },
+                    }
+                })
+                .collect(),
         });
     }
     statuses
@@ -701,7 +726,7 @@ async fn health() -> Json<Value> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    use weave_core::{HopRole, Signalling};
+    use weave_core::{DesiredEgress, HopRole, Signalling};
 
     #[derive(Debug, Clone, PartialEq)]
     enum Op {
@@ -715,6 +740,7 @@ mod tests {
     struct RecordingFlowApi {
         ops: Mutex<Vec<Op>>,
         flows_after: Vec<(String, String)>,
+        stats: Value,
     }
 
     impl RecordingFlowApi {
@@ -725,7 +751,13 @@ mod tests {
                     .into_iter()
                     .map(|(name, id)| (name.to_string(), id.to_string()))
                     .collect(),
+                stats: json!({}),
             }
+        }
+
+        fn with_stats(mut self, stats: Value) -> Self {
+            self.stats = stats;
+            self
         }
 
         fn ops(&self) -> Vec<Op> {
@@ -761,7 +793,7 @@ mod tests {
         }
         async fn srt_stats(&self, id: &str) -> Result<Value, StromError> {
             self.record(Op::Stats(id.to_string()));
-            Ok(json!({}))
+            Ok(self.stats.clone())
         }
     }
 
@@ -771,7 +803,10 @@ mod tests {
             node_id: "strom-node-1".to_string(),
             role: HopRole::Sender,
             ingress: SocketSpec::srt_listen(port, 200),
-            egresses: vec![SocketSpec::srt_connect("10.0.0.2", port + 1, 1000)],
+            egresses: vec![DesiredEgress {
+                branch_id: "destination-0".to_string(),
+                socket: SocketSpec::srt_connect("10.0.0.2", port + 1, 1000),
+            }],
         }
     }
 
@@ -868,6 +903,86 @@ strom:
                 whep: None,
             },
             "WHIP is offered but WHEP is not"
+        );
+    }
+
+    #[tokio::test]
+    async fn hop_status_reports_each_fanout_branch_independently() {
+        let mut desired = hop("weave-fanout-sender", 7001);
+        desired.egresses.push(DesiredEgress {
+            branch_id: "destination-1".to_string(),
+            socket: SocketSpec::srt_connect("10.0.0.3", 7003, 1000),
+        });
+        let flows = vec![flow("weave-fanout-sender", "id-fanout", true)];
+        let fake = RecordingFlowApi::new(Vec::new()).with_stats(json!({
+            "stats": { "connections": {
+                "srtsrc_0": { "connected": true, "callers": [
+                    { "recv_rate_mbps": 4.5, "bytes_received": 1000 }
+                ]},
+                "srtsink_0": { "connected": true, "callers": [
+                    { "send_rate_mbps": 4.4, "bytes_sent": 900,
+                      "packets_sent_lost": 2 }
+                ]},
+                "srtsink_1": { "connected": false, "callers": [] }
+            }}
+        }));
+        let mut tracker = StallTracker::default();
+
+        let statuses = hop_statuses(
+            &fake,
+            &[desired],
+            &flows,
+            Some("10.0.0.1"),
+            &std::collections::HashSet::new(),
+            &mut tracker,
+        )
+        .await;
+
+        let status = &statuses[0];
+        assert_eq!(status.ingress.condition, LinkCondition::Flowing);
+        assert_eq!(
+            status.ingress.stats.as_ref().map(|stats| stats.rate_mbps),
+            Some(4.5)
+        );
+        assert_eq!(status.egresses.len(), 2);
+        assert_eq!(status.egresses[0].branch_id, "destination-0");
+        assert_eq!(status.egresses[0].status.condition, LinkCondition::Flowing);
+        assert_eq!(
+            status.egresses[0]
+                .status
+                .resolved
+                .as_ref()
+                .map(|address| (address.host.as_str(), address.port)),
+            Some(("10.0.0.2", 7002))
+        );
+        assert_eq!(
+            status.egresses[0]
+                .status
+                .stats
+                .as_ref()
+                .map(|stats| (stats.rate_mbps, stats.packets_sent_lost)),
+            Some((4.4, 2))
+        );
+        assert_eq!(status.egresses[1].branch_id, "destination-1");
+        assert_eq!(
+            status.egresses[1].status.condition,
+            LinkCondition::Connecting
+        );
+        assert_eq!(
+            status.egresses[1]
+                .status
+                .resolved
+                .as_ref()
+                .map(|address| (address.host.as_str(), address.port)),
+            Some(("10.0.0.3", 7003))
+        );
+        assert_eq!(
+            status.egresses[1]
+                .status
+                .stats
+                .as_ref()
+                .map(|stats| stats.rate_mbps),
+            Some(0.0)
         );
     }
 
