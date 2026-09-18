@@ -101,12 +101,12 @@ connect/provision resources depending on its capabilities.
 
 ## API versioning
 
-Both control-plane contracts are served under **`/v5`**:
+Both control-plane contracts are served under **`/v6`**:
 
 | Contract | Served by | Routes |
 |---|---|---|
-| operator (northbound) | northbound, controller | `/v5/streams`, `/v5/streams/{name}`, `/v5/streams/{name}/endpoints`, `/v5/stream-plans`, `/v5/status` |
-| adapter (southbound) | southbound, controller | `/v5/nodes/register`, `/v5/nodes/{id}/heartbeat`, `/v5/nodes/{id}/desired`, `/v5/nodes`, `/v5/endpoints`, `/v5/state` |
+| operator (northbound) | northbound, controller | `/v6/streams`, `/v6/streams/{name}`, `/v6/stream-sets`, `/v6/stream-sets/{owner}`, `/v6/streams/{name}/endpoints`, `/v6/stream-plans`, `/v6/status` |
+| adapter (southbound) | southbound, controller | `/v6/nodes/register`, `/v6/nodes/{id}/heartbeat`, `/v6/nodes/{id}/desired`, `/v6/nodes`, `/v6/endpoints`, `/v6/state` |
 
 The controller serves the union of both, because northbound and southbound are
 stateless proxies onto it. One prefix covers both contracts: they are two halves
@@ -119,19 +119,37 @@ response payloads, and error shapes. Any breaking change to either surface moves
 the prefix. Additive fields may ship within a major when clients can ignore them.
 There is no separate northbound payload version to miss.
 
-`GET /v5/streams` lists stream resources. `GET /v5/streams/{name}` returns one
+`GET /v6/streams` lists stream resources. `GET /v6/streams/{name}` returns one
 or `404 stream_not_found`. A resource contains its desired definition under
-`spec` and its current `generation`. A single-resource response also carries an
-opaque `ETag`.
+`spec`, its current `generation`, and an `owner` when it belongs to a stream
+set. A single-resource response also carries an opaque `ETag`.
 
-`POST /v5/streams` creates with `If-None-Match: *` or replaces with the current
-`If-Match` ETag. `DELETE /v5/streams/{name}` also requires the current
+`POST /v6/streams` creates with `If-None-Match: *` or replaces with the current
+`If-Match` ETag. `DELETE /v6/streams/{name}` also requires the current
 `If-Match`. A missing precondition returns `428 precondition_required`; a stale
 one returns `412 precondition_failed`. The server does not retry or merge a
 conflicting write. Reapplying an identical spec returns `changed: false` and
 preserves both generation and ETag.
 
-`POST /v5/stream-plans` accepts the same stream definition as apply and changes
+`GET /v6/stream-sets` lists ownership sets. `GET /v6/stream-sets/{owner}`
+returns one with its streams and a set ETag. `PUT /v6/stream-sets/{owner}`
+atomically applies its `streams` list. Create uses `If-None-Match: *`; updates
+use the current set `If-Match` ETag. The owner follows the same identifier rule
+as streams and nodes.
+
+With `prune: false`, owned streams omitted from the request remain unchanged.
+With `prune: true`, omitted streams owned by that set are deleted. Pruning never
+deletes an unmanaged stream or one owned by another set. A requested name that
+already exists outside the set returns `409 ownership_conflict`; stream sets do
+not adopt existing resources. An owned stream cannot be changed or deleted
+through the single-stream routes, which return `409 stream_owned`.
+
+The set write and all member writes commit together. An identical apply returns
+`changed: false` and preserves the set ETag plus every member's generation and
+ETag. An empty `streams` list is accepted only with `prune: true`; the empty set
+remains addressable for later conditional writes.
+
+`POST /v6/stream-plans` accepts the same stream definition as apply and changes
 no state. It validates the definition, plans it alongside the current desired
 streams against the current nodes, and returns `placed`, `unplaced`, or
 `disabled` with the resolved nodes, desired hops, endpoints, and any placement
@@ -141,7 +159,7 @@ Use `weave plan -f examples/stream.yaml` or `just plan`.
 
 The adapter contract is the one that matters most: operators attach their own
 media nodes, including third-party adapters open-weave does not ship, and those
-bind to `/v5` southbound.
+bind to `/v6` southbound.
 
 Deliberately **not** versioned:
 
@@ -150,21 +168,22 @@ Deliberately **not** versioned:
 - **`/`, `/ui`, `/view`** on the controller — the dashboard and its data source
   ship inside the controller binary and version with it. **`/view` carries no
   stability guarantee**: its shape follows whatever the embedded UI needs, and it
-  may change in any release. Script against `/v5/status`, not `/view`.
+  may change in any release. Script against `/v6/status`, not `/view`.
 
 `/status` *is* versioned: it is a scriptable rollup that people automate against
 (the bench justfile does), so it belongs to the operator contract rather than to
 the dashboard. The unauthenticated copy is the controller's, which the dashboard
 shares; northbound's copy sits behind the bearer.
 
-There are no back-compat aliases: `/v1` through `/v4` and the unprefixed paths
+There are no back-compat aliases: `/v1` through `/v5` and the unprefixed paths
 return `404`. `/v3` added resource identifiers, `/v4` standardized errors, and
 `/v5` added resource generations, structured conditions, and conditional writes.
+`/v6` added atomic owned stream sets and the stream resource `owner` field.
 
 ### Protocol version negotiation
 
 A URL prefix tells a client where to send a request; it does not let the server
-notice a stale adapter. So `POST /v5/nodes/register` also carries a
+notice a stale adapter. So `POST /v6/nodes/register` also carries a
 `protocol_version` field, which adapters set from `weave_core::PROTOCOL_VERSION`:
 
 ```json
@@ -303,7 +322,7 @@ the URL major. `details` is absent when the error has no field context.
 
 Generated OpenAPI 3.1 documents for the northbound and southbound surfaces are
 in `contracts/openapi/`. JSON Schema 2020-12 documents for their request and
-response payloads are in `contracts/json-schema/v5/`. They are generated from
+response payloads are in `contracts/json-schema/v6/`. They are generated from
 the Rust wire types. Resource-id patterns, required destination lists, non-empty
 format constraints, unknown-field rejection, and enum values are present in the
 schemas. Rules that depend on where a shared endpoint type appears, such as
@@ -357,7 +376,7 @@ constant time and never logged.
 
 | Variable | Presented by | Accepted by |
 |---|---|---|
-| `WEAVE_NORTHBOUND_TOKEN` | operators, the `weave` CLI (`--token`), northbound → controller | northbound (every operator route), controller (every operator route but `/v5/status`) |
+| `WEAVE_NORTHBOUND_TOKEN` | operators, the `weave` CLI (`--token`), northbound → controller | northbound (every operator route), controller (every operator route but `/v6/status`) |
 | `WEAVE_SOUTHBOUND_TOKEN` | adapters and media nodes, southbound → controller | southbound, controller |
 
 The controller backs both surfaces, so it needs both variables and requires the
@@ -370,7 +389,7 @@ end. Nodes may instead carry the token in their config file as
 A browser node (`nodes/browser/`) is a media node too: the page presents
 `WEAVE_SOUTHBOUND_TOKEN` on every southbound call, passed in through the URL
 fragment so it never reaches a server log. Because the page runs on a different
-origin from southbound, southbound sends CORS headers on its `/v5` routes when
+origin from southbound, southbound sends CORS headers on its `/v6` routes when
 `WEAVE_SOUTHBOUND_CORS_ORIGIN` is set — an exact origin such as
 `https://studio.example`, or `*` for development. Unset, no CORS headers are
 sent and only non-browser adapters can register. The preflight is answered
@@ -393,15 +412,15 @@ so `WEAVE_AUTH_DISABLED=0` leaves authentication on.
 Left unauthenticated on purpose:
 
 - **`/health`** on every service — compose healthchecks and load balancers need it.
-- **The controller dashboard** (`/`, `/ui`, `/view`) and the `/v5/status` rollup
-  it shares its data with — on the controller only. Northbound's `/v5/status` and
-  `/v5/streams/{name}/endpoints` require the northbound token, so an operator can
+- **The controller dashboard** (`/`, `/ui`, `/view`) and the `/v6/status` rollup
+  it shares its data with — on the controller only. Northbound's `/v6/status` and
+  `/v6/streams/{name}/endpoints` require the northbound token, so an operator can
   read a stream's resolved address through northbound with the controller port
   unexposed. The dashboard is browser-loaded and polls `/view`, which a bearer
   token cannot carry without a cookie/session mechanism or a reverse proxy.
   `/view` exposes topology and allocated ports, so **do not expose the controller
   port publicly** — keep it on a private network or put a reverse proxy in front
-  of it. The controller's `/v5/streams` and `/v5/nodes` API routes *are*
+  of it. The controller's `/v6/streams` and `/v6/nodes` API routes *are*
   authenticated, so an exposed port leaks read-only dashboard data rather than
   write access.
 
@@ -413,7 +432,7 @@ registration and mTLS are follow-ups, not implemented here.
 The controller POSTs a JSON event to one configured receiver when a node
 registers, goes offline, or comes back. It exists so a service that hosts guest
 pages can declare a stream for a guest's seat on being told the page registered,
-rather than polling `/v5/nodes`.
+rather than polling `/v6/nodes`.
 
 | Variable | Meaning |
 |---|---|
@@ -466,7 +485,7 @@ not retried. A full queue drops rather than waits, and the queue is in memory, s
 events do not survive a controller restart.
 
 **Delivery is at-least-once and incomplete by design.** A receiver reconciles
-against southbound `GET /v5/nodes` on boot and treats events as hints, not truth.
+against southbound `GET /v6/nodes` on boot and treats events as hints, not truth.
 
 The bearer token authenticates the controller to the receiver; it does not let
 the receiver tell a genuine event from anyone who has learned the token. A
@@ -529,7 +548,7 @@ node that goes offline is reported `degraded`, not swapped out: the manifest nam
 it, so no other node stands in for it.
 
 A relay carries bytes and terminates nothing. Consumers still attach at the
-destination node, and `GET /v5/streams/{name}/endpoints` is unchanged by transit.
+destination node, and `GET /v6/streams/{name}/endpoints` is unchanged by transit.
 One consequence worth stating: a consumer output on an `outbound_only` node is
 only dialable from inside that node's network, because that is what the node
 declared about itself.
@@ -600,7 +619,7 @@ because the adapter reads media progress from a hop's SRT byte counters and
 such a hop has none. The browser node realises `device → whip` and
 `whep → device` and nothing else. Neither adapter ever decides a transport.
 
-`GET /v5/streams/{name}/endpoints` lists only what an external peer can dial,
+`GET /v6/streams/{name}/endpoints` lists only what an external peer can dial,
 so a `device` end reads `null` in its place (`ingress: null` for a camera
 source, a `null` output for a screen destination). See `nodes/browser/README.md`
 for the page and `bench/README.md` for running it against the bench.

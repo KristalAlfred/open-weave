@@ -16,8 +16,8 @@ use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Guard, Token, require_bearer};
 use weave_core::{
     API_PREFIX, ApiError, ApiErrorCode, ROUTE_STATUS, ROUTE_STREAM, ROUTE_STREAM_ENDPOINTS,
-    ROUTE_STREAM_PLANS, ROUTE_STREAMS, StreamDefinition, ValidationIssue, resource_id_issue,
-    validate_resource_id, validate_stream,
+    ROUTE_STREAM_PLANS, ROUTE_STREAM_SET, ROUTE_STREAM_SETS, ROUTE_STREAMS, StreamDefinition,
+    StreamSetApply, ValidationIssue, resource_id_issue, validate_resource_id, validate_stream,
 };
 
 const DEFAULT_ADDR: &str = "127.0.0.1:9080";
@@ -87,6 +87,8 @@ fn router(state: AppState, guard: Guard) -> Router {
         .route(ROUTE_STREAM, get(get_stream).delete(delete_stream))
         .route(ROUTE_STREAM_ENDPOINTS, get(get_endpoints))
         .route(ROUTE_STREAM_PLANS, axum::routing::post(plan_stream))
+        .route(ROUTE_STREAM_SETS, get(list_stream_sets))
+        .route(ROUTE_STREAM_SET, get(get_stream_set).put(put_stream_set))
         .route(ROUTE_STATUS, get(get_status))
         .fallback(api_route_not_found)
         .method_not_allowed_fallback(api_method_not_allowed)
@@ -202,6 +204,64 @@ async fn plan_stream(
         reqwest::Method::POST,
         ROUTE_STREAM_PLANS,
         Some(body.into()),
+    )
+    .await
+}
+
+async fn list_stream_sets(State(state): State<AppState>) -> Response {
+    proxy(&state, reqwest::Method::GET, ROUTE_STREAM_SETS, None).await
+}
+
+async fn get_stream_set(State(state): State<AppState>, Path(owner): Path<String>) -> Response {
+    if let Err(reason) = validate_resource_id(&owner) {
+        return invalid_request(
+            "stream-set owner is invalid",
+            vec![resource_id_issue("owner", "stream-set owner", reason)],
+        );
+    }
+    proxy(
+        &state,
+        reqwest::Method::GET,
+        &format!("/stream-sets/{owner}"),
+        None,
+    )
+    .await
+}
+
+async fn put_stream_set(
+    State(state): State<AppState>,
+    Path(owner): Path<String>,
+    headers: HeaderMap,
+    payload: Result<Json<StreamSetApply>, JsonRejection>,
+) -> Response {
+    if let Err(reason) = validate_resource_id(&owner) {
+        return invalid_request(
+            "stream-set owner is invalid",
+            vec![resource_id_issue("owner", "stream-set owner", reason)],
+        );
+    }
+    let Json(apply) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return invalid_json(rejection),
+    };
+    let body = match serde_json::to_vec(&apply) {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::error!(%err, "serializing stream set failed");
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiErrorCode::EncodingFailed,
+                "failed to encode stream set",
+            );
+        }
+    };
+    proxy_with_headers(
+        &state,
+        reqwest::Method::PUT,
+        &format!("/stream-sets/{owner}"),
+        Some(body.into()),
+        &headers,
+        &[reqwest::header::IF_MATCH, reqwest::header::IF_NONE_MATCH],
     )
     .await
 }
@@ -481,7 +541,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v5/streams")
+                    .uri("/v6/streams")
                     .header("content-type", "application/json")
                     .body(Body::from(payload.to_string()))
                     .unwrap(),
@@ -509,7 +569,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v5/streams")
+                    .uri("/v6/streams")
                     .header("content-type", "application/json")
                     .body(Body::from(payload.to_string()))
                     .unwrap(),
@@ -536,7 +596,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v5/streams")
+                    .uri("/v6/streams")
                     .header("content-type", "application/json")
                     .body(Body::from(serde_json::to_vec(&sample_stream()).unwrap()))
                     .unwrap(),
@@ -552,7 +612,7 @@ mod tests {
             .clone()
             .expect("controller saw a request");
         assert_eq!(seen.method, "POST");
-        assert_eq!(seen.path, "/v5/streams");
+        assert_eq!(seen.path, "/v6/streams");
         let forwarded: StreamDefinition = serde_json::from_slice(&seen.body).unwrap();
         assert_eq!(forwarded, sample_stream());
     }
@@ -566,7 +626,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v5/streams")
+                    .uri("/v6/streams")
                     .header("content-type", "application/json")
                     .header("if-match", "\"revision-6\"")
                     .header("if-none-match", "*")
@@ -591,7 +651,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v5/stream-plans")
+                    .uri("/v6/stream-plans")
                     .header("content-type", "application/json")
                     .body(Body::from(serde_json::to_vec(&sample_stream()).unwrap()))
                     .unwrap(),
@@ -602,11 +662,117 @@ mod tests {
 
         let seen = captured.lock().unwrap().clone().expect("forwarded");
         assert_eq!(seen.method, "POST");
-        assert_eq!(seen.path, "/v5/stream-plans");
+        assert_eq!(seen.path, "/v6/stream-plans");
         assert_eq!(
             serde_json::from_slice::<StreamDefinition>(&seen.body).unwrap(),
             sample_stream()
         );
+    }
+
+    #[tokio::test]
+    async fn stream_set_reads_forward_paths_and_etags() {
+        let (url, captured) = stub_controller(StatusCode::OK).await;
+        let app = open_app(url);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v6/stream-sets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            captured.lock().unwrap().as_ref().unwrap().path,
+            "/v6/stream-sets"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v6/stream-sets/studio-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::ETAG],
+            "\"revision-7\""
+        );
+        assert_eq!(
+            captured.lock().unwrap().as_ref().unwrap().path,
+            "/v6/stream-sets/studio-a"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_set_put_forwards_body_and_conditional_headers() {
+        let (url, captured) = stub_controller(StatusCode::ACCEPTED).await;
+        let app = open_app(url);
+        let payload = json!({ "streams": [sample_stream()], "prune": true });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v6/stream-sets/studio-a")
+                    .header("content-type", "application/json")
+                    .header("if-match", "\"set-revision-6\"")
+                    .header("if-none-match", "*")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response.headers()[axum::http::header::ETAG],
+            "\"revision-7\""
+        );
+
+        let seen = captured.lock().unwrap().clone().expect("forwarded");
+        assert_eq!(seen.method, "PUT");
+        assert_eq!(seen.path, "/v6/stream-sets/studio-a");
+        assert_eq!(seen.if_match.as_deref(), Some("\"set-revision-6\""));
+        assert_eq!(seen.if_none_match.as_deref(), Some("*"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&seen.body).unwrap(),
+            payload
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_stream_set_owner_is_rejected_before_proxying() {
+        let (url, captured) = stub_controller(StatusCode::OK).await;
+        let app = open_app(url);
+
+        for (method, uri) in [
+            ("GET", "/v6/stream-sets/foo%3Fignored"),
+            ("PUT", "/v6/stream-sets/foo%3Fignored"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method} {uri}");
+            let body = body_json(response).await;
+            assert_eq!(body["code"], "invalid_request");
+            assert_eq!(body["details"][0]["field"], "owner");
+        }
+        assert!(captured.lock().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -618,7 +784,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri("/v5/streams/basic")
+                    .uri("/v6/streams/basic")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -632,7 +798,7 @@ mod tests {
             .clone()
             .expect("controller saw a request");
         assert_eq!(seen.method, "DELETE");
-        assert_eq!(seen.path, "/v5/streams/basic");
+        assert_eq!(seen.path, "/v6/streams/basic");
     }
 
     #[tokio::test]
@@ -644,7 +810,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri("/v5/streams/basic")
+                    .uri("/v6/streams/basic")
                     .header("if-match", "\"revision-7\"")
                     .body(Body::empty())
                     .unwrap(),
@@ -666,7 +832,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v5/streams/basic")
+                    .uri("/v6/streams/basic")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -676,7 +842,7 @@ mod tests {
 
         let seen = captured.lock().unwrap().clone().expect("forwarded");
         assert_eq!(seen.method, "GET");
-        assert_eq!(seen.path, "/v5/streams/basic");
+        assert_eq!(seen.path, "/v6/streams/basic");
     }
 
     #[tokio::test]
@@ -687,7 +853,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v5/streams/basic")
+                    .uri("/v6/streams/basic")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -708,7 +874,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v5/streams/basic/endpoints")
+                    .uri("/v6/streams/basic/endpoints")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -723,7 +889,7 @@ mod tests {
             .clone()
             .expect("controller saw a request");
         assert_eq!(seen.method, "GET");
-        assert_eq!(seen.path, "/v5/streams/basic/endpoints");
+        assert_eq!(seen.path, "/v6/streams/basic/endpoints");
     }
 
     #[tokio::test]
@@ -734,7 +900,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v5/status")
+                    .uri("/v6/status")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -748,7 +914,7 @@ mod tests {
             .clone()
             .expect("controller saw a request");
         assert_eq!(seen.method, "GET");
-        assert_eq!(seen.path, "/v5/status");
+        assert_eq!(seen.path, "/v6/status");
     }
 
     #[tokio::test]
@@ -759,7 +925,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v5/streams")
+                    .uri("/v6/streams")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -782,7 +948,7 @@ mod tests {
             port: 9000,
         });
 
-        for uri in ["/v5/streams", "/v5/stream-plans"] {
+        for uri in ["/v6/streams", "/v6/stream-plans"] {
             let response = app
                 .clone()
                 .oneshot(
@@ -814,7 +980,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v5/streams")
+                    .uri("/v6/streams")
                     .header("content-type", "application/json")
                     .body(Body::from("{"))
                     .unwrap(),
@@ -835,7 +1001,7 @@ mod tests {
         let response = guarded_app(url)
             .oneshot(
                 Request::builder()
-                    .uri("/v5/streams")
+                    .uri("/v6/streams")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -854,13 +1020,13 @@ mod tests {
         for (method, uri, expected_status, expected_code) in [
             (
                 "GET",
-                "/v5/no-such-route",
+                "/v6/no-such-route",
                 StatusCode::NOT_FOUND,
                 "route_not_found",
             ),
             (
                 "PUT",
-                "/v5/streams",
+                "/v6/streams",
                 StatusCode::METHOD_NOT_ALLOWED,
                 "method_not_allowed",
             ),
@@ -887,9 +1053,9 @@ mod tests {
         let app = open_app(url);
 
         for (method, uri) in [
-            ("GET", "/v5/streams/foo%3Fignored"),
-            ("DELETE", "/v5/streams/foo%3Fignored"),
-            ("GET", "/v5/streams/foo%3Fignored/endpoints"),
+            ("GET", "/v6/streams/foo%3Fignored"),
+            ("DELETE", "/v6/streams/foo%3Fignored"),
+            ("GET", "/v6/streams/foo%3Fignored/endpoints"),
         ] {
             let response = app
                 .clone()
@@ -950,6 +1116,16 @@ mod tests {
             ("DELETE", "/v4/streams/basic"),
             ("GET", "/v4/streams/basic/endpoints"),
             ("GET", "/v4/status"),
+            ("GET", "/v5/streams"),
+            ("POST", "/v5/streams"),
+            ("POST", "/v5/stream-plans"),
+            ("GET", "/v5/streams/basic"),
+            ("DELETE", "/v5/streams/basic"),
+            ("GET", "/v5/streams/basic/endpoints"),
+            ("GET", "/v5/stream-sets"),
+            ("GET", "/v5/stream-sets/studio-a"),
+            ("PUT", "/v5/stream-sets/studio-a"),
+            ("GET", "/v5/status"),
         ] {
             let response = app
                 .clone()
@@ -995,21 +1171,24 @@ mod tests {
             let app = guarded_app(url);
 
             for (method, uri, body) in [
-                ("GET", "/v5/streams", Body::empty()),
+                ("GET", "/v6/streams", Body::empty()),
                 (
                     "POST",
-                    "/v5/streams",
+                    "/v6/streams",
                     Body::from(serde_json::to_vec(&sample_stream()).unwrap()),
                 ),
                 (
                     "POST",
-                    "/v5/stream-plans",
+                    "/v6/stream-plans",
                     Body::from(serde_json::to_vec(&sample_stream()).unwrap()),
                 ),
-                ("GET", "/v5/streams/basic", Body::empty()),
-                ("DELETE", "/v5/streams/basic", Body::empty()),
-                ("GET", "/v5/streams/basic/endpoints", Body::empty()),
-                ("GET", "/v5/status", Body::empty()),
+                ("GET", "/v6/streams/basic", Body::empty()),
+                ("DELETE", "/v6/streams/basic", Body::empty()),
+                ("GET", "/v6/streams/basic/endpoints", Body::empty()),
+                ("GET", "/v6/stream-sets", Body::empty()),
+                ("GET", "/v6/stream-sets/studio-a", Body::empty()),
+                ("PUT", "/v6/stream-sets/studio-a", Body::from("{}")),
+                ("GET", "/v6/status", Body::empty()),
             ] {
                 let mut request = Request::builder()
                     .method(method)
@@ -1047,7 +1226,7 @@ mod tests {
         let response = guarded_app(url)
             .oneshot(
                 Request::builder()
-                    .uri("/v5/streams")
+                    .uri("/v6/streams")
                     .header("authorization", format!("Bearer {TOKEN}"))
                     .body(Body::empty())
                     .unwrap(),

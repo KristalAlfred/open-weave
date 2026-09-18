@@ -16,7 +16,7 @@ The bundled `producer`/`consumer` verification endpoints take a stream name so
 any scenario can be driven end to end
 (`just bench producer-up <stream>` / `consumer-up <stream>`, default `basic`).
 Addresses are not hardcoded: the recipes resolve them from the controller's
-discovery API (`GET :29082/v5/streams/<name>/endpoints`, or the
+discovery API (`GET :29082/v6/streams/<name>/endpoints`, or the
 `scripts/endpoints.sh` helper) — the producer dials the reported `ingress` and
 each consumer dials an `outputs[]` entry. Fan-out has one output per destination,
 so a consumer attaches to each: `consumer-up <stream>` (output 0) and

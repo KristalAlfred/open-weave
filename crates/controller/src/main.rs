@@ -32,15 +32,19 @@ use weave_core::{
     NodeAccepted, NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus, ObservedState,
     PROTOCOL_VERSION, PathStatus, PlanStatus, ROUTE_ENDPOINTS, ROUTE_NODE_DESIRED,
     ROUTE_NODE_HEARTBEAT, ROUTE_NODE_REGISTER, ROUTE_NODES, ROUTE_STATE, ROUTE_STATUS,
-    ROUTE_STREAM, ROUTE_STREAM_ENDPOINTS, ROUTE_STREAM_PLANS, ROUTE_STREAMS, ReconcileReport,
-    ReconcileStatus, RunningStatus, StartingState, StartingStatus, StatusResponse, StreamAccepted,
-    StreamCondition, StreamConditionReason, StreamConditionStatus, StreamConditionType,
-    StreamDefinition, StreamEndpoints, StreamPlan, StreamResource, StreamStatus, ValidationIssue,
-    protocol_compatible, resource_id_issue, validate_resource_id, validate_stream,
+    ROUTE_STREAM, ROUTE_STREAM_ENDPOINTS, ROUTE_STREAM_PLANS, ROUTE_STREAM_SET, ROUTE_STREAM_SETS,
+    ROUTE_STREAMS, ReconcileReport, ReconcileStatus, RunningStatus, StartingState, StartingStatus,
+    StatusResponse, StreamAccepted, StreamCondition, StreamConditionReason, StreamConditionStatus,
+    StreamConditionType, StreamDefinition, StreamEndpoints, StreamPlan, StreamResource,
+    StreamSetAccepted, StreamSetAction, StreamSetApply, StreamSetMemberResult, StreamSetResource,
+    StreamStatus, ValidationIssue, protocol_compatible, resource_id_issue, validate_resource_id,
+    validate_stream,
 };
 
 use path::{PlacementError, PortAllocator, derive_path, path_status, stream_endpoints};
-use store::{MemStore, PgStore, StateStore, StoreError, StoredStream};
+use store::{
+    MemStore, PgStore, StateStore, StoreError, StoredStream, StreamSetMemberAction, StreamSetWrite,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "weave-controller", version, about = "open-weave reconciler")]
@@ -84,6 +88,7 @@ struct ControllerView {
 struct AppState {
     store: Arc<dyn StateStore>,
     streams: Arc<RwLock<BTreeMap<String, StoredStream>>>,
+    stream_sets: Arc<RwLock<BTreeMap<String, u64>>>,
     nodes: Arc<RwLock<BTreeMap<String, NodeRegistration>>>,
     last_seen: Arc<RwLock<BTreeMap<String, Instant>>>,
     node_ttl: Duration,
@@ -109,11 +114,34 @@ impl AppState {
                     issue.message
                 );
             }
+            if let Some(owner) = stream.owner.as_deref()
+                && let Err(error) = validate_resource_id(owner)
+            {
+                anyhow::bail!(
+                    "stored stream {:?} has invalid owner: {error}",
+                    stream.spec.name
+                );
+            }
         }
         let streams = loaded_streams
             .into_iter()
             .map(|stream| (stream.spec.name.clone(), stream))
             .collect();
+        let stream_sets = store
+            .load_stream_sets()
+            .await
+            .context("hydrating stream sets")?
+            .into_iter()
+            .map(|stream_set| {
+                validate_resource_id(&stream_set.owner).map_err(|error| {
+                    anyhow::anyhow!(
+                        "stored stream set {:?} has an invalid owner: {error}",
+                        stream_set.owner
+                    )
+                })?;
+                Ok((stream_set.owner, stream_set.revision))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
         let nodes = store
             .load_nodes()
             .await
@@ -138,6 +166,7 @@ impl AppState {
         Ok(Self {
             store,
             streams: Arc::new(RwLock::new(streams)),
+            stream_sets: Arc::new(RwLock::new(stream_sets)),
             nodes: Arc::new(RwLock::new(nodes)),
             last_seen: Arc::new(RwLock::new(last_seen)),
             node_ttl,
@@ -423,16 +452,7 @@ fn stamp_condition_transition_times(
     }
 }
 
-async fn update_pending_generation(state: &AppState, stored: &StoredStream) {
-    let mut view = state.view.write().await;
-    if let Some(status) = view
-        .streams
-        .iter_mut()
-        .find(|status| status.name == stored.spec.name)
-    {
-        status.generation = stored.generation;
-        return;
-    }
+fn unreconciled_stream_status(stored: &StoredStream) -> StreamStatus {
     let now = now_rfc3339();
     let conditions = [
         StreamConditionType::PlacementReady,
@@ -450,7 +470,7 @@ async fn update_pending_generation(state: &AppState, stored: &StoredStream) {
         last_transition_time: now.clone(),
     })
     .collect();
-    view.streams.push(StreamStatus {
+    StreamStatus {
         name: stored.spec.name.clone(),
         generation: stored.generation,
         observed_generation: None,
@@ -458,7 +478,38 @@ async fn update_pending_generation(state: &AppState, stored: &StoredStream) {
         nodes: Vec::new(),
         conditions,
         endpoints: None,
-    });
+    }
+}
+
+fn update_view_generation(view: &mut ControllerView, stored: &StoredStream) {
+    if let Some(status) = view
+        .streams
+        .iter_mut()
+        .find(|status| status.name == stored.spec.name)
+    {
+        status.generation = stored.generation;
+    } else {
+        view.streams.push(unreconciled_stream_status(stored));
+    }
+}
+
+async fn update_pending_generation(state: &AppState, stored: &StoredStream) {
+    let mut view = state.view.write().await;
+    update_view_generation(&mut view, stored);
+    view.streams
+        .sort_by(|left, right| left.name.cmp(&right.name));
+}
+
+async fn update_stream_set_view(state: &AppState, write: &StreamSetWrite) {
+    let mut view = state.view.write().await;
+    for name in &write.deleted {
+        view.streams.retain(|status| status.name != *name);
+        view.endpoints.remove(name);
+        view.hops.remove(name);
+    }
+    for stream in &write.stream_set.streams {
+        update_view_generation(&mut view, stream);
+    }
     view.streams
         .sort_by(|left, right| left.name.cmp(&right.name));
 }
@@ -513,7 +564,7 @@ fn observed_state(nodes: &BTreeMap<String, NodeRegistration>) -> ObservedState {
 /// directly, and the dashboard (`/`, `/ui`, `/view`), which ships inside this
 /// binary. `/view` carries no stability guarantee.
 ///
-/// The dashboard is unauthenticated, as is the `/v5/status` rollup it shares its
+/// The dashboard is unauthenticated, as is the `/v6/status` rollup it shares its
 /// data with: both are browser-reachable, and a bearer token cannot travel with a
 /// page load without a cookie/session mechanism or a reverse proxy.
 /// They expose topology and allocated ports, so **the controller port must not be
@@ -524,6 +575,8 @@ fn router(state: AppState, north: Guard, south: Guard) -> Router {
         .route(ROUTE_STREAM, get(get_stream).delete(delete_stream))
         .route(ROUTE_STREAM_ENDPOINTS, get(get_endpoints))
         .route(ROUTE_STREAM_PLANS, post(plan_stream))
+        .route(ROUTE_STREAM_SETS, get(list_stream_sets))
+        .route(ROUTE_STREAM_SET, get(get_stream_set).put(put_stream_set))
         .layer(axum::middleware::from_fn_with_state(north, require_bearer));
 
     let nodes = Router::new()
@@ -724,12 +777,18 @@ impl RequestError {
 fn stream_resource(stream: &StoredStream) -> StreamResource {
     StreamResource {
         generation: stream.generation,
+        owner: stream.owner.clone(),
         spec: stream.spec.clone(),
     }
 }
 
 fn revision_etag(revision: u64) -> HeaderValue {
     HeaderValue::from_str(&format!("\"revision-{revision}\""))
+        .expect("numeric revision always forms a valid ETag")
+}
+
+fn stream_set_etag(revision: u64) -> HeaderValue {
+    HeaderValue::from_str(&format!("\"set-revision-{revision}\""))
         .expect("numeric revision always forms a valid ETag")
 }
 
@@ -740,11 +799,28 @@ fn with_etag(mut response: Response, revision: u64) -> Response {
     response
 }
 
+fn with_stream_set_etag(mut response: Response, revision: u64) -> Response {
+    response
+        .headers_mut()
+        .insert(header::ETAG, stream_set_etag(revision));
+    response
+}
+
 fn parse_revision(value: &HeaderValue) -> Option<u64> {
     value
         .to_str()
         .ok()?
         .strip_prefix("\"revision-")?
+        .strip_suffix('"')?
+        .parse()
+        .ok()
+}
+
+fn parse_stream_set_revision(value: &HeaderValue) -> Option<u64> {
+    value
+        .to_str()
+        .ok()?
+        .strip_prefix("\"set-revision-")?
         .strip_suffix('"')?
         .parse()
         .ok()
@@ -796,6 +872,39 @@ fn stream_write_precondition(headers: &HeaderMap) -> Result<StreamWritePrecondit
     }
 }
 
+fn stream_set_write_precondition(
+    headers: &HeaderMap,
+) -> Result<StreamWritePrecondition, RequestError> {
+    match (
+        headers.get(header::IF_MATCH),
+        headers.get(header::IF_NONE_MATCH),
+    ) {
+        (None, None) => Err(RequestError {
+            status: StatusCode::PRECONDITION_REQUIRED,
+            code: ApiErrorCode::PreconditionRequired,
+            message: "If-Match or If-None-Match is required",
+        }),
+        (Some(_), Some(_)) => Err(RequestError {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::InvalidRequest,
+            message: "send either If-Match or If-None-Match, not both",
+        }),
+        (Some(value), None) => parse_stream_set_revision(value)
+            .map(StreamWritePrecondition::Revision)
+            .ok_or(RequestError {
+                status: StatusCode::BAD_REQUEST,
+                code: ApiErrorCode::InvalidRequest,
+                message: "If-Match must contain one current stream-set ETag",
+            }),
+        (None, Some(value)) if value == "*" => Ok(StreamWritePrecondition::Absent),
+        (None, Some(_)) => Err(RequestError {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::InvalidRequest,
+            message: "If-None-Match must be * when creating a stream set",
+        }),
+    }
+}
+
 async fn list_streams(State(state): State<AppState>) -> Json<Vec<StreamResource>> {
     Json(
         state
@@ -826,6 +935,183 @@ async fn get_stream(State(state): State<AppState>, Path(name): Path<String>) -> 
             "stream not found",
         ),
     }
+}
+
+fn stream_set_resource(owner: &str, streams: &BTreeMap<String, StoredStream>) -> StreamSetResource {
+    StreamSetResource {
+        owner: owner.to_string(),
+        streams: streams
+            .values()
+            .filter(|stream| stream.owner.as_deref() == Some(owner))
+            .map(stream_resource)
+            .collect(),
+    }
+}
+
+async fn list_stream_sets(State(state): State<AppState>) -> Json<Vec<StreamSetResource>> {
+    let streams = state.streams.read().await;
+    let stream_sets = state.stream_sets.read().await;
+    Json(
+        stream_sets
+            .keys()
+            .map(|owner| stream_set_resource(owner, &streams))
+            .collect(),
+    )
+}
+
+async fn get_stream_set(State(state): State<AppState>, Path(owner): Path<String>) -> Response {
+    if let Err(reason) = validate_resource_id(&owner) {
+        return invalid_request(
+            "stream-set owner is invalid",
+            vec![resource_id_issue("owner", "stream-set owner", reason)],
+        );
+    }
+    let streams = state.streams.read().await;
+    let stream_sets = state.stream_sets.read().await;
+    match stream_sets.get(&owner).copied() {
+        Some(revision) => with_stream_set_etag(
+            Json(stream_set_resource(&owner, &streams)).into_response(),
+            revision,
+        ),
+        None => error(
+            StatusCode::NOT_FOUND,
+            ApiErrorCode::StreamSetNotFound,
+            "stream set not found",
+        ),
+    }
+}
+
+fn validate_stream_set(owner: &str, apply: &StreamSetApply) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    if let Err(reason) = validate_resource_id(owner) {
+        issues.push(resource_id_issue("owner", "stream-set owner", reason));
+    }
+    if apply.streams.is_empty() && !apply.prune {
+        issues.push(ValidationIssue::new(
+            "streams",
+            "required",
+            "streams must not be empty unless prune is true",
+        ));
+    }
+    let mut names = BTreeSet::new();
+    for (index, stream) in apply.streams.iter().enumerate() {
+        for mut issue in validate_stream(stream) {
+            issue.field = format!("streams[{index}].{}", issue.field);
+            issues.push(issue);
+        }
+        if !names.insert(stream.name.as_str()) {
+            issues.push(ValidationIssue::new(
+                format!("streams[{index}].name"),
+                "duplicate",
+                format!("stream {:?} appears more than once", stream.name),
+            ));
+        }
+    }
+    issues
+}
+
+fn stream_set_action(action: StreamSetMemberAction) -> StreamSetAction {
+    match action {
+        StreamSetMemberAction::Created => StreamSetAction::Created,
+        StreamSetMemberAction::Updated => StreamSetAction::Updated,
+        StreamSetMemberAction::Unchanged => StreamSetAction::Unchanged,
+    }
+}
+
+async fn put_stream_set(
+    State(state): State<AppState>,
+    Path(owner): Path<String>,
+    headers: HeaderMap,
+    payload: Result<Json<StreamSetApply>, JsonRejection>,
+) -> Response {
+    let Json(apply) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return invalid_json(rejection),
+    };
+    let issues = validate_stream_set(&owner, &apply);
+    if !issues.is_empty() {
+        return invalid_request("stream-set validation failed", issues);
+    }
+    let precondition = match stream_set_write_precondition(&headers) {
+        Ok(precondition) => precondition,
+        Err(error) => return error.response(),
+    };
+
+    let write = {
+        let mut streams = state.streams.write().await;
+        let mut stream_sets = state.stream_sets.write().await;
+        let result = match precondition {
+            StreamWritePrecondition::Absent => {
+                state
+                    .store
+                    .create_stream_set(&owner, &apply.streams, apply.prune)
+                    .await
+            }
+            StreamWritePrecondition::Revision(revision) => {
+                state
+                    .store
+                    .update_stream_set(&owner, &apply.streams, apply.prune, revision)
+                    .await
+            }
+        };
+        let write = match result {
+            Ok(write) => write,
+            Err(StoreError::PreconditionFailed) => {
+                return error(
+                    StatusCode::PRECONDITION_FAILED,
+                    ApiErrorCode::PreconditionFailed,
+                    "stream set changed or the requested owner already exists",
+                );
+            }
+            Err(StoreError::OwnershipConflict { .. }) => {
+                return error(
+                    StatusCode::CONFLICT,
+                    ApiErrorCode::OwnershipConflict,
+                    "a stream name belongs to another workflow",
+                );
+            }
+            Err(StoreError::DuplicateStreamName { .. }) => {
+                return invalid_request("stream-set validation failed", Vec::new());
+            }
+            Err(err) => {
+                tracing::error!(%err, %owner, "persisting stream set failed");
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ApiErrorCode::PersistenceFailed,
+                    "failed to persist stream set",
+                );
+            }
+        };
+        streams.retain(|_, stream| stream.owner.as_deref() != Some(owner.as_str()));
+        for stream in &write.stream_set.streams {
+            streams.insert(stream.spec.name.clone(), stream.clone());
+        }
+        stream_sets.insert(owner.clone(), write.stream_set.revision);
+        write
+    };
+
+    update_stream_set_view(&state, &write).await;
+    let response = StreamSetAccepted {
+        status: AcceptedState::Accepted,
+        owner: owner.clone(),
+        changed: write.changed,
+        streams: write
+            .stream_set
+            .streams
+            .iter()
+            .map(|stream| StreamSetMemberResult {
+                name: stream.spec.name.clone(),
+                generation: stream.generation,
+                action: stream_set_action(write.actions[&stream.spec.name]),
+            })
+            .collect(),
+        pruned: write.deleted.clone(),
+    };
+    tracing::info!(%owner, changed = write.changed, "stream set accepted");
+    with_stream_set_etag(
+        (StatusCode::ACCEPTED, Json(response)).into_response(),
+        write.stream_set.revision,
+    )
 }
 
 async fn submit_stream(
@@ -864,6 +1150,13 @@ async fn submit_stream(
                     StatusCode::PRECONDITION_FAILED,
                     ApiErrorCode::PreconditionFailed,
                     "stream changed or the requested create name already exists",
+                );
+            }
+            Err(StoreError::OwnershipConflict { .. }) => {
+                return error(
+                    StatusCode::CONFLICT,
+                    ApiErrorCode::StreamOwned,
+                    "stream belongs to a stream set",
                 );
             }
             Err(err) => {
@@ -982,6 +1275,13 @@ async fn delete_stream(
                 StatusCode::PRECONDITION_FAILED,
                 ApiErrorCode::PreconditionFailed,
                 "stream changed or no longer exists",
+            );
+        }
+        Err(StoreError::OwnershipConflict { .. }) => {
+            return error(
+                StatusCode::CONFLICT,
+                ApiErrorCode::StreamOwned,
+                "stream belongs to a stream set",
             );
         }
         Err(err) => {
@@ -1698,6 +1998,7 @@ mod tests {
         let state = AppState {
             store: mem.clone(),
             streams: Arc::new(RwLock::new(BTreeMap::new())),
+            stream_sets: Arc::new(RwLock::new(BTreeMap::new())),
             nodes: Arc::new(RwLock::new(BTreeMap::new())),
             last_seen: Arc::new(RwLock::new(BTreeMap::new())),
             node_ttl: Duration::from_secs(15),
@@ -1781,6 +2082,7 @@ mod tests {
             spec,
             generation: 1,
             revision: 1,
+            owner: None,
         }
     }
 
@@ -1794,10 +2096,10 @@ mod tests {
             .method(method)
             .uri(uri)
             .header("content-type", "application/json");
-        if method == "POST" && uri == "/v5/streams" {
+        if method == "POST" && uri == "/v6/streams" {
             request = request.header("if-none-match", "*");
         }
-        if method == "DELETE" && uri.starts_with("/v5/streams/") {
+        if method == "DELETE" && uri.starts_with("/v6/streams/") {
             request = request.header("if-match", "\"revision-1\"");
         }
         let request = request
@@ -1869,29 +2171,30 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v5/streams",
+            "/v6/streams",
             Some(serde_json::to_value(stream("basic")).unwrap()),
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
 
-        let (status, body) = send(&app, "GET", "/v5/streams", None).await;
+        let (status, body) = send(&app, "GET", "/v6/streams", None).await;
         assert_eq!(status, StatusCode::OK);
         let listed: Vec<StreamResource> = serde_json::from_value(body).unwrap();
         assert_eq!(listed[0].generation, 1);
         assert_eq!(listed[0].spec, stream("basic"));
 
-        let (status, body) = send(&app, "GET", "/v5/streams/basic", None).await;
+        let (status, body) = send(&app, "GET", "/v6/streams/basic", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             serde_json::from_value::<StreamResource>(body).unwrap(),
             StreamResource {
                 generation: 1,
+                owner: None,
                 spec: stream("basic")
             }
         );
 
-        let (status, body) = send(&app, "GET", "/v5/streams/missing", None).await;
+        let (status, body) = send(&app, "GET", "/v6/streams/missing", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["code"], "stream_not_found");
 
@@ -1912,7 +2215,7 @@ mod tests {
         let (status, _, body) = send_with_headers(
             &app,
             "POST",
-            "/v5/streams",
+            "/v6/streams",
             Some(serde_json::to_value(&original).unwrap()),
             &[],
         )
@@ -1923,7 +2226,7 @@ mod tests {
         let (status, headers, body) = send_with_headers(
             &app,
             "POST",
-            "/v5/streams",
+            "/v6/streams",
             Some(serde_json::to_value(&original).unwrap()),
             &[("if-none-match", "*")],
         )
@@ -1937,7 +2240,7 @@ mod tests {
         let (status, headers, body) = send_with_headers(
             &app,
             "POST",
-            "/v5/streams",
+            "/v6/streams",
             Some(serde_json::to_value(&original).unwrap()),
             &[("if-match", &first_etag)],
         )
@@ -1953,7 +2256,7 @@ mod tests {
         let (status, headers, body) = send_with_headers(
             &app,
             "POST",
-            "/v5/streams",
+            "/v6/streams",
             Some(serde_json::to_value(&changed).unwrap()),
             &[("if-match", &first_etag)],
         )
@@ -1968,7 +2271,7 @@ mod tests {
         let (status, _, body) = send_with_headers(
             &app,
             "POST",
-            "/v5/streams",
+            "/v6/streams",
             Some(serde_json::to_value(&original).unwrap()),
             &[("if-match", &first_etag)],
         )
@@ -1977,12 +2280,217 @@ mod tests {
         assert_eq!(body["code"], "precondition_failed");
 
         let (status, headers, body) =
-            send_with_headers(&app, "GET", "/v5/streams/basic", None, &[]).await;
+            send_with_headers(&app, "GET", "/v6/streams/basic", None, &[]).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(response_etag(&headers), second_etag);
         let resource: StreamResource = serde_json::from_value(body).unwrap();
         assert_eq!(resource.generation, 2);
         assert_eq!(resource.spec, changed);
+    }
+
+    #[tokio::test]
+    async fn stream_set_apply_retains_noops_and_prunes_atomically() {
+        let (state, _mem) = mem_state();
+        let app = open_router(state);
+        let alpha = stream("alpha");
+        let beta = stream("beta");
+        let create = StreamSetApply {
+            streams: vec![alpha.clone(), beta.clone()],
+            prune: false,
+        };
+        let (status, headers, body) = send_with_headers(
+            &app,
+            "PUT",
+            "/v6/stream-sets/studio-a",
+            Some(serde_json::to_value(create).unwrap()),
+            &[("if-none-match", "*")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let first_etag = response_etag(&headers);
+        let accepted: StreamSetAccepted = serde_json::from_value(body).unwrap();
+        assert!(accepted.changed);
+        assert_eq!(accepted.streams.len(), 2);
+        assert!(
+            accepted
+                .streams
+                .iter()
+                .all(|stream| stream.action == StreamSetAction::Created)
+        );
+
+        let mut changed_alpha = alpha;
+        changed_alpha.enabled = false;
+        let gamma = stream("gamma");
+        let update = StreamSetApply {
+            streams: vec![changed_alpha.clone(), gamma.clone()],
+            prune: false,
+        };
+        let (status, headers, body) = send_with_headers(
+            &app,
+            "PUT",
+            "/v6/stream-sets/studio-a",
+            Some(serde_json::to_value(&update).unwrap()),
+            &[("if-match", &first_etag)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let second_etag = response_etag(&headers);
+        assert_ne!(second_etag, first_etag);
+        let accepted: StreamSetAccepted = serde_json::from_value(body).unwrap();
+        assert_eq!(
+            accepted
+                .streams
+                .iter()
+                .map(|stream| (stream.name.as_str(), stream.generation, stream.action))
+                .collect::<Vec<_>>(),
+            [
+                ("alpha", 2, StreamSetAction::Updated),
+                ("beta", 1, StreamSetAction::Unchanged),
+                ("gamma", 1, StreamSetAction::Created),
+            ]
+        );
+
+        let (status, headers, body) = send_with_headers(
+            &app,
+            "PUT",
+            "/v6/stream-sets/studio-a",
+            Some(serde_json::to_value(&update).unwrap()),
+            &[("if-match", &second_etag)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(response_etag(&headers), second_etag);
+        let accepted: StreamSetAccepted = serde_json::from_value(body).unwrap();
+        assert!(!accepted.changed);
+        assert!(
+            accepted
+                .streams
+                .iter()
+                .all(|stream| stream.action == StreamSetAction::Unchanged)
+        );
+
+        let prune = StreamSetApply {
+            streams: vec![changed_alpha.clone()],
+            prune: true,
+        };
+        let (status, headers, body) = send_with_headers(
+            &app,
+            "PUT",
+            "/v6/stream-sets/studio-a",
+            Some(serde_json::to_value(prune).unwrap()),
+            &[("if-match", &second_etag)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let third_etag = response_etag(&headers);
+        let accepted: StreamSetAccepted = serde_json::from_value(body).unwrap();
+        assert_eq!(accepted.pruned, ["beta", "gamma"]);
+
+        let mut stale = changed_alpha;
+        stale.enabled = true;
+        let (status, _, body) = send_with_headers(
+            &app,
+            "PUT",
+            "/v6/stream-sets/studio-a",
+            Some(
+                serde_json::to_value(StreamSetApply {
+                    streams: vec![stale],
+                    prune: true,
+                })
+                .unwrap(),
+            ),
+            &[("if-match", &second_etag)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(body["code"], "precondition_failed");
+
+        let (status, headers, body) =
+            send_with_headers(&app, "GET", "/v6/stream-sets/studio-a", None, &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response_etag(&headers), third_etag);
+        let resource: StreamSetResource = serde_json::from_value(body).unwrap();
+        assert_eq!(resource.streams.len(), 1);
+        assert_eq!(resource.streams[0].owner.as_deref(), Some("studio-a"));
+        assert_eq!(resource.streams[0].spec.name, "alpha");
+    }
+
+    #[tokio::test]
+    async fn stream_set_conflicts_do_not_partially_apply() {
+        let (state, _mem) = mem_state();
+        let app = open_router(state);
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/v6/streams",
+            Some(serde_json::to_value(stream("taken")).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let (status, _, body) = send_with_headers(
+            &app,
+            "PUT",
+            "/v6/stream-sets/studio-a",
+            Some(
+                serde_json::to_value(StreamSetApply {
+                    streams: vec![stream("new"), stream("taken")],
+                    prune: false,
+                })
+                .unwrap(),
+            ),
+            &[("if-none-match", "*")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "ownership_conflict");
+        let (status, _) = send(&app, "GET", "/v6/streams/new", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = send(&app, "GET", "/v6/stream-sets/studio-a", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn owned_streams_reject_single_resource_mutations() {
+        let (state, _mem) = mem_state();
+        let app = open_router(state);
+        let (status, _, _) = send_with_headers(
+            &app,
+            "PUT",
+            "/v6/stream-sets/studio-a",
+            Some(
+                serde_json::to_value(StreamSetApply {
+                    streams: vec![stream("alpha")],
+                    prune: false,
+                })
+                .unwrap(),
+            ),
+            &[("if-none-match", "*")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let (_, headers, _) = send_with_headers(&app, "GET", "/v6/streams/alpha", None, &[]).await;
+        let stream_etag = response_etag(&headers);
+
+        for (method, body) in [
+            ("POST", Some(serde_json::to_value(stream("alpha")).unwrap())),
+            ("DELETE", None),
+        ] {
+            let (status, _, body) = send_with_headers(
+                &app,
+                method,
+                if method == "POST" {
+                    "/v6/streams"
+                } else {
+                    "/v6/streams/alpha"
+                },
+                body,
+                &[("if-match", &stream_etag)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["code"], "stream_owned");
+        }
     }
 
     #[tokio::test]
@@ -1993,7 +2501,7 @@ mod tests {
         let (_, headers, _) = send_with_headers(
             &app,
             "POST",
-            "/v5/streams",
+            "/v6/streams",
             Some(serde_json::to_value(&definition).unwrap()),
             &[("if-none-match", "*")],
         )
@@ -2025,7 +2533,7 @@ mod tests {
         let (status, _, _) = send_with_headers(
             &app,
             "POST",
-            "/v5/streams",
+            "/v6/streams",
             Some(serde_json::to_value(&changed).unwrap()),
             &[("if-match", &etag)],
         )
@@ -2104,7 +2612,7 @@ mod tests {
         let (status, body) = send(
             &app,
             "POST",
-            "/v5/streams",
+            "/v6/streams",
             Some(serde_json::to_value(&invalid).unwrap()),
         )
         .await;
@@ -2118,7 +2626,7 @@ mod tests {
         let (status, body) = send(
             &app,
             "POST",
-            "/v5/stream-plans",
+            "/v6/stream-plans",
             Some(serde_json::to_value(invalid).unwrap()),
         )
         .await;
@@ -2126,7 +2634,7 @@ mod tests {
         assert_eq!(body["code"], "invalid_request");
         assert_eq!(mem.upsert_stream_calls(), 0);
 
-        let (_, body) = send(&app, "GET", "/v5/streams", None).await;
+        let (_, body) = send(&app, "GET", "/v6/streams", None).await;
         let listed: Vec<StreamResource> = serde_json::from_value(body).unwrap();
         assert!(listed.is_empty());
     }
@@ -2142,7 +2650,7 @@ mod tests {
             let (status, _) = send(
                 &app,
                 "POST",
-                "/v5/nodes/register",
+                "/v6/nodes/register",
                 Some(serde_json::to_value(registration).unwrap()),
             )
             .await;
@@ -2152,7 +2660,7 @@ mod tests {
         let (status, body) = send(
             &app,
             "POST",
-            "/v5/stream-plans",
+            "/v6/stream-plans",
             Some(serde_json::to_value(stream("preview")).unwrap()),
         )
         .await;
@@ -2177,7 +2685,7 @@ mod tests {
         let (status, body) = send(
             &app,
             "POST",
-            "/v5/stream-plans",
+            "/v6/stream-plans",
             Some(serde_json::to_value(stream("unplaced")).unwrap()),
         )
         .await;
@@ -2192,7 +2700,7 @@ mod tests {
         let (status, body) = send(
             &app,
             "POST",
-            "/v5/stream-plans",
+            "/v6/stream-plans",
             Some(serde_json::to_value(disabled).unwrap()),
         )
         .await;
@@ -2219,7 +2727,7 @@ mod tests {
             send(
                 &app,
                 "POST",
-                "/v5/nodes/register",
+                "/v6/nodes/register",
                 Some(serde_json::to_value(registration).unwrap()),
             )
             .await;
@@ -2227,7 +2735,7 @@ mod tests {
         send(
             &app,
             "POST",
-            "/v5/streams",
+            "/v6/streams",
             Some(serde_json::to_value(stream("existing")).unwrap()),
         )
         .await;
@@ -2235,7 +2743,7 @@ mod tests {
         let (status, body) = send(
             &app,
             "POST",
-            "/v5/stream-plans",
+            "/v6/stream-plans",
             Some(serde_json::to_value(stream("preview")).unwrap()),
         )
         .await;
@@ -2245,7 +2753,7 @@ mod tests {
         assert_eq!(plan.status, PlanStatus::Unplaced);
         assert!(plan.reason.unwrap().contains("no free port"));
         assert_eq!(mem.upsert_stream_calls(), 1, "plan did not write a stream");
-        let (_, body) = send(&app, "GET", "/v5/streams", None).await;
+        let (_, body) = send(&app, "GET", "/v6/streams", None).await;
         let streams: Vec<StreamResource> = serde_json::from_value(body).unwrap();
         assert_eq!(streams[0].spec, stream("existing"));
     }
@@ -2255,7 +2763,7 @@ mod tests {
         let (state, mem) = mem_state();
         let request = Request::builder()
             .method("POST")
-            .uri("/v5/streams")
+            .uri("/v6/streams")
             .header("content-type", "application/json")
             .body(Body::from("{"))
             .unwrap();
@@ -2308,19 +2816,19 @@ mod tests {
         send(
             &app,
             "POST",
-            "/v5/streams",
+            "/v6/streams",
             Some(serde_json::to_value(stream("basic")).unwrap()),
         )
         .await;
-        let (status, _) = send(&app, "DELETE", "/v5/streams/basic", None).await;
+        let (status, _) = send(&app, "DELETE", "/v6/streams/basic", None).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert_eq!(mem.delete_stream_calls(), 1);
 
-        let (_, body) = send(&app, "GET", "/v5/streams", None).await;
+        let (_, body) = send(&app, "GET", "/v6/streams", None).await;
         let listed: Vec<StreamResource> = serde_json::from_value(body).unwrap();
         assert!(listed.is_empty());
 
-        let (status, _) = send(&app, "DELETE", "/v5/streams/basic", None).await;
+        let (status, _) = send(&app, "DELETE", "/v6/streams/basic", None).await;
         assert_eq!(
             status,
             StatusCode::PRECONDITION_FAILED,
@@ -2334,15 +2842,15 @@ mod tests {
         let app = open_router(state);
 
         for (method, uri, body) in [
-            ("GET", "/v5/streams/foo%3Fignored", None),
-            ("DELETE", "/v5/streams/foo%3Fignored", None),
-            ("GET", "/v5/streams/foo%3Fignored/endpoints", None),
+            ("GET", "/v6/streams/foo%3Fignored", None),
+            ("DELETE", "/v6/streams/foo%3Fignored", None),
+            ("GET", "/v6/streams/foo%3Fignored/endpoints", None),
             (
                 "POST",
-                "/v5/nodes/foo%3Fignored/heartbeat",
+                "/v6/nodes/foo%3Fignored/heartbeat",
                 Some(json!({ "node_id": "foo?ignored", "status": "ready" })),
             ),
-            ("GET", "/v5/nodes/foo%3Fignored/desired", None),
+            ("GET", "/v6/nodes/foo%3Fignored/desired", None),
         ] {
             let (status, _) = send(&app, method, uri, body).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}");
@@ -2359,7 +2867,7 @@ mod tests {
         send(
             &app,
             "POST",
-            "/v5/nodes/register",
+            "/v6/nodes/register",
             Some(serde_json::to_value(node_registration("strom-node-1", "172.26.0.10")).unwrap()),
         )
         .await;
@@ -2374,7 +2882,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v5/nodes/strom-node-1/heartbeat",
+            "/v6/nodes/strom-node-1/heartbeat",
             Some(serde_json::to_value(&heartbeat).unwrap()),
         )
         .await;
@@ -2385,7 +2893,7 @@ mod tests {
             "heartbeat must not write through to the store"
         );
 
-        let (_, body) = send(&app, "GET", "/v5/state", None).await;
+        let (_, body) = send(&app, "GET", "/v6/state", None).await;
         let observed: ObservedState = serde_json::from_value(body).unwrap();
         assert_eq!(observed.nodes[0].status, NodeStatus::Degraded);
     }
@@ -2404,7 +2912,7 @@ mod tests {
             let (status, body) = send(
                 &app,
                 "POST",
-                "/v5/nodes/register",
+                "/v6/nodes/register",
                 Some(serde_json::to_value(&registration).unwrap()),
             )
             .await;
@@ -2423,7 +2931,7 @@ mod tests {
             0,
             "a rejected node is never persisted"
         );
-        let (_, body) = send(&app, "GET", "/v5/nodes", None).await;
+        let (_, body) = send(&app, "GET", "/v6/nodes", None).await;
         assert_eq!(body, json!([]), "a rejected node is never registered");
     }
 
@@ -2436,7 +2944,7 @@ mod tests {
         let (status, body) = send(
             &app,
             "POST",
-            "/v5/nodes/register",
+            "/v6/nodes/register",
             Some(serde_json::to_value(&registration).unwrap()),
         )
         .await;
@@ -2446,7 +2954,7 @@ mod tests {
         assert_eq!(body["details"][0]["field"], "node.id");
         assert_eq!(body["details"][0]["code"], "invalid_characters");
         assert_eq!(mem.upsert_node_calls(), 0);
-        let (_, body) = send(&app, "GET", "/v5/nodes", None).await;
+        let (_, body) = send(&app, "GET", "/v6/nodes", None).await;
         assert_eq!(body, json!([]));
 
         let mut registration = node_registration("node-one", "172.26.0.10");
@@ -2461,7 +2969,7 @@ mod tests {
         let (status, body) = send(
             &app,
             "POST",
-            "/v5/nodes/register",
+            "/v6/nodes/register",
             Some(serde_json::to_value(&registration).unwrap()),
         )
         .await;
@@ -2492,7 +3000,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v5/nodes/register",
+            "/v6/nodes/register",
             Some(serde_json::to_value(&registration).unwrap()),
         )
         .await;
@@ -2503,7 +3011,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v5/nodes/register",
+            "/v6/nodes/register",
             Some(serde_json::to_value(&registration).unwrap()),
         )
         .await;
@@ -2518,7 +3026,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v5/nodes/strom-node-1/heartbeat",
+            "/v6/nodes/strom-node-1/heartbeat",
             Some(serde_json::to_value(&heartbeat).unwrap()),
         )
         .await;
@@ -2564,7 +3072,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v5/nodes/register",
+            "/v6/nodes/register",
             Some(serde_json::to_value(&browser).unwrap()),
         )
         .await;
@@ -2589,7 +3097,7 @@ mod tests {
         send(
             &app,
             "POST",
-            "/v5/nodes/register",
+            "/v6/nodes/register",
             Some(serde_json::to_value(&strom).unwrap()),
         )
         .await;
@@ -2607,12 +3115,12 @@ mod tests {
 
         reconcile_tick(&state).await;
 
-        let (_, body) = send(&app, "GET", "/v5/nodes", None).await;
+        let (_, body) = send(&app, "GET", "/v6/nodes", None).await;
         let nodes: Vec<NodeDescriptor> = serde_json::from_value(body).unwrap();
         let page = nodes.iter().find(|n| n.id == "browser-a1b2").unwrap();
         assert_eq!(page.endpoint, "browser://browser-a1b2");
 
-        let (status, body) = send(&app, "GET", "/v5/nodes/browser-a1b2/desired", None).await;
+        let (status, body) = send(&app, "GET", "/v6/nodes/browser-a1b2/desired", None).await;
         assert_eq!(status, StatusCode::OK);
         let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
         assert_eq!(hops.len(), 1);
@@ -2654,13 +3162,13 @@ mod tests {
         reconcile_tick(&state).await;
 
         let app = open_router(state);
-        let (status, body) = send(&app, "GET", "/v5/nodes/strom-node-1/desired", None).await;
+        let (status, body) = send(&app, "GET", "/v6/nodes/strom-node-1/desired", None).await;
         assert_eq!(status, StatusCode::OK);
         let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
         assert_eq!(hops.len(), 1, "sender hop placed on node 1");
         assert_eq!(hops[0].id, "weave-basic-sender");
 
-        let (_, body) = send(&app, "GET", "/v5/nodes/strom-node-2/desired", None).await;
+        let (_, body) = send(&app, "GET", "/v6/nodes/strom-node-2/desired", None).await;
         let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
         assert_eq!(hops.len(), 1, "receiver hop placed on node 2");
         assert_eq!(hops[0].id, "weave-basic-receiver-0");
@@ -2682,10 +3190,10 @@ mod tests {
             }];
         }
         let app = open_router(state);
-        let (status, _) = send(&app, "GET", "/v5/streams/basic/endpoints", None).await;
+        let (status, _) = send(&app, "GET", "/v6/streams/basic/endpoints", None).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
-        let (status, _) = send(&app, "GET", "/v5/streams/nope/endpoints", None).await;
+        let (status, _) = send(&app, "GET", "/v6/streams/nope/endpoints", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -2919,7 +3427,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v5/nodes/register",
+            "/v6/nodes/register",
             Some(serde_json::to_value(node_registration("guest-1", "172.26.0.10")).unwrap()),
         )
         .await;
@@ -2977,7 +3485,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v5/nodes/guest-1/heartbeat",
+            "/v6/nodes/guest-1/heartbeat",
             Some(json!({ "node_id": "guest-1", "status": "ready" })),
         )
         .await;
@@ -3001,7 +3509,7 @@ mod tests {
         send(
             &app,
             "POST",
-            "/v5/nodes/guest-1/heartbeat",
+            "/v6/nodes/guest-1/heartbeat",
             Some(json!({ "node_id": "guest-1", "status": "ready" })),
         )
         .await;
@@ -3026,7 +3534,7 @@ mod tests {
             send(
                 &app,
                 "POST",
-                "/v5/nodes/register",
+                "/v6/nodes/register",
                 Some(serde_json::to_value(node_registration("guest-1", "172.26.0.10")).unwrap()),
             ),
         )
@@ -3174,13 +3682,13 @@ mod tests {
         reconcile_tick(&state).await;
 
         let app = open_router(state);
-        let (status, body) = send(&app, "GET", "/v5/nodes", None).await;
+        let (status, body) = send(&app, "GET", "/v6/nodes", None).await;
         assert_eq!(status, StatusCode::OK);
         let nodes: Vec<NodeDescriptor> = serde_json::from_value(body).unwrap();
         let node1 = nodes.iter().find(|n| n.id == "strom-node-1").unwrap();
         assert_eq!(node1.status, NodeStatus::Offline);
 
-        let (status, body) = send(&app, "GET", "/v5/nodes/strom-node-1/desired", None).await;
+        let (status, body) = send(&app, "GET", "/v6/nodes/strom-node-1/desired", None).await;
         assert_eq!(status, StatusCode::OK);
         let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
         assert!(
@@ -3216,22 +3724,25 @@ mod tests {
         (response.status(), challenge)
     }
 
-    const NORTH_ROUTES: [(&str, &str); 6] = [
-        ("GET", "/v5/streams"),
-        ("POST", "/v5/streams"),
-        ("POST", "/v5/stream-plans"),
-        ("GET", "/v5/streams/basic"),
-        ("DELETE", "/v5/streams/basic"),
-        ("GET", "/v5/streams/basic/endpoints"),
+    const NORTH_ROUTES: [(&str, &str); 9] = [
+        ("GET", "/v6/streams"),
+        ("POST", "/v6/streams"),
+        ("POST", "/v6/stream-plans"),
+        ("GET", "/v6/streams/basic"),
+        ("DELETE", "/v6/streams/basic"),
+        ("GET", "/v6/streams/basic/endpoints"),
+        ("GET", "/v6/stream-sets"),
+        ("GET", "/v6/stream-sets/studio-a"),
+        ("PUT", "/v6/stream-sets/studio-a"),
     ];
 
     const SOUTH_ROUTES: [(&str, &str); 6] = [
-        ("GET", "/v5/nodes"),
-        ("POST", "/v5/nodes/register"),
-        ("POST", "/v5/nodes/strom-node-1/heartbeat"),
-        ("GET", "/v5/nodes/strom-node-1/desired"),
-        ("GET", "/v5/endpoints"),
-        ("GET", "/v5/state"),
+        ("GET", "/v6/nodes"),
+        ("POST", "/v6/nodes/register"),
+        ("POST", "/v6/nodes/strom-node-1/heartbeat"),
+        ("GET", "/v6/nodes/strom-node-1/desired"),
+        ("GET", "/v6/endpoints"),
+        ("GET", "/v6/state"),
     ];
 
     /// Unversioned and retired-major paths are gone: this is a clean break, not
@@ -3251,7 +3762,7 @@ mod tests {
         }
         let (status, _) = send(&app, "GET", "/status", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        for retired_prefix in ["/v1", "/v2", "/v3", "/v4"] {
+        for retired_prefix in ["/v1", "/v2", "/v3", "/v4", "/v5"] {
             for (method, uri) in NORTH_ROUTES.iter().chain(&SOUTH_ROUTES) {
                 let retired = uri.replacen(API_PREFIX, retired_prefix, 1);
                 let (status, _) = send(&app, method, &retired, None).await;
@@ -3268,7 +3779,7 @@ mod tests {
     async fn dashboard_and_health_stay_open() {
         let (state, _mem) = mem_state();
         let app = guarded_router(state);
-        for uri in ["/", "/ui", "/health", "/view", "/v5/status"] {
+        for uri in ["/", "/ui", "/health", "/view", "/v6/status"] {
             let (status, _) = send_auth(&app, "GET", uri, None).await;
             assert_eq!(status, StatusCode::OK, "{uri} must not require a token");
         }
@@ -3330,7 +3841,7 @@ mod tests {
         let (status, _) = send_auth(
             &app,
             "GET",
-            "/v5/streams",
+            "/v6/streams",
             Some(&format!("Bearer {NORTH_TOKEN}")),
         )
         .await;
@@ -3339,7 +3850,7 @@ mod tests {
         let (status, _) = send_auth(
             &app,
             "GET",
-            "/v5/state",
+            "/v6/state",
             Some(&format!("Bearer {SOUTH_TOKEN}")),
         )
         .await;

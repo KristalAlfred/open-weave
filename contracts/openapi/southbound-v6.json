@@ -13,6 +13,9 @@
               "route_not_found",
               "method_not_allowed",
               "stream_not_found",
+              "stream_set_not_found",
+              "stream_owned",
+              "ownership_conflict",
               "node_not_found",
               "stream_not_ready",
               "precondition_required",
@@ -1978,11 +1981,11 @@
   },
   "info": {
     "title": "open-weave southbound API",
-    "version": "v5"
+    "version": "v6"
   },
   "openapi": "3.1.0",
   "paths": {
-    "/v5/endpoints": {
+    "/v6/endpoints": {
       "get": {
         "operationId": "listEndpoints",
         "responses": {
@@ -2019,7 +2022,7 @@
         }
       }
     },
-    "/v5/nodes": {
+    "/v6/nodes": {
       "get": {
         "operationId": "listNodes",
         "responses": {
@@ -2056,7 +2059,7 @@
         }
       }
     },
-    "/v5/nodes/register": {
+    "/v6/nodes/register": {
       "post": {
         "operationId": "registerNode",
         "requestBody": {
@@ -2133,7 +2136,7 @@
         }
       }
     },
-    "/v5/nodes/{node_id}/desired": {
+    "/v6/nodes/{node_id}/desired": {
       "get": {
         "operationId": "getDesiredHops",
         "parameters": [
@@ -2193,7 +2196,7 @@
         }
       }
     },
-    "/v5/nodes/{node_id}/heartbeat": {
+    "/v6/nodes/{node_id}/heartbeat": {
       "post": {
         "operationId": "heartbeatNode",
         "parameters": [
@@ -2273,7 +2276,7 @@
         }
       }
     },
-    "/v5/state": {
+    "/v6/state": {
       "get": {
         "operationId": "getObservedState",
         "responses": {

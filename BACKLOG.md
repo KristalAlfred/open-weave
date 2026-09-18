@@ -42,9 +42,9 @@ that is easy to break while fixing it.
   deregistration route, and the controller's node TTL only changes a status:
   `mark_offline` sets the entry to `Offline` after `WEAVE_NODE_TTL_SECS` (15s by
   default) and nothing ever removes it (`crates/controller/src/main.rs`), so the
-  node stays in `GET /v5/nodes` and `/v5/status` as `offline`. Each browser
+  node stays in `GET /v6/nodes` and `/v6/status` as `offline`. Each browser
   page start without `--node` picks a fresh id, and one bench run left three
-  stale `browser-…` nodes beside `browser-bench` (`7 node(s)` in `/v5/status`).
+  stale `browser-…` nodes beside `browser-bench` (`7 node(s)` in `/v6/status`).
   Done: a node that has not heartbeated for some interval leaves the listing, or
   a node can deregister itself. Easy to break: dropping an entry replans every
   stream placed on it. `pick_relay` skips `Offline` nodes and a pinned relay
@@ -108,6 +108,10 @@ Listed so they are not picked up by accident.
 - Preserve stream generations on semantic no-op applies and never reuse opaque
   revisions after delete and recreate. Generation describes the current spec;
   revision is mutation identity and must prevent ABA during conditional writes.
+- A stream-set write is one transaction. It may prune only streams carrying the
+  same owner, and a semantic no-op must preserve the set ETag and member
+  generations. Existing unmanaged or differently owned names remain conflicts;
+  do not turn apply into implicit adoption.
 - Keep `generation` ahead of `observed_generation` until reconciliation has
   processed the new spec. Condition reason codes are stable API values, and a
   condition's transition time changes only when its status changes.

@@ -113,7 +113,71 @@ pub enum StreamConditionReason {
 pub struct StreamResource {
     #[schemars(range(min = 1))]
     pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
+    pub owner: Option<String>,
     pub spec: StreamDefinition,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StreamSetApply {
+    pub streams: Vec<StreamDefinition>,
+    #[serde(default)]
+    pub prune: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StreamSetResource {
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
+    pub owner: String,
+    pub streams: Vec<StreamResource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StreamSetAccepted {
+    pub status: AcceptedState,
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
+    pub owner: String,
+    pub changed: bool,
+    pub streams: Vec<StreamSetMemberResult>,
+    #[schemars(inner(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    ))]
+    pub pruned: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StreamSetMemberResult {
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
+    pub name: String,
+    #[schemars(range(min = 1))]
+    pub generation: u64,
+    pub action: StreamSetAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamSetAction {
+    Created,
+    Updated,
+    Unchanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -185,6 +249,9 @@ pub enum ApiErrorCode {
     RouteNotFound,
     MethodNotAllowed,
     StreamNotFound,
+    StreamSetNotFound,
+    StreamOwned,
+    OwnershipConflict,
     NodeNotFound,
     StreamNotReady,
     PreconditionRequired,
@@ -289,5 +356,41 @@ mod tests {
                 "last_transition_time": "2026-09-18T09:30:00Z"
             })
         );
+    }
+
+    #[test]
+    fn stream_set_contract_uses_stable_wire_names() {
+        let accepted = StreamSetAccepted {
+            status: AcceptedState::Accepted,
+            owner: "production".to_string(),
+            changed: true,
+            streams: vec![StreamSetMemberResult {
+                name: "camera".to_string(),
+                generation: 2,
+                action: StreamSetAction::Updated,
+            }],
+            pruned: vec!["old-camera".to_string()],
+        };
+
+        assert_eq!(
+            serde_json::to_value(accepted).unwrap(),
+            serde_json::json!({
+                "status": "accepted",
+                "owner": "production",
+                "changed": true,
+                "streams": [{
+                    "name": "camera",
+                    "generation": 2,
+                    "action": "updated"
+                }],
+                "pruned": ["old-camera"]
+            })
+        );
+
+        let apply: StreamSetApply = serde_json::from_value(serde_json::json!({
+            "streams": []
+        }))
+        .unwrap();
+        assert!(!apply.prune);
     }
 }

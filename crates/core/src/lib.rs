@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 pub use api::{
     AcceptedState, ApiError, ApiErrorCode, NodeAccepted, PlanStatus, RunningStatus, StartingState,
     StartingStatus, StatusResponse, StreamAccepted, StreamCondition, StreamConditionReason,
-    StreamConditionStatus, StreamConditionType, StreamPlan, StreamResource, StreamStatus,
+    StreamConditionStatus, StreamConditionType, StreamPlan, StreamResource, StreamSetAccepted,
+    StreamSetAction, StreamSetApply, StreamSetMemberResult, StreamSetResource, StreamStatus,
 };
 pub use media::{
     AudioCodec, AudioConstraint, AudioFormat, ChromaSubsampling, Container, FormatConstraint,
@@ -40,7 +41,7 @@ pub const DEFAULT_DATA_PLANE_ALIAS: &str = "default";
 /// Outside it: `/health` on every service, which healthchecks and
 /// load balancers address directly, and the controller's `/`, `/ui`, and `/view` —
 /// the dashboard ships inside the controller binary and versions with it.
-pub const API_PREFIX: &str = "/v5";
+pub const API_PREFIX: &str = "/v6";
 pub const ROUTE_ENDPOINTS: &str = "/endpoints";
 pub const ROUTE_NODES: &str = "/nodes";
 pub const ROUTE_NODE_DESIRED: &str = "/nodes/{node_id}/desired";
@@ -51,6 +52,8 @@ pub const ROUTE_STATUS: &str = "/status";
 pub const ROUTE_STREAM: &str = "/streams/{name}";
 pub const ROUTE_STREAM_ENDPOINTS: &str = "/streams/{name}/endpoints";
 pub const ROUTE_STREAM_PLANS: &str = "/stream-plans";
+pub const ROUTE_STREAM_SET: &str = "/stream-sets/{owner}";
+pub const ROUTE_STREAM_SETS: &str = "/stream-sets";
 pub const ROUTE_STREAMS: &str = "/streams";
 
 /// Wire-protocol version an adapter declares when it registers.

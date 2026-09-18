@@ -5,8 +5,9 @@ use crate::{
     API_PREFIX, ApiError, DesiredHop, EndpointDescriptor, NodeAccepted, NodeDescriptor,
     NodeHeartbeat, NodeRegistration, ObservedState, ROUTE_ENDPOINTS, ROUTE_NODE_DESIRED,
     ROUTE_NODE_HEARTBEAT, ROUTE_NODE_REGISTER, ROUTE_NODES, ROUTE_STATE, ROUTE_STATUS,
-    ROUTE_STREAM, ROUTE_STREAM_ENDPOINTS, ROUTE_STREAM_PLANS, ROUTE_STREAMS, StatusResponse,
-    StreamAccepted, StreamDefinition, StreamEndpoints, StreamPlan, StreamResource,
+    ROUTE_STREAM, ROUTE_STREAM_ENDPOINTS, ROUTE_STREAM_PLANS, ROUTE_STREAM_SET, ROUTE_STREAM_SETS,
+    ROUTE_STREAMS, StatusResponse, StreamAccepted, StreamDefinition, StreamEndpoints, StreamPlan,
+    StreamResource, StreamSetAccepted, StreamSetApply, StreamSetResource,
 };
 
 pub struct ContractArtifact {
@@ -17,20 +18,23 @@ pub struct ContractArtifact {
 #[must_use]
 pub fn artifacts() -> Vec<ContractArtifact> {
     vec![
-        artifact("contracts/openapi/northbound-v5.json", northbound_openapi()),
-        artifact("contracts/openapi/southbound-v5.json", southbound_openapi()),
-        schema_artifact::<ApiError>("contracts/json-schema/v5/api-error.json"),
-        schema_artifact::<StatusResponse>("contracts/json-schema/v5/status-response.json"),
-        schema_artifact::<StreamAccepted>("contracts/json-schema/v5/stream-accepted.json"),
-        schema_artifact::<StreamDefinition>("contracts/json-schema/v5/stream-definition.json"),
-        schema_artifact::<StreamEndpoints>("contracts/json-schema/v5/stream-endpoints.json"),
-        schema_artifact::<StreamPlan>("contracts/json-schema/v5/stream-plan.json"),
-        schema_artifact::<StreamResource>("contracts/json-schema/v5/stream-resource.json"),
-        schema_artifact::<NodeAccepted>("contracts/json-schema/v5/node-accepted.json"),
-        schema_artifact::<NodeHeartbeat>("contracts/json-schema/v5/node-heartbeat.json"),
-        schema_artifact::<NodeRegistration>("contracts/json-schema/v5/node-registration.json"),
-        schema_artifact::<ObservedState>("contracts/json-schema/v5/observed-state.json"),
-        schema_artifact::<Vec<DesiredHop>>("contracts/json-schema/v5/desired-hops.json"),
+        artifact("contracts/openapi/northbound-v6.json", northbound_openapi()),
+        artifact("contracts/openapi/southbound-v6.json", southbound_openapi()),
+        schema_artifact::<ApiError>("contracts/json-schema/v6/api-error.json"),
+        schema_artifact::<StatusResponse>("contracts/json-schema/v6/status-response.json"),
+        schema_artifact::<StreamAccepted>("contracts/json-schema/v6/stream-accepted.json"),
+        schema_artifact::<StreamDefinition>("contracts/json-schema/v6/stream-definition.json"),
+        schema_artifact::<StreamEndpoints>("contracts/json-schema/v6/stream-endpoints.json"),
+        schema_artifact::<StreamPlan>("contracts/json-schema/v6/stream-plan.json"),
+        schema_artifact::<StreamResource>("contracts/json-schema/v6/stream-resource.json"),
+        schema_artifact::<StreamSetAccepted>("contracts/json-schema/v6/stream-set-accepted.json"),
+        schema_artifact::<StreamSetApply>("contracts/json-schema/v6/stream-set-apply.json"),
+        schema_artifact::<StreamSetResource>("contracts/json-schema/v6/stream-set-resource.json"),
+        schema_artifact::<NodeAccepted>("contracts/json-schema/v6/node-accepted.json"),
+        schema_artifact::<NodeHeartbeat>("contracts/json-schema/v6/node-heartbeat.json"),
+        schema_artifact::<NodeRegistration>("contracts/json-schema/v6/node-registration.json"),
+        schema_artifact::<ObservedState>("contracts/json-schema/v6/observed-state.json"),
+        schema_artifact::<Vec<DesiredHop>>("contracts/json-schema/v6/desired-hops.json"),
     ]
 }
 
@@ -84,7 +88,7 @@ fn response_with_etag(description: &str, schema: Value) -> Value {
         "description": description,
         "headers": {
             "ETag": {
-                "description": "Opaque stream revision for conditional mutations",
+                "description": "Opaque resource revision for conditional mutations",
                 "schema": { "type": "string" }
             }
         },
@@ -172,6 +176,7 @@ pub fn northbound_openapi() -> Value {
                         "202": response_with_etag("Stream accepted", schema_ref("StreamAccepted")),
                         "400": error_response("Invalid stream"),
                         "401": error_response("Authentication failed"),
+                        "409": error_response("Stream is owned by a stream set"),
                         "412": error_response("Revision precondition failed"),
                         "428": error_response("A revision precondition is required"),
                         "500": error_response("Persistence or encoding failed"),
@@ -205,6 +210,7 @@ pub fn northbound_openapi() -> Value {
                         "204": response("Stream deleted", None),
                         "400": error_response("Invalid stream name"),
                         "401": error_response("Authentication failed"),
+                        "409": error_response("Stream is owned by a stream set"),
                         "412": error_response("Revision precondition failed"),
                         "428": error_response("A revision precondition is required"),
                         "500": error_response("Persistence failed"),
@@ -222,6 +228,57 @@ pub fn northbound_openapi() -> Value {
                         "401": error_response("Authentication failed"),
                         "404": error_response("Stream not found"),
                         "503": error_response("Stream not placed"),
+                        "502": error_response("Controller unavailable")
+                    }
+                }
+            },
+            format!("{API_PREFIX}{ROUTE_STREAM_SETS}"): {
+                "get": {
+                    "operationId": "listStreamSets",
+                    "responses": {
+                        "200": response("Stream ownership sets", Some(schema_ref("StreamSetList"))),
+                        "401": error_response("Authentication failed"),
+                        "502": error_response("Controller unavailable")
+                    }
+                }
+            },
+            format!("{API_PREFIX}{ROUTE_STREAM_SET}"): {
+                "get": {
+                    "operationId": "getStreamSet",
+                    "parameters": [path_parameter("owner")],
+                    "responses": {
+                        "200": response_with_etag("Stream ownership set", schema_ref("StreamSetResource")),
+                        "400": error_response("Invalid owner"),
+                        "401": error_response("Authentication failed"),
+                        "404": error_response("Stream set not found"),
+                        "502": error_response("Controller unavailable")
+                    }
+                },
+                "put": {
+                    "operationId": "applyStreamSet",
+                    "description": "Atomically applies the streams and optionally prunes omitted streams owned by this set. Exactly one of If-Match or If-None-Match is required",
+                    "parameters": [
+                        path_parameter("owner"),
+                        header_parameter(
+                            "If-Match",
+                            "Current ETag when updating an existing stream set",
+                            false,
+                        ),
+                        header_parameter(
+                            "If-None-Match",
+                            "Use * when creating a stream set that must not already exist",
+                            false,
+                        )
+                    ],
+                    "requestBody": request_body("StreamSetApply"),
+                    "responses": {
+                        "202": response_with_etag("Stream set accepted", schema_ref("StreamSetAccepted")),
+                        "400": error_response("Invalid stream set"),
+                        "401": error_response("Authentication failed"),
+                        "409": error_response("Stream ownership conflict"),
+                        "412": error_response("Revision precondition failed"),
+                        "428": error_response("A revision precondition is required"),
+                        "500": error_response("Persistence or encoding failed"),
                         "502": error_response("Controller unavailable")
                     }
                 }
@@ -259,6 +316,10 @@ pub fn northbound_openapi() -> Value {
             ("StreamPlan", schema::<StreamPlan>()),
             ("StreamResource", schema::<StreamResource>()),
             ("StreamList", schema::<Vec<StreamResource>>()),
+            ("StreamSetAccepted", schema::<StreamSetAccepted>()),
+            ("StreamSetApply", schema::<StreamSetApply>()),
+            ("StreamSetResource", schema::<StreamSetResource>()),
+            ("StreamSetList", schema::<Vec<StreamSetResource>>()),
         ]),
     )
 }
@@ -377,7 +438,7 @@ mod tests {
         assert_eq!(north["security"][0]["bearerAuth"], json!([]));
         assert_eq!(south["security"][0]["bearerAuth"], json!([]));
         assert_eq!(
-            north["paths"]["/v5/streams/{name}"]
+            north["paths"]["/v6/streams/{name}"]
                 .as_object()
                 .unwrap()
                 .keys()
@@ -390,11 +451,13 @@ mod tests {
         assert_eq!(
             north_paths.keys().copied().collect::<Vec<_>>(),
             [
-                "/v5/status",
-                "/v5/stream-plans",
-                "/v5/streams",
-                "/v5/streams/{name}",
-                "/v5/streams/{name}/endpoints"
+                "/v6/status",
+                "/v6/stream-plans",
+                "/v6/stream-sets",
+                "/v6/stream-sets/{owner}",
+                "/v6/streams",
+                "/v6/streams/{name}",
+                "/v6/streams/{name}/endpoints"
             ]
         );
 
@@ -402,12 +465,12 @@ mod tests {
         assert_eq!(
             south_paths.keys().copied().collect::<Vec<_>>(),
             [
-                "/v5/endpoints",
-                "/v5/nodes",
-                "/v5/nodes/register",
-                "/v5/nodes/{node_id}/desired",
-                "/v5/nodes/{node_id}/heartbeat",
-                "/v5/state"
+                "/v6/endpoints",
+                "/v6/nodes",
+                "/v6/nodes/register",
+                "/v6/nodes/{node_id}/desired",
+                "/v6/nodes/{node_id}/heartbeat",
+                "/v6/state"
             ]
         );
     }
@@ -422,8 +485,8 @@ mod tests {
     #[test]
     fn northbound_contract_exposes_resource_revisions() {
         let document = northbound_openapi();
-        let apply = &document["paths"]["/v5/streams"]["post"];
-        let stream = &document["paths"]["/v5/streams/{name}"];
+        let apply = &document["paths"]["/v6/streams"]["post"];
+        let stream = &document["paths"]["/v6/streams/{name}"];
 
         assert_eq!(
             stream["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
@@ -435,6 +498,25 @@ mod tests {
         assert!(apply["responses"]["428"].is_object());
         assert_eq!(stream["delete"]["parameters"][1]["name"], "If-Match");
         assert_eq!(stream["delete"]["parameters"][1]["required"], true);
+    }
+
+    #[test]
+    fn northbound_contract_exposes_atomic_stream_sets() {
+        let document = northbound_openapi();
+        let sets = &document["paths"]["/v6/stream-sets"];
+        let set = &document["paths"]["/v6/stream-sets/{owner}"];
+
+        assert!(sets["get"].is_object());
+        assert_eq!(set["get"]["parameters"][0]["name"], "owner");
+        assert!(set["get"]["responses"]["200"]["headers"]["ETag"].is_object());
+        assert_eq!(
+            set["put"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/StreamSetApply"
+        );
+        assert!(set["put"]["responses"]["202"]["headers"]["ETag"].is_object());
+        assert!(set["put"]["responses"]["409"].is_object());
+        assert!(set["put"]["responses"]["412"].is_object());
+        assert!(set["put"]["responses"]["428"].is_object());
     }
 
     #[test]

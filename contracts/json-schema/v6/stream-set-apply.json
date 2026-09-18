@@ -1,0 +1,840 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "prune": {
+      "default": false,
+      "type": "boolean"
+    },
+    "streams": {
+      "items": {
+        "additionalProperties": false,
+        "description": "Operator intent: one source streamed to one or more destinations over a transport.",
+        "properties": {
+          "destinations": {
+            "items": {
+              "description": "Transport carrying a stream endpoint. Externally tagged by transport name.",
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "srt": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "accepts": {
+                          "additionalProperties": false,
+                          "description": "What this endpoint will accept. Destinations only. Absent accepts\n anything.",
+                          "properties": {
+                            "audio": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "channels": {
+                                  "items": {
+                                    "format": "uint8",
+                                    "maximum": 255,
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "minItems": 1,
+                                  "type": [
+                                    "array",
+                                    "null"
+                                  ]
+                                },
+                                "codec": {
+                                  "items": {
+                                    "enum": [
+                                      "aac",
+                                      "opus",
+                                      "mp2",
+                                      "pcm_s16",
+                                      "pcm_s24"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  "minItems": 1,
+                                  "type": [
+                                    "array",
+                                    "null"
+                                  ]
+                                },
+                                "sample_rate": {
+                                  "items": {
+                                    "format": "uint32",
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "minItems": 1,
+                                  "type": [
+                                    "array",
+                                    "null"
+                                  ]
+                                }
+                              },
+                              "type": [
+                                "object",
+                                "null"
+                              ]
+                            },
+                            "container": {
+                              "items": {
+                                "enum": [
+                                  "mpeg_ts",
+                                  "rtp"
+                                ],
+                                "type": "string"
+                              },
+                              "minItems": 1,
+                              "type": [
+                                "array",
+                                "null"
+                              ]
+                            },
+                            "video": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "chroma_subsampling": {
+                                  "items": {
+                                    "enum": [
+                                      "yuv420",
+                                      "yuv422",
+                                      "yuv444"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  "minItems": 1,
+                                  "type": [
+                                    "array",
+                                    "null"
+                                  ]
+                                },
+                                "codec": {
+                                  "items": {
+                                    "enum": [
+                                      "h264",
+                                      "h265",
+                                      "av1",
+                                      "vp9"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  "minItems": 1,
+                                  "type": [
+                                    "array",
+                                    "null"
+                                  ]
+                                },
+                                "framerate": {
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "description": "Frames per second as a rational, because broadcast rates are not integers:\n 29.97 is exactly 30000/1001 and rounding it loses the distinction from 30.",
+                                    "properties": {
+                                      "denominator": {
+                                        "format": "uint32",
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "numerator": {
+                                        "format": "uint32",
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "numerator",
+                                      "denominator"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "minItems": 1,
+                                  "type": [
+                                    "array",
+                                    "null"
+                                  ]
+                                },
+                                "height": {
+                                  "items": {
+                                    "format": "uint32",
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "minItems": 1,
+                                  "type": [
+                                    "array",
+                                    "null"
+                                  ]
+                                },
+                                "width": {
+                                  "items": {
+                                    "format": "uint32",
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "minItems": 1,
+                                  "type": [
+                                    "array",
+                                    "null"
+                                  ]
+                                }
+                              },
+                              "type": [
+                                "object",
+                                "null"
+                              ]
+                            }
+                          },
+                          "type": [
+                            "object",
+                            "null"
+                          ]
+                        },
+                        "format": {
+                          "additionalProperties": false,
+                          "description": "What the producer feeding this endpoint sends. Sources only.\n\n Declared, not discovered: an SRT flow that only moves bytes never parses\n its payload, so nothing downstream knows what is inside it. Absent means\n the format is unknown and nothing is checked against it.",
+                          "properties": {
+                            "audio": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "channels": {
+                                  "format": "uint8",
+                                  "maximum": 255,
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "codec": {
+                                  "enum": [
+                                    "aac",
+                                    "opus",
+                                    "mp2",
+                                    "pcm_s16",
+                                    "pcm_s24"
+                                  ],
+                                  "type": "string"
+                                },
+                                "sample_rate": {
+                                  "description": "Samples per second. The field a sample-rate conversion changes.",
+                                  "format": "uint32",
+                                  "minimum": 0,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "codec",
+                                "sample_rate",
+                                "channels"
+                              ],
+                              "type": [
+                                "object",
+                                "null"
+                              ]
+                            },
+                            "container": {
+                              "enum": [
+                                "mpeg_ts",
+                                "rtp"
+                              ],
+                              "type": "string"
+                            },
+                            "video": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "chroma_subsampling": {
+                                  "enum": [
+                                    "yuv420",
+                                    "yuv422",
+                                    "yuv444"
+                                  ],
+                                  "type": "string"
+                                },
+                                "codec": {
+                                  "enum": [
+                                    "h264",
+                                    "h265",
+                                    "av1",
+                                    "vp9"
+                                  ],
+                                  "type": "string"
+                                },
+                                "framerate": {
+                                  "additionalProperties": false,
+                                  "description": "Frames per second as a rational, because broadcast rates are not integers:\n 29.97 is exactly 30000/1001 and rounding it loses the distinction from 30.",
+                                  "properties": {
+                                    "denominator": {
+                                      "format": "uint32",
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "numerator": {
+                                      "format": "uint32",
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "numerator",
+                                    "denominator"
+                                  ],
+                                  "type": "object"
+                                },
+                                "height": {
+                                  "format": "uint32",
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "width": {
+                                  "format": "uint32",
+                                  "minimum": 0,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "codec",
+                                "width",
+                                "height",
+                                "framerate",
+                                "chroma_subsampling"
+                              ],
+                              "type": [
+                                "object",
+                                "null"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "container"
+                          ],
+                          "type": [
+                            "object",
+                            "null"
+                          ]
+                        },
+                        "latency": {
+                          "format": "uint32",
+                          "minimum": 0,
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "network": {
+                          "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "node": {
+                          "description": "Registered node id hosting this endpoint. Mutually exclusive with\n [`SrtEndpoint::remote`]; exactly one must be set (enforced at validation).",
+                          "maxLength": 63,
+                          "minLength": 1,
+                          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "remote": {
+                          "additionalProperties": false,
+                          "description": "External SRT listener this endpoint dials out to. Destinations only;\n mutually exclusive with [`SrtEndpoint::node`].",
+                          "properties": {
+                            "host": {
+                              "type": "string"
+                            },
+                            "port": {
+                              "format": "uint16",
+                              "maximum": 65535,
+                              "minimum": 0,
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "host",
+                            "port"
+                          ],
+                          "type": [
+                            "object",
+                            "null"
+                          ]
+                        },
+                        "via": {
+                          "description": "Registered node ids to relay through, upstream-first, before reaching this\n destination. Destinations only. Pins transit the planner would otherwise\n choose itself; it still inserts a relay of its own when a link needs one\n and none is pinned.",
+                          "items": {
+                            "maxLength": 63,
+                            "minLength": 1,
+                            "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                            "type": "string"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "srt"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "description": "The media starts or ends at a node's own capture or display device: a\n camera when this is the source, a screen when it is a destination. The\n controller chooses the transport that carries it to or from the node.",
+                  "properties": {
+                    "device": {
+                      "additionalProperties": false,
+                      "description": "An endpoint that is nothing but a node: the node itself produces or consumes\n the media, so there is no address, latency, or format to declare.",
+                      "properties": {
+                        "network": {
+                          "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "node": {
+                          "maxLength": 63,
+                          "minLength": 1,
+                          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "node"
+                      ],
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "device"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "enabled": {
+            "default": true,
+            "type": "boolean"
+          },
+          "name": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          },
+          "source": {
+            "description": "Transport carrying a stream endpoint. Externally tagged by transport name.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "srt": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "accepts": {
+                        "additionalProperties": false,
+                        "description": "What this endpoint will accept. Destinations only. Absent accepts\n anything.",
+                        "properties": {
+                          "audio": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "channels": {
+                                "items": {
+                                  "format": "uint8",
+                                  "maximum": 255,
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "minItems": 1,
+                                "type": [
+                                  "array",
+                                  "null"
+                                ]
+                              },
+                              "codec": {
+                                "items": {
+                                  "enum": [
+                                    "aac",
+                                    "opus",
+                                    "mp2",
+                                    "pcm_s16",
+                                    "pcm_s24"
+                                  ],
+                                  "type": "string"
+                                },
+                                "minItems": 1,
+                                "type": [
+                                  "array",
+                                  "null"
+                                ]
+                              },
+                              "sample_rate": {
+                                "items": {
+                                  "format": "uint32",
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "minItems": 1,
+                                "type": [
+                                  "array",
+                                  "null"
+                                ]
+                              }
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "container": {
+                            "items": {
+                              "enum": [
+                                "mpeg_ts",
+                                "rtp"
+                              ],
+                              "type": "string"
+                            },
+                            "minItems": 1,
+                            "type": [
+                              "array",
+                              "null"
+                            ]
+                          },
+                          "video": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "chroma_subsampling": {
+                                "items": {
+                                  "enum": [
+                                    "yuv420",
+                                    "yuv422",
+                                    "yuv444"
+                                  ],
+                                  "type": "string"
+                                },
+                                "minItems": 1,
+                                "type": [
+                                  "array",
+                                  "null"
+                                ]
+                              },
+                              "codec": {
+                                "items": {
+                                  "enum": [
+                                    "h264",
+                                    "h265",
+                                    "av1",
+                                    "vp9"
+                                  ],
+                                  "type": "string"
+                                },
+                                "minItems": 1,
+                                "type": [
+                                  "array",
+                                  "null"
+                                ]
+                              },
+                              "framerate": {
+                                "items": {
+                                  "additionalProperties": false,
+                                  "description": "Frames per second as a rational, because broadcast rates are not integers:\n 29.97 is exactly 30000/1001 and rounding it loses the distinction from 30.",
+                                  "properties": {
+                                    "denominator": {
+                                      "format": "uint32",
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "numerator": {
+                                      "format": "uint32",
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "numerator",
+                                    "denominator"
+                                  ],
+                                  "type": "object"
+                                },
+                                "minItems": 1,
+                                "type": [
+                                  "array",
+                                  "null"
+                                ]
+                              },
+                              "height": {
+                                "items": {
+                                  "format": "uint32",
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "minItems": 1,
+                                "type": [
+                                  "array",
+                                  "null"
+                                ]
+                              },
+                              "width": {
+                                "items": {
+                                  "format": "uint32",
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "minItems": 1,
+                                "type": [
+                                  "array",
+                                  "null"
+                                ]
+                              }
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          }
+                        },
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      },
+                      "format": {
+                        "additionalProperties": false,
+                        "description": "What the producer feeding this endpoint sends. Sources only.\n\n Declared, not discovered: an SRT flow that only moves bytes never parses\n its payload, so nothing downstream knows what is inside it. Absent means\n the format is unknown and nothing is checked against it.",
+                        "properties": {
+                          "audio": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "channels": {
+                                "format": "uint8",
+                                "maximum": 255,
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "codec": {
+                                "enum": [
+                                  "aac",
+                                  "opus",
+                                  "mp2",
+                                  "pcm_s16",
+                                  "pcm_s24"
+                                ],
+                                "type": "string"
+                              },
+                              "sample_rate": {
+                                "description": "Samples per second. The field a sample-rate conversion changes.",
+                                "format": "uint32",
+                                "minimum": 0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "codec",
+                              "sample_rate",
+                              "channels"
+                            ],
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "container": {
+                            "enum": [
+                              "mpeg_ts",
+                              "rtp"
+                            ],
+                            "type": "string"
+                          },
+                          "video": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "chroma_subsampling": {
+                                "enum": [
+                                  "yuv420",
+                                  "yuv422",
+                                  "yuv444"
+                                ],
+                                "type": "string"
+                              },
+                              "codec": {
+                                "enum": [
+                                  "h264",
+                                  "h265",
+                                  "av1",
+                                  "vp9"
+                                ],
+                                "type": "string"
+                              },
+                              "framerate": {
+                                "additionalProperties": false,
+                                "description": "Frames per second as a rational, because broadcast rates are not integers:\n 29.97 is exactly 30000/1001 and rounding it loses the distinction from 30.",
+                                "properties": {
+                                  "denominator": {
+                                    "format": "uint32",
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "numerator": {
+                                    "format": "uint32",
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "numerator",
+                                  "denominator"
+                                ],
+                                "type": "object"
+                              },
+                              "height": {
+                                "format": "uint32",
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "width": {
+                                "format": "uint32",
+                                "minimum": 0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "codec",
+                              "width",
+                              "height",
+                              "framerate",
+                              "chroma_subsampling"
+                            ],
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "container"
+                        ],
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      },
+                      "latency": {
+                        "format": "uint32",
+                        "minimum": 0,
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "network": {
+                        "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "node": {
+                        "description": "Registered node id hosting this endpoint. Mutually exclusive with\n [`SrtEndpoint::remote`]; exactly one must be set (enforced at validation).",
+                        "maxLength": 63,
+                        "minLength": 1,
+                        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "remote": {
+                        "additionalProperties": false,
+                        "description": "External SRT listener this endpoint dials out to. Destinations only;\n mutually exclusive with [`SrtEndpoint::node`].",
+                        "properties": {
+                          "host": {
+                            "type": "string"
+                          },
+                          "port": {
+                            "format": "uint16",
+                            "maximum": 65535,
+                            "minimum": 0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "host",
+                          "port"
+                        ],
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      },
+                      "via": {
+                        "description": "Registered node ids to relay through, upstream-first, before reaching this\n destination. Destinations only. Pins transit the planner would otherwise\n choose itself; it still inserts a relay of its own when a link needs one\n and none is pinned.",
+                        "items": {
+                          "maxLength": 63,
+                          "minLength": 1,
+                          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                          "type": "string"
+                        },
+                        "type": "array"
+                      }
+                    },
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "srt"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The media starts or ends at a node's own capture or display device: a\n camera when this is the source, a screen when it is a destination. The\n controller chooses the transport that carries it to or from the node.",
+                "properties": {
+                  "device": {
+                    "additionalProperties": false,
+                    "description": "An endpoint that is nothing but a node: the node itself produces or consumes\n the media, so there is no address, latency, or format to declare.",
+                    "properties": {
+                      "network": {
+                        "description": "Data-plane alias resolved against the node's declared address map.\n Absent means [`DEFAULT_DATA_PLANE_ALIAS`].",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "node": {
+                        "maxLength": 63,
+                        "minLength": 1,
+                        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "node"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "device"
+                ],
+                "type": "object"
+              }
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "source",
+          "destinations"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "streams"
+  ],
+  "title": "StreamSetApply",
+  "type": "object"
+}

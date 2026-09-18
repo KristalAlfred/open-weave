@@ -11,7 +11,7 @@ page_dir := source_directory() / ".." / "nodes" / "browser"
 
 # Version prefix carrying both control-plane contracts, matching weave_core::API_PREFIX.
 # `/health` and the controller dashboard (`/`, `/ui`, `/view`) sit outside it.
-v       := "/v5"
+v       := "/v6"
 
 # Bearer tokens per API surface. Defaults match docker-compose.yml so the bench
 # needs no exports; override by exporting either variable. `/health` and the

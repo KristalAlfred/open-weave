@@ -463,11 +463,11 @@ destinations:
     fn api_url_inserts_the_version_prefix_once() {
         assert_eq!(
             api_url("http://127.0.0.1:9080", "/streams"),
-            "http://127.0.0.1:9080/v5/streams"
+            "http://127.0.0.1:9080/v6/streams"
         );
         assert_eq!(
             api_url("http://127.0.0.1:9080/", "/streams"),
-            "http://127.0.0.1:9080/v5/streams",
+            "http://127.0.0.1:9080/v6/streams",
             "a trailing slash on the base does not double up"
         );
     }
@@ -695,7 +695,7 @@ destinations:
 
         assert_eq!(
             seen.lock().unwrap().as_deref(),
-            Some("POST /v5/stream-plans Bearer cli-test-token preview")
+            Some("POST /v6/stream-plans Bearer cli-test-token preview")
         );
     }
 
@@ -704,6 +704,7 @@ destinations:
         let token = Token::new("cli-test-token").unwrap();
         let resource = StreamResource {
             generation: 7,
+            owner: None,
             spec: sample_stream(),
         };
         let (url, seen) = stub_resource(Some(resource), StatusCode::ACCEPTED).await;
@@ -714,7 +715,7 @@ destinations:
 
         assert_eq!(
             seen.lock().unwrap().as_slice(),
-            ["GET /v5/streams/cam1-to-studio Bearer cli-test-token - -"]
+            ["GET /v6/streams/cam1-to-studio Bearer cli-test-token - -"]
         );
     }
 
@@ -730,8 +731,8 @@ destinations:
         assert_eq!(
             seen.lock().unwrap().as_slice(),
             [
-                "GET /v5/streams/cam1-to-studio Bearer cli-test-token - -",
-                "POST /v5/streams Bearer cli-test-token - *"
+                "GET /v6/streams/cam1-to-studio Bearer cli-test-token - -",
+                "POST /v6/streams Bearer cli-test-token - *"
             ]
         );
     }
@@ -741,6 +742,7 @@ destinations:
         let token = Token::new("cli-test-token").unwrap();
         let resource = StreamResource {
             generation: 7,
+            owner: None,
             spec: sample_stream(),
         };
         let (url, seen) = stub_resource(Some(resource), StatusCode::ACCEPTED).await;
@@ -752,8 +754,8 @@ destinations:
         assert_eq!(
             seen.lock().unwrap().as_slice(),
             [
-                "GET /v5/streams/cam1-to-studio Bearer cli-test-token - -",
-                "POST /v5/streams Bearer cli-test-token \"revision-7\" -"
+                "GET /v6/streams/cam1-to-studio Bearer cli-test-token - -",
+                "POST /v6/streams Bearer cli-test-token \"revision-7\" -"
             ]
         );
     }
@@ -762,6 +764,7 @@ destinations:
     async fn apply_surfaces_a_structured_conflict_without_retrying() {
         let resource = StreamResource {
             generation: 7,
+            owner: None,
             spec: sample_stream(),
         };
         let (url, seen) = stub_resource(Some(resource), StatusCode::PRECONDITION_FAILED).await;
@@ -781,6 +784,7 @@ destinations:
     async fn apply_refuses_to_update_without_the_get_etag() {
         let resource = StreamResource {
             generation: 7,
+            owner: None,
             spec: sample_stream(),
         };
         let (url, seen) = start_resource_stub(Some(resource), StatusCode::ACCEPTED, false).await;
@@ -797,6 +801,7 @@ destinations:
     async fn lookup_decodes_the_resource_generation() {
         let resource = StreamResource {
             generation: 23,
+            owner: None,
             spec: sample_stream(),
         };
         let (url, _seen) = stub_resource(Some(resource), StatusCode::ACCEPTED).await;
@@ -823,6 +828,7 @@ destinations:
 
         let resource = StreamResource {
             generation: 7,
+            owner: None,
             spec: sample_stream(),
         };
         let (url, seen) = stub_resource(Some(resource), StatusCode::NO_CONTENT).await;
@@ -832,8 +838,8 @@ destinations:
         assert_eq!(
             seen.lock().unwrap().as_slice(),
             [
-                "GET /v5/streams/cam1-to-studio Bearer cli-test-token - -",
-                "DELETE /v5/streams/cam1-to-studio Bearer cli-test-token \"revision-7\" -"
+                "GET /v6/streams/cam1-to-studio Bearer cli-test-token - -",
+                "DELETE /v6/streams/cam1-to-studio Bearer cli-test-token \"revision-7\" -"
             ]
         );
 
