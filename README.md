@@ -105,7 +105,7 @@ Both control-plane contracts are served under **`/v6`**:
 
 | Contract | Served by | Routes |
 |---|---|---|
-| operator (northbound) | northbound, controller | `/v6/streams`, `/v6/streams/{name}`, `/v6/stream-sets`, `/v6/stream-sets/{owner}`, `/v6/streams/{name}/endpoints`, `/v6/stream-plans`, `/v6/status` |
+| operator (northbound) | northbound, controller | `/v6/streams`, `/v6/streams/{name}`, `/v6/stream-sets`, `/v6/stream-sets/{owner}`, `/v6/streams/{name}/endpoints`, `/v6/stream-plans`, `/v6/nodes`, `/v6/status` |
 | adapter (southbound) | southbound, controller | `/v6/nodes/register`, `/v6/nodes/{id}/heartbeat`, `/v6/nodes/{id}/desired`, `/v6/nodes`, `/v6/endpoints`, `/v6/state` |
 
 The controller serves the union of both, because northbound and southbound are
@@ -118,6 +118,8 @@ The URL major covers the complete HTTP contract: routes, request payloads,
 response payloads, and error shapes. Any breaking change to either surface moves
 the prefix. Additive fields may ship within a major when clients can ignore them.
 There is no separate northbound payload version to miss.
+
+`GET /v6/nodes` lists registered nodes for operator and adapter reads.
 
 `GET /v6/streams` lists stream resources. `GET /v6/streams/{name}` returns one
 or `404 stream_not_found`. A resource contains its desired definition under
@@ -385,6 +387,11 @@ cannot create streams. Northbound and southbound each re-present their own
 surface token on the hop to the controller, so one secret covers a surface end to
 end. Nodes may instead carry the token in their config file as
 `node.southbound_token`, which takes precedence over the environment.
+
+Controller `GET /v6/nodes` accepts either token because both surfaces expose the
+same read-only inventory. This does not cross the mutation boundary: operator
+stream writes accept only the northbound token, and node lifecycle writes accept
+only the southbound token.
 
 A browser node (`nodes/browser/`) is a media node too: the page presents
 `WEAVE_SOUTHBOUND_TOKEN` on every southbound call, passed in through the URL
@@ -725,6 +732,8 @@ just run-strom-adapter --config examples/node.yaml
 just cli --help
 just apply               # examples/stream.yaml through northbound
 just get-streams
+just get-nodes
+just get-status
 ```
 
 The adapter needs a node config, from `--config` or `WEAVE_NODE_CONFIG`; it will
@@ -732,11 +741,30 @@ not start without one. `examples/node.yaml` names the bench's southbound and
 Strom addresses, so point them at your own before running it anywhere else —
 until they answer, the adapter serves `/health` and keeps retrying.
 
-`just apply` and `just get-streams` call northbound, so it has to be up. The
+`just apply` and the `just get-*` commands call northbound, so it has to be up. The
 applied stream stays `Pending` until the nodes it names register.
 
 The CLI picks `WEAVE_NORTHBOUND_TOKEN` up from the environment; `--token`
 overrides it.
+
+CLI output defaults to a compact human-readable form. The global
+`-o human|yaml|json` option selects an explicit format; YAML and JSON are useful
+for scripts and for retaining every response field.
+
+```sh
+weave get nodes
+weave get status
+weave get endpoints STREAM
+weave get streams
+weave get stream NAME
+weave get stream-sets
+weave get stream-set OWNER
+weave -o yaml get status
+weave -o json get stream NAME
+```
+
+`get endpoints STREAM` returns the resolved addresses for that stream. The
+stream-set commands above are reads; the CLI does not apply stream sets.
 
 ## License
 

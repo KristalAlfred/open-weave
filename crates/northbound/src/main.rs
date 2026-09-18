@@ -15,9 +15,10 @@ use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Guard, Token, require_bearer};
 use weave_core::{
-    API_PREFIX, ApiError, ApiErrorCode, ROUTE_STATUS, ROUTE_STREAM, ROUTE_STREAM_ENDPOINTS,
-    ROUTE_STREAM_PLANS, ROUTE_STREAM_SET, ROUTE_STREAM_SETS, ROUTE_STREAMS, StreamDefinition,
-    StreamSetApply, ValidationIssue, resource_id_issue, validate_resource_id, validate_stream,
+    API_PREFIX, ApiError, ApiErrorCode, ROUTE_NODES, ROUTE_STATUS, ROUTE_STREAM,
+    ROUTE_STREAM_ENDPOINTS, ROUTE_STREAM_PLANS, ROUTE_STREAM_SET, ROUTE_STREAM_SETS, ROUTE_STREAMS,
+    StreamDefinition, StreamSetApply, ValidationIssue, resource_id_issue, validate_resource_id,
+    validate_stream,
 };
 
 const DEFAULT_ADDR: &str = "127.0.0.1:9080";
@@ -83,6 +84,7 @@ async fn main() -> Result<()> {
 /// controller, where the embedded dashboard reads the same rollup.
 fn router(state: AppState, guard: Guard) -> Router {
     let operator = Router::new()
+        .route(ROUTE_NODES, get(list_nodes))
         .route(ROUTE_STREAMS, get(list_streams).post(submit_stream))
         .route(ROUTE_STREAM, get(get_stream).delete(delete_stream))
         .route(ROUTE_STREAM_ENDPOINTS, get(get_endpoints))
@@ -122,6 +124,10 @@ async fn api_method_not_allowed() -> Response {
 
 async fn list_streams(State(state): State<AppState>) -> Response {
     proxy(&state, reqwest::Method::GET, "/streams", None).await
+}
+
+async fn list_nodes(State(state): State<AppState>) -> Response {
+    proxy(&state, reqwest::Method::GET, ROUTE_NODES, None).await
 }
 
 async fn get_stream(State(state): State<AppState>, Path(name): Path<String>) -> Response {
@@ -935,6 +941,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nodes_forwards_get_with_the_northbound_token() {
+        let (url, captured) = stub_controller(StatusCode::OK).await;
+        let response = guarded_app(url)
+            .oneshot(
+                Request::builder()
+                    .uri("/v6/nodes")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let seen = captured.lock().unwrap().clone().expect("forwarded");
+        assert_eq!(seen.method, "GET");
+        assert_eq!(seen.path, "/v6/nodes");
+        assert_eq!(
+            seen.authorization.as_deref(),
+            Some(format!("Bearer {TOKEN}").as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn invalid_stream_is_rejected_before_proxying() {
         let (url, captured) = stub_controller(StatusCode::ACCEPTED).await;
         let app = open_app(url);
@@ -1081,6 +1111,7 @@ mod tests {
         let app = open_app(url);
 
         for (method, uri) in [
+            ("GET", "/nodes"),
             ("GET", "/streams"),
             ("POST", "/streams"),
             ("POST", "/stream-plans"),
@@ -1089,6 +1120,7 @@ mod tests {
             ("GET", "/streams/basic/endpoints"),
             ("GET", "/status"),
             ("GET", "/v1/streams"),
+            ("GET", "/v1/nodes"),
             ("POST", "/v1/streams"),
             ("POST", "/v1/stream-plans"),
             ("GET", "/v1/streams/basic"),
@@ -1096,6 +1128,7 @@ mod tests {
             ("GET", "/v1/streams/basic/endpoints"),
             ("GET", "/v1/status"),
             ("GET", "/v2/streams"),
+            ("GET", "/v2/nodes"),
             ("POST", "/v2/streams"),
             ("POST", "/v2/stream-plans"),
             ("GET", "/v2/streams/basic"),
@@ -1103,6 +1136,7 @@ mod tests {
             ("GET", "/v2/streams/basic/endpoints"),
             ("GET", "/v2/status"),
             ("GET", "/v3/streams"),
+            ("GET", "/v3/nodes"),
             ("POST", "/v3/streams"),
             ("POST", "/v3/stream-plans"),
             ("GET", "/v3/streams/basic"),
@@ -1110,6 +1144,7 @@ mod tests {
             ("GET", "/v3/streams/basic/endpoints"),
             ("GET", "/v3/status"),
             ("GET", "/v4/streams"),
+            ("GET", "/v4/nodes"),
             ("POST", "/v4/streams"),
             ("POST", "/v4/stream-plans"),
             ("GET", "/v4/streams/basic"),
@@ -1117,6 +1152,7 @@ mod tests {
             ("GET", "/v4/streams/basic/endpoints"),
             ("GET", "/v4/status"),
             ("GET", "/v5/streams"),
+            ("GET", "/v5/nodes"),
             ("POST", "/v5/streams"),
             ("POST", "/v5/stream-plans"),
             ("GET", "/v5/streams/basic"),
@@ -1171,6 +1207,7 @@ mod tests {
             let app = guarded_app(url);
 
             for (method, uri, body) in [
+                ("GET", "/v6/nodes", Body::empty()),
                 ("GET", "/v6/streams", Body::empty()),
                 (
                     "POST",

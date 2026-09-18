@@ -98,6 +98,12 @@ struct AppState {
     webhooks: Option<Arc<webhook::Emitter>>,
 }
 
+#[derive(Clone)]
+struct SharedReadGuards {
+    north: Guard,
+    south: Guard,
+}
+
 impl AppState {
     async fn hydrate(
         store: Arc<dyn StateStore>,
@@ -557,8 +563,8 @@ fn observed_state(nodes: &BTreeMap<String, NodeRegistration>) -> ObservedState {
 /// is nested under [`API_PREFIX`] here too.
 ///
 /// It backs both surfaces, so it validates both tokens and requires the one
-/// matching the surface a route belongs to — an adapter's southbound token cannot
-/// create streams.
+/// matching the surface a route belongs to. Node inventory is a shared read;
+/// mutations and node desired state remain separated.
 ///
 /// Unversioned: `/health`, which compose healthchecks and load balancers address
 /// directly, and the dashboard (`/`, `/ui`, `/view`), which ships inside this
@@ -570,6 +576,16 @@ fn observed_state(nodes: &BTreeMap<String, NodeRegistration>) -> ObservedState {
 /// They expose topology and allocated ports, so **the controller port must not be
 /// publicly exposed** — put it behind a proxy or keep it on a private network.
 fn router(state: AppState, north: Guard, south: Guard) -> Router {
+    let shared_reads = Router::new().route(ROUTE_NODES, get(list_nodes)).layer(
+        axum::middleware::from_fn_with_state(
+            SharedReadGuards {
+                north: north.clone(),
+                south: south.clone(),
+            },
+            require_shared_read_bearer,
+        ),
+    );
+
     let streams = Router::new()
         .route(ROUTE_STREAMS, get(list_streams).post(submit_stream))
         .route(ROUTE_STREAM, get(get_stream).delete(delete_stream))
@@ -580,7 +596,6 @@ fn router(state: AppState, north: Guard, south: Guard) -> Router {
         .layer(axum::middleware::from_fn_with_state(north, require_bearer));
 
     let nodes = Router::new()
-        .route(ROUTE_NODES, get(list_nodes))
         .route(ROUTE_NODE_REGISTER, post(register_node))
         .route(ROUTE_NODE_HEARTBEAT, post(node_heartbeat))
         .route(ROUTE_NODE_DESIRED, get(get_desired))
@@ -592,6 +607,7 @@ fn router(state: AppState, north: Guard, south: Guard) -> Router {
     // like `/view`.
     let api = Router::new()
         .route(ROUTE_STATUS, get(get_status))
+        .merge(shared_reads)
         .merge(streams)
         .merge(nodes)
         .fallback(api_route_not_found)
@@ -604,6 +620,42 @@ fn router(state: AppState, north: Guard, south: Guard) -> Router {
         .route("/view", get(get_view))
         .nest(API_PREFIX, api)
         .with_state(state)
+}
+
+async fn require_shared_read_bearer(
+    State(guards): State<SharedReadGuards>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if guards.north.is_disabled() || guards.south.is_disabled() {
+        return next.run(request).await;
+    }
+    let authorized = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            guards
+                .north
+                .token()
+                .is_some_and(|token| token.matches_header(value))
+                || guards
+                    .south
+                    .token()
+                    .is_some_and(|token| token.matches_header(value))
+        });
+    if authorized {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"))],
+        Json(ApiError::new(
+            ApiErrorCode::Unauthorized,
+            "missing or invalid bearer token",
+        )),
+    )
+        .into_response()
 }
 
 fn spawn_api_server(
@@ -3736,8 +3788,7 @@ mod tests {
         ("PUT", "/v6/stream-sets/studio-a"),
     ];
 
-    const SOUTH_ROUTES: [(&str, &str); 6] = [
-        ("GET", "/v6/nodes"),
+    const SOUTH_ROUTES: [(&str, &str); 5] = [
         ("POST", "/v6/nodes/register"),
         ("POST", "/v6/nodes/strom-node-1/heartbeat"),
         ("GET", "/v6/nodes/strom-node-1/desired"),
@@ -3745,13 +3796,19 @@ mod tests {
         ("GET", "/v6/state"),
     ];
 
+    const SHARED_READ_ROUTES: [(&str, &str); 1] = [("GET", "/v6/nodes")];
+
     /// Unversioned and retired-major paths are gone: this is a clean break, not
     /// an alias.
     #[tokio::test]
     async fn unversioned_and_retired_api_paths_are_not_served() {
         let (state, _mem) = mem_state();
         let app = open_router(state);
-        for (method, uri) in NORTH_ROUTES.iter().chain(&SOUTH_ROUTES) {
+        for (method, uri) in NORTH_ROUTES
+            .iter()
+            .chain(&SOUTH_ROUTES)
+            .chain(&SHARED_READ_ROUTES)
+        {
             let unversioned = uri.strip_prefix(API_PREFIX).expect("route is versioned");
             let (status, _) = send(&app, method, unversioned, None).await;
             assert_eq!(
@@ -3763,7 +3820,11 @@ mod tests {
         let (status, _) = send(&app, "GET", "/status", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         for retired_prefix in ["/v1", "/v2", "/v3", "/v4", "/v5"] {
-            for (method, uri) in NORTH_ROUTES.iter().chain(&SOUTH_ROUTES) {
+            for (method, uri) in NORTH_ROUTES
+                .iter()
+                .chain(&SOUTH_ROUTES)
+                .chain(&SHARED_READ_ROUTES)
+            {
                 let retired = uri.replacen(API_PREFIX, retired_prefix, 1);
                 let (status, _) = send(&app, method, &retired, None).await;
                 assert_eq!(status, StatusCode::NOT_FOUND, "{retired} must stay retired");
@@ -3791,7 +3852,11 @@ mod tests {
         let app = guarded_router(state);
 
         for authorization in [None, Some("Bearer wrong-token"), Some("Basic ignored")] {
-            for (method, uri) in NORTH_ROUTES.iter().chain(&SOUTH_ROUTES) {
+            for (method, uri) in NORTH_ROUTES
+                .iter()
+                .chain(&SOUTH_ROUTES)
+                .chain(&SHARED_READ_ROUTES)
+            {
                 let (status, challenge) = send_auth(&app, method, uri, authorization).await;
                 assert_eq!(
                     status,
@@ -3855,5 +3920,17 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn node_inventory_accepts_either_surface_token() {
+        let (state, _mem) = mem_state();
+        let app = guarded_router(state);
+
+        for token in [NORTH_TOKEN, SOUTH_TOKEN] {
+            let (status, _) =
+                send_auth(&app, "GET", "/v6/nodes", Some(&format!("Bearer {token}"))).await;
+            assert_eq!(status, StatusCode::OK);
+        }
     }
 }

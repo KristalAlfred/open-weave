@@ -61,6 +61,254 @@
         "title": "ApiError",
         "type": "object"
       },
+      "NodeList": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "items": {
+          "properties": {
+            "capabilities": {
+              "default": {
+                "adapters": [],
+                "data_plane": {},
+                "relay": false,
+                "transports": []
+              },
+              "properties": {
+                "adapters": {
+                  "default": [],
+                  "items": {
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "strom",
+                          "nmos",
+                          "mxl_domain",
+                          "mxl_k8s",
+                          "mcm",
+                          "vendor",
+                          "custom"
+                        ],
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name",
+                      "kind"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "data_plane": {
+                  "additionalProperties": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "properties": {
+                          "host": {
+                            "type": "string"
+                          },
+                          "reachability": {
+                            "default": "dialable",
+                            "description": "Whether peers can open a connection to an address, or the node behind it can\n only dial out. Planning reads this to decide which end of a link listens.",
+                            "oneOf": [
+                              {
+                                "const": "dialable",
+                                "description": "Peers can connect to this address.",
+                                "type": "string"
+                              },
+                              {
+                                "const": "outbound_only",
+                                "description": "Behind NAT or a firewall: this node must initiate every connection.",
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          "signalling": {
+                            "additionalProperties": false,
+                            "default": {},
+                            "description": "Base URLs a node serves WHIP and WHEP signalling at, per WebRTC transport.\n A transport with no base is not offered for hosting at that address.",
+                            "properties": {
+                              "whep": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "whip": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              }
+                            },
+                            "type": "object"
+                          }
+                        },
+                        "required": [
+                          "host"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
+                  "default": {},
+                  "description": "Data-plane addresses this node advertises, keyed by alias. The\n [`DEFAULT_DATA_PLANE_ALIAS`] entry serves node-referenced endpoints\n that pin no network.",
+                  "type": "object"
+                },
+                "devices": {
+                  "description": "Devices the node can capture from or display on.",
+                  "items": {
+                    "description": "The node's own capture or display device, where media starts or ends.",
+                    "enum": [
+                      "capture",
+                      "display"
+                    ],
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "port_range": {
+                  "description": "Inclusive port range the controller may assign from for this node's\n hops. A soft contract: bind failures surface as [`HopState::Failed`].",
+                  "properties": {
+                    "end": {
+                      "format": "uint16",
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "start": {
+                      "format": "uint16",
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "start",
+                    "end"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "relay": {
+                  "default": false,
+                  "description": "Whether this node may carry transit for streams that neither terminate\n nor originate on it — the pool the planner draws a relay from when two\n endpoints cannot dial each other.",
+                  "type": "boolean"
+                },
+                "transports": {
+                  "default": [],
+                  "description": "Link transports this node offers, with the roles it can take.",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "description": "A transport that carries media between two nodes.",
+                        "oneOf": [
+                          {
+                            "enum": [
+                              "srt"
+                            ],
+                            "type": "string"
+                          },
+                          {
+                            "const": "whip",
+                            "description": "WebRTC ingest. The `Connect` end pushes media to the `Listen` end's\n signalling URL.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "whep",
+                            "description": "WebRTC playback. The `Connect` end pulls media from the `Listen` end's\n signalling URL.",
+                            "type": "string"
+                          }
+                        ]
+                      },
+                      {
+                        "properties": {
+                          "name": {
+                            "description": "A transport that carries media between two nodes.",
+                            "oneOf": [
+                              {
+                                "enum": [
+                                  "srt"
+                                ],
+                                "type": "string"
+                              },
+                              {
+                                "const": "whip",
+                                "description": "WebRTC ingest. The `Connect` end pushes media to the `Listen` end's\n signalling URL.",
+                                "type": "string"
+                              },
+                              {
+                                "const": "whep",
+                                "description": "WebRTC playback. The `Connect` end pulls media from the `Listen` end's\n signalling URL.",
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          "roles": {
+                            "default": [
+                              "listen",
+                              "connect"
+                            ],
+                            "items": {
+                              "description": "Which end of a link a socket is: `Listen` hosts and `Connect` dials.",
+                              "enum": [
+                                "listen",
+                                "connect"
+                              ],
+                              "type": "string"
+                            },
+                            "minItems": 1,
+                            "type": "array"
+                          }
+                        },
+                        "required": [
+                          "name"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
+                  "type": "array"
+                }
+              },
+              "type": "object"
+            },
+            "endpoint": {
+              "type": "string"
+            },
+            "id": {
+              "maxLength": 63,
+              "minLength": 1,
+              "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "unknown",
+                "ready",
+                "degraded",
+                "offline"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "endpoint",
+            "status"
+          ],
+          "type": "object"
+        },
+        "title": "Array_of_NodeDescriptor",
+        "type": "array"
+      },
       "StatusResponse": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "anyOf": [
@@ -5915,6 +6163,43 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/v6/nodes": {
+      "get": {
+        "operationId": "listNodes",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeList"
+                }
+              }
+            },
+            "description": "Registered nodes"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Authentication failed"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Controller unavailable"
+          }
+        }
+      }
+    },
     "/v6/status": {
       "get": {
         "operationId": "getStatus",

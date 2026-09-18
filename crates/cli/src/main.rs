@@ -3,13 +3,15 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::RequestBuilder;
 use reqwest::header::{ETAG, HeaderValue, IF_MATCH, IF_NONE_MATCH};
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Token};
 use weave_core::{
-    API_PREFIX, ApiError, StreamDefinition, StreamPlan, StreamResource, validate_resource_id,
+    API_PREFIX, ApiError, NodeDescriptor, PathStatus, PlanStatus, ReconcileStatus, StatusResponse,
+    StreamAccepted, StreamDefinition, StreamEndpoints, StreamPlan, StreamResource,
+    StreamSetResource, validate_resource_id,
 };
 
 #[derive(Parser)]
@@ -34,8 +36,18 @@ struct Cli {
         global = true
     )]
     token: Option<String>,
+    /// Output format.
+    #[arg(short, long, value_enum, default_value_t = OutputFormat::Human, global = true)]
+    output: OutputFormat,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    Human,
+    Yaml,
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -62,8 +74,6 @@ enum Command {
         #[command(subcommand)]
         resource: DeleteResource,
     },
-    /// List registered nodes.
-    Nodes,
 }
 
 #[derive(Subcommand)]
@@ -74,6 +84,22 @@ enum GetResource {
     Stream {
         /// Name of the stream to get.
         name: String,
+    },
+    /// Get the current control-plane status.
+    Status,
+    /// List registered nodes.
+    Nodes,
+    /// Get the resolved endpoints for one stream.
+    Endpoints {
+        /// Name of the stream whose endpoints to get.
+        name: String,
+    },
+    /// List stream ownership sets.
+    StreamSets,
+    /// Get one stream ownership set.
+    StreamSet {
+        /// Owner of the stream set to get.
+        owner: String,
     },
 }
 
@@ -97,21 +123,32 @@ async fn main() -> Result<()> {
     let Cli {
         url,
         token,
+        output,
         command,
     } = Cli::parse();
     let token = token.as_deref().and_then(Token::new);
 
     match command {
-        Command::Apply { file } => apply(&url, token.as_ref(), &file).await,
-        Command::Plan { file } => plan(&url, token.as_ref(), &file).await,
+        Command::Apply { file } => apply(&url, token.as_ref(), &file, output).await,
+        Command::Plan { file } => plan(&url, token.as_ref(), &file, output).await,
         Command::Get { resource } => match resource {
-            GetResource::Streams => get_streams(&url, token.as_ref()).await,
-            GetResource::Stream { name } => get_stream(&url, token.as_ref(), &name).await,
+            GetResource::Streams => get_streams(&url, token.as_ref(), output).await,
+            GetResource::Stream { name } => get_stream(&url, token.as_ref(), &name, output).await,
+            GetResource::Status => get_status(&url, token.as_ref(), output).await,
+            GetResource::Nodes => get_nodes(&url, token.as_ref(), output).await,
+            GetResource::Endpoints { name } => {
+                get_endpoints(&url, token.as_ref(), &name, output).await
+            }
+            GetResource::StreamSets => get_stream_sets(&url, token.as_ref(), output).await,
+            GetResource::StreamSet { owner } => {
+                get_stream_set(&url, token.as_ref(), &owner, output).await
+            }
         },
         Command::Delete { resource } => match resource {
-            DeleteResource::Stream { name } => delete_stream(&url, token.as_ref(), &name).await,
+            DeleteResource::Stream { name } => {
+                delete_stream(&url, token.as_ref(), &name, output).await
+            }
         },
-        Command::Nodes => nodes(),
     }
 }
 
@@ -152,6 +189,265 @@ fn error_detail(body: &str) -> String {
     detail
 }
 
+fn format_output(output: OutputFormat, value: &serde_json::Value, human: String) -> Result<String> {
+    Ok(match output {
+        OutputFormat::Human => human,
+        OutputFormat::Yaml => serde_norway::to_string(&value).context("encoding YAML output")?,
+        OutputFormat::Json => {
+            serde_json::to_string_pretty(&value).context("encoding JSON output")?
+        }
+    })
+}
+
+fn emit(output: OutputFormat, value: serde_json::Value, human: String) -> Result<()> {
+    let rendered = format_output(output, &value, human)?;
+    println!("{}", rendered.trim_end());
+    Ok(())
+}
+
+fn table(headers: &[&str], rows: Vec<Vec<String>>) -> String {
+    let mut widths = headers
+        .iter()
+        .map(|header| header.len())
+        .collect::<Vec<_>>();
+    for row in &rows {
+        for (index, value) in row.iter().enumerate() {
+            widths[index] = widths[index].max(value.len());
+        }
+    }
+
+    let render_row = |row: Vec<String>| {
+        row.into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                if index + 1 == widths.len() {
+                    value
+                } else {
+                    format!("{value:<width$}", width = widths[index])
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+
+    let mut lines = vec![render_row(
+        headers.iter().map(|header| (*header).to_string()).collect(),
+    )];
+    lines.extend(rows.into_iter().map(render_row));
+    lines.join("\n")
+}
+
+fn stream_rows(streams: &[StreamResource]) -> Vec<Vec<String>> {
+    let mut streams = streams.iter().collect::<Vec<_>>();
+    streams.sort_by(|left, right| left.spec.name.cmp(&right.spec.name));
+    streams
+        .into_iter()
+        .map(|stream| {
+            vec![
+                stream.spec.name.clone(),
+                stream.generation.to_string(),
+                stream.owner.clone().unwrap_or_else(|| "-".to_string()),
+                stream.spec.enabled.to_string(),
+            ]
+        })
+        .collect()
+}
+
+fn render_streams(streams: &[StreamResource]) -> String {
+    table(
+        &["NAME", "GENERATION", "OWNER", "ENABLED"],
+        stream_rows(streams),
+    )
+}
+
+fn render_nodes(nodes: &[NodeDescriptor]) -> String {
+    let mut nodes = nodes.iter().collect::<Vec<_>>();
+    nodes.sort_by(|left, right| left.id.cmp(&right.id));
+    let rows = nodes
+        .into_iter()
+        .map(|node| {
+            let transports = if node.capabilities.transports.is_empty() {
+                "srt".to_string()
+            } else {
+                node.capabilities
+                    .transports
+                    .iter()
+                    .map(|offer| offer.name.name())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            vec![
+                node.id.clone(),
+                format!("{:?}", node.status).to_ascii_lowercase(),
+                node.endpoint.clone(),
+                transports,
+                node.capabilities.relay.to_string(),
+            ]
+        })
+        .collect();
+    table(&["ID", "STATUS", "ENDPOINT", "TRANSPORTS", "RELAY"], rows)
+}
+
+fn path_status_name(status: PathStatus) -> &'static str {
+    match status {
+        PathStatus::Idle => "idle",
+        PathStatus::Failed => "failed",
+        PathStatus::Pending => "pending",
+        PathStatus::AwaitingInput => "awaiting_input",
+        PathStatus::Degraded => "degraded",
+        PathStatus::Flowing => "flowing",
+    }
+}
+
+fn reconcile_status_name(status: ReconcileStatus) -> &'static str {
+    match status {
+        ReconcileStatus::Idle => "idle",
+        ReconcileStatus::Converging => "converging",
+        ReconcileStatus::Converged => "converged",
+        ReconcileStatus::Degraded => "degraded",
+    }
+}
+
+fn render_status(status: &StatusResponse) -> String {
+    match status {
+        StatusResponse::Starting(_) => "STATUS\nstarting".to_string(),
+        StatusResponse::Running(status) => {
+            let mut streams = status.streams.iter().collect::<Vec<_>>();
+            streams.sort_by(|left, right| left.name.cmp(&right.name));
+            let rows = streams
+                .into_iter()
+                .map(|stream| {
+                    vec![
+                        stream.name.clone(),
+                        stream.generation.to_string(),
+                        stream
+                            .observed_generation
+                            .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                        path_status_name(stream.status).to_string(),
+                        if stream.nodes.is_empty() {
+                            "-".to_string()
+                        } else {
+                            stream.nodes.join(",")
+                        },
+                    ]
+                })
+                .collect();
+            format!(
+                "STATUS: {}\nSUMMARY: {}\n\n{}",
+                reconcile_status_name(status.status),
+                status.summary,
+                table(&["NAME", "GENERATION", "OBSERVED", "STATUS", "NODES"], rows,)
+            )
+        }
+    }
+}
+
+fn render_endpoints(endpoints: &StreamEndpoints) -> String {
+    let mut rows = Vec::with_capacity(endpoints.outputs.len() + 1);
+    rows.push(match &endpoints.ingress {
+        Some(endpoint) => vec![
+            "ingress".to_string(),
+            "-".to_string(),
+            endpoint.node.clone(),
+            endpoint.url.clone(),
+        ],
+        None => vec![
+            "ingress".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+        ],
+    });
+    rows.extend(
+        endpoints
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(index, endpoint)| match endpoint {
+                Some(endpoint) => vec![
+                    "output".to_string(),
+                    index.to_string(),
+                    endpoint.node.clone(),
+                    endpoint.url.clone(),
+                ],
+                None => vec![
+                    "output".to_string(),
+                    index.to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                ],
+            }),
+    );
+    table(&["ROLE", "INDEX", "NODE", "URL"], rows)
+}
+
+fn render_stream_sets(stream_sets: &[StreamSetResource]) -> String {
+    let mut sets = stream_sets.iter().collect::<Vec<_>>();
+    sets.sort_by(|left, right| left.owner.cmp(&right.owner));
+    table(
+        &["OWNER", "STREAMS"],
+        sets.into_iter()
+            .map(|set| vec![set.owner.clone(), set.streams.len().to_string()])
+            .collect(),
+    )
+}
+
+fn render_stream_set(stream_set: &StreamSetResource) -> String {
+    format!(
+        "OWNER: {}\n\n{}",
+        stream_set.owner,
+        render_streams(&stream_set.streams)
+    )
+}
+
+fn render_plan(plan: &StreamPlan) -> String {
+    let status = match plan.status {
+        PlanStatus::Disabled => "disabled",
+        PlanStatus::Placed => "placed",
+        PlanStatus::Unplaced => "unplaced",
+    };
+    table(
+        &["NAME", "STATUS", "NODES", "REASON"],
+        vec![vec![
+            plan.name.clone(),
+            status.to_string(),
+            if plan.nodes.is_empty() {
+                "-".to_string()
+            } else {
+                plan.nodes.join(",")
+            },
+            plan.reason.clone().unwrap_or_else(|| "-".to_string()),
+        ]],
+    )
+}
+
+async fn get_body(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&Token>,
+    path: &str,
+    label: &str,
+) -> Result<String> {
+    let response = authorized(client.get(api_url(url, path)), token)
+        .send()
+        .await
+        .with_context(|| format!("fetching {label}"))?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let hint = if status == reqwest::StatusCode::UNAUTHORIZED {
+            unauthorized_hint(token)
+        } else {
+            ""
+        };
+        bail!(
+            "northbound {label} request failed: {status}: {}{hint}",
+            error_detail(&body)
+        );
+    }
+    Ok(body)
+}
+
 fn parse_stream(yaml: &str) -> Result<StreamDefinition> {
     serde_norway::with::singleton_map_recursive::deserialize(serde_norway::Deserializer::from_str(
         yaml,
@@ -159,12 +455,17 @@ fn parse_stream(yaml: &str) -> Result<StreamDefinition> {
     .context("parsing stream YAML")
 }
 
-async fn apply(url: &str, token: Option<&Token>, file: &Path) -> Result<()> {
+async fn apply(url: &str, token: Option<&Token>, file: &Path, output: OutputFormat) -> Result<()> {
     let stream = read_stream(file)?;
-    apply_stream(url, token, &stream).await
+    apply_stream(url, token, &stream, output).await
 }
 
-async fn apply_stream(url: &str, token: Option<&Token>, stream: &StreamDefinition) -> Result<()> {
+async fn apply_stream(
+    url: &str,
+    token: Option<&Token>,
+    stream: &StreamDefinition,
+    output: OutputFormat,
+) -> Result<()> {
     if let Err(error) = validate_resource_id(&stream.name) {
         bail!("invalid stream name: {error}");
     }
@@ -196,8 +497,17 @@ async fn apply_stream(url: &str, token: Option<&Token>, stream: &StreamDefinitio
     }
 
     tracing::info!(name = %stream.name, %status, "stream applied");
-    println!("{body}");
-    Ok(())
+    let accepted: StreamAccepted =
+        serde_json::from_str(&body).context("decoding accepted stream")?;
+    let human = table(
+        &["NAME", "GENERATION", "CHANGED"],
+        vec![vec![
+            accepted.name.clone(),
+            accepted.generation.to_string(),
+            accepted.changed.to_string(),
+        ]],
+    );
+    emit(output, serde_json::to_value(&accepted)?, human)
 }
 
 fn read_stream(file: &Path) -> Result<StreamDefinition> {
@@ -206,12 +516,17 @@ fn read_stream(file: &Path) -> Result<StreamDefinition> {
     parse_stream(&text).with_context(|| format!("parsing stream from {}", file.display()))
 }
 
-async fn plan(url: &str, token: Option<&Token>, file: &Path) -> Result<()> {
+async fn plan(url: &str, token: Option<&Token>, file: &Path, output: OutputFormat) -> Result<()> {
     let stream = read_stream(file)?;
-    plan_stream(url, token, &stream).await
+    plan_stream(url, token, &stream, output).await
 }
 
-async fn plan_stream(url: &str, token: Option<&Token>, stream: &StreamDefinition) -> Result<()> {
+async fn plan_stream(
+    url: &str,
+    token: Option<&Token>,
+    stream: &StreamDefinition,
+    output: OutputFormat,
+) -> Result<()> {
     let response = authorized(
         reqwest::Client::new().post(api_url(url, "/stream-plans")),
         token,
@@ -235,35 +550,24 @@ async fn plan_stream(url: &str, token: Option<&Token>, stream: &StreamDefinition
         );
     }
     let plan: StreamPlan = serde_json::from_str(&body).context("decoding stream plan")?;
-    println!("{}", serde_json::to_string_pretty(&plan)?);
-    Ok(())
+    let human = render_plan(&plan);
+    emit(output, serde_json::to_value(&plan)?, human)
 }
 
-async fn get_streams(url: &str, token: Option<&Token>) -> Result<()> {
-    let response = authorized(reqwest::Client::new().get(api_url(url, "/streams")), token)
-        .send()
-        .await
-        .context("fetching streams")?;
-
-    let status = response.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        bail!(
-            "northbound streams request failed: {status}{}",
-            unauthorized_hint(token)
-        );
-    }
-    let streams = response
-        .error_for_status()
-        .context("northbound streams request failed")?
-        .json::<Vec<StreamResource>>()
-        .await
-        .context("decoding streams")?;
-
-    println!("{}", serde_json::to_string_pretty(&streams)?);
-    Ok(())
+async fn get_streams(url: &str, token: Option<&Token>, output: OutputFormat) -> Result<()> {
+    let client = reqwest::Client::new();
+    let body = get_body(&client, url, token, "/streams", "streams").await?;
+    let streams: Vec<StreamResource> = serde_json::from_str(&body).context("decoding streams")?;
+    let human = render_streams(&streams);
+    emit(output, serde_json::to_value(&streams)?, human)
 }
 
-async fn get_stream(url: &str, token: Option<&Token>, name: &str) -> Result<()> {
+async fn get_stream(
+    url: &str,
+    token: Option<&Token>,
+    name: &str,
+    output: OutputFormat,
+) -> Result<()> {
     if let Err(error) = validate_resource_id(name) {
         bail!("invalid stream name: {error}");
     }
@@ -271,11 +575,89 @@ async fn get_stream(url: &str, token: Option<&Token>, name: &str) -> Result<()> 
     let Some(stream) = lookup_stream(&client, url, token, name).await? else {
         bail!("no stream named {name}");
     };
-    println!("{}", serde_json::to_string_pretty(&stream.resource)?);
-    Ok(())
+    let human = render_streams(std::slice::from_ref(&stream.resource));
+    emit(output, serde_json::to_value(&stream.resource)?, human)
 }
 
-async fn delete_stream(url: &str, token: Option<&Token>, name: &str) -> Result<()> {
+async fn get_status(url: &str, token: Option<&Token>, output: OutputFormat) -> Result<()> {
+    let client = reqwest::Client::new();
+    let body = get_body(&client, url, token, "/status", "status").await?;
+    let status: StatusResponse = serde_json::from_str(&body).context("decoding status")?;
+    let human = render_status(&status);
+    emit(output, serde_json::to_value(&status)?, human)
+}
+
+async fn get_nodes(url: &str, token: Option<&Token>, output: OutputFormat) -> Result<()> {
+    let client = reqwest::Client::new();
+    let body = get_body(&client, url, token, "/nodes", "nodes").await?;
+    let nodes: Vec<NodeDescriptor> = serde_json::from_str(&body).context("decoding nodes")?;
+    let human = render_nodes(&nodes);
+    emit(output, serde_json::to_value(&nodes)?, human)
+}
+
+async fn get_endpoints(
+    url: &str,
+    token: Option<&Token>,
+    name: &str,
+    output: OutputFormat,
+) -> Result<()> {
+    if let Err(error) = validate_resource_id(name) {
+        bail!("invalid stream name: {error}");
+    }
+    let client = reqwest::Client::new();
+    let body = get_body(
+        &client,
+        url,
+        token,
+        &format!("/streams/{name}/endpoints"),
+        "stream endpoints",
+    )
+    .await?;
+    let endpoints: StreamEndpoints =
+        serde_json::from_str(&body).context("decoding stream endpoints")?;
+    let human = render_endpoints(&endpoints);
+    emit(output, serde_json::to_value(&endpoints)?, human)
+}
+
+async fn get_stream_sets(url: &str, token: Option<&Token>, output: OutputFormat) -> Result<()> {
+    let client = reqwest::Client::new();
+    let body = get_body(&client, url, token, "/stream-sets", "stream sets").await?;
+    let stream_sets: Vec<StreamSetResource> =
+        serde_json::from_str(&body).context("decoding stream sets")?;
+    let human = render_stream_sets(&stream_sets);
+    emit(output, serde_json::to_value(&stream_sets)?, human)
+}
+
+async fn get_stream_set(
+    url: &str,
+    token: Option<&Token>,
+    owner: &str,
+    output: OutputFormat,
+) -> Result<()> {
+    if let Err(error) = validate_resource_id(owner) {
+        bail!("invalid stream-set owner: {error}");
+    }
+    let client = reqwest::Client::new();
+    let body = get_body(
+        &client,
+        url,
+        token,
+        &format!("/stream-sets/{owner}"),
+        "stream set",
+    )
+    .await?;
+    let stream_set: StreamSetResource =
+        serde_json::from_str(&body).context("decoding stream set")?;
+    let human = render_stream_set(&stream_set);
+    emit(output, serde_json::to_value(&stream_set)?, human)
+}
+
+async fn delete_stream(
+    url: &str,
+    token: Option<&Token>,
+    name: &str,
+    output: OutputFormat,
+) -> Result<()> {
     if let Err(error) = validate_resource_id(name) {
         bail!("invalid stream name: {error}");
     }
@@ -315,8 +697,11 @@ async fn delete_stream(url: &str, token: Option<&Token>, name: &str) -> Result<(
     }
 
     tracing::info!(%name, %status, "stream deleted");
-    println!("deleted stream {name}");
-    Ok(())
+    emit(
+        output,
+        serde_json::json!({ "deleted": name }),
+        format!("deleted stream {name}"),
+    )
 }
 
 struct StreamLookup {
@@ -357,11 +742,6 @@ async fn lookup_stream(
     Ok(Some(StreamLookup { resource, etag }))
 }
 
-fn nodes() -> Result<()> {
-    tracing::info!("nodes: not implemented");
-    Ok(())
-}
-
 /// Build a northbound API URL from a contract-relative `path`, inserting the
 /// version prefix so the literal lives only in [`weave_core::API_PREFIX`].
 fn api_url(base: &str, path: &str) -> String {
@@ -376,6 +756,7 @@ mod tests {
     use axum::extract::State;
     use axum::http::{Request, StatusCode};
     use axum::response::{IntoResponse, Response};
+    use serde_json::Value;
     use std::sync::{Arc, Mutex};
     use weave_core::{ApiErrorCode, SrtEndpoint, StreamAccepted, StreamTransport};
 
@@ -469,6 +850,86 @@ destinations:
             api_url("http://127.0.0.1:9080/", "/streams"),
             "http://127.0.0.1:9080/v6/streams",
             "a trailing slash on the base does not double up"
+        );
+    }
+
+    #[test]
+    fn parses_read_commands_and_output_formats() {
+        let cases = [
+            (vec!["weave", "get", "nodes"], "nodes"),
+            (vec!["weave", "get", "status"], "status"),
+            (
+                vec!["weave", "get", "endpoints", "cam1-to-studio"],
+                "endpoints",
+            ),
+            (vec!["weave", "get", "stream-sets"], "stream-sets"),
+            (vec!["weave", "get", "stream-set", "studio-a"], "stream-set"),
+        ];
+
+        for (args, expected) in cases {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.output, OutputFormat::Human);
+            let Command::Get { resource } = cli.command else {
+                panic!("expected get command");
+            };
+            let actual = match resource {
+                GetResource::Nodes => "nodes",
+                GetResource::Status => "status",
+                GetResource::Endpoints { .. } => "endpoints",
+                GetResource::StreamSets => "stream-sets",
+                GetResource::StreamSet { .. } => "stream-set",
+                GetResource::Streams | GetResource::Stream { .. } => "unexpected",
+            };
+            assert_eq!(actual, expected);
+        }
+
+        let cli = Cli::try_parse_from(["weave", "-o", "yaml", "get", "streams"]).unwrap();
+        assert_eq!(cli.output, OutputFormat::Yaml);
+        let cli = Cli::try_parse_from(["weave", "get", "streams", "--output", "json"]).unwrap();
+        assert_eq!(cli.output, OutputFormat::Json);
+        assert!(Cli::try_parse_from(["weave", "nodes"]).is_err());
+    }
+
+    #[test]
+    fn json_and_yaml_outputs_preserve_the_typed_value() {
+        let value = serde_json::json!({
+            "generation": 3,
+            "owner": "studio-a",
+            "spec": { "name": "cam1-to-studio" }
+        });
+
+        let json = format_output(OutputFormat::Json, &value, String::new()).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&json).unwrap(), value);
+
+        let yaml = format_output(OutputFormat::Yaml, &value, String::new()).unwrap();
+        assert_eq!(serde_norway::from_str::<Value>(&yaml).unwrap(), value);
+    }
+
+    #[test]
+    fn human_stream_and_endpoint_tables_are_stable() {
+        let streams = vec![StreamResource {
+            generation: 3,
+            owner: Some("studio-a".to_string()),
+            spec: sample_stream(),
+        }];
+        assert_eq!(
+            render_streams(&streams),
+            "NAME            GENERATION  OWNER     ENABLED\ncam1-to-studio  3           studio-a  true"
+        );
+
+        let endpoints: StreamEndpoints = serde_json::from_value(serde_json::json!({
+            "ingress": {
+                "node": "strom-node-1",
+                "host": "172.26.0.10",
+                "port": 20000,
+                "url": "srt://172.26.0.10:20000"
+            },
+            "outputs": [null]
+        }))
+        .unwrap();
+        assert_eq!(
+            render_endpoints(&endpoints),
+            "ROLE     INDEX  NODE          URL\ningress  -      strom-node-1  srt://172.26.0.10:20000\noutput   0      -             -"
         );
     }
 
@@ -664,6 +1125,149 @@ destinations:
         (format!("http://{addr}"), seen)
     }
 
+    #[derive(Clone)]
+    struct GetStub {
+        seen: Arc<Mutex<Option<String>>>,
+        status: StatusCode,
+        body: Value,
+    }
+
+    async fn stub_get(status: StatusCode, body: Value) -> (String, Arc<Mutex<Option<String>>>) {
+        async fn record(
+            State(state): State<GetStub>,
+            method: axum::http::Method,
+            uri: axum::http::Uri,
+            headers: axum::http::HeaderMap,
+        ) -> Response {
+            let authorization = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("");
+            *state.seen.lock().unwrap() = Some(format!("{method} {} {authorization}", uri.path()));
+            (state.status, axum::Json(state.body)).into_response()
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let app = Router::new().fallback(record).with_state(GetStub {
+            seen: Arc::clone(&seen),
+            status,
+            body,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    #[tokio::test]
+    async fn read_commands_call_their_versioned_routes_with_auth() {
+        let token = Token::new("cli-test-token").unwrap();
+        let cases = [
+            (
+                "/v6/nodes",
+                serde_json::json!([{
+                    "id": "strom-node-1",
+                    "endpoint": "http://strom-node-1:8091",
+                    "status": "ready"
+                }]),
+                "nodes",
+            ),
+            (
+                "/v6/status",
+                serde_json::json!({ "status": "starting" }),
+                "status",
+            ),
+            (
+                "/v6/streams/cam1-to-studio/endpoints",
+                serde_json::json!({ "ingress": null, "outputs": [null] }),
+                "endpoints",
+            ),
+            ("/v6/stream-sets", serde_json::json!([]), "stream-sets"),
+            (
+                "/v6/stream-sets/studio-a",
+                serde_json::json!({ "owner": "studio-a", "streams": [] }),
+                "stream-set",
+            ),
+        ];
+
+        for (path, body, command) in cases {
+            let (url, seen) = stub_get(StatusCode::OK, body).await;
+            match command {
+                "nodes" => get_nodes(&url, Some(&token), OutputFormat::Json)
+                    .await
+                    .unwrap(),
+                "status" => get_status(&url, Some(&token), OutputFormat::Json)
+                    .await
+                    .unwrap(),
+                "endpoints" => {
+                    get_endpoints(&url, Some(&token), "cam1-to-studio", OutputFormat::Json)
+                        .await
+                        .unwrap()
+                }
+                "stream-sets" => get_stream_sets(&url, Some(&token), OutputFormat::Json)
+                    .await
+                    .unwrap(),
+                "stream-set" => get_stream_set(&url, Some(&token), "studio-a", OutputFormat::Json)
+                    .await
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                seen.lock().unwrap().as_deref(),
+                Some(format!("GET {path} Bearer cli-test-token").as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_commands_surface_structured_errors() {
+        let error = serde_json::json!({
+            "code": "controller_unreachable",
+            "message": "controller unreachable",
+            "details": [{
+                "field": "controller",
+                "code": "unavailable",
+                "message": "try again later"
+            }]
+        });
+        let (url, _seen) = stub_get(StatusCode::BAD_GATEWAY, error).await;
+
+        let error = get_nodes(&url, None, OutputFormat::Human)
+            .await
+            .expect_err("a failed GET must preserve the structured error");
+        assert!(
+            error
+                .to_string()
+                .contains("[controller_unreachable] controller unreachable")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("controller [unavailable]: try again later")
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_and_stream_set_ids_are_validated_locally() {
+        let endpoint_error = get_endpoints("not a URL", None, "foo?ignored", OutputFormat::Human)
+            .await
+            .expect_err("unsafe stream name must be rejected locally");
+        assert!(
+            endpoint_error
+                .to_string()
+                .starts_with("invalid stream name:")
+        );
+
+        let owner_error = get_stream_set("not a URL", None, "foo?ignored", OutputFormat::Human)
+            .await
+            .expect_err("unsafe owner must be rejected locally");
+        assert!(
+            owner_error
+                .to_string()
+                .starts_with("invalid stream-set owner:")
+        );
+    }
+
     #[tokio::test]
     async fn plan_calls_the_versioned_route_with_auth_and_body() {
         let token = Token::new("cli-test-token").unwrap();
@@ -691,7 +1295,9 @@ destinations:
         };
         let (url, seen) = stub_plan().await;
 
-        plan_stream(&url, Some(&token), &stream).await.unwrap();
+        plan_stream(&url, Some(&token), &stream, OutputFormat::Json)
+            .await
+            .unwrap();
 
         assert_eq!(
             seen.lock().unwrap().as_deref(),
@@ -709,7 +1315,7 @@ destinations:
         };
         let (url, seen) = stub_resource(Some(resource), StatusCode::ACCEPTED).await;
 
-        get_stream(&url, Some(&token), "cam1-to-studio")
+        get_stream(&url, Some(&token), "cam1-to-studio", OutputFormat::Json)
             .await
             .unwrap();
 
@@ -724,7 +1330,7 @@ destinations:
         let token = Token::new("cli-test-token").unwrap();
         let (url, seen) = stub_resource(None, StatusCode::ACCEPTED).await;
 
-        apply_stream(&url, Some(&token), &sample_stream())
+        apply_stream(&url, Some(&token), &sample_stream(), OutputFormat::Json)
             .await
             .unwrap();
 
@@ -747,7 +1353,7 @@ destinations:
         };
         let (url, seen) = stub_resource(Some(resource), StatusCode::ACCEPTED).await;
 
-        apply_stream(&url, Some(&token), &sample_stream())
+        apply_stream(&url, Some(&token), &sample_stream(), OutputFormat::Json)
             .await
             .unwrap();
 
@@ -769,7 +1375,7 @@ destinations:
         };
         let (url, seen) = stub_resource(Some(resource), StatusCode::PRECONDITION_FAILED).await;
 
-        let error = apply_stream(&url, None, &sample_stream())
+        let error = apply_stream(&url, None, &sample_stream(), OutputFormat::Json)
             .await
             .expect_err("a stale revision must fail");
 
@@ -789,7 +1395,7 @@ destinations:
         };
         let (url, seen) = start_resource_stub(Some(resource), StatusCode::ACCEPTED, false).await;
 
-        let error = apply_stream(&url, None, &sample_stream())
+        let error = apply_stream(&url, None, &sample_stream(), OutputFormat::Json)
             .await
             .expect_err("an update needs the revision ETag");
 
@@ -816,7 +1422,7 @@ destinations:
 
     #[tokio::test]
     async fn get_stream_rejects_an_unsafe_name_locally() {
-        let error = get_stream("not a URL", None, "foo?ignored")
+        let error = get_stream("not a URL", None, "foo?ignored", OutputFormat::Json)
             .await
             .expect_err("unsafe name must be rejected locally");
         assert!(error.to_string().starts_with("invalid stream name:"));
@@ -832,7 +1438,7 @@ destinations:
             spec: sample_stream(),
         };
         let (url, seen) = stub_resource(Some(resource), StatusCode::NO_CONTENT).await;
-        delete_stream(&url, Some(&token), "cam1-to-studio")
+        delete_stream(&url, Some(&token), "cam1-to-studio", OutputFormat::Json)
             .await
             .expect("204 deletes the stream");
         assert_eq!(
@@ -844,7 +1450,7 @@ destinations:
         );
 
         let (url, _seen) = stub_resource(None, StatusCode::NO_CONTENT).await;
-        let err = delete_stream(&url, Some(&token), "missing")
+        let err = delete_stream(&url, Some(&token), "missing", OutputFormat::Json)
             .await
             .expect_err("404 is an error");
         assert!(err.to_string().contains("missing"), "{err}");
@@ -852,7 +1458,7 @@ destinations:
 
     #[tokio::test]
     async fn delete_rejects_an_unsafe_name_before_building_a_request() {
-        let error = delete_stream("not a URL", None, "foo?ignored")
+        let error = delete_stream("not a URL", None, "foo?ignored", OutputFormat::Json)
             .await
             .expect_err("unsafe name must be rejected locally");
         assert_eq!(

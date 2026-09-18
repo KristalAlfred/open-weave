@@ -53,5 +53,17 @@ plan FILE="examples/stream.yaml":
 get-streams:
     cargo run -p weave-cli -- get streams
 
+get-stream NAME:
+    cargo run -p weave-cli -- get stream {{NAME}}
+
+get-nodes:
+    cargo run -p weave-cli -- get nodes
+
+get-status:
+    cargo run -p weave-cli -- get status
+
+get-endpoints NAME:
+    cargo run -p weave-cli -- get endpoints {{NAME}}
+
 delete-stream NAME:
     cargo run -p weave-cli -- delete stream {{NAME}}

@@ -147,6 +147,16 @@ pub fn northbound_openapi() -> Value {
     common_document(
         "open-weave northbound API",
         json!({
+            format!("{API_PREFIX}{ROUTE_NODES}"): {
+                "get": {
+                    "operationId": "listNodes",
+                    "responses": {
+                        "200": response("Registered nodes", Some(schema_ref("NodeList"))),
+                        "401": error_response("Authentication failed"),
+                        "502": error_response("Controller unavailable")
+                    }
+                }
+            },
             format!("{API_PREFIX}{ROUTE_STREAMS}"): {
                 "get": {
                     "operationId": "listStreams",
@@ -309,6 +319,7 @@ pub fn northbound_openapi() -> Value {
         }),
         components(&[
             ("ApiError", error),
+            ("NodeList", schema::<Vec<NodeDescriptor>>()),
             ("StatusResponse", schema::<StatusResponse>()),
             ("StreamAccepted", schema::<StreamAccepted>()),
             ("StreamDefinition", schema::<StreamDefinition>()),
@@ -451,6 +462,7 @@ mod tests {
         assert_eq!(
             north_paths.keys().copied().collect::<Vec<_>>(),
             [
+                "/v6/nodes",
                 "/v6/status",
                 "/v6/stream-plans",
                 "/v6/stream-sets",
@@ -480,6 +492,21 @@ mod tests {
         let schema = serde_json::to_string(&schema::<StreamDefinition>()).unwrap();
         assert!(schema.contains("maxLength"));
         assert!(schema.contains("^[a-z0-9]"));
+    }
+
+    #[test]
+    fn northbound_contract_exposes_node_inventory() {
+        let document = northbound_openapi();
+        let nodes = &document["paths"]["/v6/nodes"]["get"];
+
+        assert_eq!(nodes["operationId"], "listNodes");
+        assert_eq!(
+            nodes["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/NodeList"
+        );
+        assert!(nodes["responses"]["401"].is_object());
+        assert!(nodes["responses"]["502"].is_object());
+        assert!(document["components"]["schemas"]["NodeList"].is_object());
     }
 
     #[test]
