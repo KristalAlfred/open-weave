@@ -3,7 +3,7 @@
 // Must equal weave_core::PROTOCOL_VERSION; check.mjs reads this line and
 // compares it with the constant in crates/core.
 const PROTOCOL_VERSION = 3;
-const API_PREFIX = "/v2";
+const API_PREFIX = "/v3";
 const HEARTBEAT_MS = 5000;
 const POLL_MS = 2000;
 const STALL_POLLS = 3;
@@ -12,12 +12,17 @@ const FAILED_AFTER_ATTEMPTS = 5;
 const ICE_GATHER_MS = 2000;
 const CAPTURE_MS = 4000;
 const NODE_ID_KEY = "weave-node-id";
+const RESOURCE_ID_MAX_LEN = 63;
+const RESOURCE_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
 
 const config = readConfig();
+let fatal = null;
 const nodeId = readNodeId();
 const hops = new Map();
 let registered = false;
-let fatal = null;
+if (!validResourceId(nodeId)) {
+  fatal = "node id must be 1–63 lowercase letters, digits, or hyphens and start and end with a letter or digit";
+}
 
 function readConfig() {
   const params = new URLSearchParams(location.hash.slice(1));
@@ -41,6 +46,10 @@ function readNodeId() {
     sessionStorage.setItem(NODE_ID_KEY, id);
   }
   return id;
+}
+
+function validResourceId(value) {
+  return value.length <= RESOURCE_ID_MAX_LEN && RESOURCE_ID_PATTERN.test(value);
 }
 
 // --- southbound ---
@@ -81,8 +90,8 @@ function registration() {
 
 async function register() {
   const response = await southbound("POST", "/nodes/register", registration());
-  if (response.status === 409) {
-    fatal = `southbound refused protocol version ${PROTOCOL_VERSION}: ${await response.text()}`;
+  if (response.status === 400 || response.status === 409) {
+    fatal = `southbound refused registration: ${response.status} ${await response.text()}`;
     throw new Error(fatal);
   }
   if (!response.ok) throw new Error(`register: ${response.status} ${await response.text()}`);
@@ -524,8 +533,10 @@ function log(line) {
 }
 
 function manifests() {
+  const cameraName = derivedStreamName("cam");
+  const returnName = derivedStreamName("return");
   return `# camera to a Strom node
-name: ${nodeId}-cam
+name: ${cameraName}
 source:
   device:
     node: ${nodeId}
@@ -534,13 +545,23 @@ destinations:
       node: strom-node-1
 
 # a Strom node's SRT ingress to this screen
-name: ${nodeId}-return
+name: ${returnName}
 source:
   srt:
     node: strom-node-1
 destinations:
   - device:
       node: ${nodeId}`;
+}
+
+function derivedStreamName(suffix) {
+  const full = `${nodeId}-${suffix}`;
+  if (full.length <= RESOURCE_ID_MAX_LEN) return full;
+
+  let hash = 2166136261;
+  for (const char of nodeId) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
+  const tail = `-${(hash >>> 0).toString(16).padStart(8, "0")}-${suffix}`;
+  return `${nodeId.slice(0, RESOURCE_ID_MAX_LEN - tail.length)}${tail}`;
 }
 
 function el(tag, cls, text) {
@@ -606,7 +627,9 @@ document.getElementById("copy").addEventListener("click", () => {
 });
 
 render();
-if (!config.southbound) {
+if (fatal) {
+  render();
+} else if (!config.southbound) {
   fatal = "open this page as index.html#southbound=http://host:8081&token=…";
   render();
 } else {

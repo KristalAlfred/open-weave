@@ -16,7 +16,7 @@ The bundled `producer`/`consumer` verification endpoints take a stream name so
 any scenario can be driven end to end
 (`just bench producer-up <stream>` / `consumer-up <stream>`, default `basic`).
 Addresses are not hardcoded: the recipes resolve them from the controller's
-discovery API (`GET :29082/v2/streams/<name>/endpoints`, or the
+discovery API (`GET :29082/v3/streams/<name>/endpoints`, or the
 `scripts/endpoints.sh` helper) — the producer dials the reported `ingress` and
 each consumer dials an `outputs[]` entry. Fan-out has one output per destination,
 so a consumer attaches to each: `consumer-up <stream>` (output 0) and
@@ -115,7 +115,7 @@ Notes:
   rather than the NAT case that makes the controller insert a relay by itself —
   that one needs a node the bench cannot dial, which the topology does not yet
   have.
-- **`browser-*`**: templates, `BROWSER_NODE` is the page's node id and
+- **`browser-*`**: templates, `browser-placeholder` is the page's node id and
   `just bench browser-stream` fills it in; applying one directly leaves it
   `pending` on an unregistered node. The media for `browser-cam` comes from the
   page itself, so its "No media" column is the page with no consumer attached.

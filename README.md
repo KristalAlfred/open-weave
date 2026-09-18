@@ -101,12 +101,12 @@ connect/provision resources depending on its capabilities.
 
 ## API versioning
 
-Both control-plane contracts are served under **`/v2`**:
+Both control-plane contracts are served under **`/v3`**:
 
 | Contract | Served by | Routes |
 |---|---|---|
-| operator (northbound) | northbound, controller | `/v2/streams`, `/v2/streams/{name}`, `/v2/streams/{name}/endpoints`, `/v2/status` |
-| adapter (southbound) | southbound, controller | `/v2/nodes/register`, `/v2/nodes/{id}/heartbeat`, `/v2/nodes/{id}/desired`, `/v2/nodes`, `/v2/endpoints`, `/v2/state` |
+| operator (northbound) | northbound, controller | `/v3/streams`, `/v3/streams/{name}`, `/v3/streams/{name}/endpoints`, `/v3/status` |
+| adapter (southbound) | southbound, controller | `/v3/nodes/register`, `/v3/nodes/{id}/heartbeat`, `/v3/nodes/{id}/desired`, `/v3/nodes`, `/v3/endpoints`, `/v3/state` |
 
 The controller serves the union of both, because northbound and southbound are
 stateless proxies onto it. One prefix covers both contracts: they are two halves
@@ -121,7 +121,7 @@ There is no separate northbound payload version to miss.
 
 The adapter contract is the one that matters most: operators attach their own
 media nodes, including third-party adapters open-weave does not ship, and those
-bind to `/v2` southbound.
+bind to `/v3` southbound.
 
 Deliberately **not** versioned:
 
@@ -130,19 +130,21 @@ Deliberately **not** versioned:
 - **`/`, `/ui`, `/view`** on the controller — the dashboard and its data source
   ship inside the controller binary and version with it. **`/view` carries no
   stability guarantee**: its shape follows whatever the embedded UI needs, and it
-  may change in any release. Script against `/v2/status`, not `/view`.
+  may change in any release. Script against `/v3/status`, not `/view`.
 
 `/status` *is* versioned: it is a scriptable rollup that people automate against
 (the bench justfile does), so it belongs to the operator contract rather than to
 the dashboard. The unauthenticated copy is the controller's, which the dashboard
 shares; northbound's copy sits behind the bearer.
 
-There are no back-compat aliases: `/v1` and the unprefixed paths return `404`.
+There are no back-compat aliases: `/v1`, `/v2`, and the unprefixed paths return
+`404`. `/v3` adds the resource identifier contract below; clients using `/v2`
+must update their identifiers before changing the URL.
 
 ### Protocol version negotiation
 
 A URL prefix tells a client where to send a request; it does not let the server
-notice a stale adapter. So `POST /v2/nodes/register` also carries a
+notice a stale adapter. So `POST /v3/nodes/register` also carries a
 `protocol_version` field, which adapters set from `weave_core::PROTOCOL_VERSION`:
 
 ```json
@@ -255,6 +257,20 @@ Validation collects field-addressed issues internally. The current HTTP error
 shape returns the first message; structured error details are tracked separately.
 Top-level and endpoint payloads reject unknown fields.
 
+### Resource identifiers
+
+Stream and node ids are 1–63 characters and match
+`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`: lowercase ASCII letters, digits, and
+interior hyphens. They are not trimmed or normalized. The same rule applies to
+stream names, registered node ids, and every node reference in `node`, `device`,
+and `via` fields. Invalid request paths return `400` before a proxy constructs an
+upstream URL.
+
+This keeps ids safe as URL segments, database keys, log fields, hop ids, and
+Strom flow names. Invalid persisted stream definitions stop controller startup
+and name the failing field. Stored node registrations are caches, so invalid
+ones are dropped; a node must re-register with a valid id.
+
 ## Authentication
 
 Each API surface is protected by one shared bearer token, supplied through the
@@ -264,7 +280,7 @@ constant time and never logged.
 
 | Variable | Presented by | Accepted by |
 |---|---|---|
-| `WEAVE_NORTHBOUND_TOKEN` | operators, the `weave` CLI (`--token`), northbound → controller | northbound (every operator route), controller (every operator route but `/v2/status`) |
+| `WEAVE_NORTHBOUND_TOKEN` | operators, the `weave` CLI (`--token`), northbound → controller | northbound (every operator route), controller (every operator route but `/v3/status`) |
 | `WEAVE_SOUTHBOUND_TOKEN` | adapters and media nodes, southbound → controller | southbound, controller |
 
 The controller backs both surfaces, so it needs both variables and requires the
@@ -277,7 +293,7 @@ end. Nodes may instead carry the token in their config file as
 A browser node (`nodes/browser/`) is a media node too: the page presents
 `WEAVE_SOUTHBOUND_TOKEN` on every southbound call, passed in through the URL
 fragment so it never reaches a server log. Because the page runs on a different
-origin from southbound, southbound sends CORS headers on its `/v2` routes when
+origin from southbound, southbound sends CORS headers on its `/v3` routes when
 `WEAVE_SOUTHBOUND_CORS_ORIGIN` is set — an exact origin such as
 `https://studio.example`, or `*` for development. Unset, no CORS headers are
 sent and only non-browser adapters can register. The preflight is answered
@@ -300,15 +316,15 @@ so `WEAVE_AUTH_DISABLED=0` leaves authentication on.
 Left unauthenticated on purpose:
 
 - **`/health`** on every service — compose healthchecks and load balancers need it.
-- **The controller dashboard** (`/`, `/ui`, `/view`) and the `/v2/status` rollup
-  it shares its data with — on the controller only. Northbound's `/v2/status` and
-  `/v2/streams/{name}/endpoints` require the northbound token, so an operator can
+- **The controller dashboard** (`/`, `/ui`, `/view`) and the `/v3/status` rollup
+  it shares its data with — on the controller only. Northbound's `/v3/status` and
+  `/v3/streams/{name}/endpoints` require the northbound token, so an operator can
   read a stream's resolved address through northbound with the controller port
   unexposed. The dashboard is browser-loaded and polls `/view`, which a bearer
   token cannot carry without a cookie/session mechanism or a reverse proxy.
   `/view` exposes topology and allocated ports, so **do not expose the controller
   port publicly** — keep it on a private network or put a reverse proxy in front
-  of it. The controller's `/v2/streams` and `/v2/nodes` API routes *are*
+  of it. The controller's `/v3/streams` and `/v3/nodes` API routes *are*
   authenticated, so an exposed port leaks read-only dashboard data rather than
   write access.
 
@@ -320,7 +336,7 @@ registration and mTLS are follow-ups, not implemented here.
 The controller POSTs a JSON event to one configured receiver when a node
 registers, goes offline, or comes back. It exists so a service that hosts guest
 pages can declare a stream for a guest's seat on being told the page registered,
-rather than polling `/v2/nodes`.
+rather than polling `/v3/nodes`.
 
 | Variable | Meaning |
 |---|---|
@@ -373,7 +389,7 @@ not retried. A full queue drops rather than waits, and the queue is in memory, s
 events do not survive a controller restart.
 
 **Delivery is at-least-once and incomplete by design.** A receiver reconciles
-against southbound `GET /v2/nodes` on boot and treats events as hints, not truth.
+against southbound `GET /v3/nodes` on boot and treats events as hints, not truth.
 
 The bearer token authenticates the controller to the receiver; it does not let
 the receiver tell a genuine event from anyone who has learned the token. A
@@ -436,7 +452,7 @@ node that goes offline is reported `degraded`, not swapped out: the manifest nam
 it, so no other node stands in for it.
 
 A relay carries bytes and terminates nothing. Consumers still attach at the
-destination node, and `GET /v2/streams/{name}/endpoints` is unchanged by transit.
+destination node, and `GET /v3/streams/{name}/endpoints` is unchanged by transit.
 One consequence worth stating: a consumer output on an `outbound_only` node is
 only dialable from inside that node's network, because that is what the node
 declared about itself.
@@ -507,7 +523,7 @@ because the adapter reads media progress from a hop's SRT byte counters and
 such a hop has none. The browser node realises `device → whip` and
 `whep → device` and nothing else. Neither adapter ever decides a transport.
 
-`GET /v2/streams/{name}/endpoints` lists only what an external peer can dial,
+`GET /v3/streams/{name}/endpoints` lists only what an external peer can dial,
 so a `device` end reads `null` in its place (`ingress: null` for a camera
 source, a `null` output for a screen destination). See `nodes/browser/README.md`
 for the page and `bench/README.md` for running it against the bench.

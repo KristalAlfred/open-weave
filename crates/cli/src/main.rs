@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use reqwest::RequestBuilder;
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Token};
-use weave_core::{API_PREFIX, StreamDefinition};
+use weave_core::{API_PREFIX, StreamDefinition, validate_resource_id};
 
 #[derive(Parser)]
 #[command(name = "weave", version, about = "open-weave control plane CLI")]
@@ -178,6 +178,9 @@ async fn get_streams(url: &str, token: Option<&Token>) -> Result<()> {
 }
 
 async fn delete_stream(url: &str, token: Option<&Token>, name: &str) -> Result<()> {
+    if let Err(error) = validate_resource_id(name) {
+        bail!("invalid stream name: {error}");
+    }
     let response = authorized(
         reqwest::Client::new().delete(api_url(url, &format!("/streams/{name}"))),
         token,
@@ -282,11 +285,11 @@ destinations:
     fn api_url_inserts_the_version_prefix_once() {
         assert_eq!(
             api_url("http://127.0.0.1:9080", "/streams"),
-            "http://127.0.0.1:9080/v2/streams"
+            "http://127.0.0.1:9080/v3/streams"
         );
         assert_eq!(
             api_url("http://127.0.0.1:9080/", "/streams"),
-            "http://127.0.0.1:9080/v2/streams",
+            "http://127.0.0.1:9080/v3/streams",
             "a trailing slash on the base does not double up"
         );
     }
@@ -353,7 +356,7 @@ destinations:
             .expect("204 deletes the stream");
         assert_eq!(
             seen.lock().unwrap().as_deref(),
-            Some("DELETE /v2/streams/cam1-to-studio Bearer cli-test-token")
+            Some("DELETE /v3/streams/cam1-to-studio Bearer cli-test-token")
         );
 
         let (url, _seen) = stub_northbound(StatusCode::NOT_FOUND).await;
@@ -361,5 +364,16 @@ destinations:
             .await
             .expect_err("404 is an error");
         assert!(err.to_string().contains("missing"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_an_unsafe_name_before_building_a_request() {
+        let error = delete_stream("not a URL", None, "foo?ignored")
+            .await
+            .expect_err("unsafe name must be rejected locally");
+        assert_eq!(
+            error.to_string(),
+            "invalid stream name: must contain only lowercase ASCII letters, digits, or hyphens, and must start and end with a letter or digit"
+        );
     }
 }

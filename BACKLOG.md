@@ -42,9 +42,9 @@ that is easy to break while fixing it.
   deregistration route, and the controller's node TTL only changes a status:
   `mark_offline` sets the entry to `Offline` after `WEAVE_NODE_TTL_SECS` (15s by
   default) and nothing ever removes it (`crates/controller/src/main.rs`), so the
-  node stays in `GET /v2/nodes` and `/v2/status` as `offline`. Each browser
+  node stays in `GET /v3/nodes` and `/v3/status` as `offline`. Each browser
   page start without `--node` picks a fresh id, and one bench run left three
-  stale `browser-…` nodes beside `browser-bench` (`7 node(s)` in `/v2/status`).
+  stale `browser-…` nodes beside `browser-bench` (`7 node(s)` in `/v3/status`).
   Done: a node that has not heartbeated for some interval leaves the listing, or
   a node can deregister itself. Easy to break: dropping an entry replans every
   stream placed on it. `pick_relay` skips `Offline` nodes and a pinned relay

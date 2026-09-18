@@ -13,7 +13,9 @@ pub use media::{
     AudioCodec, AudioConstraint, AudioFormat, ChromaSubsampling, Container, FormatConstraint,
     Framerate, MediaFormat, Mismatch, VideoCodec, VideoConstraint, VideoFormat,
 };
-pub use validation::{ValidationIssue, validate_stream};
+pub use validation::{
+    RESOURCE_ID_MAX_LEN, ResourceIdError, ValidationIssue, validate_resource_id, validate_stream,
+};
 
 /// Conventional data-plane alias resolved when a manifest pins no network.
 pub const DEFAULT_DATA_PLANE_ALIAS: &str = "default";
@@ -29,7 +31,7 @@ pub const DEFAULT_DATA_PLANE_ALIAS: &str = "default";
 /// Outside it: `/health` on every service, which healthchecks and
 /// load balancers address directly, and the controller's `/`, `/ui`, and `/view` —
 /// the dashboard ships inside the controller binary and versions with it.
-pub const API_PREFIX: &str = "/v2";
+pub const API_PREFIX: &str = "/v3";
 
 /// Wire-protocol version an adapter declares when it registers.
 ///
@@ -1186,15 +1188,13 @@ impl NodeConfig {
             })
     }
 
-    /// Enforce the invariants placement depends on: a named node, a `default`
+    /// Enforce the invariants placement depends on: a valid node id, a `default`
     /// data-plane alias with no blank entries, and a well-ordered port range.
     ///
     /// # Errors
     /// Returns [`ConfigError`] describing the first violated invariant.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.id.trim().is_empty() {
-            return Err(ConfigError::EmptyId);
-        }
+        validate_resource_id(&self.id).map_err(ConfigError::InvalidId)?;
         if !self.data_plane.contains_key(DEFAULT_DATA_PLANE_ALIAS) {
             return Err(ConfigError::MissingDefaultAlias);
         }
@@ -1217,8 +1217,8 @@ impl NodeConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
-    #[error("node id must not be empty")]
-    EmptyId,
+    #[error("node id {0}")]
+    InvalidId(ResourceIdError),
     #[error("data_plane must define the '{DEFAULT_DATA_PLANE_ALIAS}' alias")]
     MissingDefaultAlias,
     #[error("data_plane has an empty alias or host")]
@@ -2013,7 +2013,17 @@ mod tests {
     fn node_config_validate_rejects_invariant_violations() {
         let mut empty_id = node_config();
         empty_id.id = "  ".to_string();
-        assert_eq!(empty_id.validate(), Err(ConfigError::EmptyId));
+        assert_eq!(
+            empty_id.validate(),
+            Err(ConfigError::InvalidId(ResourceIdError::InvalidCharacters))
+        );
+
+        let mut long_id = node_config();
+        long_id.id = "a".repeat(RESOURCE_ID_MAX_LEN + 1);
+        assert_eq!(
+            long_id.validate(),
+            Err(ConfigError::InvalidId(ResourceIdError::InvalidLength))
+        );
 
         let mut no_default = node_config();
         no_default.data_plane =

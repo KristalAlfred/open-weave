@@ -18,7 +18,9 @@ blocks every later one in the page, so the choice is made up front rather than
 by falling back.
 
 The page generates a `browser-<8 hex>` node id per tab (`&node=<id>` pins one
-instead, so a page that restarts keeps its name), registers it with
+instead, so a page that restarts keeps its name). A pinned id must be 1–63
+lowercase ASCII letters, digits, or interior hyphens. An invalid pin is shown as
+rejected and is not retried. The page registers a valid id with
 transports `whip [connect]` and `whep [connect]`, devices `capture, display`,
 and an `outbound_only` data plane, then heartbeats every 5 s and polls its
 desired hops every 2 s. It realises two hop shapes and nothing else:
@@ -38,7 +40,7 @@ and apply it. Southbound must allow the page's origin
 (`WEAVE_SOUTHBOUND_CORS_ORIGIN`, see the root README).
 
 `check.mjs` drives the page with Playwright and a fake camera and waits for the
-node to appear in `GET /v2/nodes`:
+node to appear in `GET /v3/nodes`:
 
 ```sh
 pnpm install

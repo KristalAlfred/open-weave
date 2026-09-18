@@ -11,7 +11,7 @@ page_dir := source_directory() / ".." / "nodes" / "browser"
 
 # Version prefix carrying both control-plane contracts, matching weave_core::API_PREFIX.
 # `/health` and the controller dashboard (`/`, `/ui`, `/view`) sit outside it.
-v       := "/v2"
+v       := "/v3"
 
 # Bearer tokens per API surface. Defaults match docker-compose.yml so the bench
 # needs no exports; override by exporting either variable. `/health` and the
@@ -261,7 +261,7 @@ browser-stream id="":
     [ -n "$id" ] || id="$(just browser-id)"
     tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
     for m in browser-cam browser-return; do
-        sed "s/BROWSER_NODE/$id/" {{manifests}}/$m.yaml > "$tmp"
+        sed "s/browser-placeholder/$id/" {{manifests}}/$m.yaml > "$tmp"
         WEAVE_NORTHBOUND_URL={{nb}} WEAVE_NORTHBOUND_TOKEN={{nb_token}} \
             cargo run --quiet -p weave-cli -- apply -f "$tmp"
     done
@@ -305,7 +305,7 @@ host-cam seat="guest-1":
     #!/usr/bin/env bash
     set -euo pipefail
     tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
-    sed "s/BROWSER_NODE/{{seat}}/" {{manifests}}/browser-cam-host.yaml > "$tmp"
+    sed "s/browser-placeholder/{{seat}}/" {{manifests}}/browser-cam-host.yaml > "$tmp"
     WEAVE_NORTHBOUND_URL={{nb}} WEAVE_NORTHBOUND_TOKEN={{nb_token}} \
         cargo run --quiet -p weave-cli -- apply -f "$tmp"
     url=""

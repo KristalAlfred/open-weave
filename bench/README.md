@@ -191,7 +191,7 @@ the controller's discovery API.
 
 ```sh
 curl -s -H "Authorization: Bearer bench-northbound-token" \
-  localhost:29082/v2/streams/basic/endpoints | jq
+  localhost:29082/v3/streams/basic/endpoints | jq
 # { "ingress": {node,host,port,url}, "outputs": [{node,host,port,url}] }
 ```
 
@@ -296,8 +296,8 @@ payload and the delivery guarantees.
 | Port | Service |
 |------|---------|
 | 29080 | northbound (`WEAVE_NORTHBOUND_URL=http://localhost:29080 weave ...`) |
-| 29081 | southbound (`/v2/nodes` shows registered capabilities) |
-| 29082 | controller: dashboard at `/ui`, `/view`; API at `/v2/status`, `/v2/streams/{name}/endpoints` |
+| 29081 | southbound (`/v3/nodes` shows registered capabilities) |
+| 29082 | controller: dashboard at `/ui`, `/view`; API at `/v3/status`, `/v3/streams/{name}/endpoints` |
 | 28080 | strom-1 API |
 | 28081 | strom-2 API |
 | 28082 | strom-3 API (host→container; grants no route into net_node3) |
@@ -322,8 +322,8 @@ The `just` recipes add the right header for you. Calling the APIs by hand needs
 it explicitly:
 
 ```sh
-curl -s -H "Authorization: Bearer bench-southbound-token" localhost:29081/v2/nodes | jq
-curl -s -H "Authorization: Bearer bench-northbound-token" localhost:29080/v2/streams | jq
+curl -s -H "Authorization: Bearer bench-southbound-token" localhost:29081/v3/nodes | jq
+curl -s -H "Authorization: Bearer bench-northbound-token" localhost:29080/v3/streams | jq
 ```
 
 Without a valid token these return `401` and `WWW-Authenticate: Bearer`. Every
@@ -333,14 +333,14 @@ error is the fail-closed default working, not a bug. `WEAVE_AUTH_DISABLED=1`
 opts out for local runs.
 
 `/health` on all three services, the controller's dashboard (`/ui`, `/view`),
-and the `/v2/status` rollup need no token, so anyone who can reach port 29082
+and the `/v3/status` rollup need no token, so anyone who can reach port 29082
 can read the full topology and allocated ports. Compose publishes it on all
 interfaces: fine on a laptop, but **do not expose a controller port on a shared
 or public host.**
 
 ## API versioning
 
-Both contracts live under `/v2` (see the root README). `/health` and the
+Both contracts live under `/v3` (see the root README). `/health` and the
 controller's `/`, `/ui`, `/view` sit outside it. There are no unprefixed
 aliases, so `curl localhost:29081/nodes` returns `404` — add the prefix. The
 recipes carry it in the `v` variable at the top of the `justfile`.
@@ -389,12 +389,12 @@ per repair and is otherwise quiet.
   — a **sender** hop and a **receiver** hop — places each on a node (sender by
   `source.node` or host-match on the source URL; receiver by host-match on the
   destination), and groups the desired hops per node. The per-node **adapters**
-  pull their own hops (`GET /v2/nodes/{id}/desired` via southbound, full replace of
+  pull their own hops (`GET /v3/nodes/{id}/desired` via southbound, full replace of
   what that node should run) and create/start/delete the `weave-…` Strom flows.
   Hops for a node that has not registered yet just wait until it does.
 - Per-stream status is rolled up from adapter-reported hop conditions:
   `awaiting_input` (no source media) → `degraded` (source flowing, not end to end)
-  → `flowing`. See the controller `/v2/status` endpoint.
+  → `flowing`. See the controller `/v3/status` endpoint.
 - The receiver hop listens on the destination port and re-exposes the media on
   `port + 1` for a downstream consumer.
 - No pre-configured flows are shipped — create them through the CLI.

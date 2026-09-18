@@ -30,7 +30,7 @@ use weave_core::webhook::{EventType, NodeSummary};
 use weave_core::{
     API_PREFIX, DesiredHop, EndpointDescriptor, HopStatus, NodeDescriptor, NodeHeartbeat,
     NodeRegistration, NodeStatus, ObservedState, PROTOCOL_VERSION, PathStatus, ReconcileReport,
-    ReconcileStatus, StreamDefinition, protocol_compatible, validate_stream,
+    ReconcileStatus, StreamDefinition, protocol_compatible, validate_resource_id, validate_stream,
 };
 
 use path::{PortAllocator, StreamEndpoints, derive_path, path_status, stream_endpoints};
@@ -113,6 +113,18 @@ impl AppState {
             .await
             .context("hydrating nodes")?
             .into_iter()
+            .filter(|registration| {
+                if let Err(error) = validate_resource_id(&registration.node.id) {
+                    tracing::warn!(
+                        node_id = %registration.node.id,
+                        %error,
+                        "dropping a stored registration with an invalid node id; the node must re-register with a valid id"
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
             .map(|registration| (registration.node.id.clone(), registration))
             .collect::<BTreeMap<String, NodeRegistration>>();
         let boot = Instant::now();
@@ -419,7 +431,7 @@ fn observed_state(nodes: &BTreeMap<String, NodeRegistration>) -> ObservedState {
 /// directly, and the dashboard (`/`, `/ui`, `/view`), which ships inside this
 /// binary. `/view` carries no stability guarantee.
 ///
-/// The dashboard is unauthenticated, as is the `/v2/status` rollup it shares its
+/// The dashboard is unauthenticated, as is the `/v3/status` rollup it shares its
 /// data with: both are browser-reachable, and a bearer token cannot travel with a
 /// page load without a cookie/session mechanism or a reverse proxy.
 /// They expose topology and allocated ports, so **the controller port must not be
@@ -616,6 +628,9 @@ async fn submit_stream(
 }
 
 async fn delete_stream(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    if let Err(reason) = validate_resource_id(&name) {
+        return error(StatusCode::BAD_REQUEST, &format!("stream name {reason}"));
+    }
     let mut streams = state.streams.write().await;
     if !streams.contains_key(&name) {
         return error(StatusCode::NOT_FOUND, "stream not found");
@@ -633,6 +648,9 @@ async fn delete_stream(State(state): State<AppState>, Path(name): Path<String>) 
 /// the stream is known but not yet placed, `404` when unknown. A `device` end
 /// has nothing to dial and reads `null` in its place.
 async fn get_endpoints(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    if let Err(reason) = validate_resource_id(&name) {
+        return error(StatusCode::BAD_REQUEST, &format!("stream name {reason}"));
+    }
     let view = state.view.read().await;
     if let Some(endpoints) = view.endpoints.get(&name) {
         (StatusCode::OK, Json(endpoints)).into_response()
@@ -708,6 +726,12 @@ async fn register_node(
         )
             .into_response();
     }
+    if let Err(reason) = validate_resource_id(&node_id) {
+        return error(StatusCode::BAD_REQUEST, &format!("node id {reason}"));
+    }
+    if let Err(message) = validate_endpoint_node_ids(&registration.endpoints) {
+        return error(StatusCode::BAD_REQUEST, &message);
+    }
     if registration
         .hop_status
         .iter()
@@ -751,8 +775,14 @@ async fn node_heartbeat(
     Path(node_id): Path<String>,
     Json(heartbeat): Json<NodeHeartbeat>,
 ) -> Response {
+    if let Err(reason) = validate_resource_id(&node_id) {
+        return error(StatusCode::BAD_REQUEST, &format!("node id {reason}"));
+    }
     if node_id != heartbeat.node_id {
         return error(StatusCode::BAD_REQUEST, "node id mismatch");
+    }
+    if let Err(message) = validate_endpoint_node_ids(&heartbeat.endpoints) {
+        return error(StatusCode::BAD_REQUEST, &message);
     }
     if heartbeat
         .hop_status
@@ -794,10 +824,10 @@ async fn node_heartbeat(
 }
 
 /// Serve the desired hops computed for a node on the last reconcile tick.
-async fn get_desired(
-    State(state): State<AppState>,
-    Path(node_id): Path<String>,
-) -> Json<Vec<DesiredHop>> {
+async fn get_desired(State(state): State<AppState>, Path(node_id): Path<String>) -> Response {
+    if let Err(reason) = validate_resource_id(&node_id) {
+        return error(StatusCode::BAD_REQUEST, &format!("node id {reason}"));
+    }
     Json(
         state
             .desired
@@ -807,10 +837,22 @@ async fn get_desired(
             .cloned()
             .unwrap_or_default(),
     )
+    .into_response()
 }
 
 fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
+}
+
+fn validate_endpoint_node_ids(endpoints: &[EndpointDescriptor]) -> Result<(), String> {
+    for endpoint in endpoints {
+        if let Some(node_id) = endpoint.node_id.as_deref()
+            && let Err(error) = validate_resource_id(node_id)
+        {
+            return Err(format!("endpoint node id {error}"));
+        }
+    }
+    Ok(())
 }
 
 /// One line naming every destination that cannot accept the declared source
@@ -1113,13 +1155,13 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v2/streams",
+            "/v3/streams",
             Some(serde_json::to_value(stream("basic")).unwrap()),
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
 
-        let (status, body) = send(&app, "GET", "/v2/streams", None).await;
+        let (status, body) = send(&app, "GET", "/v3/streams", None).await;
         assert_eq!(status, StatusCode::OK);
         let listed: Vec<StreamDefinition> = serde_json::from_value(body).unwrap();
         assert_eq!(listed, vec![stream("basic")]);
@@ -1148,7 +1190,7 @@ mod tests {
         let (status, body) = send(
             &app,
             "POST",
-            "/v2/streams",
+            "/v3/streams",
             Some(serde_json::to_value(invalid).unwrap()),
         )
         .await;
@@ -1160,7 +1202,7 @@ mod tests {
         );
         assert_eq!(mem.upsert_stream_calls(), 0);
 
-        let (_, body) = send(&app, "GET", "/v2/streams", None).await;
+        let (_, body) = send(&app, "GET", "/v3/streams", None).await;
         let listed: Vec<StreamDefinition> = serde_json::from_value(body).unwrap();
         assert!(listed.is_empty());
     }
@@ -1184,6 +1226,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hydration_drops_persisted_nodes_with_invalid_ids() {
+        let mem = Arc::new(MemStore::new());
+        let registration = node_registration("node/one", "172.26.0.10");
+        mem.upsert_node(&registration).await.unwrap();
+
+        let state = AppState::hydrate(mem, Duration::from_secs(15), None)
+            .await
+            .expect("invalid cached nodes must not prevent startup");
+
+        assert!(state.nodes.read().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn delete_stream_removes_and_writes_through() {
         let (state, mem) = mem_state();
         let app = open_router(state);
@@ -1191,20 +1246,42 @@ mod tests {
         send(
             &app,
             "POST",
-            "/v2/streams",
+            "/v3/streams",
             Some(serde_json::to_value(stream("basic")).unwrap()),
         )
         .await;
-        let (status, _) = send(&app, "DELETE", "/v2/streams/basic", None).await;
+        let (status, _) = send(&app, "DELETE", "/v3/streams/basic", None).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert_eq!(mem.delete_stream_calls(), 1);
 
-        let (_, body) = send(&app, "GET", "/v2/streams", None).await;
+        let (_, body) = send(&app, "GET", "/v3/streams", None).await;
         let listed: Vec<StreamDefinition> = serde_json::from_value(body).unwrap();
         assert!(listed.is_empty());
 
-        let (status, _) = send(&app, "DELETE", "/v2/streams/basic", None).await;
+        let (status, _) = send(&app, "DELETE", "/v3/streams/basic", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "second delete is a miss");
+    }
+
+    #[tokio::test]
+    async fn invalid_resource_paths_are_rejected() {
+        let (state, mem) = mem_state();
+        let app = open_router(state);
+
+        for (method, uri, body) in [
+            ("DELETE", "/v3/streams/foo%3Fignored", None),
+            ("GET", "/v3/streams/foo%3Fignored/endpoints", None),
+            (
+                "POST",
+                "/v3/nodes/foo%3Fignored/heartbeat",
+                Some(json!({ "node_id": "foo?ignored", "status": "ready" })),
+            ),
+            ("GET", "/v3/nodes/foo%3Fignored/desired", None),
+        ] {
+            let (status, _) = send(&app, method, uri, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}");
+        }
+
+        assert_eq!(mem.delete_stream_calls(), 0);
     }
 
     #[tokio::test]
@@ -1215,7 +1292,7 @@ mod tests {
         send(
             &app,
             "POST",
-            "/v2/nodes/register",
+            "/v3/nodes/register",
             Some(serde_json::to_value(node_registration("strom-node-1", "172.26.0.10")).unwrap()),
         )
         .await;
@@ -1230,7 +1307,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v2/nodes/strom-node-1/heartbeat",
+            "/v3/nodes/strom-node-1/heartbeat",
             Some(serde_json::to_value(&heartbeat).unwrap()),
         )
         .await;
@@ -1241,7 +1318,7 @@ mod tests {
             "heartbeat must not write through to the store"
         );
 
-        let (_, body) = send(&app, "GET", "/v2/state", None).await;
+        let (_, body) = send(&app, "GET", "/v3/state", None).await;
         let observed: ObservedState = serde_json::from_value(body).unwrap();
         assert_eq!(observed.nodes[0].status, NodeStatus::Degraded);
     }
@@ -1260,7 +1337,7 @@ mod tests {
             let (status, body) = send(
                 &app,
                 "POST",
-                "/v2/nodes/register",
+                "/v3/nodes/register",
                 Some(serde_json::to_value(&registration).unwrap()),
             )
             .await;
@@ -1276,8 +1353,57 @@ mod tests {
             0,
             "a rejected node is never persisted"
         );
-        let (_, body) = send(&app, "GET", "/v2/nodes", None).await;
+        let (_, body) = send(&app, "GET", "/v3/nodes", None).await;
         assert_eq!(body, json!([]), "a rejected node is never registered");
+    }
+
+    #[tokio::test]
+    async fn registration_with_an_invalid_node_id_is_rejected() {
+        let (state, mem) = mem_state();
+        let app = open_router(state);
+        let registration = node_registration("node/one", "172.26.0.10");
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v3/nodes/register",
+            Some(serde_json::to_value(&registration).unwrap()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"],
+            "node id must contain only lowercase ASCII letters, digits, or hyphens, and must start and end with a letter or digit"
+        );
+        assert_eq!(mem.upsert_node_calls(), 0);
+        let (_, body) = send(&app, "GET", "/v3/nodes", None).await;
+        assert_eq!(body, json!([]));
+
+        let mut registration = node_registration("node-one", "172.26.0.10");
+        registration.endpoints.push(EndpointDescriptor {
+            id: "capture-1".to_string(),
+            label: "Capture".to_string(),
+            node_id: Some("node/one".to_string()),
+            kind: weave_core::EndpointKind::Source,
+            transports: Vec::new(),
+            metadata: Value::Null,
+        });
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v3/nodes/register",
+            Some(serde_json::to_value(&registration).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("endpoint node id ")
+        );
+        assert_eq!(mem.upsert_node_calls(), 0);
     }
 
     #[tokio::test]
@@ -1301,7 +1427,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v2/nodes/register",
+            "/v3/nodes/register",
             Some(serde_json::to_value(&registration).unwrap()),
         )
         .await;
@@ -1312,7 +1438,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v2/nodes/register",
+            "/v3/nodes/register",
             Some(serde_json::to_value(&registration).unwrap()),
         )
         .await;
@@ -1327,7 +1453,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v2/nodes/strom-node-1/heartbeat",
+            "/v3/nodes/strom-node-1/heartbeat",
             Some(serde_json::to_value(&heartbeat).unwrap()),
         )
         .await;
@@ -1373,7 +1499,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v2/nodes/register",
+            "/v3/nodes/register",
             Some(serde_json::to_value(&browser).unwrap()),
         )
         .await;
@@ -1398,7 +1524,7 @@ mod tests {
         send(
             &app,
             "POST",
-            "/v2/nodes/register",
+            "/v3/nodes/register",
             Some(serde_json::to_value(&strom).unwrap()),
         )
         .await;
@@ -1412,12 +1538,12 @@ mod tests {
 
         reconcile_tick(&state).await;
 
-        let (_, body) = send(&app, "GET", "/v2/nodes", None).await;
+        let (_, body) = send(&app, "GET", "/v3/nodes", None).await;
         let nodes: Vec<NodeDescriptor> = serde_json::from_value(body).unwrap();
         let page = nodes.iter().find(|n| n.id == "browser-a1b2").unwrap();
         assert_eq!(page.endpoint, "browser://browser-a1b2");
 
-        let (status, body) = send(&app, "GET", "/v2/nodes/browser-a1b2/desired", None).await;
+        let (status, body) = send(&app, "GET", "/v3/nodes/browser-a1b2/desired", None).await;
         assert_eq!(status, StatusCode::OK);
         let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
         assert_eq!(hops.len(), 1);
@@ -1459,13 +1585,13 @@ mod tests {
         reconcile_tick(&state).await;
 
         let app = open_router(state);
-        let (status, body) = send(&app, "GET", "/v2/nodes/strom-node-1/desired", None).await;
+        let (status, body) = send(&app, "GET", "/v3/nodes/strom-node-1/desired", None).await;
         assert_eq!(status, StatusCode::OK);
         let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
         assert_eq!(hops.len(), 1, "sender hop placed on node 1");
         assert_eq!(hops[0].id, "weave-basic-sender");
 
-        let (_, body) = send(&app, "GET", "/v2/nodes/strom-node-2/desired", None).await;
+        let (_, body) = send(&app, "GET", "/v3/nodes/strom-node-2/desired", None).await;
         let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
         assert_eq!(hops.len(), 1, "receiver hop placed on node 2");
         assert_eq!(hops[0].id, "weave-basic-receiver-0");
@@ -1485,10 +1611,10 @@ mod tests {
             }];
         }
         let app = open_router(state);
-        let (status, _) = send(&app, "GET", "/v2/streams/basic/endpoints", None).await;
+        let (status, _) = send(&app, "GET", "/v3/streams/basic/endpoints", None).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
-        let (status, _) = send(&app, "GET", "/v2/streams/nope/endpoints", None).await;
+        let (status, _) = send(&app, "GET", "/v3/streams/nope/endpoints", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -1722,7 +1848,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v2/nodes/register",
+            "/v3/nodes/register",
             Some(serde_json::to_value(node_registration("guest-1", "172.26.0.10")).unwrap()),
         )
         .await;
@@ -1780,7 +1906,7 @@ mod tests {
         let (status, _) = send(
             &app,
             "POST",
-            "/v2/nodes/guest-1/heartbeat",
+            "/v3/nodes/guest-1/heartbeat",
             Some(json!({ "node_id": "guest-1", "status": "ready" })),
         )
         .await;
@@ -1804,7 +1930,7 @@ mod tests {
         send(
             &app,
             "POST",
-            "/v2/nodes/guest-1/heartbeat",
+            "/v3/nodes/guest-1/heartbeat",
             Some(json!({ "node_id": "guest-1", "status": "ready" })),
         )
         .await;
@@ -1829,7 +1955,7 @@ mod tests {
             send(
                 &app,
                 "POST",
-                "/v2/nodes/register",
+                "/v3/nodes/register",
                 Some(serde_json::to_value(node_registration("guest-1", "172.26.0.10")).unwrap()),
             ),
         )
@@ -1942,13 +2068,13 @@ mod tests {
         reconcile_tick(&state).await;
 
         let app = open_router(state);
-        let (status, body) = send(&app, "GET", "/v2/nodes", None).await;
+        let (status, body) = send(&app, "GET", "/v3/nodes", None).await;
         assert_eq!(status, StatusCode::OK);
         let nodes: Vec<NodeDescriptor> = serde_json::from_value(body).unwrap();
         let node1 = nodes.iter().find(|n| n.id == "strom-node-1").unwrap();
         assert_eq!(node1.status, NodeStatus::Offline);
 
-        let (status, body) = send(&app, "GET", "/v2/nodes/strom-node-1/desired", None).await;
+        let (status, body) = send(&app, "GET", "/v3/nodes/strom-node-1/desired", None).await;
         assert_eq!(status, StatusCode::OK);
         let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
         assert!(
@@ -1985,19 +2111,19 @@ mod tests {
     }
 
     const NORTH_ROUTES: [(&str, &str); 4] = [
-        ("GET", "/v2/streams"),
-        ("POST", "/v2/streams"),
-        ("DELETE", "/v2/streams/basic"),
-        ("GET", "/v2/streams/basic/endpoints"),
+        ("GET", "/v3/streams"),
+        ("POST", "/v3/streams"),
+        ("DELETE", "/v3/streams/basic"),
+        ("GET", "/v3/streams/basic/endpoints"),
     ];
 
     const SOUTH_ROUTES: [(&str, &str); 6] = [
-        ("GET", "/v2/nodes"),
-        ("POST", "/v2/nodes/register"),
-        ("POST", "/v2/nodes/strom-node-1/heartbeat"),
-        ("GET", "/v2/nodes/strom-node-1/desired"),
-        ("GET", "/v2/endpoints"),
-        ("GET", "/v2/state"),
+        ("GET", "/v3/nodes"),
+        ("POST", "/v3/nodes/register"),
+        ("POST", "/v3/nodes/strom-node-1/heartbeat"),
+        ("GET", "/v3/nodes/strom-node-1/desired"),
+        ("GET", "/v3/endpoints"),
+        ("GET", "/v3/state"),
     ];
 
     /// Unversioned and retired-major paths are gone: this is a clean break, not
@@ -2017,13 +2143,15 @@ mod tests {
         }
         let (status, _) = send(&app, "GET", "/status", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        for (method, uri) in NORTH_ROUTES.iter().chain(&SOUTH_ROUTES) {
-            let retired = uri.replacen(API_PREFIX, "/v1", 1);
-            let (status, _) = send(&app, method, &retired, None).await;
-            assert_eq!(status, StatusCode::NOT_FOUND, "{retired} must stay retired");
+        for retired_prefix in ["/v1", "/v2"] {
+            for (method, uri) in NORTH_ROUTES.iter().chain(&SOUTH_ROUTES) {
+                let retired = uri.replacen(API_PREFIX, retired_prefix, 1);
+                let (status, _) = send(&app, method, &retired, None).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{retired} must stay retired");
+            }
+            let (status, _) = send(&app, "GET", &format!("{retired_prefix}/status"), None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
         }
-        let (status, _) = send(&app, "GET", "/v1/status", None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     /// The dashboard surface is unauthenticated — it is browser-loaded and cannot
@@ -2032,7 +2160,7 @@ mod tests {
     async fn dashboard_and_health_stay_open() {
         let (state, _mem) = mem_state();
         let app = guarded_router(state);
-        for uri in ["/", "/ui", "/health", "/view", "/v2/status"] {
+        for uri in ["/", "/ui", "/health", "/view", "/v3/status"] {
             let (status, _) = send_auth(&app, "GET", uri, None).await;
             assert_eq!(status, StatusCode::OK, "{uri} must not require a token");
         }
@@ -2094,7 +2222,7 @@ mod tests {
         let (status, _) = send_auth(
             &app,
             "GET",
-            "/v2/streams",
+            "/v3/streams",
             Some(&format!("Bearer {NORTH_TOKEN}")),
         )
         .await;
@@ -2103,7 +2231,7 @@ mod tests {
         let (status, _) = send_auth(
             &app,
             "GET",
-            "/v2/state",
+            "/v3/state",
             Some(&format!("Bearer {SOUTH_TOKEN}")),
         )
         .await;
