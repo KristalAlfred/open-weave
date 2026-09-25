@@ -563,7 +563,16 @@ impl LeaseTiming {
 
 /// Which router, if any, a controller on a shared store serves.
 #[derive(Clone, Default)]
-struct Leadership(Arc<std::sync::RwLock<Role>>);
+struct Leadership(Arc<std::sync::RwLock<Held>>);
+
+/// The role, and the instant it lapses unless a renewal moves it on. The
+/// router serves nothing past it even when the renewal task has not run, as
+/// after the process was paused.
+#[derive(Default)]
+struct Held {
+    role: Role,
+    until: Option<Instant>,
+}
 
 #[derive(Default)]
 enum Role {
@@ -574,42 +583,50 @@ enum Role {
 }
 
 impl Leadership {
-    fn set(&self, role: Role) {
-        *self
-            .0
+    fn held(&self) -> std::sync::RwLockWriteGuard<'_, Held> {
+        self.0
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = role;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn taking(&self) {
-        self.set(Role::Taking);
+    fn taking(&self, until: Instant) {
+        *self.held() = Held {
+            role: Role::Taking,
+            until: Some(until),
+        };
+    }
+
+    fn hold_until(&self, until: Instant) {
+        let mut held = self.held();
+        if !matches!(held.role, Role::Standby) {
+            held.until = Some(until);
+        }
     }
 
     /// Serve `app`, unless the lease was lost since [`Leadership::taking`].
     fn lead(&self, app: Router) -> bool {
-        let mut role = self
-            .0
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !matches!(*role, Role::Taking) {
+        let mut held = self.held();
+        if !matches!(held.role, Role::Taking) {
             return false;
         }
-        *role = Role::Leading(app);
+        held.role = Role::Leading(app);
         true
     }
 
     fn stand_by(&self) {
-        self.set(Role::Standby);
+        *self.held() = Held::default();
     }
 
     fn router(&self) -> Option<Router> {
-        match &*self
+        let held = self
             .0
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-        {
-            Role::Leading(app) => Some(app.clone()),
-            Role::Standby | Role::Taking => None,
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &held.role {
+            Role::Leading(app) if held.until.is_some_and(|until| Instant::now() < until) => {
+                Some(app.clone())
+            }
+            Role::Leading(_) | Role::Standby | Role::Taking => None,
         }
     }
 }
@@ -668,7 +685,7 @@ async fn run_with_lease(
             epoch = term.epoch,
             "took the controller lease; loading state"
         );
-        leadership.taking();
+        leadership.taking(asked + timing.hold_for);
         let mut hold = tokio::spawn(hold_lease(pg.clone(), leadership.clone(), asked, timing));
         if let Some(emitter) = &controller.webhooks {
             emitter.count_from(term.started_micros);
@@ -772,6 +789,7 @@ async fn hold_lease(
         match tokio::time::timeout_at(deadline.into(), pg.renew_lease(timing.ttl)).await {
             Ok(Ok(true)) => {
                 deadline = sent + timing.hold_for;
+                leadership.hold_until(deadline);
                 wait = timing.renew_every;
             }
             Ok(Ok(false)) => break "the lease expired or another controller took it",
@@ -5390,7 +5408,7 @@ mod tests {
         let leadership = Leadership::default();
         let app = leadership_router(leadership.clone());
 
-        leadership.taking();
+        leadership.taking(Instant::now() + Duration::from_secs(60));
         assert_eq!(
             desired_hops(&app, "strom-node-1").await.0,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -5407,11 +5425,27 @@ mod tests {
         assert_eq!(body["code"], "not_leader");
     }
 
+    #[tokio::test]
+    async fn a_leader_serves_nothing_past_its_hold_deadline_without_a_renewal() {
+        let (state, _mem) = mem_state();
+        let leadership = Leadership::default();
+        let app = leadership_router(leadership.clone());
+        leadership.taking(Instant::now() + Duration::from_millis(200));
+        let led = router_after_first_tick(&state, Guard::Disabled, NodeGuard::Disabled).await;
+        assert!(leadership.lead(led));
+        assert_eq!(send(&app, "GET", "/status", None).await.0, StatusCode::OK);
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let (status, body) = send(&app, "GET", "/status", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "not_leader");
+    }
+
     #[test]
     fn a_lease_lost_while_the_state_loads_is_never_served() {
         let (state, _mem) = mem_state();
         let leadership = Leadership::default();
-        leadership.taking();
+        leadership.taking(Instant::now() + Duration::from_secs(60));
         leadership.stand_by();
 
         assert!(!leadership.lead(open_router(state)));
