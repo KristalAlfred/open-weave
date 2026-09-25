@@ -212,7 +212,7 @@ fn two_paths_over_two_networks_share_no_attachment_at_either_end() {
     assert_eq!(port, second);
     assert_eq!(
         params.passphrase,
-        Some(LinkKeys::for_tests().link("weave-feed-receiver-studio.2"))
+        Some(LinkKeys::for_tests().link("weave-feed-receiver-studio.2", ["source", "studio-node"]))
     );
     assert_eq!(planned.path.hops.len(), 2);
 }

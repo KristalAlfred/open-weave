@@ -1321,7 +1321,8 @@ fn has_listener(attachment: &NetworkAttachment, transport: Transport) -> bool {
 /// listener claims its port on the listening node, always keyed by the
 /// downstream hop id so an assignment stays stable when a link's direction is
 /// the same across ticks. Both SRT sockets carry the key derived from that same
-/// id, so the key survives a replan and a change of direction. A WebRTC
+/// id and the two end nodes, so the key survives a replan and a change of
+/// direction, and changes when either end moves to another node. A WebRTC
 /// listener claims no port: its socket is signalled at the base its node
 /// declares, addressed by the downstream hop id so every link is a distinct
 /// endpoint.
@@ -1352,7 +1353,11 @@ fn plan_link(
                 .as_ref()
                 .expect("SRT link choice has an SRT listener");
             let port = ports.claim(host.node, &choice.attachment, downstream.hop_id)?;
-            let params = srt_params(latency, Some(keys.link(downstream.hop_id)));
+            let ends = [
+                upstream.station.node_id.as_str(),
+                downstream.station.node_id.as_str(),
+            ];
+            let params = srt_params(latency, Some(keys.link(downstream.hop_id, ends)));
             (
                 SocketSpec::Srt(SrtSocket::Listen {
                     port,
@@ -2280,7 +2285,12 @@ mod contract_tests {
             let receiver = hop(&path, &format!("weave-feed-receiver-{branch}"));
             let key = link_key(egress(sender, branch)).expect("link is keyed");
             assert_eq!(link_key(&receiver.ingress), Some(key));
-            assert_eq!(key, keys().link(&receiver.id).expose());
+            assert_eq!(
+                key,
+                keys()
+                    .link(&receiver.id, [&receiver.node_id, "source"])
+                    .expose()
+            );
             assert_eq!(srt_params(&receiver.ingress).pbkeylen, Some(32));
             assert_eq!(srt_params(egress(sender, branch)).pbkeylen, Some(32));
             link_keys.push(key.to_string());
@@ -2340,6 +2350,56 @@ mod contract_tests {
     }
 
     #[test]
+    fn a_link_rekeys_when_either_end_moves_to_another_node() {
+        let mut nodes = shared_nodes();
+        for (id, host) in [("relay-a", "192.0.2.4"), ("relay-b", "192.0.2.5")] {
+            nodes.push(node(
+                id,
+                vec![attachment("wan", "internet", true, Some(host))],
+            ));
+        }
+        let via = |relay: &str| {
+            let mut definition = stream(vec![destination("studio", "studio-node")]);
+            let StreamTransport::Srt(endpoint) = &mut definition.destinations[0].endpoint else {
+                unreachable!()
+            };
+            endpoint.via = vec![relay.to_string()];
+            plan(&definition, &nodes)
+        };
+        let (a, b) = (via("relay-a"), via("relay-b"));
+        let bridge = "weave-feed-bridge-studio-0";
+        let receiver = "weave-feed-receiver-studio";
+        assert_eq!(hop(&a, bridge).node_id, "relay-a");
+        assert_eq!(hop(&b, bridge).node_id, "relay-b");
+        assert_ne!(
+            link_key(&hop(&a, bridge).ingress),
+            link_key(&hop(&b, bridge).ingress),
+            "the link into the relay"
+        );
+        assert_ne!(
+            link_key(&hop(&a, receiver).ingress),
+            link_key(&hop(&b, receiver).ingress),
+            "the link out of the relay"
+        );
+        assert_eq!(
+            link_key(egress(hop(&b, "weave-feed-sender"), "studio")),
+            link_key(&hop(&b, bridge).ingress)
+        );
+        assert_eq!(
+            link_key(egress(hop(&b, bridge), "studio")),
+            link_key(&hop(&b, receiver).ingress)
+        );
+
+        let direct = plan(&stream(vec![destination("studio", "studio-node")]), &nodes);
+        let moved = plan(&stream(vec![destination("studio", "preview-node")]), &nodes);
+        assert_eq!(hop(&moved, receiver).node_id, "preview-node");
+        assert_ne!(
+            link_key(&hop(&moved, receiver).ingress),
+            link_key(&hop(&direct, receiver).ingress)
+        );
+    }
+
+    #[test]
     fn terminal_sockets_carry_the_manifest_passphrase_or_none() {
         let keyed = |endpoint: &mut StreamTransport, passphrase: &str| {
             let StreamTransport::Srt(endpoint) = endpoint else {
@@ -2392,7 +2452,11 @@ mod contract_tests {
         );
         assert_eq!(
             link_key(&receiver.ingress),
-            Some(keys().link(&receiver.id).expose()),
+            Some(
+                keys()
+                    .link(&receiver.id, ["source", "studio-node"])
+                    .expose()
+            ),
             "the manifest passphrase does not replace the link key"
         );
     }

@@ -1,6 +1,6 @@
 //! Keys for SRT links between nodes. Each key is derived from one controller
-//! secret and the id of the hop the link feeds, so both ends get the same key
-//! on every tick and nothing is stored.
+//! secret, the id of the hop the link feeds and the two nodes it joins, so both
+//! ends get the same key on every tick and nothing is stored.
 
 use std::fmt::{self, Write};
 
@@ -81,13 +81,18 @@ impl LinkKeys {
         Self::new("0123456789abcdef0123456789abcdef")
     }
 
-    /// The key for the link feeding hop `hop_id`: HMAC-SHA256 of the secret
-    /// over that id, as 64 lowercase hex characters.
-    pub(crate) fn link(&self, hop_id: &str) -> Passphrase {
+    /// The key for the link feeding hop `hop_id` between the nodes `ends`, in
+    /// either order: HMAC-SHA256 of the secret over the hop id and both node
+    /// ids, as 64 lowercase hex characters.
+    pub(crate) fn link(&self, hop_id: &str, mut ends: [&str; 2]) -> Passphrase {
+        ends.sort_unstable();
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret)
             .expect("HMAC-SHA256 accepts a key of any length");
         mac.update(LINK_LABEL);
-        mac.update(hop_id.as_bytes());
+        for part in [hop_id, ends[0], ends[1]] {
+            mac.update(part.as_bytes());
+            mac.update(b"\0");
+        }
         let mut key = String::with_capacity(64);
         for byte in mac.finalize().into_bytes() {
             write!(key, "{byte:02x}").expect("writing to a string cannot fail");
@@ -102,17 +107,31 @@ mod tests {
 
     const SECRET: &str = "0123456789abcdef0123456789abcdef";
 
+    const HOP: &str = "weave-feed-receiver-studio";
+    const ENDS: [&str; 2] = ["source", "studio-node"];
+
     #[test]
     fn a_link_key_is_stable_per_hop_and_distinct_across_hops_and_secrets() {
         let keys = LinkKeys::new(SECRET);
-        let key = keys.link("weave-feed-receiver-studio");
-        assert_eq!(key, keys.link("weave-feed-receiver-studio"));
+        let key = keys.link(HOP, ENDS);
+        assert_eq!(key, keys.link(HOP, ENDS));
         assert_eq!(key.expose().len(), 64);
         assert!(key.expose().bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert_ne!(key, keys.link("weave-feed-receiver-preview"));
+        assert_ne!(key, keys.link("weave-feed-receiver-preview", ENDS));
+        assert_ne!(key, LinkKeys::new(format!("{SECRET}x")).link(HOP, ENDS));
+    }
+
+    #[test]
+    fn a_link_key_changes_with_either_end_node_but_not_their_order() {
+        let keys = LinkKeys::new(SECRET);
+        let key = keys.link(HOP, ENDS);
+        assert_eq!(key, keys.link(HOP, ["studio-node", "source"]));
+        assert_ne!(key, keys.link(HOP, ["relay", "studio-node"]));
+        assert_ne!(key, keys.link(HOP, ["source", "relay"]));
         assert_ne!(
-            key,
-            LinkKeys::new(format!("{SECRET}x")).link("weave-feed-receiver-studio")
+            keys.link("hop", ["a", "bc"]),
+            keys.link("hop", ["ab", "c"]),
+            "the ids are separated"
         );
     }
 
@@ -129,7 +148,7 @@ mod tests {
         let (first, source) = LinkKeys::resolve(None, true).unwrap();
         assert_eq!(source, SecretSource::Generated);
         let (second, _) = LinkKeys::resolve(None, true).unwrap();
-        assert_ne!(first.link("hop"), second.link("hop"));
+        assert_ne!(first.link(HOP, ENDS), second.link(HOP, ENDS));
     }
 
     #[test]
@@ -140,7 +159,7 @@ mod tests {
         );
         let (keys, source) = LinkKeys::resolve(Some(SECRET), false).unwrap();
         assert_eq!(source, SecretSource::Configured);
-        assert_eq!(keys.link("hop"), LinkKeys::new(SECRET).link("hop"));
+        assert_eq!(keys.link(HOP, ENDS), LinkKeys::new(SECRET).link(HOP, ENDS));
     }
 
     #[test]

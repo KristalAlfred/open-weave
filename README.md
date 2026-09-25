@@ -557,11 +557,15 @@ There is no TLS: terminate it at a reverse proxy. There is no mTLS.
 ## SRT encryption
 
 Every SRT link between two nodes is encrypted. The controller derives its key as
-HMAC-SHA256 of `WEAVE_SRT_KEY_SECRET` over the id of the hop the link feeds,
-written as 64 hex characters, and puts it with `pbkeylen: 32` (AES-256) in both
-ends' desired hops. The same secret and topology give the same key on every
-tick, so no key is stored and a replan, or a link changing direction, does not
-rekey it. Changing the secret rekeys every link once.
+HMAC-SHA256 of `WEAVE_SRT_KEY_SECRET` over the id of the hop the link feeds and
+the ids of the two nodes it joins, written as 64 hex characters, and puts it
+with `pbkeylen: 32` (AES-256) in both ends' desired hops. The same secret and
+topology give the same key on every tick, so no key is stored and a replan, or a
+link changing direction, does not rekey it. A link that moves to another node,
+such as a swapped `via` relay or a destination re-applied on another node, gets
+a new key, so the node it left holds no valid key for it. Changing the secret
+rekeys every link once. So does upgrading from a controller that derived keys
+from the hop id alone; each adapter rebuilds its keyed flows once.
 
 `WEAVE_SRT_KEY_SECRET` must be at least 32 characters, for example
 `openssl rand -hex 32`. Without it the controller refuses to start, like a
