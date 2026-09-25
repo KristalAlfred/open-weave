@@ -55,6 +55,8 @@ are encrypted with keys the controller derives. All of it is verified on
 the docker-compose bench in `bench/`, which runs real Strom instances behind
 per-node `netem` routers, and nowhere else. Automatic relay insertion is the
 exception: the bench has one NAT'd site, so only planner tests cover it.
+Redundant paths are another: no shipped node merges two paths, so only planner
+and status tests cover them.
 
 Not built: TLS, controller HA, format conversion, and any adapter other than
 Strom. The items in `backlog/` list the known gaps with the
@@ -236,13 +238,17 @@ process at registration rather than wait for a later request to fail. It is `5`:
 SRT socket `params` carry a `passphrase` and `pbkeylen` (see
 [SRT encryption](#srt-encryption)). An adapter at `4` would ignore both and
 build its end of every keyed link in the clear, which the other end refuses.
+The same version adds a hop profile's `merge`, a desired hop's
+`merge_ingress`, and the hop status that reports it (see
+[Redundant paths](#redundant-paths)).
 
 ### Hop status and fan-out
 
 Every destination has a stable resource id. The same id is the `branch_id` on
 every hop that carries it. Receiver ids use the destination id; bridge ids use
 the destination id and bridge position. Reordering the manifest list changes no
-hop ids, ports, or desired snapshots.
+hop ids, ports, or desired snapshots. A destination's second path carries
+`{id}.2` instead (see [Redundant paths](#redundant-paths)).
 
 ```json
 {
@@ -273,7 +279,9 @@ hop ids, ports, or desired snapshots.
 An adapter reports ingress separately and one status entry for every desired
 branch. Branch order is not significant; `branch_id` is the join key. Missing,
 duplicate, or unknown branch ids make the hop report incomplete, so it remains
-`pending` instead of allowing one healthy destination to hide another:
+`pending` instead of allowing one healthy destination to hide another. A hop
+with a `merge_ingress` reports its status in a `merge_ingress` field of the same
+shape as `ingress`, and is incomplete without it:
 
 ```json
 {
@@ -410,7 +418,8 @@ reconcile, or `null` before one completes. Conditions are always keyed by stable
 types: `placement_ready`, `nodes_available`, `hops_ready`, `format_compatible`,
 and `media_flowing`. Each has `true`, `false`, or `unknown` status, a stable
 reason code, a detail string, and an RFC 3339 `last_transition_time`. The time
-changes when the condition status changes, not when only its detail changes.
+changes when the condition status changes, not when only its reason or detail
+changes.
 
 ## Authentication
 
@@ -769,6 +778,54 @@ destinations:
 `GET /streams/{name}/endpoints` returns `ingress` plus a `destinations` list of
 `{id, endpoint}` objects. A device end has a null endpoint. See
 `nodes/browser/README.md` and `bench/README.md` for the shipped nodes.
+
+### Redundant paths
+
+A destination can ask for two paths to its node:
+
+```yaml
+destinations:
+  - id: studio
+    paths: 2
+    srt: { node: studio-node }
+```
+
+`paths` is 1 or 2 and defaults to 1. A `remote` destination cannot ask for two,
+since no receiver hop exists to merge them, and neither can one that pins `via`.
+
+The planner places every destination's first path as it would with `paths: 1`,
+then each second path. A second path passes through no relay the first one
+uses, and at the sender and the receiver it uses no attachment the first one
+may carry its link on. A dialing socket names no local address, so at an end
+that dials, every dialing attachment on that network counts as used: two paths
+that both dial out of one node leave it over different networks.
+
+Merging the two copies is the receiver's job. A second path is placed only when
+the receiver has a hop profile with `merge: true`. The receiver hop then gets a
+`merge_ingress`, a second socket of that profile's ingress class:
+
+```yaml
+hop_profiles:
+  - id: srt-merge
+    ingress: { transport: srt, roles: [listen, connect] }
+    egress: { transport: srt, roles: [listen] }
+    merge: true
+```
+
+No shipped node advertises `merge`. The Strom adapter refuses a hop with a
+`merge_ingress`.
+
+The second path's egresses carry the branch id `{destination}.2`, and its
+bridges are `weave-{stream}-bridge-{destination}.2-{position}`. `.` is not
+allowed in a destination id, so these never equal another destination's ids.
+Asking for a second path changes none of the first path's hop ids, ports, or
+branch ids. A destination's status covers both paths, so one that is down
+reads `degraded`.
+
+When the second path cannot be placed, the stream is placed with one. Its
+`placement_ready` condition and the destination's stay `true` with reason
+`single_path`, and the detail names the destination and why. `POST
+/stream-plans` returns the same detail as its `reason`.
 
 ## Media formats
 

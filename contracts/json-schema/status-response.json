@@ -46,6 +46,7 @@
                     "reason": {
                       "enum": [
                         "placed",
+                        "single_path",
                         "disabled",
                         "placement_failed",
                         "nodes_available",
@@ -114,6 +115,7 @@
                           "reason": {
                             "enum": [
                               "placed",
+                              "single_path",
                               "disabled",
                               "placement_failed",
                               "nodes_available",

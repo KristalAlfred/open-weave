@@ -50,3 +50,9 @@ Nothing measures plan time, desired-state size or heartbeat load at that size.
   plan 315-320 ms, reconcile tick 350-356 ms; every bridge lands on `relay-a`.
   A scratch copy at 500 and 1000 receivers found relayed planning cubic (OW-25)
   and the relay out of ports at 501 destinations (OW-26).
+- 2026-09-25: the first three runs above used the shared target dir, where
+  cargo could link another worktree's `weave-core`; the fourth used a target dir
+  of this worktree only and agreed with them. Re-run in this worktree's own
+  target (`debug = "line-tables-only"`) with the OW-5 changes, load average
+  14-22, two runs: direct plan 2.7-2.8 ms, reconcile tick 24 ms; relayed plan
+  234-246 ms, reconcile tick 271-277 ms.

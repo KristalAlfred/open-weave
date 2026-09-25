@@ -421,6 +421,7 @@ async fn hop_statuses(
                 resolved: resolved_addr(&hop.ingress, listener_host),
                 stats: ingress.map(LinkStats::from),
             },
+            merge_ingress: None,
             egresses: hop
                 .egresses
                 .iter()
@@ -523,18 +524,21 @@ fn strom_hop_profiles() -> Vec<HopProfile> {
             ingress: transport_class(Transport::Srt, RoleSet::both()),
             egress: transport_class(Transport::Srt, RoleSet::both()),
             max_egresses: None,
+            merge: false,
         },
         HopProfile {
             id: "whip-to-srt".to_string(),
             ingress: transport_class(Transport::Whip, RoleSet::only(SocketRole::Listen)),
             egress: transport_class(Transport::Srt, RoleSet::both()),
             max_egresses: None,
+            merge: false,
         },
         HopProfile {
             id: "srt-to-whep".to_string(),
             ingress: transport_class(Transport::Srt, RoleSet::both()),
             egress: transport_class(Transport::Whep, RoleSet::only(SocketRole::Listen)),
             max_egresses: None,
+            merge: false,
         },
     ]
 }
@@ -849,6 +853,7 @@ mod tests {
             profile_id: "srt-forward".to_string(),
             role: HopRole::Sender,
             ingress: SocketSpec::srt_listen(port, 200),
+            merge_ingress: None,
             egresses: vec![DesiredEgress {
                 branch_id: "studio".to_string(),
                 socket: SocketSpec::srt_connect("10.0.0.2", port + 1, 1000),

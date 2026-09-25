@@ -43,6 +43,7 @@ mod tests {
             profile_id: "test-profile".to_string(),
             role: HopRole::Sender,
             ingress: SocketSpec::Device(DeviceKind::Capture),
+            merge_ingress: None,
             egresses: vec![DesiredEgress {
                 branch_id: branch_id.to_string(),
                 socket: SocketSpec::Device(DeviceKind::Display),

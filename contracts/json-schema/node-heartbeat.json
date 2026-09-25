@@ -266,6 +266,107 @@
             },
             "type": "object"
           },
+          "merge_ingress": {
+            "description": "Observed condition, address, and statistics for one socket.",
+            "properties": {
+              "condition": {
+                "default": "idle",
+                "description": "Observed condition of one socket on a hop, independent of control-plane lifecycle.",
+                "oneOf": [
+                  {
+                    "const": "idle",
+                    "description": "No connection; the socket is a listener patiently waiting. Healthy.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "connecting",
+                    "description": "No connection; the socket is a caller still retrying. Ambiguous, not degraded.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "connected",
+                    "description": "Connection up but rate ~0 — fine on our end, nothing coming through yet.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "flowing",
+                    "description": "Connection up and media flowing.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "stalled",
+                    "description": "Ingress once carried media but byte progress has frozen while the flow still\n claims to run — detected across polls, not from any instantaneous field.",
+                    "type": "string"
+                  }
+                ]
+              },
+              "resolved": {
+                "properties": {
+                  "host": {
+                    "type": "string"
+                  },
+                  "port": {
+                    "format": "uint16",
+                    "maximum": 65535,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "host",
+                  "port"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "stats": {
+                "description": "Socket-level SRT stats mirrored from Strom's `srt-stats` payload.",
+                "properties": {
+                  "connections": {
+                    "default": 0,
+                    "format": "uint",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "packets_received_lost": {
+                    "default": 0,
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "packets_received_retransmitted": {
+                    "default": 0,
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "packets_retransmitted": {
+                    "default": 0,
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "packets_sent_lost": {
+                    "default": 0,
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "rate_mbps": {
+                    "default": 0.0,
+                    "format": "double",
+                    "type": "number"
+                  }
+                },
+                "type": [
+                  "object",
+                  "null"
+                ]
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "node_id": {
             "type": "string"
           },

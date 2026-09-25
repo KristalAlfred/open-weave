@@ -7,6 +7,8 @@ mod desired;
 mod keys;
 mod path;
 #[cfg(test)]
+mod redundant_paths_tests;
+#[cfg(test)]
 mod scale_tests;
 mod store;
 mod webhook;
@@ -50,8 +52,8 @@ use weave_core::{
 
 use keys::{LinkKeys, SecretSource};
 use path::{
-    PlacementError, PortAllocator, derive_path, destination_nodes, destination_path_status,
-    path_status, stream_endpoints,
+    PlacementError, PortAllocator, SinglePath, derive_stream, destination_nodes,
+    destination_path_status, path_status, stream_endpoints,
 };
 use store::{
     MemStore, PgStore, StateStore, StoreError, StoredStream, StreamSetMemberAction, StreamSetWrite,
@@ -1467,17 +1469,15 @@ async fn plan_stream(
         nodes: planned.nodes,
         hops,
         endpoints,
-        reason: (status == PlanStatus::Unplaced)
-            .then(|| {
-                planned
-                    .conditions
-                    .iter()
-                    .find(|condition| {
-                        condition.condition_type == StreamConditionType::PlacementReady
-                    })
-                    .map(|condition| condition.detail.clone())
+        reason: planned
+            .conditions
+            .iter()
+            .find(|condition| condition.condition_type == StreamConditionType::PlacementReady)
+            .filter(|condition| {
+                status == PlanStatus::Unplaced
+                    || condition.reason == StreamConditionReason::SinglePath
             })
-            .flatten(),
+            .map(|condition| condition.detail.clone()),
     })
     .into_response()
 }
@@ -2025,10 +2025,26 @@ fn placement_failed_conditions(
     ]
 }
 
+/// One line naming every destination in `shortfalls` and why it got one path of
+/// the two it asked for, or `None` when there are none.
+fn single_path_detail<'a>(shortfalls: impl IntoIterator<Item = &'a SinglePath>) -> Option<String> {
+    let details: Vec<String> = shortfalls
+        .into_iter()
+        .map(|shortfall| {
+            format!(
+                "destination {} has one path of two: {}",
+                shortfall.destination, shortfall.reason
+            )
+        })
+        .collect();
+    (!details.is_empty()).then(|| details.join("; "))
+}
+
 fn placed_conditions(
     stream: &StreamDefinition,
     path_status: PathStatus,
     offline_node: Option<&str>,
+    single_path: Option<&str>,
 ) -> Vec<StreamCondition> {
     let nodes = match offline_node {
         Some(node) => stream_condition(
@@ -2064,13 +2080,22 @@ fn placed_conditions(
             "every desired hop is provisioned",
         ),
     };
-    vec![
-        stream_condition(
+    let placement = match single_path {
+        Some(detail) => stream_condition(
+            StreamConditionType::PlacementReady,
+            StreamConditionStatus::True,
+            StreamConditionReason::SinglePath,
+            detail,
+        ),
+        None => stream_condition(
             StreamConditionType::PlacementReady,
             StreamConditionStatus::True,
             StreamConditionReason::Placed,
             "the stream has a complete path",
         ),
+    };
+    vec![
+        placement,
         nodes,
         hops,
         format_condition(stream),
@@ -2160,8 +2185,10 @@ fn reconcile(
         }
         enabled += 1;
 
-        let status = match derive_path(stream, &observed.nodes, &observed.hops, &mut ports, keys) {
-            Ok(path) => {
+        let status = match derive_stream(stream, &observed.nodes, &observed.hops, &mut ports, keys)
+        {
+            Ok(planned) => {
+                let path = planned.path;
                 hops_by_stream.insert(stream.name.clone(), path.hops.clone());
                 let mut nodes = Vec::new();
                 for hop in &path.hops {
@@ -2212,6 +2239,12 @@ fn reconcile(
                         } else {
                             branch_status
                         };
+                        let single_path = single_path_detail(
+                            planned
+                                .single_path
+                                .iter()
+                                .filter(|shortfall| shortfall.destination == destination.id),
+                        );
                         StreamDestinationStatus {
                             id: destination.id.clone(),
                             status,
@@ -2220,6 +2253,7 @@ fn reconcile(
                                 &destination_stream,
                                 branch_status,
                                 offline_node.as_deref(),
+                                single_path.as_deref(),
                             ),
                             endpoint: endpoints.as_ref().and_then(|endpoints| {
                                 endpoints
@@ -2239,7 +2273,12 @@ fn reconcile(
                     nodes,
                     ingress: endpoints.as_ref().and_then(|value| value.ingress.clone()),
                     destinations: destination_statuses,
-                    conditions: placed_conditions(stream, path_status, offline_node.as_deref()),
+                    conditions: placed_conditions(
+                        stream,
+                        path_status,
+                        offline_node.as_deref(),
+                        single_path_detail(&planned.single_path).as_deref(),
+                    ),
                 });
                 status
             }
@@ -2364,6 +2403,7 @@ mod tests {
             ingress: srt.clone(),
             egress: srt,
             max_egresses: None,
+            merge: false,
         }
     }
 
@@ -2437,6 +2477,7 @@ mod tests {
             source: srt_endpoint(source, 200),
             destinations: vec![StreamDestination {
                 id: "studio".to_string(),
+                paths: 1,
                 endpoint: srt_endpoint(destination, 1000),
             }],
         }
@@ -3004,6 +3045,7 @@ mod tests {
                     ..weave_core::LinkStats::default()
                 }),
             },
+            merge_ingress: None,
             egresses: vec![
                 weave_core::EgressStatus {
                     branch_id: "preview".to_string(),
@@ -3539,6 +3581,7 @@ mod tests {
                 resolved: None,
                 stats: None,
             },
+            merge_ingress: None,
             egresses: Vec::new(),
         };
 
@@ -3601,6 +3644,7 @@ mod tests {
                 roles: RoleSet::only(weave_core::SocketRole::Connect),
             }),
             max_egresses: Some(1),
+            merge: false,
         }];
         browser.node.topology.attachments[0].listeners = NetworkListeners::default();
         let (status, _) = send(
@@ -3624,6 +3668,7 @@ mod tests {
                 roles: RoleSet::both(),
             }),
             max_egresses: None,
+            merge: false,
         });
         strom.node.topology.attachments[0].listeners.whip = Some(weave_core::SignallingListener {
             base_url: "http://172.27.0.10:8080/whip".to_string(),
@@ -4388,6 +4433,7 @@ mod tests {
                             resolved: None,
                             stats: None,
                         },
+                        merge_ingress: None,
                         egresses: hop
                             .egresses
                             .iter()
@@ -4484,6 +4530,7 @@ mod tests {
         studio.via = vec!["relay-node".to_string()];
         definition.destinations.push(StreamDestination {
             id: "partner".to_string(),
+            paths: 1,
             endpoint: StreamTransport::Srt(SrtEndpoint {
                 node: None,
                 remote: Some(weave_core::RemoteAddr {
@@ -4946,6 +4993,7 @@ mod key_exposure_tests {
                         ingress: srt(),
                         egress: srt(),
                         max_egresses: None,
+                        merge: false,
                     }],
                 },
                 topology: NodeTopology {
@@ -4992,6 +5040,7 @@ mod key_exposure_tests {
             source: endpoint("node-a", PRODUCER_KEY),
             destinations: vec![StreamDestination {
                 id: "studio".to_string(),
+                paths: 1,
                 endpoint: endpoint("node-b", CONSUMER_KEY),
             }],
         }

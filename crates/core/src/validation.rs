@@ -4,7 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    FormatConstraint, NodeDescriptor, Passphrase, SrtEndpoint, StreamDefinition, StreamTransport,
+    FormatConstraint, NodeDescriptor, Passphrase, SrtEndpoint, StreamDefinition, StreamDestination,
+    StreamTransport,
 };
 
 pub const RESOURCE_ID_MAX_LEN: usize = 63;
@@ -103,9 +104,41 @@ pub fn validate_stream(stream: &StreamDefinition) -> Vec<ValidationIssue> {
             ));
         }
         validate_transport(&destination.endpoint, &path, false, &mut issues);
+        validate_paths(destination, &path, &mut issues);
     }
 
     issues
+}
+
+fn validate_paths(destination: &StreamDestination, path: &str, issues: &mut Vec<ValidationIssue>) {
+    let field = format!("{path}.paths");
+    if !(1..=2).contains(&destination.paths) {
+        issues.push(ValidationIssue::new(
+            field,
+            "invalid_range",
+            "paths must be 1 or 2",
+        ));
+        return;
+    }
+    if destination.paths == 1 {
+        return;
+    }
+    let StreamTransport::Srt(endpoint) = &destination.endpoint else {
+        return;
+    };
+    if endpoint.remote.is_some() {
+        issues.push(ValidationIssue::new(
+            field,
+            "not_allowed",
+            "a remote destination has no receiver to merge two paths",
+        ));
+    } else if !endpoint.via.is_empty() {
+        issues.push(ValidationIssue::new(
+            field,
+            "not_allowed",
+            "a destination with two paths must not pin via",
+        ));
+    }
 }
 
 #[must_use]
@@ -410,6 +443,7 @@ mod tests {
     fn destination(id: &str, endpoint: StreamTransport) -> StreamDestination {
         StreamDestination {
             id: id.to_string(),
+            paths: 1,
             endpoint,
         }
     }
@@ -748,6 +782,63 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn two_paths_need_a_receiver_and_no_via() {
+        let mut two = stream();
+        two.destinations[0].paths = 2;
+        assert!(validate_stream(&two).is_empty());
+
+        let mut out_of_range = stream();
+        out_of_range.destinations[0].paths = 3;
+        assert_eq!(
+            validate_stream(&out_of_range),
+            [issue(
+                "destinations[0].paths",
+                "invalid_range",
+                "paths must be 1 or 2"
+            )]
+        );
+        out_of_range.destinations[0].paths = 0;
+        assert_eq!(validate_stream(&out_of_range).len(), 1);
+
+        let mut remote = srt_node("unused");
+        remote.node = None;
+        remote.remote = Some(crate::RemoteAddr {
+            host: "198.51.100.5".to_string(),
+            port: 9000,
+            network: "internet".to_string(),
+        });
+        let mut to_remote = stream();
+        to_remote.destinations = vec![StreamDestination {
+            paths: 2,
+            ..destination("uplink", StreamTransport::Srt(remote))
+        }];
+        assert_eq!(
+            validate_stream(&to_remote),
+            [issue(
+                "destinations[0].paths",
+                "not_allowed",
+                "a remote destination has no receiver to merge two paths"
+            )]
+        );
+
+        let mut pinned = srt_node("destination");
+        pinned.via = vec!["relay".to_string()];
+        let mut via = stream();
+        via.destinations = vec![StreamDestination {
+            paths: 2,
+            ..destination("destination", StreamTransport::Srt(pinned))
+        }];
+        assert_eq!(
+            validate_stream(&via),
+            [issue(
+                "destinations[0].paths",
+                "not_allowed",
+                "a destination with two paths must not pin via"
+            )]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -771,6 +862,7 @@ mod passphrase_tests {
             }),
             destinations: vec![StreamDestination {
                 id: "studio".to_string(),
+                paths: 1,
                 endpoint: StreamTransport::Srt(SrtEndpoint {
                     node: Some("studio".to_string()),
                     remote: None,

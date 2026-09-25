@@ -108,6 +108,7 @@ pub enum StreamConditionStatus {
 #[serde(rename_all = "snake_case")]
 pub enum StreamConditionReason {
     Placed,
+    SinglePath,
     Disabled,
     PlacementFailed,
     NodesAvailable,

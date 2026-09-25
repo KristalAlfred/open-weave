@@ -304,6 +304,7 @@ mod tests {
             profile_id: "srt-forward".to_string(),
             role: HopRole::Sender,
             ingress: SocketSpec::srt_listen(7001, 200),
+            merge_ingress: None,
             egresses: vec![DesiredEgress {
                 branch_id: "studio".to_string(),
                 socket: SocketSpec::srt_connect("10.0.0.2", 7002, 1000),
@@ -766,6 +767,7 @@ mod tests {
                 "http://172.27.0.10:8080/whip",
                 "weave-alice-cam-receiver-studio",
             ),
+            merge_ingress: None,
             egresses: vec![DesiredEgress {
                 branch_id: "studio".to_string(),
                 socket: SocketSpec::srt_listen(7003, 200),

@@ -1205,6 +1205,7 @@ destinations:
             }),
             destinations: vec![StreamDestination {
                 id: "studio".to_string(),
+                paths: 1,
                 endpoint: StreamTransport::Srt(SrtEndpoint {
                     node: Some("strom-node-2".to_string()),
                     remote: None,
@@ -1640,6 +1641,7 @@ destinations:
             }),
             destinations: vec![StreamDestination {
                 id: "preview".to_string(),
+                paths: 1,
                 endpoint: StreamTransport::Srt(SrtEndpoint {
                     node: Some("also-missing".to_string()),
                     remote: None,

@@ -56,6 +56,8 @@ pub enum MappingError {
     },
     #[error("hop has no egress socket")]
     NoEgress,
+    #[error("no Strom flow shape merges a second ingress")]
+    MergeIngress,
     #[error("no Strom flow shape carries a {0} socket")]
     UnsupportedSocket(String),
     #[error(
@@ -82,9 +84,14 @@ pub enum MappingError {
 ///   the decoded video and audio.
 ///
 /// Every egress of a hop must ask for one shape; a hop asked to fan out over two
-/// is [`MappingError::MixedEgress`]. The selected profile id dispatches the
-/// constructor and its sockets are checked against that profile.
+/// is [`MappingError::MixedEgress`]. No shape merges two ingresses, so a hop
+/// with a merge ingress is [`MappingError::MergeIngress`]. The selected profile
+/// id dispatches the constructor and its sockets are checked against that
+/// profile.
 pub fn flow_spec_from_hop(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
+    if hop.merge_ingress.is_some() {
+        return Err(MappingError::MergeIngress);
+    }
     let egress = sole_egress(hop)?;
     let shapes = (shape(&hop.ingress), shape(egress));
     match hop.profile_id.as_str() {
@@ -611,6 +618,7 @@ mod tests {
             profile_id: "srt-forward".to_string(),
             role: HopRole::Sender,
             ingress: SocketSpec::srt_listen(7001, 200),
+            merge_ingress: None,
             egresses: vec![egress(
                 "studio",
                 SocketSpec::srt_connect("172.31.0.10", 7002, 1000),
@@ -625,6 +633,7 @@ mod tests {
             profile_id: "srt-forward".to_string(),
             role: HopRole::Receiver,
             ingress: SocketSpec::srt_listen(7002, 1000),
+            merge_ingress: None,
             egresses: vec![egress("studio", SocketSpec::srt_listen(7003, 200))],
         }
     }
@@ -669,6 +678,16 @@ mod tests {
             serde_json::from_str(include_str!("testdata/tee.json")).expect("parse tee.json");
 
         assert_eq!(produced, golden);
+    }
+
+    #[test]
+    fn a_merge_ingress_is_an_error() {
+        let mut hop = demo_recv_hop("bench-recv");
+        hop.merge_ingress = Some(SocketSpec::srt_listen(7004, 1000));
+        assert!(matches!(
+            flow_spec_from_hop(&hop),
+            Err(MappingError::MergeIngress)
+        ));
     }
 
     #[test]
@@ -865,6 +884,7 @@ mod tests {
             profile_id: "whip-to-srt".to_string(),
             role: HopRole::Receiver,
             ingress: whip_socket(SocketRole::Listen, "weave-alice-cam-receiver-studio"),
+            merge_ingress: None,
             egresses: vec![egress("studio", SocketSpec::srt_listen(7003, 200))],
         }
     }
@@ -878,6 +898,7 @@ mod tests {
             profile_id: "srt-to-whep".to_string(),
             role: HopRole::Sender,
             ingress: SocketSpec::srt_listen(7001, 200),
+            merge_ingress: None,
             egresses: vec![egress(
                 "studio",
                 whep_socket(SocketRole::Listen, "weave-alice-return-receiver-studio"),

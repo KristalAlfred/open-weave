@@ -79,6 +79,7 @@ mod contract_tests {
     fn destination(id: &str, node: &str) -> StreamDestination {
         StreamDestination {
             id: id.to_string(),
+            paths: 1,
             endpoint: endpoint(node),
         }
     }
@@ -153,6 +154,39 @@ mod contract_tests {
     }
 
     #[test]
+    fn destination_paths_default_to_one_and_serialize_only_when_two() {
+        let parsed: StreamDestination = serde_json::from_value(serde_json::json!({
+            "id": "studio",
+            "srt": { "node": "studio-node" }
+        }))
+        .unwrap();
+        assert_eq!(parsed.paths, 1);
+        assert!(
+            serde_json::to_value(&parsed)
+                .unwrap()
+                .get("paths")
+                .is_none()
+        );
+
+        let two: StreamDestination = serde_json::from_value(serde_json::json!({
+            "id": "studio",
+            "paths": 2,
+            "srt": { "node": "studio-node" }
+        }))
+        .unwrap();
+        assert_eq!(two.paths, 2);
+        assert_eq!(serde_json::to_value(&two).unwrap()["paths"], 2);
+        assert!(
+            serde_json::from_value::<StreamDestination>(serde_json::json!({
+                "id": "studio",
+                "path": 2,
+                "srt": { "node": "studio-node" }
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn superseded_capability_fields_are_rejected() {
         let result = serde_json::from_value::<NodeCapabilities>(serde_json::json!({
             "transports": ["srt"],
@@ -200,8 +234,21 @@ pub struct StreamDestination {
         regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
     )]
     pub id: String,
+    /// How many disjoint paths the planner places to this destination. A second
+    /// path needs a receiver whose hop profile merges.
+    #[serde(default = "one_path", skip_serializing_if = "is_one_path")]
+    #[schemars(range(min = 1, max = 2))]
+    pub paths: u8,
     #[serde(flatten)]
     pub endpoint: StreamTransport,
+}
+
+fn one_path() -> u8 {
+    1
+}
+
+fn is_one_path(paths: &u8) -> bool {
+    *paths == 1
 }
 
 impl Deref for StreamDestination {
@@ -403,6 +450,11 @@ pub struct DesiredHop {
     pub profile_id: String,
     pub role: HopRole,
     pub ingress: SocketSpec,
+    /// A second ingress carrying another copy of the same media over a disjoint
+    /// path, for the hop to merge with `ingress`. Only a receiver whose profile
+    /// merges has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_ingress: Option<SocketSpec>,
     pub egresses: Vec<DesiredEgress>,
 }
 
@@ -979,6 +1031,8 @@ pub struct HopStatus {
     pub node_id: String,
     pub state: HopState,
     pub ingress: SocketStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_ingress: Option<SocketStatus>,
     #[serde(default)]
     pub egresses: Vec<EgressStatus>,
 }
@@ -1006,9 +1060,15 @@ impl HopStatus {
     /// The lifecycle and socket conditions consumed by [`roll_up_path`].
     ///
     /// A status describes `desired` only when it reports each desired branch
-    /// exactly once and no others.
+    /// exactly once and no others, and a merge ingress exactly when one is
+    /// desired.
     #[must_use]
     pub fn conditions(&self, desired: &DesiredHop) -> Option<HopConditions> {
+        let merge_ingress = match (&desired.merge_ingress, &self.merge_ingress) {
+            (Some(_), Some(status)) => Some(status.condition),
+            (None, None) => None,
+            _ => return None,
+        };
         let mut observed = BTreeMap::new();
         for egress in &self.egresses {
             if observed
@@ -1031,6 +1091,7 @@ impl HopStatus {
         Some(HopConditions {
             state: self.state,
             ingress: self.ingress.condition,
+            merge_ingress,
             egresses,
         })
     }
@@ -1069,7 +1130,14 @@ pub enum LinkCondition {
 pub struct HopConditions {
     pub state: HopState,
     pub ingress: LinkCondition,
+    pub merge_ingress: Option<LinkCondition>,
     pub egresses: Vec<LinkCondition>,
+}
+
+impl HopConditions {
+    fn ingresses(&self) -> impl Iterator<Item = LinkCondition> + '_ {
+        std::iter::once(self.ingress).chain(self.merge_ingress)
+    }
 }
 
 /// End-to-end status of a path, derived from its hops' conditions.
@@ -1115,7 +1183,9 @@ pub fn roll_up_path(enabled: bool, hops: &[Option<HopConditions>]) -> PathStatus
         return PathStatus::Pending;
     }
     if hops.iter().flatten().any(|h| {
-        h.ingress == LinkCondition::Stalled || h.egresses.contains(&LinkCondition::Stalled)
+        h.ingresses()
+            .any(|condition| condition == LinkCondition::Stalled)
+            || h.egresses.contains(&LinkCondition::Stalled)
     }) {
         return PathStatus::Degraded;
     }
@@ -1127,7 +1197,8 @@ pub fn roll_up_path(enabled: bool, hops: &[Option<HopConditions>]) -> PathStatus
     }
 
     let all_flowing = hops.iter().flatten().all(|h| {
-        h.ingress == LinkCondition::Flowing
+        h.ingresses()
+            .all(|condition| condition == LinkCondition::Flowing)
             && h.egresses
                 .iter()
                 .all(|condition| *condition == LinkCondition::Flowing)
@@ -1228,6 +1299,10 @@ pub struct HopProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub max_egresses: Option<usize>,
+    /// The hop can take a second ingress of the `ingress` class carrying another
+    /// copy of the same media, and merge the two.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub merge: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1755,6 +1830,7 @@ mod tests {
             profile_id: "srt-forward".to_string(),
             role: HopRole::Sender,
             ingress: SocketSpec::srt_listen(7001, 200),
+            merge_ingress: None,
             egresses: vec![DesiredEgress {
                 branch_id: "studio".to_string(),
                 socket: SocketSpec::srt_connect("172.31.0.10", 7002, 1000),
@@ -1824,6 +1900,7 @@ mod tests {
                     ..LinkStats::default()
                 }),
             },
+            merge_ingress: None,
             egresses: vec![EgressStatus {
                 branch_id: "studio".to_string(),
                 status: SocketStatus {
@@ -1885,6 +1962,7 @@ mod tests {
         Some(HopConditions {
             state,
             ingress,
+            merge_ingress: None,
             egresses: vec![egress],
         })
     }
@@ -2019,6 +2097,7 @@ mod tests {
         let hops = [Some(HopConditions {
             state: HopState::Provisioned,
             ingress: LinkCondition::Flowing,
+            merge_ingress: None,
             egresses: vec![LinkCondition::Flowing, LinkCondition::Connecting],
         })];
         assert_eq!(roll_up_path(true, &hops), PathStatus::Degraded);
@@ -2040,6 +2119,7 @@ mod tests {
                 resolved: None,
                 stats: None,
             },
+            merge_ingress: None,
             egresses: vec![
                 EgressStatus {
                     branch_id: "preview".to_string(),
@@ -2064,6 +2144,7 @@ mod tests {
             Some(HopConditions {
                 state: HopState::Provisioned,
                 ingress: LinkCondition::Flowing,
+                merge_ingress: None,
                 egresses: vec![LinkCondition::Flowing, LinkCondition::Connected],
             })
         );
@@ -2082,6 +2163,7 @@ mod tests {
             node_id: desired.node_id.clone(),
             state: HopState::Provisioned,
             ingress: socket.clone(),
+            merge_ingress: None,
             egresses: Vec::new(),
         };
         assert_eq!(status.conditions(&desired), None);
@@ -2258,6 +2340,7 @@ mod tests {
             source: StreamTransport::Srt(source),
             destinations: vec![StreamDestination {
                 id: "studio".to_string(),
+                paths: 1,
                 endpoint: StreamTransport::Srt(destination),
             }],
         }
@@ -2321,6 +2404,7 @@ mod tests {
 
         let destination = |id: &str, endpoint: &SrtEndpoint| StreamDestination {
             id: id.to_string(),
+            paths: 1,
             endpoint: StreamTransport::Srt(endpoint.clone()),
         };
         stream.destinations = vec![
@@ -2414,6 +2498,7 @@ mod tests {
             }),
             destinations: vec![StreamDestination {
                 id: "studio".to_string(),
+                paths: 1,
                 endpoint: StreamTransport::Srt(SrtEndpoint {
                     node: Some("strom-node-2".to_string()),
                     remote: None,
@@ -2693,5 +2778,81 @@ mod tests {
             );
             assert_eq!(kind.to_string(), kind.name());
         }
+    }
+
+    #[test]
+    fn a_merge_ingress_is_reported_exactly_when_desired() {
+        let socket = |condition| SocketStatus {
+            condition,
+            resolved: None,
+            stats: None,
+        };
+        let mut desired = sample_hop();
+        desired.merge_ingress = Some(SocketSpec::srt_listen(7004, 1000));
+        let mut status = HopStatus {
+            id: desired.id.clone(),
+            node_id: desired.node_id.clone(),
+            state: HopState::Provisioned,
+            ingress: socket(LinkCondition::Flowing),
+            merge_ingress: None,
+            egresses: vec![EgressStatus {
+                branch_id: "studio".to_string(),
+                status: socket(LinkCondition::Flowing),
+            }],
+        };
+        assert_eq!(status.conditions(&desired), None);
+
+        status.merge_ingress = Some(socket(LinkCondition::Idle));
+        let conditions = status.conditions(&desired).unwrap();
+        assert_eq!(conditions.merge_ingress, Some(LinkCondition::Idle));
+        assert_eq!(status.conditions(&sample_hop()), None);
+
+        let sender = hc(
+            HopState::Provisioned,
+            LinkCondition::Flowing,
+            LinkCondition::Flowing,
+        );
+        assert_eq!(
+            roll_up_path(true, &[sender.clone(), Some(conditions.clone())]),
+            PathStatus::Degraded
+        );
+        let flowing = HopConditions {
+            merge_ingress: Some(LinkCondition::Flowing),
+            ..conditions.clone()
+        };
+        assert_eq!(
+            roll_up_path(true, &[sender.clone(), Some(flowing)]),
+            PathStatus::Flowing
+        );
+        let stalled = HopConditions {
+            merge_ingress: Some(LinkCondition::Stalled),
+            ..conditions
+        };
+        assert_eq!(
+            roll_up_path(true, &[sender, Some(stalled)]),
+            PathStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn hop_profile_merge_defaults_off_and_is_omitted_when_off() {
+        let profile: HopProfile = serde_json::from_value(serde_json::json!({
+            "id": "srt-merge",
+            "ingress": { "transport": "srt", "roles": ["listen", "connect"] },
+            "egress": { "transport": "srt", "roles": ["listen"] }
+        }))
+        .unwrap();
+        assert!(!profile.merge);
+        assert!(
+            serde_json::to_value(&profile)
+                .unwrap()
+                .get("merge")
+                .is_none()
+        );
+        let merging = HopProfile {
+            merge: true,
+            ..profile
+        };
+        assert_eq!(serde_json::to_value(&merging).unwrap()["merge"], true);
     }
 }

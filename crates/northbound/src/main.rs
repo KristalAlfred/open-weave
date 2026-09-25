@@ -521,6 +521,7 @@ mod tests {
             source: StreamTransport::Srt(node_ref("strom-node-1")),
             destinations: vec![StreamDestination {
                 id: "studio".to_string(),
+                paths: 1,
                 endpoint: StreamTransport::Srt(node_ref("strom-node-2")),
             }],
         }

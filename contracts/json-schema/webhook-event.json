@@ -188,6 +188,10 @@
                           "integer",
                           "null"
                         ]
+                      },
+                      "merge": {
+                        "description": "The hop can take a second ingress of the `ingress` class carrying another\n copy of the same media, and merge the two.",
+                        "type": "boolean"
                       }
                     },
                     "required": [
@@ -362,6 +366,7 @@
                   "reason": {
                     "enum": [
                       "placed",
+                      "single_path",
                       "disabled",
                       "placement_failed",
                       "nodes_available",
@@ -429,6 +434,7 @@
                         "reason": {
                           "enum": [
                             "placed",
+                            "single_path",
                             "disabled",
                             "placement_failed",
                             "nodes_available",

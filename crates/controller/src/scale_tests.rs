@@ -67,6 +67,7 @@ fn registration(id: &str, attachments: Vec<NetworkAttachment>) -> NodeRegistrati
                     ingress: srt(),
                     egress: srt(),
                     max_egresses: None,
+                    merge: false,
                 }],
             },
             topology: NodeTopology { attachments },
@@ -116,6 +117,7 @@ fn fan_out_stream() -> StreamDefinition {
         destinations: (0..RECEIVERS)
             .map(|index| StreamDestination {
                 id: receiver_id(index),
+                paths: 1,
                 endpoint: endpoint(&receiver_id(index)),
             })
             .collect(),

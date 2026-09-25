@@ -247,6 +247,10 @@
                           "integer",
                           "null"
                         ]
+                      },
+                      "merge": {
+                        "description": "The hop can take a second ingress of the `ingress` class carrying another\n copy of the same media, and merge the two.",
+                        "type": "boolean"
                       }
                     },
                     "required": [
@@ -450,6 +454,7 @@
                           "reason": {
                             "enum": [
                               "placed",
+                              "single_path",
                               "disabled",
                               "placement_failed",
                               "nodes_available",
@@ -518,6 +523,7 @@
                                 "reason": {
                                   "enum": [
                                     "placed",
+                                    "single_path",
                                     "disabled",
                                     "placement_failed",
                                     "nodes_available",
@@ -1236,6 +1242,13 @@
                   "minLength": 1,
                   "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
                   "type": "string"
+                },
+                "paths": {
+                  "description": "How many disjoint paths the planner places to this destination. A second\n path needs a receiver whose hop profile merges.",
+                  "format": "uint8",
+                  "maximum": 2,
+                  "minimum": 1,
+                  "type": "integer"
                 }
               },
               "required": [
@@ -2210,6 +2223,13 @@
                         "minLength": 1,
                         "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
                         "type": "string"
+                      },
+                      "paths": {
+                        "description": "How many disjoint paths the planner places to this destination. A second\n path needs a receiver whose hop profile merges.",
+                        "format": "uint8",
+                        "maximum": 2,
+                        "minimum": 1,
+                        "type": "integer"
                       }
                     },
                     "required": [
@@ -2962,6 +2982,105 @@
                   ],
                   "type": "object"
                 },
+                "merge_ingress": {
+                  "additionalProperties": false,
+                  "description": "A second ingress carrying another copy of the same media over a disjoint\n path, for the hop to merge with `ingress`. Only a receiver whose profile\n merges has one.",
+                  "properties": {
+                    "endpoint_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "host": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "params": {
+                      "properties": {
+                        "latency": {
+                          "format": "uint32",
+                          "minimum": 0,
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "passphrase": {
+                          "description": "Encrypts the socket. Both ends of a link carry the same passphrase.",
+                          "maxLength": 80,
+                          "minLength": 10,
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "pbkeylen": {
+                          "description": "AES key length in bytes, 16, 24 or 32, used with `passphrase`.",
+                          "enum": [
+                            16,
+                            24,
+                            32
+                          ],
+                          "format": "uint8",
+                          "maximum": 255,
+                          "minimum": 0,
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        }
+                      },
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "port": {
+                      "format": "uint16",
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "role": {
+                      "enum": [
+                        "listen",
+                        "connect",
+                        "capture",
+                        "display"
+                      ],
+                      "type": "string"
+                    },
+                    "transport": {
+                      "enum": [
+                        "srt",
+                        "whip",
+                        "whep",
+                        "device"
+                      ],
+                      "type": "string"
+                    },
+                    "url": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "transport",
+                    "role"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
                 "node_id": {
                   "type": "string"
                 },
@@ -3468,6 +3587,13 @@
                       "minLength": 1,
                       "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
                       "type": "string"
+                    },
+                    "paths": {
+                      "description": "How many disjoint paths the planner places to this destination. A second\n path needs a receiver whose hop profile merges.",
+                      "format": "uint8",
+                      "maximum": 2,
+                      "minimum": 1,
+                      "type": "integer"
                     }
                   },
                   "required": [
@@ -4422,6 +4548,13 @@
                         "minLength": 1,
                         "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
                         "type": "string"
+                      },
+                      "paths": {
+                        "description": "How many disjoint paths the planner places to this destination. A second\n path needs a receiver whose hop profile merges.",
+                        "format": "uint8",
+                        "maximum": 2,
+                        "minimum": 1,
+                        "type": "integer"
                       }
                     },
                     "required": [
@@ -5325,6 +5458,13 @@
                               "minLength": 1,
                               "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
                               "type": "string"
+                            },
+                            "paths": {
+                              "description": "How many disjoint paths the planner places to this destination. A second\n path needs a receiver whose hop profile merges.",
+                              "format": "uint8",
+                              "maximum": 2,
+                              "minimum": 1,
+                              "type": "integer"
                             }
                           },
                           "required": [
@@ -6237,6 +6377,13 @@
                             "minLength": 1,
                             "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
                             "type": "string"
+                          },
+                          "paths": {
+                            "description": "How many disjoint paths the planner places to this destination. A second\n path needs a receiver whose hop profile merges.",
+                            "format": "uint8",
+                            "maximum": 2,
+                            "minimum": 1,
+                            "type": "integer"
                           }
                         },
                         "required": [

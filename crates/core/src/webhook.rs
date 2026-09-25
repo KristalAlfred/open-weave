@@ -199,6 +199,7 @@ mod tests {
                             roles: RoleSet::only(SocketRole::Connect),
                         }),
                         max_egresses: Some(1),
+                        merge: false,
                     }],
                 },
                 topology: NodeTopology::default(),

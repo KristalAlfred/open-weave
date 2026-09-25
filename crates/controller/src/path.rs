@@ -74,6 +74,10 @@ pub enum PlacementError {
     },
     #[error("a source endpoint must not pin via")]
     SourceVia,
+    #[error("node {node} has no hop profile that merges a second path")]
+    NoMergeProfile { node: String },
+    #[error("a remote destination has no receiver to merge a second path")]
+    NoMergeReceiver,
 }
 
 /// Names `socket` for [`PlacementError::NotAnSrtListener`]. A device's `Display`
@@ -233,13 +237,17 @@ impl PortAllocator {
 /// Fan-out is one sender hop teeing to one egress per destination, each with its
 /// own chain. Placement is all-or-nothing: if any destination is unplaceable the
 /// whole derivation fails and the stream stays pending.
-pub fn derive_path(
+///
+/// A destination asking for two paths gets its second once every first path is
+/// placed, see [`place_second_path`]. A second path that cannot be placed leaves
+/// the stream placed with one and is reported in [`PlannedStream::single_path`].
+pub fn derive_stream(
     stream: &StreamDefinition,
     nodes: &[NodeDescriptor],
     _observed: &[HopStatus],
     committed_ports: &mut PortAllocator,
     keys: &LinkKeys,
-) -> Result<Path, PlacementError> {
+) -> Result<PlannedStream, PlacementError> {
     let mut ports = committed_ports.clone();
     let source = read_endpoint(&stream.source)?;
     if stream.destinations.is_empty() {
@@ -254,10 +262,13 @@ pub fn derive_path(
     let source_station = Station {
         node_id: sender_node.to_string(),
         network: source.network.map(str::to_string),
+        avoid: Vec::new(),
     };
 
     let mut sender_egresses = Vec::with_capacity(stream.destinations.len());
     let mut downstream = Vec::new();
+    let mut first_paths = Vec::new();
+    let mut single_path = Vec::new();
 
     let mut destinations: Vec<_> = stream.destinations.iter().collect();
     destinations.sort_by(|left, right| left.id.cmp(&right.id));
@@ -275,9 +286,12 @@ pub fn derive_path(
             station: &source_station,
             hop_id: &sender_id,
         };
+        let mut sender_attachments = None;
 
         for bridge in &chain.bridges {
-            let (up_socket, hop) = plan_hop(&upstream, bridge, latency, nodes, &mut ports, keys)?;
+            let (up_socket, hop, attachments) =
+                plan_hop(&upstream, bridge, latency, nodes, &mut ports, keys)?;
+            sender_attachments.get_or_insert(attachments.upstream);
             push_egress(&mut sender_egresses, &mut hops, &branch_id, up_socket);
             hops.push(hop);
             upstream = LinkEnd {
@@ -297,7 +311,7 @@ pub fn derive_path(
                         id: bridge_hop_id(&stream.name, &destination.id, chain.bridges.len()),
                         role: HopRole::Bridge,
                     };
-                    let (up_socket, hop) =
+                    let (up_socket, hop, _) =
                         plan_hop(&upstream, &bridge, latency, nodes, &mut ports, keys)?;
                     push_egress(&mut sender_egresses, &mut hops, &branch_id, up_socket);
                     hops.push(hop);
@@ -308,11 +322,17 @@ pub fn derive_path(
                     params: srt_params(latency, dest.passphrase.cloned()),
                 });
                 push_egress(&mut sender_egresses, &mut hops, &branch_id, socket);
+                if destination.paths > 1 {
+                    single_path.push(SinglePath {
+                        destination: destination.id.clone(),
+                        reason: PlacementError::NoMergeReceiver,
+                    });
+                }
             }
             // The chain ends on a receiver hop, whose remaining egress is the
             // socket the consumer dials or the device the media ends on.
             ChainTerminal::Receiver(receiver) => {
-                let (up_socket, mut hop) =
+                let (up_socket, mut hop, attachments) =
                     plan_hop(&upstream, receiver, latency, nodes, &mut ports, keys)?;
                 push_egress(&mut sender_egresses, &mut hops, &branch_id, up_socket);
                 let socket = match dest.terminal {
@@ -330,6 +350,20 @@ pub fn derive_path(
                     branch_id: branch_id.clone(),
                     socket,
                 });
+                if destination.paths > 1 {
+                    first_paths.push(FirstPath {
+                        destination: destination.id.clone(),
+                        latency,
+                        sender_attachments: sender_attachments.unwrap_or(attachments.upstream),
+                        receiver: receiver.station.clone(),
+                        receiver_attachments: attachments.downstream,
+                        relays: chain
+                            .bridges
+                            .iter()
+                            .map(|bridge| bridge.station.node_id.clone())
+                            .collect(),
+                    });
+                }
                 hops.push(hop);
             }
         }
@@ -343,6 +377,7 @@ pub fn derive_path(
         profile_id: String::new(),
         role: HopRole::Sender,
         ingress: source_socket(&source, sender_node, &sender_id, nodes, &mut ports)?,
+        merge_ingress: None,
         egresses: sender_egresses,
     };
 
@@ -353,13 +388,205 @@ pub fn derive_path(
     for hop in &mut hops {
         hop.profile_id = select_profile(hop, nodes)?;
     }
+
+    for first in &first_paths {
+        if let Err(reason) = place_second_path(
+            &stream.name,
+            first,
+            &source_station,
+            &mut hops,
+            nodes,
+            &mut ports,
+            keys,
+        ) {
+            single_path.push(SinglePath {
+                destination: first.destination.clone(),
+                reason,
+            });
+        }
+    }
+    single_path.sort_by(|left, right| left.destination.cmp(&right.destination));
     *committed_ports = ports;
 
-    Ok(Path {
-        stream: stream.name.clone(),
-        enabled: stream.enabled,
-        hops,
+    Ok(PlannedStream {
+        path: Path {
+            stream: stream.name.clone(),
+            enabled: stream.enabled,
+            hops,
+        },
+        single_path,
     })
+}
+
+/// [`derive_stream`]'s path alone.
+#[cfg(test)]
+pub fn derive_path(
+    stream: &StreamDefinition,
+    nodes: &[NodeDescriptor],
+    observed: &[HopStatus],
+    committed_ports: &mut PortAllocator,
+    keys: &LinkKeys,
+) -> Result<Path, PlacementError> {
+    derive_stream(stream, nodes, observed, committed_ports, keys).map(|planned| planned.path)
+}
+
+/// A placed stream, and the destinations that asked for two paths and got one.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PlannedStream {
+    pub path: Path,
+    pub single_path: Vec<SinglePath>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SinglePath {
+    pub destination: String,
+    pub reason: PlacementError,
+}
+
+/// Appended to a destination id to name its second path. `.` is outside the
+/// resource id alphabet, so no destination id can end with it.
+const SECOND_PATH_SUFFIX: &str = ".2";
+
+/// The branch id a destination's second path carries on the sender and on its
+/// bridges.
+fn second_path_branch_id(destination: &str) -> String {
+    format!("{destination}{SECOND_PATH_SUFFIX}")
+}
+
+/// Whether an egress with `branch_id` carries media to `destination`, over its
+/// first path or its second.
+fn carries_destination(branch_id: &str, destination: &str) -> bool {
+    branch_id
+        .strip_prefix(destination)
+        .is_some_and(|rest| rest.is_empty() || rest == SECOND_PATH_SUFFIX)
+}
+
+/// What a destination's first path used, so its second can avoid it.
+struct FirstPath {
+    destination: String,
+    latency: u32,
+    sender_attachments: Vec<String>,
+    receiver: Station,
+    receiver_attachments: Vec<String>,
+    relays: Vec<String>,
+}
+
+/// Plan a destination's second path and add it to `hops`: one more sender
+/// egress, the bridges of its own chain, and the receiver's merge ingress.
+///
+/// The second path uses no relay the first one does, and at the sender and the
+/// receiver no attachment the first one may carry its link on. It is planned
+/// against a copy of `ports` and changes neither `hops` nor `ports` unless every
+/// hop it touches still has a matching profile. The first path's hops, ids and
+/// ports are left as they are.
+fn place_second_path(
+    stream: &str,
+    first: &FirstPath,
+    source: &Station,
+    hops: &mut Vec<DesiredHop>,
+    nodes: &[NodeDescriptor],
+    committed_ports: &mut PortAllocator,
+    keys: &LinkKeys,
+) -> Result<(), PlacementError> {
+    let receiver_node = find_node(nodes, &first.receiver.node_id).ok_or_else(|| {
+        PlacementError::NodeNotRegistered {
+            node: first.receiver.node_id.clone(),
+        }
+    })?;
+    if !receiver_node
+        .capabilities
+        .hop_profiles
+        .iter()
+        .any(|profile| profile.merge)
+    {
+        return Err(PlacementError::NoMergeProfile {
+            node: receiver_node.id.clone(),
+        });
+    }
+
+    let mut ports = committed_ports.clone();
+    let branch_id = second_path_branch_id(&first.destination);
+    let sender = Station {
+        avoid: first.sender_attachments.clone(),
+        ..source.clone()
+    };
+    let receiver = Station {
+        avoid: first.receiver_attachments.clone(),
+        ..first.receiver.clone()
+    };
+    let mut stations = Vec::new();
+    relay_before(&mut stations, &sender, &receiver, nodes, &first.relays)?;
+    let bridges: Vec<ChainHop> = stations
+        .into_iter()
+        .enumerate()
+        .map(|(position, station)| ChainHop {
+            station,
+            id: bridge_hop_id(stream, &branch_id, position),
+            role: HopRole::Bridge,
+        })
+        .collect();
+
+    let sender_id = sender_hop_id(stream);
+    let mut sender_egresses = Vec::with_capacity(1);
+    let mut new_hops: Vec<DesiredHop> = Vec::with_capacity(bridges.len());
+    let mut upstream = LinkEnd {
+        station: &sender,
+        hop_id: &sender_id,
+    };
+    for bridge in &bridges {
+        let (up_socket, hop, _) =
+            plan_hop(&upstream, bridge, first.latency, nodes, &mut ports, keys)?;
+        push_egress(&mut sender_egresses, &mut new_hops, &branch_id, up_socket);
+        new_hops.push(hop);
+        upstream = LinkEnd {
+            station: &bridge.station,
+            hop_id: &bridge.id,
+        };
+    }
+    let merge_id = receiver_hop_id(stream, &branch_id);
+    let merge_end = LinkEnd {
+        station: &receiver,
+        hop_id: &merge_id,
+    };
+    let link = plan_link(
+        &upstream,
+        &merge_end,
+        first.latency,
+        nodes,
+        &mut ports,
+        keys,
+    )?;
+    push_egress(
+        &mut sender_egresses,
+        &mut new_hops,
+        &branch_id,
+        link.upstream,
+    );
+
+    let receiver_id = receiver_hop_id(stream, &first.destination);
+    let receiver_index = hops
+        .iter()
+        .position(|hop| hop.id == receiver_id)
+        .ok_or_else(|| PlacementError::MissingHop {
+            stream: stream.to_string(),
+            hop: receiver_id.clone(),
+        })?;
+    let mut sender_hop = hops[0].clone();
+    sender_hop.egresses.extend(sender_egresses);
+    let mut receiver_hop = hops[receiver_index].clone();
+    receiver_hop.merge_ingress = Some(link.downstream);
+    for hop in [&mut sender_hop, &mut receiver_hop]
+        .into_iter()
+        .chain(new_hops.iter_mut())
+    {
+        hop.profile_id = select_profile(hop, nodes)?;
+    }
+
+    hops[0] = sender_hop;
+    hops[receiver_index] = receiver_hop;
+    hops.extend(new_hops);
+    *committed_ports = ports;
+    Ok(())
 }
 
 fn can_dial_network(
@@ -424,6 +651,10 @@ fn select_profile(hop: &DesiredHop, nodes: &[NodeDescriptor]) -> Result<String, 
     if let Some(profile) = profiles.into_iter().find(|profile| {
         profile.ingress.matches_socket(&hop.ingress)
             && hop
+                .merge_ingress
+                .as_ref()
+                .is_none_or(|socket| profile.merge && profile.ingress.matches_socket(socket))
+            && hop
                 .egresses
                 .iter()
                 .all(|egress| profile.egress.matches_socket(&egress.socket))
@@ -453,22 +684,24 @@ fn plan_hop(
     nodes: &[NodeDescriptor],
     ports: &mut PortAllocator,
     keys: &LinkKeys,
-) -> Result<(SocketSpec, DesiredHop), PlacementError> {
+) -> Result<(SocketSpec, DesiredHop, LinkAttachments), PlacementError> {
     let downstream = LinkEnd {
         station: &hop.station,
         hop_id: &hop.id,
     };
-    let (up_socket, down_socket) = plan_link(upstream, &downstream, latency, nodes, ports, keys)?;
+    let link = plan_link(upstream, &downstream, latency, nodes, ports, keys)?;
     Ok((
-        up_socket,
+        link.upstream,
         DesiredHop {
             id: hop.id.clone(),
             node_id: hop.station.node_id.clone(),
             profile_id: String::new(),
             role: hop.role,
-            ingress: down_socket,
+            ingress: link.downstream,
+            merge_ingress: None,
             egresses: Vec::new(),
         },
+        link.attachments,
     ))
 }
 
@@ -490,11 +723,13 @@ fn push_egress(
     }
 }
 
-/// One node a stream passes through, optionally constrained to one network.
+/// One node a stream passes through, optionally constrained to one network and
+/// kept off some of its attachments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Station {
     node_id: String,
     network: Option<String>,
+    avoid: Vec<String>,
 }
 
 impl Station {
@@ -502,6 +737,7 @@ impl Station {
         Self {
             node_id: node_id.to_string(),
             network: None,
+            avoid: Vec::new(),
         }
     }
 }
@@ -544,7 +780,7 @@ fn chain_hops<'a>(
 ) -> Result<Chain<'a>, PlacementError> {
     let mut stations: Vec<Station> = Vec::with_capacity(dest.via.len());
     for station in dest.via.iter().map(|id| Station::relay(id)) {
-        relay_before(&mut stations, source, &station, nodes)?;
+        relay_before(&mut stations, source, &station, nodes, &[])?;
         stations.push(station);
     }
 
@@ -554,8 +790,9 @@ fn chain_hops<'a>(
             let station = Station {
                 node_id: node_id.to_string(),
                 network: dest.network.map(str::to_string),
+                avoid: Vec::new(),
             };
-            relay_before(&mut stations, source, &station, nodes)?;
+            relay_before(&mut stations, source, &station, nodes, &[])?;
             ChainTerminal::Receiver(ChainHop {
                 station,
                 id: receiver_hop_id(stream, destination_id),
@@ -579,7 +816,7 @@ fn chain_hops<'a>(
 
 /// Extend `chain` with a relay when no transport carries the link into `next`
 /// from the station before it — the source's own station when the chain is
-/// still empty.
+/// still empty. The relay is none of `avoid_relays`.
 ///
 /// A spliced relay is compatible with both halves by construction, so each
 /// resolves under the ordinary rule — the upstream reaches the relay, and the
@@ -590,10 +827,11 @@ fn relay_before(
     source: &Station,
     next: &Station,
     nodes: &[NodeDescriptor],
+    avoid_relays: &[String],
 ) -> Result<(), PlacementError> {
     let upstream = chain.last().unwrap_or(source);
     if let Err(failure) = station_link(upstream, next, nodes) {
-        let relay = pick_relay(nodes, upstream, next, failure)?;
+        let relay = pick_relay(nodes, upstream, next, failure, avoid_relays)?;
         chain.push(relay);
     }
     Ok(())
@@ -611,11 +849,13 @@ fn pick_relay(
     upstream: &Station,
     downstream: &Station,
     failure: LinkFailure,
+    avoid: &[String],
 ) -> Result<Station, PlacementError> {
     nodes
         .iter()
         .filter(|node| node.status != NodeStatus::Offline)
         .filter(|node| node.id != upstream.node_id && node.id != downstream.node_id)
+        .filter(|node| !avoid.contains(&node.id))
         .filter(|node| {
             let relay = Station::relay(&node.id);
             let Ok(ingress) = station_link(upstream, &relay, nodes) else {
@@ -717,10 +957,44 @@ impl ResolvedEnd<'_> {
                     .as_deref()
                     .is_none_or(|network| attachment.network == network)
             })
+            .filter(|attachment| !self.station.avoid.contains(&attachment.id))
             .collect();
         attachments
             .sort_by(|left, right| (&left.network, &left.id).cmp(&(&right.network, &right.id)));
         attachments
+    }
+
+    /// Ids of the attachments this end dials `network` from, or `None` when it
+    /// cannot. A connect socket names no local address, so any dialing
+    /// attachment on the network may carry the link, and an end that must avoid
+    /// one of them cannot dial it at all.
+    fn dialing_attachments(&self, network: &str) -> Option<Vec<String>> {
+        let dialing: Vec<_> = self
+            .node
+            .topology
+            .attachments
+            .iter()
+            .filter(|attachment| attachment.network == network && attachment.dial)
+            .filter(|attachment| {
+                self.station
+                    .network
+                    .as_deref()
+                    .is_none_or(|constraint| attachment.network == constraint)
+            })
+            .collect();
+        if dialing.is_empty()
+            || dialing
+                .iter()
+                .any(|attachment| self.station.avoid.contains(&attachment.id))
+        {
+            return None;
+        }
+        Some(
+            dialing
+                .into_iter()
+                .map(|attachment| attachment.id.clone())
+                .collect(),
+        )
     }
 }
 
@@ -729,6 +1003,20 @@ struct LinkChoice {
     transport: Transport,
     listener: Listener,
     attachment: NetworkAttachment,
+    dialer_attachments: Vec<String>,
+}
+
+/// The ids of the attachments each end of a link may carry it on.
+struct LinkAttachments {
+    upstream: Vec<String>,
+    downstream: Vec<String>,
+}
+
+/// One planned link: the socket each end owns, and the attachments carrying it.
+struct PlannedLink {
+    upstream: SocketSpec,
+    downstream: SocketSpec,
+    attachments: LinkAttachments,
 }
 
 /// The transport and direction of a link between two resolved ends, or why none
@@ -775,15 +1063,12 @@ fn link_transport(
                 if !has_listener(attachment, transport) {
                     continue;
                 }
-                if dialer
-                    .attachments()
-                    .iter()
-                    .any(|candidate| candidate.network == attachment.network && candidate.dial)
-                {
+                if let Some(dialer_attachments) = dialer.dialing_attachments(&attachment.network) {
                     return Ok(LinkChoice {
                         transport,
                         listener,
                         attachment: attachment.clone(),
+                        dialer_attachments,
                     });
                 }
             }
@@ -815,7 +1100,7 @@ fn has_listener(attachment: &NetworkAttachment, transport: Transport) -> bool {
     }
 }
 
-/// Plan one link's socket pair: `(upstream egress, downstream ingress)`.
+/// Plan one link's socket pair: the upstream egress and the downstream ingress.
 ///
 /// The transport and which end listens come from [`link_transport`]. An SRT
 /// listener claims its port on the listening node, always keyed by the
@@ -832,7 +1117,7 @@ fn plan_link(
     nodes: &[NodeDescriptor],
     ports: &mut PortAllocator,
     keys: &LinkKeys,
-) -> Result<(SocketSpec, SocketSpec), PlacementError> {
+) -> Result<PlannedLink, PlacementError> {
     let up = resolve_station(upstream.station, nodes)?;
     let down = resolve_station(downstream.station, nodes)?;
     let choice = link_transport(&up, &down).map_err(|failure| {
@@ -880,9 +1165,24 @@ fn plan_link(
             )
         }
     };
+    let listened = vec![choice.attachment.id.clone()];
     Ok(match choice.listener {
-        Listener::Downstream => (connect, listen),
-        Listener::Upstream => (listen, connect),
+        Listener::Downstream => PlannedLink {
+            upstream: connect,
+            downstream: listen,
+            attachments: LinkAttachments {
+                upstream: choice.dialer_attachments,
+                downstream: listened,
+            },
+        },
+        Listener::Upstream => PlannedLink {
+            upstream: listen,
+            downstream: connect,
+            attachments: LinkAttachments {
+                upstream: listened,
+                downstream: choice.dialer_attachments,
+            },
+        },
     })
 }
 
@@ -947,7 +1247,7 @@ pub fn destination_path_status(
             let egresses: Vec<_> = hop
                 .egresses
                 .iter()
-                .filter(|egress| egress.branch_id == destination_id)
+                .filter(|egress| carries_destination(&egress.branch_id, destination_id))
                 .cloned()
                 .collect();
             if egresses.is_empty() {
@@ -961,9 +1261,9 @@ pub fn destination_path_status(
                     .find(|status| status.id == branch.id && status.node_id == branch.node_id)
                     .and_then(|status| {
                         let mut branch_status = status.clone();
-                        branch_status
-                            .egresses
-                            .retain(|egress| egress.branch_id == destination_id);
+                        branch_status.egresses.retain(|egress| {
+                            carries_destination(&egress.branch_id, destination_id)
+                        });
                         branch_status.conditions(&branch)
                     }),
             )
@@ -979,7 +1279,7 @@ pub fn destination_nodes(path: &Path, destination_id: &str) -> Vec<String> {
         if hop
             .egresses
             .iter()
-            .any(|egress| egress.branch_id == destination_id)
+            .any(|egress| carries_destination(&egress.branch_id, destination_id))
             && !nodes.contains(&hop.node_id)
         {
             nodes.push(hop.node_id.clone());
@@ -1246,6 +1546,7 @@ mod contract_tests {
             ingress: class(Transport::Srt, weave_core::RoleSet::both()),
             egress: class(Transport::Srt, weave_core::RoleSet::both()),
             max_egresses: None,
+            merge: false,
         }
     }
 
@@ -1297,6 +1598,7 @@ mod contract_tests {
     fn destination(id: &str, node: &str) -> StreamDestination {
         StreamDestination {
             id: id.to_string(),
+            paths: 1,
             endpoint: srt_endpoint(node),
         }
     }
@@ -1406,6 +1708,7 @@ mod contract_tests {
                         weave_core::RoleSet::only(SocketRole::Connect),
                     ),
                     max_egresses: Some(1),
+                    merge: false,
                 }],
             },
             topology: NodeTopology {
@@ -1427,6 +1730,7 @@ mod contract_tests {
             ),
             egress: class(Transport::Srt, weave_core::RoleSet::both()),
             max_egresses: None,
+            merge: false,
         });
         let stream = StreamDefinition {
             name: "camera".to_string(),
@@ -1460,6 +1764,7 @@ mod contract_tests {
             }),
             egress: class(Transport::Srt, weave_core::RoleSet::both()),
             max_egresses: Some(1),
+            merge: false,
         }];
         let definition = StreamDefinition {
             name: "fanout".to_string(),
@@ -1491,6 +1796,7 @@ mod contract_tests {
                 weave_core::RoleSet::only(SocketRole::Listen),
             ),
             max_egresses: Some(1),
+            merge: false,
         }];
         let error = derive_path(
             &stream(vec![destination("studio", "studio-node")]),
@@ -1575,6 +1881,7 @@ mod contract_tests {
                     resolved: None,
                     stats: None,
                 },
+                merge_ingress: None,
                 egresses: hop
                     .egresses
                     .iter()
@@ -1730,6 +2037,7 @@ mod contract_tests {
         );
         definition.destinations.push(StreamDestination {
             id: "uplink".to_string(),
+            paths: 1,
             endpoint: StreamTransport::Srt(SrtEndpoint {
                 node: None,
                 remote: Some(RemoteAddr {
@@ -1817,6 +2125,7 @@ mod tests {
             ingress,
             egress,
             max_egresses,
+            merge: false,
         }
     }
 
@@ -1943,6 +2252,7 @@ mod tests {
     fn dest(id: &str, endpoint: SrtEndpoint) -> StreamDestination {
         StreamDestination {
             id: id.to_string(),
+            paths: 1,
             endpoint: StreamTransport::Srt(endpoint),
         }
     }
@@ -2271,6 +2581,7 @@ mod tests {
                 }),
                 stats: None,
             },
+            merge_ingress: None,
             egresses: vec![EgressStatus {
                 branch_id: "studio".to_string(),
                 status: SocketStatus {
@@ -2459,6 +2770,7 @@ mod tests {
                     resolved: None,
                     stats: None,
                 },
+                merge_ingress: None,
                 egresses: hop
                     .egresses
                     .iter()
@@ -3038,6 +3350,7 @@ mod tests {
     fn device_dest(id: &str, node: &str) -> StreamDestination {
         StreamDestination {
             id: id.to_string(),
+            paths: 1,
             endpoint: device_ref(node),
         }
     }

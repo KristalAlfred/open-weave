@@ -429,6 +429,13 @@
                   "minLength": 1,
                   "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
                   "type": "string"
+                },
+                "paths": {
+                  "description": "How many disjoint paths the planner places to this destination. A second\n path needs a receiver whose hop profile merges.",
+                  "format": "uint8",
+                  "maximum": 2,
+                  "minimum": 1,
+                  "type": "integer"
                 }
               },
               "required": [
