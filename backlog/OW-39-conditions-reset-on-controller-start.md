@@ -62,3 +62,10 @@ when its status changes.
   statuses) the test fails. `pg_stream_statuses_go_with_their_stream_and_are_fenced`
   covers the Postgres table, run against `postgres:16` in docker. A takeover
   loads state through the same `hydrate`. Not yet rerun on `bench/`.
+- 2026-09-25: on `bench/`, with `basic` flowing: `just bench controller-restart
+  basic stop` and then `... kill` each moved the lease to the other controller.
+  `/status` gave `basic` `flowing` with the same five transition times before
+  and after both takeovers, and the webhook sink got no `stream.changed` from
+  either takeover; the OW-9 run before this change got `pending`, then
+  `flowing`. After the kill the adapters registered again, which sent four
+  `node.registered`. Every `weave-` flow kept its id and kept moving bytes.
