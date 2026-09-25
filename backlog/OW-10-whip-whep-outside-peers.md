@@ -3,11 +3,8 @@ id: OW-10
 title: "WHIP and WHEP for outside peers"
 type: feature
 status: todo
-priority: 3
 depends_on: []
 assignee:
-branch:
-pr:
 ---
 
 ## Evidence

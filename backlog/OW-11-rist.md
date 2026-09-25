@@ -3,11 +3,8 @@ id: OW-11
 title: "RIST as a transport"
 type: feature
 status: todo
-priority: 3
 depends_on: []
 assignee:
-branch:
-pr:
 ---
 
 ## Evidence

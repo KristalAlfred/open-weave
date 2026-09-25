@@ -3,11 +3,8 @@ id: OW-4
 title: "TLS has never been exercised"
 type: verification
 status: todo
-priority: 2
 depends_on: []
 assignee:
-branch:
-pr:
 ---
 
 ## Evidence

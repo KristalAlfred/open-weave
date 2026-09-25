@@ -71,7 +71,7 @@ get-endpoints NAME:
 delete-stream NAME:
     cargo run -p weave-cli -- delete stream {{NAME}}
 
-# Backlog items by status, then priority. See BACKLOG.md.
+# Backlog items by status. See BACKLOG.md.
 board:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -84,7 +84,7 @@ board:
         f[FILENAME, key] = val
       }
       END {
-        split("in-progress review blocked todo done dropped", order, " ")
+        split("in-progress blocked todo done dropped", order, " ")
         for (i in order) rank[order[i]] = i
         for (i = 1; i <= n; i++) status[f[files[i], "id"]] = f[files[i], "status"]
         for (i = 1; i <= n; i++) {
@@ -96,7 +96,7 @@ board:
           note = (st == "todo" && waits != "") ? "  (waits on" waits ")" : ""
           assignee = f[file, "assignee"] == "" ? "-" : f[file, "assignee"]
           num = id; sub(/^[A-Z]+-/, "", num)
-          printf "%d\t%d\t%d\t%-6s %-11s P%s  %-12s %-10s %s%s\n", rank[st] ? rank[st] : 9, f[file, "priority"], num, id, st, f[file, "priority"], f[file, "type"], assignee, f[file, "title"], note
+          printf "%d\t%d\t%-6s %-11s %-12s %-10s %s%s\n", rank[st] ? rank[st] : 9, num, id, st, f[file, "type"], assignee, f[file, "title"], note
         }
       }
-    ' backlog/*.md | sort -t $'\t' -k1,1n -k2,2n -k3,3n | cut -f4-
+    ' backlog/*.md | sort -t $'\t' -k1,1n -k2,2n | cut -f3-

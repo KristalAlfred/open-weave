@@ -3,11 +3,8 @@ id: OW-16
 title: "Browser-to-browser media has no supported Strom profile"
 type: feature
 status: todo
-priority: 3
 depends_on: []
 assignee:
-branch:
-pr:
 ---
 
 ## Evidence

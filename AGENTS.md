@@ -13,7 +13,7 @@ just build            # cargo build
 just test             # cargo test --workspace, then node nodes/browser/check.mjs
 just lint             # clippy --workspace --all-targets --all-features -D warnings
 just fmt-check        # cargo fmt --all --check
-just board            # backlog items by status and priority
+just board            # backlog items by status
 ```
 
 CI runs `fmt-check`, `lint` and `test` on the workspace, plus the browser-node

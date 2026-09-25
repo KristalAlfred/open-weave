@@ -3,11 +3,8 @@ id: OW-3
 title: "Every node shares one southbound token"
 type: feature
 status: todo
-priority: 1
 depends_on: []
 assignee:
-branch:
-pr:
 ---
 
 ## Evidence

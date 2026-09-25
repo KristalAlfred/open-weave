@@ -3,11 +3,8 @@ id: OW-12
 title: "Nothing runs at distribution scale"
 type: verification
 status: todo
-priority: 3
 depends_on: []
 assignee:
-branch:
-pr:
 ---
 
 ## Evidence

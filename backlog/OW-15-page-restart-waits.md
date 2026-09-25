@@ -3,11 +3,8 @@ id: OW-15
 title: "A restarted page waits out Strom's inactivity timeout"
 type: bug
 status: todo
-priority: 3
 depends_on: []
 assignee:
-branch:
-pr:
 ---
 
 ## Evidence

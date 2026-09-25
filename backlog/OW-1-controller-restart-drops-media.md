@@ -3,11 +3,8 @@ id: OW-1
 title: "A controller restart probably tears down running media"
 type: bug
 status: todo
-priority: 1
 depends_on: []
 assignee:
-branch:
-pr:
 ---
 
 ## Evidence

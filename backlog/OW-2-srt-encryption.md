@@ -3,11 +3,8 @@ id: OW-2
 title: "SRT hops carry no encryption"
 type: feature
 status: todo
-priority: 1
 depends_on: []
 assignee:
-branch:
-pr:
 ---
 
 ## Evidence

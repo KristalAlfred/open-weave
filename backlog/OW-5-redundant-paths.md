@@ -3,11 +3,8 @@ id: OW-5
 title: "One destination has one path"
 type: feature
 status: todo
-priority: 2
 depends_on: []
 assignee:
-branch:
-pr:
 ---
 
 ## Evidence

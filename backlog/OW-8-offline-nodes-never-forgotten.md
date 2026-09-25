@@ -3,11 +3,8 @@ id: OW-8
 title: "A node that stops heartbeating is never forgotten"
 type: bug
 status: todo
-priority: 2
 depends_on: []
 assignee:
-branch:
-pr:
 ---
 
 ## Evidence

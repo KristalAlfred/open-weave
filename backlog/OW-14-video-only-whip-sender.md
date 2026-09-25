@@ -3,11 +3,8 @@ id: OW-14
 title: "A video-only WHIP sender leaves the gateway flow paused"
 type: bug
 status: todo
-priority: 3
 depends_on: []
 assignee:
-branch:
-pr:
 ---
 
 ## Evidence

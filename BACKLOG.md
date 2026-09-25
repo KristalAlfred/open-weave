@@ -9,8 +9,7 @@ the runtimes behind the adapters: encoding, transcoding, bonding, merging
 redundant copies. An item that needs open-weave to do either does not go here.
 That a commercial product already does something is not a reason to leave it out.
 
-Work items live in `backlog/`, one file each. `just board` lists them by status
-and priority. This file holds the rules for working them, what is not
+Work items live in `backlog/`, one file each. `just board` lists them by status. This file holds the rules for working them, what is not
 scheduled, and the scope guards every item keeps.
 
 ## Items
@@ -23,11 +22,8 @@ id: OW-2
 title: "SRT hops carry no encryption"
 type: feature        # bug | feature | verification
 status: todo         # see Status
-priority: 1          # 1 is most urgent
 depends_on: []       # ids that must be done before this one starts
 assignee:            # who is working on it; empty when nobody is
-branch:
-pr:
 ```
 
 The body has these sections, in this order:
@@ -47,24 +43,25 @@ Status lives in the frontmatter only. Nothing else in the repo repeats it.
 | Status | Meaning |
 |---|---|
 | `todo` | Not started. Ready once every `depends_on` item is `done`. |
-| `in-progress` | Has an `assignee` and a `branch`. |
-| `review` | Every Done-when box is ticked and the change waits to be merged. |
+| `in-progress` | Has an `assignee`. |
 | `blocked` | Cannot move. The last Log line says on what. |
-| `done` | Merged to `main` with CI green. |
+| `done` | Every Done-when box is ticked and the work is committed to `main`. |
 | `dropped` | Will not be done. The last Log line says why. |
 
 ## Working an item
 
-1. Take the `todo` item with the lowest `priority` whose dependencies are all
-   `done`. Ties go to the lower id.
-2. Set `status: in-progress`, `assignee` and `branch`, and add a Log line.
+Work is committed straight to `main`; there are no branches or pull requests.
+
+1. Take a `todo` item whose dependencies are all `done`.
+2. Set `status: in-progress` and `assignee`, and add a Log line.
 3. Tick a Done-when box only once it has been checked, and add a Log line saying
    how: the command, test or bench run, and what it showed. Say whether a claim
    rests on unit tests or on `bench/`.
-4. Before `review`, `just fmt-check`, `just lint` and `just test` pass, docs the
-   change made false are fixed, and `contracts/` is regenerated if a route or
-   wire type changed.
-5. Move to `done` after the merge, with `pr` or the merge commit recorded.
+4. Before each commit, `just fmt-check`, `just lint` and `just test` pass, docs
+   the change made false are fixed, and `contracts/` is regenerated if a route
+   or wire type changed.
+5. The commit that ticks the last box also sets `status: done`. `git log` on the
+   item file finds the commits that worked it.
 
 A gap found along the way becomes a new item with the next free id and
 `status: todo`; it does not widen the item being worked. A Done-when box that

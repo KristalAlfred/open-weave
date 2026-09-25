@@ -3,11 +3,8 @@ id: OW-6
 title: "Automatic relay insertion is only tested in the planner"
 type: verification
 status: todo
-priority: 2
 depends_on: []
 assignee:
-branch:
-pr:
 ---
 
 ## Evidence

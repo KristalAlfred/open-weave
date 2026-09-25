@@ -3,11 +3,8 @@ id: OW-7
 title: "Stream status reaches an application only by polling"
 type: feature
 status: todo
-priority: 2
 depends_on: []
 assignee:
-branch:
-pr:
 ---
 
 ## Evidence

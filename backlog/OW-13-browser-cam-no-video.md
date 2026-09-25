@@ -3,11 +3,8 @@ id: OW-13
 title: "browser-cam carries audio and no video"
 type: bug
 status: todo
-priority: 3
 depends_on: []
 assignee:
-branch:
-pr:
 ---
 
 ## Evidence

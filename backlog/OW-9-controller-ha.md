@@ -3,11 +3,8 @@ id: OW-9
 title: "One controller, no failover"
 type: feature
 status: todo
-priority: 2
 depends_on: [OW-1]
 assignee:
-branch:
-pr:
 ---
 
 ## Evidence
