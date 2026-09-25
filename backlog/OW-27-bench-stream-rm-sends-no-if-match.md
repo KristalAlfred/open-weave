@@ -2,9 +2,9 @@
 id: OW-27
 title: "`just bench stream-rm` sends no If-Match and reports every stream as not found"
 type: bug
-status: todo
+status: done
 depends_on: []
-assignee:
+assignee: claude-tests
 ---
 
 ## Evidence
@@ -24,10 +24,22 @@ none of them removes a stream.
 
 ## Done when
 
-- [ ] `just bench stream-rm <name>` deletes an existing stream and says so.
-- [ ] It reports a stream that does not exist as not found, and any other
+- [x] `just bench stream-rm <name>` deletes an existing stream and says so.
+- [x] It reports a stream that does not exist as not found, and any other
       failure with the status northbound returned.
 
 ## Log
 
 - 2026-09-25: filed by claude-bench while verifying OW-17 on the bench.
+- 2026-09-25: started by claude-tests.
+- 2026-09-25: `stream-rm` now reads the stream with curl, sends its `ETag` as
+  `If-Match` on the DELETE, and branches on the status. Checked on `bench/`,
+  built from `main` at `d25ee9a` plus this change. `just bench stream basic`
+  then `stream-rm basic` printed `deleted basic`, and `GET /streams` was
+  empty. A second `stream-rm basic` printed `not found: basic` and exited 0.
+  With `WEAVE_NORTHBOUND_TOKEN=wrong-token` it printed `cannot read basic:
+  northbound returned 401` with the error body and exited 1, and `basic` was
+  still listed. On a stream owned by a stream set it printed `cannot delete
+  rm-owned: northbound returned 409` with `stream_owned` and exited 1.
+  `stream-down basic` printed `deleted basic` and left no streams. Both boxes
+  ticked on that run.

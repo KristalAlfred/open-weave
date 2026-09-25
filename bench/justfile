@@ -216,7 +216,24 @@ stream-wait name status="flowing" attempts="45":
 # Remove a stream by name, e.g. `just bench stream-rm basic`. Controller tears down its hops next tick.
 [group("streams")]
 stream-rm name:
-    @curl -sf {{nb_auth}} -X DELETE {{nb}}/streams/{{name}} && echo "deleted {{name}}" || echo "not found: {{name}}"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    headers="$(mktemp)"; body="$(mktemp)"; trap 'rm -f "$headers" "$body"' EXIT
+    # DELETE needs the stream's current ETag as If-Match.
+    status="$(curl -s -o "$body" -D "$headers" -w '%{http_code}' {{nb_auth}} {{nb}}/streams/{{name}} || true)"
+    case "$status" in
+        200) ;;
+        404) echo "not found: {{name}}"; exit 0 ;;
+        *) echo "cannot read {{name}}: northbound returned $status $(cat "$body")" >&2; exit 1 ;;
+    esac
+    etag="$(awk 'tolower($1) == "etag:" { print $2 }' "$headers" | tr -d '\r')"
+    status="$(curl -s -o "$body" -w '%{http_code}' {{nb_auth}} -H "If-Match: $etag" \
+        -X DELETE {{nb}}/streams/{{name}} || true)"
+    case "$status" in
+        204) echo "deleted {{name}}" ;;
+        404) echo "not found: {{name}}" ;;
+        *) echo "cannot delete {{name}}: northbound returned $status $(cat "$body")" >&2; exit 1 ;;
+    esac
 
 # Restart the controller while <stream> flows. Fails if any `weave-` flow on the
 # four Stroms was deleted, recreated or stopped moving bytes, if an adapter
