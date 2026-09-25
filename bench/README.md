@@ -115,6 +115,22 @@ re-points them, and the previously driven stream loses its source — it reports
 that never received input, which is `awaiting_input`). Applying several streams
 at once is fine; only the media endpoints are shared.
 
+`controller-restart` restarts the controller under a flowing stream and checks
+that nothing on the media side noticed:
+
+```sh
+just bench stream-up basic
+just bench controller-restart basic          # docker compose restart
+just bench controller-restart basic kill     # SIGKILL, then start
+```
+
+It records every `weave-` flow on the three Stroms with its id and SRT byte
+count, restarts the controller, and waits 20 s for every adapter to poll it. It
+fails if a flow was deleted or recreated (Strom gives a recreated flow a new
+id), if a flow moved no bytes, if an adapter logged a delete, if a producer or
+consumer restarted ffmpeg, or if the stream does not read `flowing` again. The
+bench controller keeps its state in Postgres.
+
 ## Topology
 
 ```

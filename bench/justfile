@@ -207,6 +207,76 @@ stream-wait name status="flowing" attempts="45":
 stream-rm name:
     @curl -sf {{nb_auth}} -X DELETE {{nb}}/streams/{{name}} && echo "deleted {{name}}" || echo "not found: {{name}}"
 
+# Restart the controller while <stream> flows. Fails if any `weave-` flow on the
+# three Stroms was deleted, recreated or stopped moving bytes, if an adapter
+# logged a delete, if a producer or consumer restarted ffmpeg, or if the stream
+# does not read `flowing` again. `how=kill` sends SIGKILL instead of a clean stop.
+[doc("Restart the controller with <stream> flowing and check that no Strom flow dropped.")]
+[group("streams")]
+controller-restart stream="basic" how="restart":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just stream-wait {{stream}} flowing 5 >/dev/null || {
+        echo "{{stream}} is not flowing; 'just bench stream-up {{stream}}' drives it" >&2
+        exit 1
+    }
+    snapshot() {
+        for strom in {{strom1}} {{strom2}} {{strom3}}; do
+            curl -sf "$strom/api/flows" \
+                | jq -r '.flows[] | select(.name | startswith("weave-")) | "\(.name) \(.id)"' \
+                | while read -r name id; do
+                    moved="$(curl -sf "$strom/api/flows/$id/srt-stats" \
+                        | jq '[.. | objects | (.bytes_received // 0) + (.bytes_sent // 0)] | add // 0')"
+                    echo "$name $id $moved"
+                done
+        done | sort
+    }
+    before="$(snapshot)"
+    echo "== weave- flows before (name id bytes) =="
+    echo "$before"
+    since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    case "{{how}}" in
+        restart) {{compose}} restart controller ;;
+        kill) docker kill -s KILL ow-controller >/dev/null && {{compose}} start controller ;;
+        *) echo "how must be restart or kill, not {{how}}" >&2; exit 2 ;;
+    esac
+    for _ in $(seq 1 30); do
+        curl -sf {{ctrl}}/health >/dev/null 2>&1 && break
+        sleep 2
+    done
+    echo "controller is back; waiting 20s for every adapter to poll it"
+    sleep 20
+    after="$(snapshot)"
+    echo "== weave- flows after =="
+    echo "$after"
+    failed=0
+    if [ "$(cut -d' ' -f1,2 <<<"$before")" != "$(cut -d' ' -f1,2 <<<"$after")" ]; then
+        echo "FAIL: the set of weave- flows or their ids changed" >&2
+        failed=1
+    fi
+    while read -r name id moved; do
+        now="$(awk -v id="$id" '$2 == id { print $3 }' <<<"$after")"
+        if [ -n "$now" ] && [ "$now" -le "$moved" ]; then
+            echo "FAIL: $name moved no bytes across the restart ($moved -> $now)" >&2
+            failed=1
+        fi
+    done <<<"$before"
+    for adapter in ow-adapter-1 ow-adapter-2 ow-adapter-3; do
+        if docker logs --since "$since" "$adapter" 2>&1 | grep "deleted undesired managed flow"; then
+            echo "FAIL: $adapter deleted a flow" >&2
+            failed=1
+        fi
+    done
+    for endpoint in ow-producer ow-producer-3 ow-consumer ow-consumer-2 ow-consumer-3; do
+        if docker logs --since "$since" "$endpoint" 2>/dev/null | grep "ffmpeg exited"; then
+            echo "FAIL: $endpoint restarted ffmpeg" >&2
+            failed=1
+        fi
+    done
+    just stream-wait {{stream}} flowing
+    [ "$failed" = 0 ] && echo "ok: every weave- flow kept its id and kept moving bytes"
+    exit "$failed"
+
 # Pass a stream name; the ingress address is resolved via the controller's
 # discovery API. Verification endpoint only — not part of the system under test.
 #
