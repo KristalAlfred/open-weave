@@ -1490,13 +1490,9 @@ async fn plan_stream(
 /// sockets are keyed. Keys reach adapters through their desired hops and
 /// nowhere else.
 fn withhold_passphrases(hops: &mut [DesiredHop]) {
-    for hop in hops {
-        let sockets = std::iter::once(&mut hop.ingress)
-            .chain(hop.egresses.iter_mut().map(|egress| &mut egress.socket));
-        for socket in sockets {
-            if let weave_core::SocketSpec::Srt(socket) = socket {
-                socket.params_mut().passphrase = None;
-            }
+    for socket in hops.iter_mut().flat_map(DesiredHop::sockets_mut) {
+        if let weave_core::SocketSpec::Srt(socket) = socket {
+            socket.params_mut().passphrase = None;
         }
     }
 }
@@ -5173,26 +5169,58 @@ mod node_auth_tests {
 #[cfg(test)]
 mod key_exposure_tests {
     use super::*;
+    use crate::webhook::tests::sink;
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
     use weave_core::{
         HopEndpointClass, HopProfile, NetworkAttachment, NetworkListeners, NodeCapabilities,
-        NodeTopology, Passphrase, PortRange, RoleSet, SrtEndpoint, SrtListener, StreamDestination,
-        StreamTransport, Transport, TransportClass,
+        NodeTopology, Passphrase, PortRange, RoleSet, SocketSpec, SrtEndpoint, SrtListener,
+        StreamDestination, StreamTransport, Transport, TransportClass,
     };
 
     const PRODUCER_KEY: &str = "producer-passphrase-1";
     const CONSUMER_KEY: &str = "consumer-passphrase-1";
 
-    fn registration(id: &str, host: &str) -> NodeRegistration {
+    fn attachment(network: &str, host: &str) -> NetworkAttachment {
+        NetworkAttachment {
+            id: network.to_string(),
+            network: network.to_string(),
+            dial: true,
+            listeners: NetworkListeners {
+                srt: Some(SrtListener {
+                    host: host.to_string(),
+                    port_range: PortRange {
+                        start: 20_000,
+                        end: 20_100,
+                    },
+                }),
+                whip: None,
+                whep: None,
+            },
+        }
+    }
+
+    /// A node on `net-a` and `net-b`, so a destination on it can take two paths.
+    fn registration(id: &str, hosts: [&str; 2], merge: bool) -> NodeRegistration {
         let srt = || {
             HopEndpointClass::Transport(TransportClass {
                 transport: Transport::Srt,
                 roles: RoleSet::both(),
             })
         };
+        let profile = |id: &str, merge| HopProfile {
+            id: id.to_string(),
+            ingress: srt(),
+            egress: srt(),
+            max_egresses: None,
+            merge,
+        };
+        let mut hop_profiles = vec![profile("srt-forward", false)];
+        if merge {
+            hop_profiles.push(profile("srt-merge", true));
+        }
         NodeRegistration {
             protocol_version: PROTOCOL_VERSION,
             node: NodeDescriptor {
@@ -5201,31 +5229,10 @@ mod key_exposure_tests {
                 status: NodeStatus::Ready,
                 capabilities: NodeCapabilities {
                     adapters: Vec::new(),
-                    hop_profiles: vec![HopProfile {
-                        id: "srt-forward".to_string(),
-                        ingress: srt(),
-                        egress: srt(),
-                        max_egresses: None,
-                        merge: false,
-                    }],
+                    hop_profiles,
                 },
                 topology: NodeTopology {
-                    attachments: vec![NetworkAttachment {
-                        id: "wan".to_string(),
-                        network: "internet".to_string(),
-                        dial: true,
-                        listeners: NetworkListeners {
-                            srt: Some(SrtListener {
-                                host: host.to_string(),
-                                port_range: PortRange {
-                                    start: 20_000,
-                                    end: 20_100,
-                                },
-                            }),
-                            whip: None,
-                            whep: None,
-                        },
-                    }],
+                    attachments: vec![attachment("net-a", hosts[0]), attachment("net-b", hosts[1])],
                 },
             },
             endpoints: Vec::new(),
@@ -5246,14 +5253,14 @@ mod key_exposure_tests {
         })
     }
 
-    fn keyed_stream() -> StreamDefinition {
+    fn keyed_stream(paths: u8) -> StreamDefinition {
         StreamDefinition {
             name: "feed".to_string(),
             enabled: true,
             source: endpoint("node-a", PRODUCER_KEY),
             destinations: vec![StreamDestination {
                 id: "studio".to_string(),
-                paths: 1,
+                paths,
                 endpoint: endpoint("node-b", CONSUMER_KEY),
             }],
         }
@@ -5280,67 +5287,149 @@ mod key_exposure_tests {
         Request::builder().uri(uri).body(Body::empty()).unwrap()
     }
 
-    #[tokio::test]
-    async fn keys_reach_desired_hops_and_no_other_route() {
-        let keys = LinkKeys::new("0123456789abcdef0123456789abcdef");
-        let link_key = keys.link("weave-feed-receiver-studio");
+    fn hops(body: &str) -> Vec<DesiredHop> {
+        serde_json::from_str(body).unwrap_or_else(|error| panic!("{error}: {body}"))
+    }
+
+    fn passphrases(hops: &[DesiredHop]) -> Vec<String> {
+        hops.iter()
+            .flat_map(DesiredHop::sockets)
+            .filter_map(|socket| match socket {
+                SocketSpec::Srt(socket) => socket.params().passphrase.as_ref(),
+                _ => None,
+            })
+            .map(|passphrase| passphrase.expose().to_string())
+            .collect()
+    }
+
+    async fn keys_reach_desired_hops_and_no_other_route(paths: u8) {
+        let mut hooks = sink(StatusCode::OK).await;
+        let webhooks = webhook::Emitter::new(webhook::Config {
+            url: Some(hooks.url.clone()),
+            ..webhook::Config::default()
+        })
+        .map(Arc::new);
         let state = AppState::hydrate(
             Arc::new(MemStore::new()),
             Duration::from_secs(60),
             Duration::from_secs(300),
-            None,
-            keys,
+            webhooks,
+            LinkKeys::for_tests(),
         )
         .await
         .unwrap();
         let app = router(state.clone(), Guard::Disabled, NodeGuard::Disabled);
         for node in [
-            registration("node-a", "192.0.2.1"),
-            registration("node-b", "192.0.2.2"),
+            registration("node-a", ["192.0.2.1", "198.51.100.1"], false),
+            registration("node-b", ["192.0.2.2", "198.51.100.2"], true),
         ] {
             let (status, _) = send(&app, json_request("POST", ROUTE_NODE_REGISTER, &node)).await;
             assert_eq!(status, StatusCode::ACCEPTED);
         }
-        let (status, _) = send(&app, json_request("POST", ROUTE_STREAMS, &keyed_stream())).await;
+        let (status, _) = send(
+            &app,
+            json_request("POST", ROUTE_STREAMS, &keyed_stream(paths)),
+        )
+        .await;
         assert_eq!(status, StatusCode::ACCEPTED);
         reconcile_tick(&state).await;
 
-        let (_, sender) = send(&app, get("/nodes/node-a/desired")).await;
-        let (_, receiver) = send(&app, get("/nodes/node-b/desired")).await;
-        assert!(sender.contains(link_key.expose()) && receiver.contains(link_key.expose()));
-        assert!(sender.contains(PRODUCER_KEY) && receiver.contains(CONSUMER_KEY));
+        let sender = passphrases(&hops(&send(&app, get("/nodes/node-a/desired")).await.1));
+        let receiver = passphrases(&hops(&send(&app, get("/nodes/node-b/desired")).await.1));
+        assert!(sender.contains(&PRODUCER_KEY.to_string()));
+        assert!(receiver.contains(&CONSUMER_KEY.to_string()));
+        let mut link_keys: Vec<String> = sender
+            .iter()
+            .filter(|key| key.as_str() != PRODUCER_KEY)
+            .cloned()
+            .collect();
+        link_keys.sort();
+        let mut receiver_link_keys: Vec<String> = receiver
+            .iter()
+            .filter(|key| key.as_str() != CONSUMER_KEY)
+            .cloned()
+            .collect();
+        receiver_link_keys.sort();
+        assert_eq!(link_keys, receiver_link_keys, "both ends share each key");
+        link_keys.dedup();
+        assert_eq!(link_keys.len(), usize::from(paths), "one key per path");
 
         let (_, resource) = send(&app, get("/streams/feed")).await;
         assert!(
             resource.contains(PRODUCER_KEY),
             "the manifest reads back as written"
         );
-        assert!(!resource.contains(link_key.expose()));
 
         let (status, plan) = send(
             &app,
-            json_request("POST", ROUTE_STREAM_PLANS, &keyed_stream()),
+            json_request("POST", ROUTE_STREAM_PLANS, &keyed_stream(paths)),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        let planned: Value = serde_json::from_str(&plan).unwrap();
+        let planned = hops(&planned["hops"].to_string());
+        assert_eq!(passphrases(&planned), Vec::<String>::new());
+        assert_eq!(
+            planned.iter().any(|hop| hop.merge_ingress.is_some()),
+            paths == 2,
+            "{plan}"
+        );
         assert!(plan.contains("\"pbkeylen\":32"));
 
-        for (route, body) in [
+        let mut events = Vec::new();
+        while let Ok(delivery) =
+            tokio::time::timeout(Duration::from_millis(300), hooks.next()).await
+        {
+            events.push(serde_json::to_string(&delivery.event).unwrap());
+        }
+        assert!(!events.is_empty(), "webhooks were sent");
+
+        let routes = [
             ("/view", send(&app, get("/view")).await.1),
             (ROUTE_STATUS, send(&app, get(ROUTE_STATUS)).await.1),
+            (ROUTE_STREAMS, send(&app, get(ROUTE_STREAMS)).await.1),
+            ("/streams/feed", resource),
             (
                 "/streams/feed/endpoints",
                 send(&app, get("/streams/feed/endpoints")).await.1,
             ),
             (ROUTE_STREAM_PLANS, plan),
-        ] {
+        ];
+        for (route, body) in &routes {
             assert!(
                 body.contains("node-a"),
                 "{route} describes the stream: {body}"
             );
-            for secret in [link_key.expose(), PRODUCER_KEY, CONSUMER_KEY] {
+            for secret in &link_keys {
+                assert!(!body.contains(secret), "{route} leaks a link key: {body}");
+            }
+        }
+        for (route, body) in routes
+            .iter()
+            .filter(|(route, _)| !matches!(*route, ROUTE_STREAMS | "/streams/feed"))
+        {
+            for secret in [PRODUCER_KEY, CONSUMER_KEY] {
                 assert!(!body.contains(secret), "{route} leaks a key: {body}");
             }
         }
+        for event in &events {
+            for secret in link_keys
+                .iter()
+                .map(String::as_str)
+                .chain([PRODUCER_KEY, CONSUMER_KEY])
+            {
+                assert!(!event.contains(secret), "a webhook leaks a key: {event}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn one_path_keys_reach_desired_hops_and_no_other_route() {
+        keys_reach_desired_hops_and_no_other_route(1).await;
+    }
+
+    #[tokio::test]
+    async fn two_path_keys_reach_desired_hops_and_no_other_route() {
+        keys_reach_desired_hops_and_no_other_route(2).await;
     }
 }

@@ -505,6 +505,41 @@ pub struct DesiredHop {
     pub egresses: Vec<DesiredEgress>,
 }
 
+impl DesiredHop {
+    /// Every socket on the hop: the ingress, the merge ingress, then each egress.
+    pub fn sockets(&self) -> impl Iterator<Item = &SocketSpec> {
+        // Destructured so a new field fails to compile here until it is placed.
+        let Self {
+            id: _,
+            node_id: _,
+            profile_id: _,
+            role: _,
+            ingress,
+            merge_ingress,
+            egresses,
+        } = self;
+        std::iter::once(ingress)
+            .chain(merge_ingress)
+            .chain(egresses.iter().map(|egress| &egress.socket))
+    }
+
+    /// [`DesiredHop::sockets`], mutably.
+    pub fn sockets_mut(&mut self) -> impl Iterator<Item = &mut SocketSpec> {
+        let Self {
+            id: _,
+            node_id: _,
+            profile_id: _,
+            role: _,
+            ingress,
+            merge_ingress,
+            egresses,
+        } = self;
+        std::iter::once(ingress)
+            .chain(merge_ingress)
+            .chain(egresses.iter_mut().map(|egress| &mut egress.socket))
+    }
+}
+
 /// One identified output branch of a desired hop.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DesiredEgress {

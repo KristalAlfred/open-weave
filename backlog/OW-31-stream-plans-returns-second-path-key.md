@@ -2,7 +2,7 @@
 id: OW-31
 title: "POST /stream-plans returns the key of a second path"
 type: bug
-status: in-progress
+status: done
 depends_on: []
 assignee: claude-security
 ---
@@ -22,11 +22,23 @@ northbound. `key_exposure_tests` plans only `paths: 1`.
 
 ## Done when
 
-- [ ] `POST /stream-plans` returns no passphrase on any socket of any hop,
+- [x] `POST /stream-plans` returns no passphrase on any socket of any hop,
       `merge_ingress` included.
-- [ ] `key_exposure_tests` covers a `paths: 2` stream on every route it checks.
+- [x] `key_exposure_tests` covers a `paths: 2` stream on every route it checks.
 
 ## Log
 
 - 2026-09-25: filed from a security review of OW-2 and OW-3; started by
   claude-security.
+- 2026-09-25: `DesiredHop::sockets` and `sockets_mut` in `crates/core/src/lib.rs`
+  list the ingress, the merge ingress and every egress, destructuring the hop so
+  a new field does not compile until it is placed. `withhold_passphrases` clears
+  every socket they list. `key_exposure_tests` now plans `paths: 1` and
+  `paths: 2` between two dual-homed nodes, reads every key from both nodes'
+  desired hops through `sockets`, checks both ends carry each link key, and
+  finds none of them in `/view`, `/status`, `GET /streams`, `/streams/feed`,
+  `/streams/feed/endpoints`, `POST /stream-plans` (whose hops, `merge_ingress`
+  included, carry no passphrase) or any webhook event the controller sent.
+  With the old redaction the `paths: 2` case fails on the plan's merge ingress.
+  `/view` shows no `merge_ingress`, and webhook events and `/status` carry no
+  sockets. Unit tests only.
