@@ -37,3 +37,9 @@ OW-9 code, and checked there with a probe.
   and `a_write_that_times_out_is_not_sent_again` use a 300 ms timeout. A body
   that fails half way is now an error; it was passed back empty. Unit tests
   only; not run with `docker pause` on the bench.
+- 2026-09-26: on `bench/`, with `basic` flowing, `docker pause` on the leading
+  controller: the first northbound `GET /status` after it took 10 s, the
+  request timeout, and controller-2 answered it `200`, having taken the lease.
+  Both `weave-basic-*` flows kept their Strom ids, no adapter logged a delete,
+  and `basic` read `flowing`. After `docker unpause` the old leader answered
+  `503 not_leader` (OW-54) and controller-2 kept leading.
