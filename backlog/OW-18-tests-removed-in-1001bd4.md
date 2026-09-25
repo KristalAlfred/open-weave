@@ -2,7 +2,7 @@
 id: OW-18
 title: "Tests removed with the stable-destinations change were not replaced"
 type: verification
-status: in-progress
+status: done
 depends_on: []
 assignee: claude-tests
 ---
@@ -29,9 +29,9 @@ Status section and the header of `bench/manifests/nat-relay.yaml` still cite.
 
 ## Done when
 
-- [ ] Each removed test has been compared against current behaviour, and a
+- [x] Each removed test has been compared against current behaviour, and a
       test for every behaviour that still exists is back.
-- [ ] Behaviour a removed test covered that no longer exists is listed in this
+- [x] Behaviour a removed test covered that no longer exists is listed in this
       item's Log.
 
 ## Easy to break
@@ -212,3 +212,10 @@ Status section and the header of `bench/manifests/nat-relay.yaml` still cite.
   the lowest network while the consumer socket and its endpoint take the lowest
   attachment id. Filed as OW-33; the test is `#[ignore]`d against it. Not
   fixed here.
+- 2026-09-25: both boxes ticked. Every test `1001bd4` removed from the five
+  files in the table, and from `crates/adapter-strom/src/config.rs`, was
+  compared against the code on `main`. Each one is either back (ported to the
+  v4 types), already covered by a later test (named in the Log above), or
+  listed above as removed behaviour with the reason. No ported test found a
+  regression. Checked with `just test` at `a579221`, unit tests only; nothing
+  here was run on `bench/`.
