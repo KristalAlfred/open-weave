@@ -69,3 +69,5 @@ while working OW-42; not reproduced across streams.
   (`hop_id_tests.rs`) covers it. Since OW-32, such pairs can only come from
   streams stored before that check. `README.md` ("Hop status and fan-out",
   "Capabilities and topology") updated. Unit tests only.
+- 2026-09-26: OW-56 replaced this item's planning order with ports held
+  from hop reports and a fixed planning order; see there.

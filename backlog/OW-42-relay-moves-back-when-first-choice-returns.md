@@ -82,3 +82,5 @@ working.
   Streams, as opposed to destinations, are still planned in name order, so a
   new stream that sorts first can still take a relay's last ports from an
   existing stream.
+- 2026-09-26: OW-56 replaced this item's planning order with ports held
+  from hop reports and a fixed planning order; see there.

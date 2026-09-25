@@ -1,12 +1,13 @@
 use weave_core::{
     DesiredHop, EgressStatus, HopEndpointClass, HopProfile, HopState, HopStatus, LinkCondition,
     NetworkAttachment, NetworkListeners, NodeCapabilities, NodeDescriptor, NodeStatus,
-    NodeTopology, ObservedState, Path, PortRange, RoleSet, SocketStatus, SrtEndpoint, SrtListener,
-    StreamDefinition, StreamDestination, StreamTransport, Transport, TransportClass,
+    NodeTopology, ObservedState, Path, PortRange, ResolvedAddr, RoleSet, SocketSpec, SocketStatus,
+    SrtEndpoint, SrtListener, SrtSocket, StreamDefinition, StreamDestination, StreamTransport,
+    Transport, TransportClass,
 };
 
 use crate::keys::LinkKeys;
-use crate::path::{PortAllocator, derive_path};
+use crate::path::{HeldPorts, PortAllocator, derive_path};
 use crate::{ReconcileOutcome, reconcile};
 
 fn srt_forward() -> HopProfile {
@@ -148,35 +149,59 @@ fn plan(stream: &StreamDefinition, nodes: &[NodeDescriptor], observed: &[HopStat
         stream,
         nodes,
         observed,
-        &mut PortAllocator::new(),
+        &mut PortAllocator::holding(HeldPorts::from_reports(observed, nodes)),
         &LinkKeys::for_tests(),
     )
     .expect("derive")
 }
 
-/// What each node reports for the hops `path` gave it.
-fn reported(path: &Path, state: HopState) -> Vec<HopStatus> {
-    let socket = || SocketStatus {
+/// What each node reports for the hops `path` gave it, resolving sockets the
+/// way the Strom adapter does: a listener at the node's SRT listener host, a
+/// caller at the address it dials.
+fn reported(path: &Path, nodes: &[NodeDescriptor], state: HopState) -> Vec<HopStatus> {
+    let socket = |spec: &SocketSpec, own_host: &str| SocketStatus {
         condition: LinkCondition::Flowing,
-        resolved: None,
+        resolved: match spec {
+            SocketSpec::Srt(SrtSocket::Listen { port, .. }) => Some(ResolvedAddr {
+                host: own_host.to_string(),
+                port: *port,
+            }),
+            SocketSpec::Srt(SrtSocket::Connect { host, port, .. }) => Some(ResolvedAddr {
+                host: host.clone(),
+                port: *port,
+            }),
+            _ => None,
+        },
         stats: None,
     };
     path.hops
         .iter()
-        .map(|hop| HopStatus {
-            id: hop.id.clone(),
-            node_id: hop.node_id.clone(),
-            state,
-            ingress: socket(),
-            merge_ingress: None,
-            egresses: hop
-                .egresses
+        .map(|hop| {
+            let own_host = nodes
                 .iter()
-                .map(|egress| EgressStatus {
-                    branch_id: egress.branch_id.clone(),
-                    status: socket(),
+                .find(|node| node.id == hop.node_id)
+                .and_then(|node| {
+                    node.topology
+                        .attachments
+                        .iter()
+                        .find_map(|attachment| attachment.listeners.srt.as_ref())
                 })
-                .collect(),
+                .map_or("0.0.0.0", |listener| listener.host.as_str());
+            HopStatus {
+                id: hop.id.clone(),
+                node_id: hop.node_id.clone(),
+                state,
+                ingress: socket(&hop.ingress, own_host),
+                merge_ingress: None,
+                egresses: hop
+                    .egresses
+                    .iter()
+                    .map(|egress| EgressStatus {
+                        branch_id: egress.branch_id.clone(),
+                        status: socket(&egress.socket, own_host),
+                    })
+                    .collect(),
+            }
         })
         .collect()
 }
@@ -203,13 +228,17 @@ fn a_bridge_stays_on_its_relay_when_an_earlier_relay_comes_back() {
         plan(
             &definition,
             &nodes,
-            &reported(&moved, HopState::Provisioned)
+            &reported(&moved, &nodes, HopState::Provisioned)
         ),
         moved,
         "the bridge, its ports and every other hop stay as they are"
     );
     assert_eq!(
-        plan(&definition, &nodes, &reported(&moved, HopState::Pending)),
+        plan(
+            &definition,
+            &nodes,
+            &reported(&moved, &nodes, HopState::Pending)
+        ),
         moved,
         "a relay still provisioning the bridge keeps it"
     );
@@ -231,7 +260,7 @@ fn a_bridge_moves_off_a_relay_that_goes_offline() {
     let moved = plan(
         &definition,
         &nodes,
-        &reported(&first, HopState::Provisioned),
+        &reported(&first, &nodes, HopState::Provisioned),
     );
     assert_eq!(hop(&moved, STUDIO_BRIDGE).node_id, "relay-b");
 }
@@ -244,7 +273,11 @@ fn a_relay_that_reports_the_bridge_failed_does_not_keep_it() {
     let moved = plan(&definition, &nodes, &[]);
     set_status(&mut nodes, "relay-a", NodeStatus::Ready);
 
-    let failed = plan(&definition, &nodes, &reported(&moved, HopState::Failed));
+    let failed = plan(
+        &definition,
+        &nodes,
+        &reported(&moved, &nodes, HopState::Failed),
+    );
     assert_eq!(hop(&failed, STUDIO_BRIDGE).node_id, "relay-a");
 }
 
@@ -258,7 +291,11 @@ fn a_via_pin_wins_over_the_relay_running_the_bridge() {
 
     let mut pinned = stream(&[("studio", "studio-node")]);
     pinned.destinations[0].endpoint = endpoint("studio-node", &["relay-a"]);
-    let path = plan(&pinned, &nodes, &reported(&moved, HopState::Provisioned));
+    let path = plan(
+        &pinned,
+        &nodes,
+        &reported(&moved, &nodes, HopState::Provisioned),
+    );
     assert_eq!(hop(&path, STUDIO_BRIDGE).node_id, "relay-a");
 }
 
@@ -269,7 +306,11 @@ fn a_new_destination_takes_the_next_relay_and_leaves_an_existing_bridge_alone() 
     assert_eq!(hop(&before, STUDIO_BRIDGE).node_id, "relay-a");
 
     let grown = stream(&[("studio", "studio-node"), ("alpha", "truck-node")]);
-    let after = plan(&grown, &nodes, &reported(&before, HopState::Provisioned));
+    let after = plan(
+        &grown,
+        &nodes,
+        &reported(&before, &nodes, HopState::Provisioned),
+    );
     for id in [STUDIO_BRIDGE, "weave-feed-receiver-studio"] {
         assert_eq!(hop(&after, id), hop(&before, id), "{id} is unchanged");
     }
@@ -332,6 +373,7 @@ fn a_new_stream_that_sorts_first_takes_the_next_relay_and_leaves_an_existing_one
             enabled: true,
             hops: running.clone(),
         },
+        &nodes,
         HopState::Provisioned,
     );
 

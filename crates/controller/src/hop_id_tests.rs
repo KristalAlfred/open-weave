@@ -1,11 +1,10 @@
 use std::collections::BTreeSet;
 
 use weave_core::{
-    HopEndpointClass, HopProfile, HopState, HopStatus, LinkCondition, NetworkAttachment,
-    NetworkListeners, NodeCapabilities, NodeDescriptor, NodeStatus, NodeTopology, ObservedState,
-    PathStatus, PortRange, RoleSet, SocketStatus, SrtEndpoint, SrtListener, StreamConditionReason,
-    StreamConditionType, StreamDefinition, StreamDestination, StreamTransport, Transport,
-    TransportClass, validate_stream,
+    HopEndpointClass, HopProfile, NetworkAttachment, NetworkListeners, NodeCapabilities,
+    NodeDescriptor, NodeStatus, NodeTopology, ObservedState, PathStatus, PortRange, RoleSet,
+    SrtEndpoint, SrtListener, StreamConditionReason, StreamConditionType, StreamDefinition,
+    StreamDestination, StreamTransport, Transport, TransportClass, validate_stream,
 };
 
 use crate::keys::LinkKeys;
@@ -266,48 +265,4 @@ fn streams_whose_hop_ids_cannot_meet_are_not_flagged() {
             second.name
         );
     }
-}
-
-#[test]
-fn a_running_stream_keeps_its_hop_ids_against_an_earlier_name() {
-    let [first, second] = colliding_pairs().remove(0);
-    let alone = run(vec![second.clone()]);
-    let running = alone.hops_by_stream[&second.name].clone();
-    let reports = running
-        .iter()
-        .map(|hop| HopStatus {
-            id: hop.id.clone(),
-            node_id: hop.node_id.clone(),
-            state: HopState::Provisioned,
-            ingress: SocketStatus {
-                condition: LinkCondition::Flowing,
-                resolved: None,
-                stats: None,
-            },
-            merge_ingress: None,
-            egresses: Vec::new(),
-        })
-        .collect();
-
-    let outcome = reconcile(
-        vec![first.clone(), second.clone()],
-        &ObservedState {
-            nodes: nodes(),
-            endpoints: Vec::new(),
-            hops: reports,
-        },
-        &LinkKeys::for_tests(),
-    );
-    assert_eq!(outcome.hops_by_stream[&second.name], running);
-    assert!(!outcome.hops_by_stream.contains_key(&first.name));
-    let refused = outcome
-        .streams
-        .iter()
-        .find(|status| status.name == first.name)
-        .unwrap();
-    assert!(refused.conditions.iter().any(|condition| {
-        condition
-            .detail
-            .ends_with(&format!("is already planned for stream {}", second.name))
-    }));
 }
