@@ -450,6 +450,19 @@ impl PortAllocator {
         Ok(port)
     }
 
+    /// Claim a port for each of `listeners` on `node`, as [`Self::can_claim`]
+    /// found them.
+    fn reserve(&mut self, node: &NodeDescriptor, listeners: &[PortListener]) {
+        for listener in listeners {
+            let _ = match listener {
+                PortListener::Srt(attachment, at) => self.claim_at(node, attachment, "", Some(at)),
+                PortListener::Rist(listener, at) => {
+                    self.claim_rist_at(node, listener, "", Some(at))
+                }
+            };
+        }
+    }
+
     /// Whether `node` has a free port for each of `listeners`, taken in turn,
     /// counting [`Self::yielding`] ports only when `yielding` is set.
     fn can_claim(&self, node: &NodeDescriptor, listeners: &[PortListener], yielding: bool) -> bool {
@@ -1101,7 +1114,7 @@ fn place_second_path<'n>(
         &receiver,
         nodes,
         (&first.relays, &[]),
-        &ports,
+        &mut ports.clone(),
         relays,
     )?;
     let bridges: Vec<ChainHop> = stations
@@ -1236,7 +1249,7 @@ fn pick_remote_relay<'n>(
                 })
         });
     match relay_with_ports(candidates, ports, &keep, &[]) {
-        Some(relay) => relay.map(|node| node.id.clone()),
+        Some(relay) => relay.map(|(node, _)| node.id.clone()),
         None => Err(PlacementError::CannotDialNetwork {
             node: upstream.node_id.clone(),
             network: network.to_string(),
@@ -1420,6 +1433,7 @@ fn chain_hops<'a, 'n>(
     relays: &mut RelayCache<'n>,
     shun: &[String],
 ) -> Result<Chain<'a>, PlacementError> {
+    let mut ports = ports.clone();
     let mut stations: Vec<Station> = Vec::with_capacity(dest.via.len());
     for station in dest.via.iter().map(|id| Station::relay(id)) {
         relay_before(
@@ -1429,7 +1443,7 @@ fn chain_hops<'a, 'n>(
             &station,
             nodes,
             (&[], shun),
-            ports,
+            &mut ports,
             relays,
         )?;
         stations.push(station);
@@ -1450,7 +1464,7 @@ fn chain_hops<'a, 'n>(
                 &station,
                 nodes,
                 (&[], shun),
-                ports,
+                &mut ports,
                 relays,
             )?;
             ChainTerminal::Receiver(ChainHop {
@@ -1530,6 +1544,8 @@ impl<'n> RelayCache<'n> {
 /// still empty. The relay is none of `avoid_relays`, and is the node that
 /// reports running the bridge `(stream, branch)` would place there when that
 /// node still qualifies. It is one of `shun` only when no other relay has room.
+/// The relay's listener ports are claimed in `ports`, a scratch copy for the
+/// chain, so a later relay in the same chain sees them taken.
 ///
 /// A spliced relay is compatible with both halves by construction, so each
 /// resolves under the ordinary rule — the upstream reaches the relay, and the
@@ -1543,13 +1559,13 @@ fn relay_before<'n>(
     next: &Station,
     nodes: &'n [NodeDescriptor],
     (avoid_relays, shun): (&[String], &[String]),
-    ports: &PortAllocator,
+    ports: &mut PortAllocator,
     relays: &mut RelayCache<'n>,
 ) -> Result<(), PlacementError> {
     let upstream = chain.last().unwrap_or(source);
     if let Err(failure) = station_link(upstream, next, nodes) {
         let bridge = bridge_hop_id(stream, branch, chain.len());
-        let relay = pick_relay(
+        let (relay, listeners) = pick_relay(
             nodes,
             upstream,
             next,
@@ -1559,7 +1575,8 @@ fn relay_before<'n>(
             relays,
             (&bridge, branch),
         )?;
-        chain.push(relay);
+        ports.reserve(relay, &listeners);
+        chain.push(Station::relay(&relay.id));
     }
     Ok(())
 }
@@ -1584,7 +1601,7 @@ fn pick_relay<'n>(
     ports: &PortAllocator,
     relays: &mut RelayCache<'n>,
     (bridge, branch): (&str, &str),
-) -> Result<Station, PlacementError> {
+) -> Result<(&'n NodeDescriptor, Vec<PortListener>), PlacementError> {
     let keep = relays.running(bridge).to_vec();
     let candidates = relays
         .reachable_from(upstream, nodes)
@@ -1621,7 +1638,7 @@ fn pick_relay<'n>(
                 })
         });
     match relay_with_ports(candidates, ports, &keep, shun) {
-        Some(relay) => relay.map(|node| Station::relay(&node.id)),
+        Some(relay) => relay,
         None => Err(failure.into_error(&upstream.node_id, &downstream.node_id)),
     }
 }
@@ -1645,6 +1662,7 @@ fn port_listener_at(link: &LinkChoice, end: Listener, at: SocketAt) -> Option<Po
 }
 
 /// A listener a relay would claim ports on.
+#[derive(Clone)]
 enum PortListener {
     Srt(NetworkAttachment, SocketAt),
     Rist(RistListener, SocketAt),
@@ -1660,7 +1678,7 @@ fn relay_with_ports<'a>(
     ports: &PortAllocator,
     keep: &[String],
     shun: &[String],
-) -> Option<Result<&'a NodeDescriptor, PlacementError>> {
+) -> Option<Result<(&'a NodeDescriptor, Vec<PortListener>), PlacementError>> {
     let mut candidates: Vec<_> = candidates.collect();
     candidates.sort_by(|(left, _), (right, _)| left.id.cmp(&right.id));
     let (lowest, _) = candidates.first()?;
@@ -1681,7 +1699,7 @@ fn relay_with_ports<'a>(
             .find(with_room(false))
             .or_else(|| candidates.iter().find(with_room(false)))
             .or_else(|| candidates.iter().find(with_room(true)))
-            .map(|(node, _)| *node)
+            .map(|(node, listeners)| (*node, listeners.clone()))
             .ok_or_else(|| PlacementError::PortRangeExhausted {
                 node: lowest.id.clone(),
             }),

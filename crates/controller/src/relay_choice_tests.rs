@@ -415,3 +415,32 @@ fn hop_in<'a>(hops: &'a [DesiredHop], id: &str) -> &'a DesiredHop {
         .find(|hop| hop.id == id)
         .unwrap_or_else(|| panic!("no hop {id}"))
 }
+
+/// `source`, the pinned `transit` and `studio-node` are all NAT'd, so both
+/// links around the pin need a relay. `relay-a` has room for one bridge.
+#[test]
+fn a_chain_does_not_count_one_relays_room_twice() {
+    let nodes = vec![
+        nat_node("source"),
+        nat_node("transit"),
+        nat_node("studio-node"),
+        relay("relay-a", "198.51.100.10", 2),
+        relay("relay-b", "198.51.100.20", 100),
+    ];
+    let mut definition = stream(&[("studio", "studio-node")]);
+    definition.destinations[0].endpoint = endpoint("studio-node", &["transit"]);
+
+    let path = derive_path(
+        &definition,
+        &nodes,
+        &[],
+        &mut PortAllocator::new(),
+        &LinkKeys::for_tests(),
+    )
+    .expect("relay-b has room for the second bridge");
+    let chain: Vec<_> = path.hops[1..]
+        .iter()
+        .map(|hop| hop.node_id.as_str())
+        .collect();
+    assert_eq!(chain, ["relay-a", "transit", "relay-b", "studio-node"]);
+}
