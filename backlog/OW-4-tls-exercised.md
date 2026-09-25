@@ -3,7 +3,7 @@ id: OW-4
 title: "TLS has never been exercised"
 type: verification
 status: todo
-depends_on: []
+depends_on: [OW-17]
 assignee:
 ---
 
@@ -26,3 +26,4 @@ peer addresses, across it.
 ## Log
 
 - 2026-09-25: filed from broadcaster research.
+- 2026-09-25: depends on OW-17, since the bench does not start until its subnets move.

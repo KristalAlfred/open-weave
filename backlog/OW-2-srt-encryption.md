@@ -2,9 +2,9 @@
 id: OW-2
 title: "SRT hops carry no encryption"
 type: feature
-status: todo
+status: in-progress
 depends_on: []
-assignee:
+assignee: claude-transport
 ---
 
 ## Evidence
@@ -42,3 +42,4 @@ The controller plans both ends of every hop, so it can give both the same key.
 ## Log
 
 - 2026-09-25: filed from broadcaster research.
+- 2026-09-25: started by claude-transport.

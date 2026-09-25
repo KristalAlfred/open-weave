@@ -3,7 +3,7 @@ id: OW-6
 title: "Automatic relay insertion is only tested in the planner"
 type: verification
 status: todo
-depends_on: []
+depends_on: [OW-17]
 assignee:
 ---
 
@@ -29,3 +29,4 @@ declared reachability.
 ## Log
 
 - 2026-09-25: filed from broadcaster research.
+- 2026-09-25: depends on OW-17, since the bench does not start until its subnets move.

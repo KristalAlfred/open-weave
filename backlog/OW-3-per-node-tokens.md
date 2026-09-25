@@ -2,9 +2,9 @@
 id: OW-3
 title: "Every node shares one southbound token"
 type: feature
-status: todo
+status: in-progress
 depends_on: []
-assignee:
+assignee: claude-auth
 ---
 
 ## Evidence
@@ -29,3 +29,4 @@ stations
 ## Log
 
 - 2026-09-25: filed from broadcaster research.
+- 2026-09-25: started by claude-auth.

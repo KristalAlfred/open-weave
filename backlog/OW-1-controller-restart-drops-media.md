@@ -2,9 +2,9 @@
 id: OW-1
 title: "A controller restart probably tears down running media"
 type: bug
-status: todo
+status: in-progress
 depends_on: []
-assignee:
+assignee: claude-lifecycle
 ---
 
 ## Evidence
@@ -35,3 +35,4 @@ before the first tick finishes. None of this has been run.
 ## Log
 
 - 2026-09-25: filed from a code reading during broadcaster research.
+- 2026-09-25: started by claude-lifecycle.

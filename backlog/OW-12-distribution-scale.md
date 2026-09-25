@@ -2,9 +2,9 @@
 id: OW-12
 title: "Nothing runs at distribution scale"
 type: verification
-status: todo
+status: in-progress
 depends_on: []
-assignee:
+assignee: claude-planner
 ---
 
 ## Evidence
@@ -34,3 +34,4 @@ Nothing measures plan time, desired-state size or heartbeat load at that size.
 ## Log
 
 - 2026-09-25: filed from broadcaster research.
+- 2026-09-25: started by claude-planner.
