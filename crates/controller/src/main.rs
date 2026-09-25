@@ -5915,7 +5915,7 @@ mod node_auth_tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
-    use weave_core::auth::{NodeKey, Token};
+    use weave_core::auth::{MinEpochs, NodeKey, Token};
 
     use super::tests::{NORTH_ROUTES, SHARED_READ_ROUTES, SOUTH_ROUTES};
 
@@ -5942,7 +5942,10 @@ mod node_auth_tests {
     }
 
     fn node_bearer(node_id: &str) -> String {
-        format!("Bearer {}", NodeKey::new(KEY).unwrap().token_for(node_id))
+        format!(
+            "Bearer {}",
+            NodeKey::new(KEY).unwrap().token_for(node_id, 0)
+        )
     }
 
     fn registration(node_id: &str) -> Value {
@@ -6171,6 +6174,36 @@ mod node_auth_tests {
             endpoint_owners(&app).await,
             [Some("strom-node-2".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn a_token_below_its_nodes_minimum_epoch_gets_401_and_others_pass() {
+        let (_, state) = app().await;
+        let key = NodeKey::new(KEY).unwrap();
+        let app = router(
+            state,
+            Guard::Required(Token::new(NORTH).unwrap()),
+            NodeGuard::Required(
+                key.clone()
+                    .with_min_epochs(MinEpochs::parse("strom-node-1=1").unwrap()),
+            ),
+        );
+        for (node_id, epoch, expected) in [
+            ("strom-node-1", 0, StatusCode::UNAUTHORIZED),
+            ("strom-node-1", 1, StatusCode::ACCEPTED),
+            ("strom-node-2", 0, StatusCode::ACCEPTED),
+        ] {
+            let bearer = format!("Bearer {}", key.token_for(node_id, epoch));
+            let (status, _) = send(
+                &app,
+                "POST",
+                "/nodes/register",
+                &bearer,
+                Some(registration(node_id)),
+            )
+            .await;
+            assert_eq!(status, expected, "{node_id} at epoch {epoch}");
+        }
     }
 
     #[tokio::test]

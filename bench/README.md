@@ -344,15 +344,17 @@ defaults to development values so `just bench up` stays a single command:
 |---|---|---|
 | `WEAVE_NORTHBOUND_TOKEN` | `bench-northbound-token` | northbound, controller, CLI, `endpoints.sh` |
 | `WEAVE_SOUTHBOUND_KEY` | `bench-southbound-key-for-local-use-only` | southbound, controller, `just bench node-token` |
-| `WEAVE_ADAPTER_{1,2,3,4}_TOKEN` | `strom-node-{1,2,3,4}`'s token under the default key | adapter-1 to adapter-4; the recipes present node 1's for southbound reads |
-| `WEAVE_BROWSER_TOKEN` | `browser-bench`'s token under the default key | the in-bench browser page, which takes its node id from it |
+| `WEAVE_ADAPTER_{1,2,3,4}_TOKEN` | `strom-node-{1,2,3,4}`'s epoch-0 token under the default key | adapter-1 to adapter-4; the recipes present node 1's for southbound reads |
+| `WEAVE_BROWSER_TOKEN` | `browser-bench`'s epoch-0 token under the default key | the in-bench browser page, which takes its node id from it |
 | `WEAVE_SRT_KEY_SECRET` | `bench-srt-key-secret-for-local-use-only` | controller, to derive the keys of SRT links between nodes |
+| `WEAVE_SOUTHBOUND_MIN_EPOCHS` | unset | southbound, controller: `<id>=<epoch>` pairs that revoke a node's older tokens |
 
 `docker-compose.yml` passes each adapter its token as `WEAVE_SOUTHBOUND_TOKEN`.
 The adapter configs leave `node.southbound_token` unset and inherit it. The node
 tokens are written out in `docker-compose.yml` and the bench `justfile`, so
 exporting `WEAVE_SOUTHBOUND_KEY` means exporting the five token variables too;
-`just bench node-token <id>` prints each one under the exported key.
+`just bench node-token <id>` prints each one under the exported key, and
+`just bench node-token <id> <epoch>` a token at a later epoch.
 
 The `just` recipes add the right header for you. Calling the APIs by hand needs
 it explicitly:

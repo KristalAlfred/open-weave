@@ -456,26 +456,29 @@ compared in constant time and never logged.
 | `WEAVE_NORTHBOUND_TOKEN` | operators, the `weave` CLI (`--token`), northbound → controller | northbound (every operator route), controller (every operator route but `/status`) |
 | `WEAVE_SOUTHBOUND_KEY` | southbound, controller | nothing: node tokens are derived from it, and it is never a token itself |
 | `WEAVE_SOUTHBOUND_TOKEN` | each adapter and media node, holding its own node token | southbound, controller |
+| `WEAVE_SOUTHBOUND_MIN_EPOCHS` | southbound, controller | nothing: the lowest token epoch each node it names may present |
 
 The northbound token is one shared secret. On southbound every node has a token
-of its own:
+of its own, at an epoch that is a non-negative integer:
 
 ```
-<node id>.<lowercase hex HMAC-SHA256(WEAVE_SOUTHBOUND_KEY, node id)>
+<node id>.<epoch>.<lowercase hex HMAC-SHA256(WEAVE_SOUTHBOUND_KEY, "<node id>.<epoch>")>
 ```
 
 Southbound and the controller hold the key, recompute the MAC, and read the node
 id off the token. They keep no list of nodes, so adding a node needs a new token
 and no restart. The key must be at least 32 characters, for example
-`openssl rand -hex 32`: a token is an id and its MAC, so a leaked one is enough
-to test guesses of a short key offline. Southbound and the controller refuse to
-start with a shorter key, and `weave node-token` refuses one. `weave node-token <id>` prints a node's token from
-`WEAVE_SOUTHBOUND_KEY` (or `--key`) without calling any service. openssl gives
-the same value:
+`openssl rand -hex 32`: a token carries its own MAC input, so a leaked one is
+enough to test guesses of a short key offline. Southbound and the controller refuse to
+start with a shorter key, and `weave node-token` refuses one.
+
+`weave node-token <id>` prints a node's token at epoch 0, and
+`--epoch <n>` at another, from `WEAVE_SOUTHBOUND_KEY` (or `--key`) without
+calling any service. openssl gives the same value:
 
 ```sh
-id=strom-node-1
-printf '%s.%s\n' "$id" "$(printf %s "$id" | openssl dgst -sha256 -hmac "$WEAVE_SOUTHBOUND_KEY" -r | cut -d' ' -f1)"
+id=strom-node-1 epoch=0
+printf '%s.%s.%s\n' "$id" "$epoch" "$(printf %s "$id.$epoch" | openssl dgst -sha256 -hmac "$WEAVE_SOUTHBOUND_KEY" -r | cut -d' ' -f1)"
 ```
 
 A node token acts only for its own node. `POST /nodes/register` whose
@@ -495,8 +498,14 @@ The inventory reads `GET /nodes`, `GET /endpoints` and `GET /state` accept any
 node's token. They list every node, endpoint and hop status, but no node's
 desired hops.
 
-One node's token cannot be revoked on its own: rotating the key replaces every
-node's token (`backlog/OW-28-revoke-one-node-token.md`).
+To revoke one node's tokens, mint it a token at a higher epoch and raise its
+minimum in `WEAVE_SOUTHBOUND_MIN_EPOCHS`, given to southbound and the controller
+alike as comma-separated `<node id>=<epoch>` pairs such as
+`strom-node-1=2,guest-1=1`. A token below its node's minimum gets `401`, as a
+bad MAC does. A node the variable does not name accepts every epoch, and no
+other node's token changes. Both services read the variable at startup, so a
+change takes effect on restart, and a value that does not parse stops them from
+starting. Rotating the key still replaces every node's token.
 
 The controller backs both surfaces, so it needs `WEAVE_NORTHBOUND_TOKEN` and
 `WEAVE_SOUTHBOUND_KEY`, and requires the credential matching the surface a route

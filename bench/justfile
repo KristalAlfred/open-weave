@@ -19,12 +19,12 @@ sb_key   := env("WEAVE_SOUTHBOUND_KEY", "bench-southbound-key-for-local-use-only
 
 # Southbound's inventory reads accept any node's token; these recipes present
 # node 1's, the one docker-compose.yml gives adapter-1 under the default key.
-sb_token := env("WEAVE_ADAPTER_1_TOKEN", "strom-node-1.39d5a7c831d6b25a1b017da63efbe888265326986ce5f1bebd6032243609b014")
+sb_token := env("WEAVE_ADAPTER_1_TOKEN", "strom-node-1.0.dc18eb10e0f080536c55f9ff6569abb31d2da3ce4f782b294dd0d32fcbd8dbaf")
 sb_auth  := "-H 'Authorization: Bearer " + sb_token + "'"
 
 # The in-bench page takes its node id from its token, so the browser manifests
 # keep naming it across restarts.
-browser_token := env("WEAVE_BROWSER_TOKEN", "browser-bench.fdc250e325215af4650d4206640d18e0692670a0c83b5b23e16b7c08961c5f8f")
+browser_token := env("WEAVE_BROWSER_TOKEN", "browser-bench.0.ed7971623b06be894b581ccca99662bdb3983d232e8737a2c3e5a46455b00540")
 browser_node  := replace_regex(browser_token, '\..*', '')
 
 # Port `just hook-sink` listens on. docker-compose.yml points the controller's
@@ -433,10 +433,10 @@ page port="8000" seat="guest-1":
     @echo "open  http://localhost:{{port}}/#southbound={{sb}}&token=$(just node-token {{seat}})&node={{seat}}&network=docker-host"
     python3 -m http.server {{port}} -d {{page_dir}} --bind 127.0.0.1
 
-# Print the southbound token for node <id> under the bench key.
+# Print the southbound token for node <id> at <epoch> under the bench key.
 [group("browser")]
-node-token id:
-    @WEAVE_SOUTHBOUND_KEY={{sb_key}} cargo run --quiet -p weave-cli -- node-token {{id}}
+node-token id epoch="0":
+    @WEAVE_SOUTHBOUND_KEY={{sb_key}} cargo run --quiet -p weave-cli -- node-token {{id}} --epoch {{epoch}}
 
 # The stream a page on this host feeds: WHIP signalled at localhost:28080 via node
 # 1's `docker-host` attachment, SRT out on the node subnet for open-live's Strom.

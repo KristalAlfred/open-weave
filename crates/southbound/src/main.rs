@@ -363,7 +363,10 @@ mod tests {
 
     /// `Authorization` value presenting `node_id`'s token under [`KEY`].
     fn bearer(node_id: &str) -> String {
-        format!("Bearer {}", NodeKey::new(KEY).unwrap().token_for(node_id))
+        format!(
+            "Bearer {}",
+            NodeKey::new(KEY).unwrap().token_for(node_id, 0)
+        )
     }
 
     /// A router with authentication switched off, for the proxy-fidelity tests.

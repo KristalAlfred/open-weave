@@ -90,6 +90,10 @@ enum Command {
         /// Key southbound and the controller hold.
         #[arg(long, env = auth::SOUTHBOUND_KEY_VAR, hide_env_values = true)]
         key: Option<String>,
+        /// Token epoch. Raising the node's minimum in
+        /// `WEAVE_SOUTHBOUND_MIN_EPOCHS` past an epoch revokes its tokens.
+        #[arg(long, default_value_t = 0)]
+        epoch: u64,
     },
 }
 
@@ -169,14 +173,14 @@ async fn main() -> Result<()> {
                 delete_stream(&url, token.as_ref(), &name, output).await
             }
         },
-        Command::NodeToken { id, key } => {
-            println!("{}", node_token(key.as_deref(), &id)?);
+        Command::NodeToken { id, key, epoch } => {
+            println!("{}", node_token(key.as_deref(), &id, epoch)?);
             Ok(())
         }
     }
 }
 
-fn node_token(key: Option<&str>, id: &str) -> Result<String> {
+fn node_token(key: Option<&str>, id: &str, epoch: u64) -> Result<String> {
     if let Err(error) = validate_resource_id(id) {
         bail!("invalid node id: {error}");
     }
@@ -190,7 +194,7 @@ fn node_token(key: Option<&str>, id: &str) -> Result<String> {
             "the southbound key must be at least {MIN_NODE_KEY_LEN} characters, as southbound and the controller require"
         ),
     };
-    Ok(key.token_for(id))
+    Ok(key.token_for(id, epoch))
 }
 
 /// Present the bearer token when one is configured. Without it northbound
@@ -947,20 +951,19 @@ mod tests {
     };
 
     #[test]
-    fn node_token_is_the_node_id_and_its_mac() {
+    fn node_token_is_the_node_id_its_epoch_and_their_mac() {
+        let key = Some("bench-southbound-key-for-local-use-only");
         assert_eq!(
-            node_token(
-                Some("bench-southbound-key-for-local-use-only"),
-                "strom-node-1"
-            )
-            .unwrap(),
-            "strom-node-1.39d5a7c831d6b25a1b017da63efbe888265326986ce5f1bebd6032243609b014"
+            node_token(key, "strom-node-1", 0).unwrap(),
+            "strom-node-1.0.dc18eb10e0f080536c55f9ff6569abb31d2da3ce4f782b294dd0d32fcbd8dbaf"
         );
-        assert!(node_token(Some("k"), "Not_An_Id").is_err());
-        let error = node_token(None, "strom-node-1").unwrap_err().to_string();
+        let second = node_token(key, "strom-node-1", 1).unwrap();
+        assert!(second.starts_with("strom-node-1.1."), "{second}");
+        assert!(node_token(Some("k"), "Not_An_Id", 0).is_err());
+        let error = node_token(None, "strom-node-1", 0).unwrap_err().to_string();
         assert!(error.contains(auth::SOUTHBOUND_KEY_VAR), "{error}");
-        assert!(node_token(Some("  "), "strom-node-1").is_err());
-        let error = node_token(Some("bench-southbound-key"), "strom-node-1")
+        assert!(node_token(Some("  "), "strom-node-1", 0).is_err());
+        let error = node_token(Some("bench-southbound-key"), "strom-node-1", 0)
             .unwrap_err()
             .to_string();
         assert!(error.contains("32 characters"), "{error}");

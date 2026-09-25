@@ -37,7 +37,7 @@ function readConfig() {
   };
 }
 
-// A node token is `<node id>.<mac>`, so it names the node it authenticates as.
+// A node token is `<node id>.<epoch>.<mac>`, so it names the node it authenticates as.
 function tokenNodeId(token) {
   const dot = token.indexOf(".");
   return dot > 0 ? token.slice(0, dot) : "";

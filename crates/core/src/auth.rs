@@ -3,16 +3,18 @@
 //! Operators and the CLI present one shared secret, [`NORTHBOUND_TOKEN_VAR`], to
 //! northbound, which re-presents it to the controller. Each node presents a
 //! token of its own, [`SOUTHBOUND_TOKEN_VAR`], to southbound, which forwards it
-//! to the controller. A node token is `<node id>.<hex HMAC-SHA256(key, node id)>`,
-//! where the key is [`SOUTHBOUND_KEY_VAR`]: southbound and the controller hold
-//! the key, derive the node id from the token, and refuse a node acting under
-//! another node's id.
+//! to the controller. A node token is
+//! `<node id>.<epoch>.<hex HMAC-SHA256(key, "<node id>.<epoch>")>`, where the key
+//! is [`SOUTHBOUND_KEY_VAR`]: southbound and the controller hold the key, derive
+//! the node id from the token, and refuse a node acting under another node's id.
+//! [`SOUTHBOUND_MIN_EPOCHS_VAR`] revokes one node's older tokens.
 //!
 //! [`Guard::from_env`] and [`NodeGuard::from_env`] error when their variable is
 //! unset or blank, and [`NodeGuard::from_env`] also when the key is shorter than
 //! [`MIN_NODE_KEY_LEN`], so a service with no secret or a weak key does not start.
 //! [`AUTH_DISABLED_VAR`] switches authentication off for local development.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use hmac::{Hmac, Mac};
@@ -29,6 +31,9 @@ pub const SOUTHBOUND_TOKEN_VAR: &str = "WEAVE_SOUTHBOUND_TOKEN";
 pub const SOUTHBOUND_KEY_VAR: &str = "WEAVE_SOUTHBOUND_KEY";
 /// The fewest characters a [`NodeKey`] may have.
 pub const MIN_NODE_KEY_LEN: usize = 32;
+/// Environment variable holding the lowest token epoch southbound and the
+/// controller accept for a node, as comma-separated `<node id>=<epoch>` pairs.
+pub const SOUTHBOUND_MIN_EPOCHS_VAR: &str = "WEAVE_SOUTHBOUND_MIN_EPOCHS";
 /// Set to `1` or `true` to serve and call without authentication. Local
 /// development only.
 pub const AUTH_DISABLED_VAR: &str = "WEAVE_AUTH_DISABLED";
@@ -143,9 +148,64 @@ impl Guard {
     }
 }
 
-/// The key node tokens are derived from. [`fmt::Debug`] redacts it.
+/// The key node tokens are derived from, and the lowest epoch accepted for each
+/// node. [`fmt::Debug`] redacts the key.
 #[derive(Clone)]
-pub struct NodeKey(Vec<u8>);
+pub struct NodeKey {
+    key: Vec<u8>,
+    min_epochs: MinEpochs,
+}
+
+/// The lowest token epoch accepted for each node it names. A node it does not
+/// name accepts every epoch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MinEpochs(BTreeMap<String, u64>);
+
+impl MinEpochs {
+    /// Parse comma-separated `<node id>=<epoch>` pairs. Blank means none.
+    ///
+    /// # Errors
+    /// Returns what is wrong with the first pair that is not a valid node id and
+    /// a non-negative integer, or that names a node again.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let mut epochs = BTreeMap::new();
+        for pair in value
+            .split(',')
+            .map(str::trim)
+            .filter(|pair| !pair.is_empty())
+        {
+            let (node_id, epoch) = pair
+                .split_once('=')
+                .map(|(node_id, epoch)| (node_id.trim(), epoch.trim()))
+                .ok_or_else(|| format!("`{pair}` is not `<node id>=<epoch>`"))?;
+            validate_resource_id(node_id).map_err(|error| format!("`{pair}`: {error}"))?;
+            let epoch = epoch
+                .parse()
+                .map_err(|_| format!("`{pair}`: the epoch is not a non-negative integer"))?;
+            if epochs.insert(node_id.to_string(), epoch).is_some() {
+                return Err(format!("node {node_id} is named twice"));
+            }
+        }
+        Ok(Self(epochs))
+    }
+
+    /// Read [`SOUTHBOUND_MIN_EPOCHS_VAR`]; unset means none.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::InvalidMinEpochs`] when it does not parse.
+    pub fn from_env() -> Result<Self, AuthError> {
+        Self::parse(&std::env::var(SOUTHBOUND_MIN_EPOCHS_VAR).unwrap_or_default()).map_err(
+            |reason| AuthError::InvalidMinEpochs {
+                var: SOUTHBOUND_MIN_EPOCHS_VAR.to_string(),
+                reason,
+            },
+        )
+    }
+
+    fn of(&self, node_id: &str) -> u64 {
+        self.0.get(node_id).copied().unwrap_or(0)
+    }
+}
 
 /// Why a value is not a [`NodeKey`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -166,7 +226,10 @@ impl NodeKey {
         match value.trim() {
             "" => Err(NodeKeyError::Blank),
             value if value.len() < MIN_NODE_KEY_LEN => Err(NodeKeyError::TooShort),
-            value => Ok(Self(value.as_bytes().to_vec())),
+            value => Ok(Self {
+                key: value.as_bytes().to_vec(),
+                min_epochs: MinEpochs::default(),
+            }),
         }
     }
 
@@ -186,28 +249,42 @@ impl NodeKey {
         })
     }
 
-    /// The token that authenticates as `node_id`: the id, a `.`, and the
-    /// lowercase hex HMAC-SHA256 of the id under this key.
+    /// This key, accepting for each node only tokens at or above its epoch in
+    /// `min_epochs`.
     #[must_use]
-    pub fn token_for(&self, node_id: &str) -> String {
-        format!("{node_id}.{}", self.mac_hex(node_id))
+    pub fn with_min_epochs(self, min_epochs: MinEpochs) -> Self {
+        Self { min_epochs, ..self }
+    }
+
+    /// The token that authenticates as `node_id` at `epoch`: the id, the epoch,
+    /// and the lowercase hex HMAC-SHA256 of `<id>.<epoch>` under this key,
+    /// joined by `.`.
+    #[must_use]
+    pub fn token_for(&self, node_id: &str, epoch: u64) -> String {
+        format!("{node_id}.{epoch}.{}", self.mac_hex(node_id, epoch))
     }
 
     /// The node id an `Authorization` header value authenticates as, `None`
-    /// unless it presents a token this key issued. The MAC is compared in
-    /// constant time.
+    /// unless it presents a token this key issued at an epoch no lower than the
+    /// node's minimum. The MAC is compared in constant time.
     #[must_use]
     pub fn verify_header(&self, header: &str) -> Option<String> {
-        let (node_id, mac) = bearer_value(header)?.split_once('.')?;
+        let (node_id, rest) = bearer_value(header)?.split_once('.')?;
+        let (epoch_text, mac) = rest.split_once('.')?;
         validate_resource_id(node_id).ok()?;
-        constant_time_eq(mac.as_bytes(), self.mac_hex(node_id).as_bytes())
-            .then(|| node_id.to_string())
+        let epoch: u64 = epoch_text.parse().ok()?;
+        if epoch.to_string() != epoch_text
+            || !constant_time_eq(mac.as_bytes(), self.mac_hex(node_id, epoch).as_bytes())
+        {
+            return None;
+        }
+        (epoch >= self.min_epochs.of(node_id)).then(|| node_id.to_string())
     }
 
-    fn mac_hex(&self, node_id: &str) -> String {
+    fn mac_hex(&self, node_id: &str, epoch: u64) -> String {
         let mut mac =
-            Hmac::<Sha256>::new_from_slice(&self.0).expect("HMAC accepts a key of any length");
-        mac.update(node_id.as_bytes());
+            Hmac::<Sha256>::new_from_slice(&self.key).expect("HMAC accepts a key of any length");
+        mac.update(format!("{node_id}.{epoch}").as_bytes());
         mac.finalize()
             .into_bytes()
             .iter()
@@ -233,16 +310,18 @@ pub enum NodeGuard {
 }
 
 impl NodeGuard {
-    /// Resolve the guard from the key in `var`.
+    /// Resolve the guard from the key in `var` and the minimum epochs in
+    /// [`SOUTHBOUND_MIN_EPOCHS_VAR`].
     ///
     /// # Errors
-    /// Returns the [`NodeKey::from_env`] error when the [`AUTH_DISABLED_VAR`]
-    /// escape hatch is not engaged.
+    /// Returns the [`NodeKey::from_env`] or [`MinEpochs::from_env`] error when
+    /// the [`AUTH_DISABLED_VAR`] escape hatch is not engaged.
     pub fn from_env(var: &str) -> Result<Self, AuthError> {
         if auth_disabled() {
             return Ok(Self::Disabled);
         }
-        NodeKey::from_env(var).map(Self::Required)
+        let key = NodeKey::from_env(var)?;
+        Ok(Self::Required(key.with_min_epochs(MinEpochs::from_env()?)))
     }
 
     /// Who a request with this `Authorization` header value is from, `None`
@@ -307,6 +386,8 @@ pub enum AuthError {
         "{var} must be at least {MIN_NODE_KEY_LEN} characters, for example `openssl rand -hex 32`"
     )]
     ShortKey { var: String },
+    #[error("{var} is invalid: {reason}")]
+    InvalidMinEpochs { var: String, reason: String },
 }
 
 #[cfg(feature = "server")]
@@ -484,20 +565,20 @@ mod tests {
         format!("Bearer {token}")
     }
 
-    /// The value `printf %s strom-node-1 | openssl dgst -sha256 -hmac
+    /// The MAC `printf %s strom-node-1.0 | openssl dgst -sha256 -hmac
     /// bench-southbound-key-for-local-use-only -r` prints, which the README gives
     /// as the way to mint a token without this crate.
     #[test]
     fn node_token_matches_the_openssl_one_liner() {
         assert_eq!(
-            key().token_for("strom-node-1"),
-            "strom-node-1.39d5a7c831d6b25a1b017da63efbe888265326986ce5f1bebd6032243609b014"
+            key().token_for("strom-node-1", 0),
+            "strom-node-1.0.dc18eb10e0f080536c55f9ff6569abb31d2da3ce4f782b294dd0d32fcbd8dbaf"
         );
     }
 
     #[test]
     fn node_token_verifies_as_its_own_node() {
-        let token = key().token_for("strom-node-1");
+        let token = key().token_for("strom-node-1", 0);
         assert_eq!(
             key().verify_header(&bearer(&token)).as_deref(),
             Some("strom-node-1")
@@ -511,11 +592,11 @@ mod tests {
 
     #[test]
     fn node_token_rejects_forgeries() {
-        let token = key().token_for("strom-node-1");
-        let (_, mac) = token.split_once('.').unwrap();
+        let token = key().token_for("strom-node-1", 0);
+        let mac = token.rsplit_once('.').unwrap().1;
         let other_key = NodeKey::new("another-key-0123456789abcdef0123456789")
             .unwrap()
-            .token_for("strom-node-1");
+            .token_for("strom-node-1", 0);
         let mut tampered = token.clone();
         tampered.replace_range(
             token.len() - 1..,
@@ -524,17 +605,26 @@ mod tests {
 
         for (presented, why) in [
             (other_key, "issued under another key"),
-            (format!("strom-node-2.{mac}"), "another node's MAC"),
+            (format!("strom-node-2.0.{mac}"), "another node's MAC"),
+            (format!("strom-node-1.1.{mac}"), "another epoch's MAC"),
+            (
+                format!("strom-node-1.00.{mac}"),
+                "an epoch with a leading zero",
+            ),
+            (format!("strom-node-1.+0.{mac}"), "an epoch with a sign"),
+            (format!("strom-node-1.-1.{mac}"), "a negative epoch"),
+            (format!("strom-node-1.{mac}"), "no epoch"),
             (tampered, "tampered MAC"),
             (token.to_uppercase(), "uppercase"),
             (
-                format!("strom-node-1.{}", mac.to_uppercase()),
+                format!("strom-node-1.0.{}", mac.to_uppercase()),
                 "uppercase hex",
             ),
             ("strom-node-1".to_string(), "no MAC"),
-            ("strom-node-1.".to_string(), "empty MAC"),
+            ("strom-node-1.0.".to_string(), "empty MAC"),
             (format!("{token}0"), "MAC too long"),
-            (format!("Strom_Node.{mac}"), "invalid node id"),
+            (format!("{token}.0"), "a fourth part"),
+            (format!("Strom_Node.0.{mac}"), "invalid node id"),
             (KEY.to_string(), "the key itself"),
             ("bench-southbound-token".to_string(), "an old shared token"),
             (String::new(), "nothing"),
@@ -548,7 +638,7 @@ mod tests {
     #[test]
     fn node_guard_names_the_caller_or_refuses() {
         let guard = NodeGuard::Required(key());
-        let token = key().token_for("strom-node-1");
+        let token = key().token_for("strom-node-1", 0);
         assert_eq!(
             guard.caller(Some(&bearer(&token))),
             Some(NodeCaller::Node("strom-node-1".to_string()))
@@ -559,6 +649,54 @@ mod tests {
         let guard = NodeGuard::Disabled;
         assert!(guard.is_disabled());
         assert_eq!(guard.caller(None), Some(NodeCaller::Anyone));
+    }
+
+    #[test]
+    fn a_token_below_its_nodes_minimum_epoch_is_refused() {
+        let revoking = key().with_min_epochs(MinEpochs::parse("strom-node-1=2").unwrap());
+        let verify = |node_id: &str, epoch| {
+            revoking.verify_header(&bearer(&revoking.token_for(node_id, epoch)))
+        };
+        assert_eq!(verify("strom-node-1", 0), None);
+        assert_eq!(verify("strom-node-1", 1), None);
+        assert_eq!(verify("strom-node-1", 2).as_deref(), Some("strom-node-1"));
+        assert_eq!(verify("strom-node-1", 3).as_deref(), Some("strom-node-1"));
+        assert_eq!(
+            verify("strom-node-2", 0).as_deref(),
+            Some("strom-node-2"),
+            "another node is unaffected"
+        );
+        assert_eq!(
+            revoking.token_for("strom-node-1", 2),
+            key().token_for("strom-node-1", 2),
+            "minimum epochs do not change the tokens a key makes"
+        );
+    }
+
+    #[test]
+    fn min_epochs_parse_pairs_and_refuse_anything_else() {
+        let epochs = MinEpochs::parse(" strom-node-1=2, browser-guest = 1 ,").unwrap();
+        assert_eq!(epochs.of("strom-node-1"), 2);
+        assert_eq!(epochs.of("browser-guest"), 1);
+        assert_eq!(epochs.of("strom-node-2"), 0);
+        assert_eq!(MinEpochs::parse("").unwrap(), MinEpochs::default());
+        for (value, why) in [
+            ("strom-node-1", "no epoch"),
+            ("strom-node-1=", "an empty epoch"),
+            ("strom-node-1=-1", "a negative epoch"),
+            ("strom-node-1=two", "a word"),
+            ("Strom_Node=1", "an invalid node id"),
+            ("strom-node-1=1,strom-node-1=2", "a node named twice"),
+        ] {
+            assert!(MinEpochs::parse(value).is_err(), "{why}");
+        }
+        let message = AuthError::InvalidMinEpochs {
+            var: SOUTHBOUND_MIN_EPOCHS_VAR.to_string(),
+            reason: MinEpochs::parse("strom-node-1").unwrap_err(),
+        }
+        .to_string();
+        assert!(message.contains(SOUTHBOUND_MIN_EPOCHS_VAR), "{message}");
+        assert!(message.contains("strom-node-1"), "{message}");
     }
 
     #[test]
@@ -583,8 +721,8 @@ mod tests {
         );
         assert!(NodeKey::new(&"k".repeat(MIN_NODE_KEY_LEN)).is_ok());
         assert_eq!(
-            NodeKey::new(&format!(" {KEY} ")).unwrap().token_for("a"),
-            key().token_for("a"),
+            NodeKey::new(&format!(" {KEY} ")).unwrap().token_for("a", 0),
+            key().token_for("a", 0),
             "surrounding space trimmed"
         );
     }
