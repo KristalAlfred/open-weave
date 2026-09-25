@@ -106,8 +106,9 @@ Notes:
     With `ow-adapter-1` stopped, node 1 went offline after the 15 s node TTL and
     the bridge moved to node 2 (both ends then dial `10.97.27.10`); the stream
     read `pending`, then `awaiting_input`, and was `flowing` again about 12 s
-    later. When `ow-adapter-1` came back, the bridge moved back to node 1 with
-    the same sequence, and node 2's bridge flow was removed.
+    later. When `ow-adapter-1` came back, adapter-1 removed its stale bridge
+    flow and the bridge stayed on node 2, `flowing`, for the 97 s watched
+    (OW-42; observed at 149e5e2).
 
   Media endpoints for these live *inside* the NAT'd subnets (`producer-3` and
   `consumer-3` on net_node3, `producer-4` and `consumer-4` on net_node4). That
