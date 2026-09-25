@@ -360,8 +360,8 @@ exiting immediately with `WEAVE_..._TOKEN is unset` is the fail-closed default,
 not a crash.
 
 **A stream stays `pending`.** Nothing matched its hops. `just bench status`
-lists the registered nodes; the manifest names one that is not among them, or
-the node it names has gone offline.
+lists the registered nodes; the manifest names one that is not among them. A
+stream whose node has gone offline reads `degraded` instead.
 
 **A stream stays `awaiting_input`.** It placed, but nothing is feeding it.
 `just bench stream` applies without media on purpose — use `just bench stream-up`

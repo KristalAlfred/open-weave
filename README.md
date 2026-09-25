@@ -294,6 +294,10 @@ The second branch keeps the aggregate stream `degraded`. `/status` also carries
 one entry per destination with its own status, nodes, conditions, and endpoint.
 A fan-out is `flowing` only when every branch is flowing.
 
+A placed stream stays placed when a node it names goes offline. Its hops stay
+desired, and the stream reads `degraded` until the node heartbeats again. A
+stream that names a node that has not registered is `pending`.
+
 ```json
 {
   "name": "cam1-to-studio",
