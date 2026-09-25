@@ -4,6 +4,8 @@ pub mod api;
 pub mod auth;
 pub mod contracts;
 pub mod media;
+#[cfg(feature = "server")]
+pub mod upstream;
 pub mod validation;
 pub mod webhook;
 

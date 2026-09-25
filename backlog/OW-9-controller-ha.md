@@ -51,3 +51,11 @@ stations
   webhook ids count from the lease's start on the Postgres clock. Conditions
   still start over, as on a restart: filed as OW-39. Northbound and southbound
   do not fail over yet.
+- 2026-09-25: northbound and southbound take a comma-separated
+  `WEAVE_CONTROLLER_URL` (`weave_core::upstream`). A request goes first to the
+  controller that answered last, and moves on only on a connect error (connect
+  timeout 2 s) or `503 not_leader`. Unit tests in `crates/core/src/upstream.rs`
+  cover both, and show a `500`, a `412`, a `503 stream_not_ready` and a bare
+  `503` passed back without trying the next; each proxy has a test sending a
+  request past a standby to the leader. The Strom adapter and the browser node
+  call only southbound, so neither changed.

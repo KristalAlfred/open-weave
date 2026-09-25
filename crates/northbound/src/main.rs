@@ -1,6 +1,8 @@
 //! Northbound API — desired-state surface for operators and systems. Stateless:
 //! it validates stream submissions at the boundary and proxies every request to
-//! the controller, which owns all state.
+//! the controller, which owns all state, or to whichever of several leads.
+
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -14,6 +16,7 @@ use axum::{
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Guard, Token, require_bearer};
+use weave_core::upstream::{Answer, Controllers};
 use weave_core::{
     ApiError, ApiErrorCode, ROUTE_NODES, ROUTE_STATUS, ROUTE_STREAM, ROUTE_STREAM_ENDPOINTS,
     ROUTE_STREAM_PLANS, ROUTE_STREAM_SET, ROUTE_STREAM_SETS, ROUTE_STREAMS, StreamDefinition,
@@ -21,22 +24,19 @@ use weave_core::{
 };
 
 const DEFAULT_ADDR: &str = "127.0.0.1:9080";
-const DEFAULT_CONTROLLER_URL: &str = "http://127.0.0.1:8082";
 
 #[derive(Clone)]
 struct AppState {
-    http: reqwest::Client,
-    controller_url: String,
+    controllers: Arc<Controllers>,
     /// Re-presented to the controller on every proxied request. `None` when
     /// authentication is disabled.
     token: Option<Token>,
 }
 
 impl AppState {
-    fn new(controller_url: String, token: Option<Token>) -> Self {
+    fn new(controllers: Controllers, token: Option<Token>) -> Self {
         Self {
-            http: reqwest::Client::new(),
-            controller_url,
+            controllers: Arc::new(controllers),
             token,
         }
     }
@@ -51,8 +51,8 @@ async fn main() -> Result<()> {
         .init();
 
     let addr = std::env::var("WEAVE_NORTHBOUND_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
-    let controller_url = std::env::var("WEAVE_CONTROLLER_URL")
-        .unwrap_or_else(|_| DEFAULT_CONTROLLER_URL.to_string());
+    let controllers = Controllers::from_env()?;
+    let controller_urls = controllers.urls().join(",");
 
     let guard = Guard::from_env(auth::NORTHBOUND_TOKEN_VAR)?;
     if guard.is_disabled() {
@@ -61,15 +61,12 @@ async fn main() -> Result<()> {
             auth::AUTH_DISABLED_VAR
         );
     }
-    let app = router(
-        AppState::new(controller_url.clone(), guard.token().cloned()),
-        guard,
-    );
+    let app = router(AppState::new(controllers, guard.token().cloned()), guard);
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("binding northbound listener on {addr}"))?;
-    tracing::info!(%addr, %controller_url, "northbound API listening");
+    tracing::info!(%addr, controllers = %controller_urls, "northbound API listening");
 
     axum::serve(listener, app)
         .await
@@ -334,8 +331,8 @@ fn invalid_json(rejection: JsonRejection) -> Response {
     .response(StatusCode::BAD_REQUEST)
 }
 
-/// Forward a request to the controller, passing its status and body back
-/// faithfully. Handlers name the same paths this service serves.
+/// Forward a request to the leading controller, passing its status and body
+/// back faithfully. Handlers name the same paths this service serves.
 async fn proxy(
     state: &AppState,
     method: reqwest::Method,
@@ -353,25 +350,29 @@ async fn proxy_with_headers(
     headers: &HeaderMap,
     forwarded_headers: &[reqwest::header::HeaderName],
 ) -> Response {
-    let url = format!("{}{path}", state.controller_url.trim_end_matches('/'));
-    let mut request = state.http.request(method, &url);
-    if let Some(token) = &state.token {
-        request = request.header(reqwest::header::AUTHORIZATION, token.header_value());
-    }
-    for name in forwarded_headers {
-        if let Some(value) = headers.get(name) {
-            request = request.header(name, value);
-        }
-    }
-    if let Some(body) = body {
-        request = request
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body);
-    }
-    match request.send().await {
-        Ok(response) => relay(response).await,
-        Err(err) => {
-            tracing::warn!(%err, %url, "proxying to controller failed");
+    let sent = state
+        .controllers
+        .send(method, path, |mut request| {
+            if let Some(token) = &state.token {
+                request = request.header(reqwest::header::AUTHORIZATION, token.header_value());
+            }
+            for name in forwarded_headers {
+                if let Some(value) = headers.get(name) {
+                    request = request.header(name, value);
+                }
+            }
+            if let Some(body) = &body {
+                request = request
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body.clone());
+            }
+            request
+        })
+        .await;
+    match sent {
+        Ok(answer) => relay(answer),
+        Err(unanswered) => {
+            tracing::warn!(err = %unanswered.source, url = %unanswered.url, "proxying to controller failed");
             error(
                 StatusCode::BAD_GATEWAY,
                 ApiErrorCode::ControllerUnreachable,
@@ -381,16 +382,11 @@ async fn proxy_with_headers(
     }
 }
 
-async fn relay(response: reqwest::Response) -> Response {
-    let status =
-        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .cloned();
-    let etag = response.headers().get(reqwest::header::ETAG).cloned();
-    let body = response.bytes().await.unwrap_or_default();
-    let mut out = (status, body).into_response();
+fn relay(answer: Answer) -> Response {
+    let status = StatusCode::from_u16(answer.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = answer.headers.get(reqwest::header::CONTENT_TYPE).cloned();
+    let etag = answer.headers.get(reqwest::header::ETAG).cloned();
+    let mut out = (status, answer.body).into_response();
     if let Some(value) = content_type {
         out.headers_mut()
             .insert(reqwest::header::CONTENT_TYPE, value);
@@ -490,13 +486,16 @@ mod tests {
 
     /// A router with authentication switched off, for the proxy-fidelity tests.
     fn open_app(controller_url: String) -> Router {
-        router(AppState::new(controller_url, None), Guard::Disabled)
+        router(
+            AppState::new(Controllers::new(&controller_url).unwrap(), None),
+            Guard::Disabled,
+        )
     }
 
     /// A router requiring [`TOKEN`], which it also re-presents to the controller.
     fn guarded_app(controller_url: String) -> Router {
         router(
-            AppState::new(controller_url, Some(token())),
+            AppState::new(Controllers::new(&controller_url).unwrap(), Some(token())),
             Guard::Required(token()),
         )
     }
@@ -590,6 +589,47 @@ mod tests {
             captured.lock().unwrap().is_none(),
             "rejected at the boundary"
         );
+    }
+
+    /// A controller on standby: every request gets `503 not_leader`.
+    async fn standby_controller() -> String {
+        let app = Router::new().fallback(|| async {
+            ApiError::new(ApiErrorCode::NotLeader, "standby")
+                .response(StatusCode::SERVICE_UNAVAILABLE)
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_write_reaches_the_leading_controller_past_a_standby() {
+        let standby = standby_controller().await;
+        let (leader, captured) = stub_controller(StatusCode::ACCEPTED).await;
+        let app = open_app(format!("{standby},{leader}"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/streams")
+                    .header("content-type", "application/json")
+                    .header("if-none-match", "*")
+                    .body(Body::from(serde_json::to_vec(&sample_stream()).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.headers()["etag"], "\"revision-7\"");
+        let seen = captured.lock().unwrap().clone().expect("the leader saw it");
+        assert_eq!(seen.if_none_match.as_deref(), Some("*"));
+        let forwarded: StreamDefinition = serde_json::from_slice(&seen.body).unwrap();
+        assert_eq!(forwarded, sample_stream());
     }
 
     #[tokio::test]

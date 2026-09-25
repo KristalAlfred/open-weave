@@ -40,7 +40,8 @@ implemented: [Strom](https://github.com/Eyevinn/strom), via
 - File-based or VOD work. Every contract here describes live links between nodes.
 - Deciding what to route. Scheduling, bookings and who gets which feed belong to
   an application that drives open-weave through northbound.
-- Production, yet. No TLS, no controller HA — see [Status](#status).
+- Production, yet. No TLS, and one Postgres under every controller — see
+  [Status](#status).
 
 ## Status
 
@@ -51,14 +52,18 @@ refused rather than smoothed over.
 Built: the three control-plane services, the `weave` CLI, one southbound adapter
 (`weave-adapter-strom`), and a browser node. Links carry SRT, WHIP or WHEP, and
 the controller plans NAT traversal through relay nodes. SRT links between nodes
-are encrypted with keys the controller derives. All of it is verified on
+are encrypted with keys the controller derives. Several controllers can share
+one Postgres: one leads and the others stand by. All of it is verified on
 the docker-compose bench in `bench/`, which runs real Strom instances behind
 per-node `netem` routers, and nowhere else. Two things are exceptions, covered
 only by planner and status tests: redundant paths, since no shipped node merges
 two paths, and WHIP senders and WHEP players outside open-weave, since the bench
 has no such peer.
 
-Not built: TLS, controller HA, format conversion, and any adapter other than
+Controller failover is not verified on the bench yet: tests against a real
+Postgres cover the lease, and unit tests cover the proxies moving to the leader.
+
+Not built: TLS, Postgres HA, format conversion, and any adapter other than
 Strom. The items in `backlog/` list the known gaps with the
 evidence behind each one.
 
@@ -754,7 +759,18 @@ controller.
   key it refuses every node's token.
 - Postgres is one instance. While no controller can reach it, none leads.
 
-Northbound and southbound relay a standby's `503 not_leader` as it is.
+Northbound and southbound take every controller in `WEAVE_CONTROLLER_URL`,
+comma-separated; unset means `http://127.0.0.1:8082`. A request goes first to
+the controller that answered last. The proxy moves to the next one only when it
+cannot connect within two seconds or gets `503 not_leader`: neither controller
+has acted on the request, so a write is never sent twice. Any other answer, a
+timeout after connecting included, is passed back as it is. When no controller
+leads, the proxy passes back `503 not_leader`; when none can be reached,
+`502 controller_unreachable`.
+
+While no controller leads, the Strom adapter and the browser node get `503` or
+`502` from southbound, keep every hop they run, and register again once a
+leader answers. Each registration sends `node.registered`.
 
 ## Capabilities and topology
 

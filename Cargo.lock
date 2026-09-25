@@ -2469,11 +2469,13 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "hmac",
+ "reqwest",
  "schemars",
  "serde",
  "serde_json",
  "sha2",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 

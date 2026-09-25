@@ -74,7 +74,9 @@ docker-compose stack of real Strom instances behind per-node `netem` routers.
 - **The controller owns all state.** Northbound and southbound are stateless
   proxies that call into it. The controller answers no request by calling out;
   its one outbound call is the node and stream webhook, which is fire-and-forget
-  and off unless `WEAVE_WEBHOOK_URL` is set.
+  and off unless `WEAVE_WEBHOOK_URL` is set. With Postgres, several controllers
+  can share one database: only the one holding the lease serves or writes, and
+  the proxies move to it on a connect error or `503 not_leader`.
 - **Protocol mismatches are refused, not smoothed over.** `PROTOCOL_VERSION`
   marks the southbound adapter protocol. A registration carrying the wrong
   version gets `409` and is not recorded. HTTP routes are unversioned before a
@@ -94,7 +96,7 @@ docker-compose stack of real Strom instances behind per-node `netem` routers.
 The items in `backlog/` are the authority on gaps, with the evidence behind each
 one, and `BACKLOG.md` says how to work them. Do not infer from the code that
 something works; if an open item lists it, it does not.
-Not implemented today: TLS, controller HA, format conversion, and every adapter
+Not implemented today: TLS, Postgres HA, format conversion, and every adapter
 except Strom.
 
 Anything only verified on the `bench/` stack is verified there and nowhere else.

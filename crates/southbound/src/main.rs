@@ -1,7 +1,9 @@
 //! Southbound API — the adapter-facing surface. Stateless: every request is
 //! proxied to the controller, which owns all node and desired state. Adapters
 //! keep dialing this service; it relays to the controller with the node's own
-//! token.
+//! token, and to whichever of several controllers leads.
+
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -16,13 +18,13 @@ use serde_json::{Value, json};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, NodeCaller, NodeGuard, refuse_other_node, require_node_token};
+use weave_core::upstream::{Answer, Controllers};
 use weave_core::{
     ApiError, ApiErrorCode, ROUTE_ENDPOINTS, ROUTE_NODE_DESIRED, ROUTE_NODE_HEARTBEAT,
     ROUTE_NODE_REGISTER, ROUTE_NODES, ROUTE_STATE, resource_id_issue, validate_resource_id,
 };
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8081";
-const DEFAULT_CONTROLLER_URL: &str = "http://127.0.0.1:8082";
 
 /// Origin a browser-hosted node may call the adapter contract from. Unset means
 /// no CORS headers at all, which is right for every adapter that is not a web
@@ -31,15 +33,13 @@ const CORS_ORIGIN_VAR: &str = "WEAVE_SOUTHBOUND_CORS_ORIGIN";
 
 #[derive(Clone)]
 struct AppState {
-    http: reqwest::Client,
-    controller_url: String,
+    controllers: Arc<Controllers>,
 }
 
 impl AppState {
-    fn new(controller_url: String) -> Self {
+    fn new(controllers: Controllers) -> Self {
         Self {
-            http: reqwest::Client::new(),
-            controller_url,
+            controllers: Arc::new(controllers),
         }
     }
 }
@@ -53,8 +53,8 @@ async fn main() -> Result<()> {
         .init();
 
     let addr = std::env::var("WEAVE_SOUTHBOUND_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
-    let controller_url = std::env::var("WEAVE_CONTROLLER_URL")
-        .unwrap_or_else(|_| DEFAULT_CONTROLLER_URL.to_string());
+    let controllers = Controllers::from_env()?;
+    let controller_urls = controllers.urls().join(",");
 
     let guard = NodeGuard::from_env(auth::SOUTHBOUND_KEY_VAR)?;
     if guard.is_disabled() {
@@ -70,12 +70,12 @@ async fn main() -> Result<()> {
         }
         _ => None,
     };
-    let app = router(AppState::new(controller_url.clone()), guard, cors);
+    let app = router(AppState::new(controllers), guard, cors);
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("binding southbound listener on {addr}"))?;
-    tracing::info!(%addr, %controller_url, "southbound API listening");
+    tracing::info!(%addr, controllers = %controller_urls, "southbound API listening");
 
     axum::serve(listener, app)
         .await
@@ -233,9 +233,9 @@ async fn get_desired(
     .await
 }
 
-/// Forward a request to the controller with the caller's `Authorization`,
-/// passing its status and body back faithfully. Handlers name the same paths
-/// this service serves.
+/// Forward a request to the leading controller with the caller's
+/// `Authorization`, passing its status and body back faithfully. Handlers name
+/// the same paths this service serves.
 async fn proxy(
     state: &AppState,
     headers: &HeaderMap,
@@ -243,20 +243,25 @@ async fn proxy(
     path: &str,
     body: Option<Bytes>,
 ) -> Response {
-    let url = format!("{}{path}", state.controller_url.trim_end_matches('/'));
-    let mut request = state.http.request(method, &url);
-    if let Some(authorization) = headers.get(header::AUTHORIZATION) {
-        request = request.header(reqwest::header::AUTHORIZATION, authorization.as_bytes());
-    }
-    if let Some(body) = body {
-        request = request
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body);
-    }
-    match request.send().await {
-        Ok(response) => relay(response).await,
-        Err(err) => {
-            tracing::warn!(%err, %url, "proxying to controller failed");
+    let authorization = headers.get(header::AUTHORIZATION);
+    let sent = state
+        .controllers
+        .send(method, path, |mut request| {
+            if let Some(authorization) = authorization {
+                request = request.header(reqwest::header::AUTHORIZATION, authorization.as_bytes());
+            }
+            if let Some(body) = &body {
+                request = request
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body.clone());
+            }
+            request
+        })
+        .await;
+    match sent {
+        Ok(answer) => relay(answer),
+        Err(unanswered) => {
+            tracing::warn!(err = %unanswered.source, url = %unanswered.url, "proxying to controller failed");
             ApiError::new(
                 ApiErrorCode::ControllerUnreachable,
                 "controller unreachable",
@@ -275,16 +280,14 @@ fn invalid_node_id(error: weave_core::ResourceIdError) -> Response {
     .response(StatusCode::BAD_REQUEST)
 }
 
-async fn relay(response: reqwest::Response) -> Response {
-    let status =
-        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let content_type = response
-        .headers()
+fn relay(answer: Answer) -> Response {
+    let status = StatusCode::from_u16(answer.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = answer
+        .headers
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let body = response.bytes().await.unwrap_or_default();
-    let mut out = (status, body).into_response();
+    let mut out = (status, answer.body).into_response();
     if let Some(value) = content_type.and_then(|ct| ct.parse().ok()) {
         out.headers_mut()
             .insert(reqwest::header::CONTENT_TYPE, value);
@@ -364,13 +367,17 @@ mod tests {
     }
 
     /// A router with authentication switched off, for the proxy-fidelity tests.
+    fn state(controller_url: &str) -> AppState {
+        AppState::new(Controllers::new(controller_url).unwrap())
+    }
+
     fn open_app(controller_url: String) -> Router {
-        router(AppState::new(controller_url), NodeGuard::Disabled, None)
+        router(state(&controller_url), NodeGuard::Disabled, None)
     }
 
     /// A router requiring node tokens derived from [`KEY`].
     fn guarded_app(controller_url: String) -> Router {
-        router(AppState::new(controller_url), guard(), None)
+        router(state(&controller_url), guard(), None)
     }
 
     async fn body_json(response: Response) -> Value {
@@ -381,7 +388,7 @@ mod tests {
     /// [`guarded_app`] that also admits a browser page served from `origin`.
     fn cors_app(controller_url: String, origin: &str) -> Router {
         router(
-            AppState::new(controller_url),
+            state(&controller_url),
             guard(),
             Some(cors_layer(origin).unwrap()),
         )
@@ -608,6 +615,45 @@ mod tests {
             .expect("controller saw a request");
         assert_eq!(seen.method, "POST");
         assert_eq!(seen.path, "/nodes/strom-node-1/heartbeat");
+    }
+
+    /// A controller on standby: every request gets `503 not_leader`.
+    async fn standby_controller() -> String {
+        let app = Router::new().fallback(|| async {
+            ApiError::new(ApiErrorCode::NotLeader, "standby")
+                .response(StatusCode::SERVICE_UNAVAILABLE)
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn requests_reach_the_leading_controller_past_a_standby() {
+        let standby = standby_controller().await;
+        let (leader, captured) = stub_controller(StatusCode::OK).await;
+        let app = open_app(format!("{standby},{leader}"));
+        let desired = || {
+            Request::builder()
+                .uri("/nodes/strom-node-1/desired")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let response = app.clone().oneshot(desired()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            captured.lock().unwrap().clone().unwrap().path,
+            "/nodes/strom-node-1/desired"
+        );
+
+        let app = open_app(format!("{standby},{standby}"));
+        let response = app.oneshot(desired()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_json(response).await["code"], "not_leader");
     }
 
     #[tokio::test]
