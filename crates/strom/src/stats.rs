@@ -165,6 +165,17 @@ pub struct SessionStats {
     pub sessions: usize,
     pub bytes_received: i64,
     pub bytes_sent: i64,
+    /// The same bytes per entry, so progress can be followed per session.
+    pub by_session: Vec<SessionBytes>,
+}
+
+/// One `webrtc-stats` entry's cumulative RTP bytes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionBytes {
+    /// The entry's key, which names the session's webrtcbin.
+    pub key: String,
+    pub received: i64,
+    pub sent: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -218,8 +229,14 @@ pub fn parse_webrtc_stats(value: &Value) -> WebRtcStats {
         if !inbound.is_empty() || !outbound.is_empty() {
             block.sessions += 1;
         }
-        block.bytes_received += inbound.iter().map(|s| field_i64(s, "bytes")).sum::<i64>();
-        block.bytes_sent += outbound.iter().map(|s| field_i64(s, "bytes")).sum::<i64>();
+        let session = SessionBytes {
+            key: key.clone(),
+            received: inbound.iter().map(|s| field_i64(s, "bytes")).sum(),
+            sent: outbound.iter().map(|s| field_i64(s, "bytes")).sum(),
+        };
+        block.bytes_received += session.received;
+        block.bytes_sent += session.sent;
+        block.by_session.push(session);
     }
     WebRtcStats {
         blocks: blocks.into_values().collect(),
@@ -458,6 +475,19 @@ mod tests {
         assert_eq!(stats.blocks.len(), 1, "a key without a block is skipped");
         let egress = stats.egress_at(0).expect("whep_out_0");
         assert_eq!((egress.sessions, egress.bytes_sent), (2, 150));
+        let sent: Vec<(&str, i64)> = egress
+            .by_session
+            .iter()
+            .map(|session| (session.key.as_str(), session.sent))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                ("whep_out_0:session_a:webrtcbin-a", 100),
+                ("whep_out_0:session_b:webrtcbin-b", 50),
+                ("whep_out_0:session_c:webrtcbin-c", 0),
+            ]
+        );
     }
 
     #[test]

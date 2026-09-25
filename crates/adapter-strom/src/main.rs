@@ -22,8 +22,8 @@ use weave_core::{
     SrtSocket, Transport, TransportClass, VideoCodec, VideoConstraint,
 };
 use weave_strom::{
-    ElementStats, FlowSpec, FlowStats, SessionStats, StromClient, StromError, StromFlow,
-    WebRtcStats, flow_spec_from_hop, parse_flow_stats, parse_webrtc_stats,
+    ElementStats, FlowSpec, FlowStats, SessionBytes, SessionStats, StromClient, StromError,
+    StromFlow, WebRtcStats, flow_spec_from_hop, parse_flow_stats, parse_webrtc_stats,
 };
 
 use config::AdapterConfig;
@@ -505,11 +505,21 @@ async fn hop_statuses(
         let gst_paused = flow.and_then(|f| f.gst_state.as_deref()) == Some("Paused");
 
         let mut observe = |side: Side, spec: &SocketSpec, reading: &SocketReading| {
+            let bytes = match &reading.sessions {
+                Some(sessions) => {
+                    let sessions: Vec<(&str, i64)> = sessions
+                        .iter()
+                        .map(|(key, bytes)| (key.as_str(), *bytes))
+                        .collect();
+                    Some(tracker.session_total(&hop.id, side, &sessions))
+                }
+                None => reading.bytes,
+            };
             let stalled = tracker.observe(
                 &hop.id,
                 side,
                 SideObservation {
-                    bytes: reading.bytes,
+                    bytes,
                     running,
                     gst_paused: gst_paused && matches!(spec, SocketSpec::Srt(_)),
                 },
@@ -568,6 +578,8 @@ fn carries_webrtc(hop: &DesiredHop) -> bool {
 struct SocketReading {
     /// Cumulative bytes through the socket, `None` when its stats are unavailable.
     bytes: Option<i64>,
+    /// A WHIP or WHEP socket's bytes per session, in place of `bytes`.
+    sessions: Option<Vec<(String, i64)>>,
     /// An SRT socket has a connection; a WHIP or WHEP socket has a session
     /// carrying RTP.
     connected: bool,
@@ -580,7 +592,7 @@ impl SocketReading {
         match spec {
             SocketSpec::Srt(_) => Self::srt(srt.and_then(FlowStats::ingress), |e| e.bytes_received),
             SocketSpec::Whip(_) | SocketSpec::Whep(_) => webrtc
-                .map(|stats| Self::sessions(stats.ingress(), |b| b.bytes_received))
+                .map(|stats| Self::sessions(stats.ingress(), |b| b.received))
                 .unwrap_or_default(),
             SocketSpec::Rist(_) => Self::srt_egresses(srt),
             SocketSpec::Device(_) => Self::default(),
@@ -596,7 +608,7 @@ impl SocketReading {
         match spec {
             SocketSpec::Srt(_) => Self::srt(srt.and_then(|s| s.egress_at(index)), |e| e.bytes_sent),
             SocketSpec::Whip(_) | SocketSpec::Whep(_) => webrtc
-                .map(|stats| Self::sessions(stats.egress_at(index), |b| b.bytes_sent))
+                .map(|stats| Self::sessions(stats.egress_at(index), |b| b.sent))
                 .unwrap_or_default(),
             SocketSpec::Rist(_) => Self::srt_ingress(srt),
             SocketSpec::Device(_) => Self::default(),
@@ -609,6 +621,7 @@ impl SocketReading {
             connected: element.is_some_and(|e| e.connected),
             rate_mbps: element.map_or(0.0, |e| e.rate_mbps),
             stats: element.map(LinkStats::from),
+            ..Self::default()
         }
     }
 
@@ -632,11 +645,17 @@ impl SocketReading {
         }
     }
 
-    /// A block missing from Strom's reply carries nothing now, so its bytes read
-    /// zero rather than unknown.
-    fn sessions(block: Option<&SessionStats>, bytes: fn(&SessionStats) -> i64) -> Self {
+    /// A block missing from Strom's reply has no sessions, which is known, not
+    /// unknown.
+    fn sessions(block: Option<&SessionStats>, bytes: fn(&SessionBytes) -> i64) -> Self {
         Self {
-            bytes: Some(block.map_or(0, bytes)),
+            sessions: Some(block.map_or_else(Vec::new, |block| {
+                block
+                    .by_session
+                    .iter()
+                    .map(|session| (session.key.clone(), bytes(session)))
+                    .collect()
+            })),
             connected: block.is_some_and(|b| b.sessions > 0),
             ..Self::default()
         }
@@ -1421,6 +1440,118 @@ mod tests {
                 (LinkCondition::Flowing, LinkCondition::Flowing),
                 (LinkCondition::Idle, LinkCondition::Idle),
             ]
+        );
+    }
+
+    fn whep_sessions(sessions: &[(&str, i64)]) -> Value {
+        let connections: serde_json::Map<String, Value> = sessions
+            .iter()
+            .map(|(id, bytes)| {
+                (
+                    format!("whep_out_0:session_{id}:webrtcbin-{id}"),
+                    json!({
+                        "inbound_rtp": [],
+                        "outbound_rtp": [{ "media_type": "video", "bytes": bytes }],
+                    }),
+                )
+            })
+            .collect();
+        json!({ "flow_id": "id-a", "stats": { "connections": connections } })
+    }
+
+    /// A player that reconnects leaves its old session beside the new one until
+    /// Strom drops the old entry.
+    #[tokio::test]
+    async fn a_whep_egress_keeps_flowing_when_an_old_session_ends() {
+        let hop = srt_to_whep_hop();
+        let srt = json!({ "stats": { "connections": {
+            "srt_in:srtsrc": { "connected": true, "callers": [
+                { "recv_rate_mbps": 2.5, "bytes_received": 1000 }
+            ]}
+        }}});
+        let mut tracker = StallTracker::default();
+        let mut conditions = Vec::new();
+        for sessions in [
+            vec![("old", 5000), ("new", 100)],
+            vec![("old", 5000), ("new", 600)],
+            vec![("new", 1100)],
+            vec![("new", 1600)],
+        ] {
+            let status = poll(
+                &hop,
+                flow_in_state(&hop.id, "Playing"),
+                srt.clone(),
+                whep_sessions(&sessions),
+                &mut tracker,
+            )
+            .await;
+            conditions.push(status.egresses[0].status.condition);
+        }
+        assert_eq!(
+            conditions,
+            [
+                LinkCondition::Connected,
+                LinkCondition::Flowing,
+                LinkCondition::Flowing,
+                LinkCondition::Flowing,
+            ]
+        );
+    }
+
+    /// A source that carried media and left reads the same over WHIP as over
+    /// SRT: stalled once its bytes have not moved for three polls, so the
+    /// stream is `degraded` rather than `awaiting_input`.
+    #[tokio::test]
+    async fn a_source_that_leaves_stalls_over_whip_and_over_srt() {
+        let whip = whip_to_srt_hop();
+        let mut tracker = StallTracker::default();
+        let mut whip_conditions = Vec::new();
+        for recording in ["poll-0", "poll-1", "ended", "ended", "ended", "poll-0"] {
+            let status = poll(
+                &whip,
+                flow_in_state(&whip.id, "Playing"),
+                json!({}),
+                recorded_webrtc(recording),
+                &mut tracker,
+            )
+            .await;
+            whip_conditions.push(status.ingress.condition);
+        }
+
+        let srt = hop("weave-basic-sender", 7001);
+        let producer = |bytes: Option<i64>| match bytes {
+            Some(bytes) => json!({ "stats": { "connections": {
+                "srtsrc_0": { "connected": true, "callers": [
+                    { "recv_rate_mbps": 2.5, "bytes_received": bytes }
+                ]}
+            }}}),
+            None => json!({ "stats": { "connections": {
+                "srtsrc_0": { "connected": false, "callers": [] }
+            }}}),
+        };
+        let mut srt_conditions = Vec::new();
+        for bytes in [Some(1000), Some(2000), None, None, None, Some(500)] {
+            let status = poll(
+                &srt,
+                flow_in_state(&srt.id, "Playing"),
+                producer(bytes),
+                json!({}),
+                &mut tracker,
+            )
+            .await;
+            srt_conditions.push(status.ingress.condition);
+        }
+
+        use LinkCondition::{Connected, Flowing, Idle, Stalled};
+        assert_eq!(
+            whip_conditions,
+            [Connected, Flowing, Idle, Idle, Stalled, Flowing],
+            "WHIP"
+        );
+        assert_eq!(
+            srt_conditions,
+            [Flowing, Flowing, Idle, Idle, Stalled, Flowing],
+            "SRT"
         );
     }
 

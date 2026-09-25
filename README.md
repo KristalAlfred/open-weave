@@ -1156,8 +1156,11 @@ or whose WHIP/WHEP endpoint id or tracks do, is deleted and created again.
 The adapter reads an SRT socket's condition from Strom's `srt-stats` and a WHIP
 or WHEP socket's from `webrtc-stats`, which counts each session's RTP bytes. A
 WHIP or WHEP socket with no session carrying RTP is `idle`; with one, it is
-`flowing` while the bytes advance between polls and `connected` while they do
-not.
+`flowing` while its bytes advance between polls and `connected` while they do
+not. The bytes are followed per session, so a session that ends beside a live
+one does not read as a drop. Over either transport, a socket that carried media
+and whose bytes have not moved for three polls is `stalled`, whether its peer is
+still connected or gone, and the stream reads `degraded`.
 
 ## Quickstart
 

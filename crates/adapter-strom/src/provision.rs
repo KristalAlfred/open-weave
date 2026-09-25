@@ -52,6 +52,15 @@ const REDIAL_POLLS: u32 = 6;
 pub struct StallTracker {
     hops: HashMap<(String, Side), HopProgress>,
     unconnected_callers: HashMap<String, u32>,
+    sessions: HashMap<(String, Side), SessionTotal>,
+}
+
+/// A WebRTC side's bytes folded over its sessions: each session's last count,
+/// and the total they have carried since the side was first seen.
+#[derive(Debug, Default)]
+struct SessionTotal {
+    last: HashMap<String, i64>,
+    total: i64,
 }
 
 impl StallTracker {
@@ -93,8 +102,27 @@ impl StallTracker {
     }
 
     /// Drop tracked hops no longer desired so state cannot grow without bound.
+    /// Fold one poll's per-session byte counts for `side` of `hop_id` into one
+    /// total that never falls: each session adds what it carried since the last
+    /// poll, and a session that ends takes nothing away. The total is what
+    /// [`StallTracker::observe`] is fed for a WebRTC side, since a sum over the
+    /// sessions present would drop when one ends and read as no progress.
+    pub fn session_total(&mut self, hop_id: &str, side: Side, sessions: &[(&str, i64)]) -> i64 {
+        let entry = self.sessions.entry((hop_id.to_string(), side)).or_default();
+        let mut last = HashMap::with_capacity(sessions.len());
+        for (key, bytes) in sessions {
+            let before = entry.last.get(*key).copied().unwrap_or(0);
+            entry.total += (bytes - before).max(0);
+            last.insert((*key).to_string(), *bytes);
+        }
+        entry.last = last;
+        entry.total
+    }
+
     pub fn retain(&mut self, desired: &HashSet<&str>) {
         self.hops.retain(|(id, _), _| desired.contains(id.as_str()));
+        self.sessions
+            .retain(|(id, _), _| desired.contains(id.as_str()));
         self.unconnected_callers
             .retain(|id, _| desired.contains(id.as_str()));
     }
@@ -349,11 +377,11 @@ pub fn socket_condition(
 /// Map a WHIP or WHEP socket to its link condition, read from its own sessions
 /// in Strom's `webrtc-stats`.
 ///
-/// A socket with no session carrying RTP waits, `Idle` when it hosts and
-/// `Connecting` when it dials, whatever its bytes did: Strom stops reporting RTP
-/// for a session whose peer has gone. With a session up, a `stalled` verdict
-/// wins, as in [`socket_condition`]; otherwise the socket is `Flowing` when its
-/// bytes advanced this poll and `Connected` when they did not.
+/// A `stalled` verdict overrides all else, as in [`socket_condition`]: the
+/// socket carried media and its bytes have not moved since, whether its peer is
+/// still in session or gone. Otherwise a socket with no session carrying RTP
+/// waits, `Idle` when it hosts and `Connecting` when it dials; one in session is
+/// `Flowing` when its bytes advanced this poll and `Connected` when they did not.
 #[must_use]
 pub fn webrtc_condition(
     role: SocketRole,
@@ -361,21 +389,24 @@ pub fn webrtc_condition(
     advanced: bool,
     stalled: bool,
 ) -> LinkCondition {
+    if stalled {
+        return LinkCondition::Stalled;
+    }
     match (in_session, role) {
         (false, SocketRole::Listen) => LinkCondition::Idle,
         (false, SocketRole::Connect) => LinkCondition::Connecting,
-        (true, _) if stalled => LinkCondition::Stalled,
         (true, _) if advanced => LinkCondition::Flowing,
         (true, _) => LinkCondition::Connected,
     }
 }
 
 /// Map a RIST socket to its link condition, read from the SRT side of its hop:
-/// Strom reports nothing about RIST elements. The rule is [`webrtc_condition`]'s,
-/// with the SRT side's connection standing in for a session. A sender's RIST
-/// egress follows its SRT ingress and cannot tell whether anything receives; a
-/// receiver's RIST ingress follows its SRT egresses, so it waits until a
-/// consumer pulls.
+/// Strom reports nothing about RIST elements. A sender's RIST egress follows its
+/// SRT ingress and cannot tell whether anything receives; a receiver's RIST
+/// ingress follows its SRT egresses, so it waits until a consumer pulls. With
+/// no SRT connection the socket waits, `Idle` when it listens and `Connecting`
+/// when it dials; with one, a `stalled` verdict wins, then `Flowing` when the
+/// bytes advanced this poll and `Connected` when they did not.
 #[must_use]
 pub fn rist_condition(
     role: SocketRole,
@@ -383,7 +414,13 @@ pub fn rist_condition(
     advanced: bool,
     stalled: bool,
 ) -> LinkCondition {
-    webrtc_condition(role, srt_side_connected, advanced, stalled)
+    match (srt_side_connected, role) {
+        (false, SocketRole::Listen) => LinkCondition::Idle,
+        (false, SocketRole::Connect) => LinkCondition::Connecting,
+        (true, _) if stalled => LinkCondition::Stalled,
+        (true, _) if advanced => LinkCondition::Flowing,
+        (true, _) => LinkCondition::Connected,
+    }
 }
 
 /// Best-effort resolved address for a socket spec. A listener resolves to the
@@ -936,20 +973,36 @@ mod tests {
     }
 
     #[test]
-    fn webrtc_condition_reports_a_stall_only_while_a_session_is_up() {
+    fn webrtc_condition_reports_a_stall_whether_or_not_the_peer_is_in_session() {
         assert_eq!(
             webrtc_condition(SocketRole::Listen, true, false, true),
             LinkCondition::Stalled
         );
         assert_eq!(
             webrtc_condition(SocketRole::Listen, false, false, true),
-            LinkCondition::Idle,
-            "a peer that left is waited for, not stalled"
+            LinkCondition::Stalled,
+            "a peer that carried media and left is a stall, as over SRT"
         );
         assert_eq!(
             webrtc_condition(SocketRole::Connect, false, false, true),
-            LinkCondition::Connecting
+            LinkCondition::Stalled
         );
+    }
+
+    #[test]
+    fn session_total_never_falls_when_a_session_ends() {
+        let mut tracker = StallTracker::default();
+        let mut total =
+            |sessions: &[(&str, i64)]| tracker.session_total("weave-a", Side::Egress(0), sessions);
+        assert_eq!(total(&[("old", 5000), ("new", 100)]), 5100);
+        assert_eq!(total(&[("old", 5000), ("new", 600)]), 5600);
+        assert_eq!(
+            total(&[("new", 1100)]),
+            6100,
+            "the old session takes nothing away"
+        );
+        assert_eq!(total(&[]), 6100, "no session carries nothing");
+        assert_eq!(total(&[("next", 300)]), 6400);
     }
 
     fn whip_gateway_hop() -> DesiredHop {

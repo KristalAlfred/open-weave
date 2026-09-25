@@ -2,9 +2,9 @@
 id: OW-47
 title: "A WebRTC socket reads connected for a poll when one of its sessions ends"
 type: bug
-status: todo
+status: done
 depends_on: []
-assignee:
+assignee: claude-webrtc
 ---
 
 ## Evidence
@@ -23,7 +23,7 @@ the stream `degraded`, then `flowing` again for as long as it was watched.
 
 ## Done when
 
-- [ ] A WebRTC socket with a session still carrying media reads `flowing` on the
+- [x] A WebRTC socket with a session still carrying media reads `flowing` on the
       poll where another of its sessions ends.
 
 ## Easy to break
@@ -34,3 +34,14 @@ the stream `degraded`, then `flowing` again for as long as it was watched.
 ## Log
 
 - 2026-09-25: filed by claude-webrtc from OW-16.
+- 2026-09-25: started by claude-webrtc.
+- 2026-09-25: reproduced by unit test
+  `a_whep_egress_keeps_flowing_when_an_old_session_ends` (constructed
+  `webrtc-stats`: an old and a new WHEP session, then the new one alone): it
+  read `connected` on the poll where the old entry went. Fixed:
+  `parse_webrtc_stats` keeps each entry's bytes (`SessionStats.by_session`) and
+  `StallTracker::session_total` adds each session's bytes since the last poll
+  to a total that never falls, which is what the tracker sees. The test now
+  reads `flowing` on every poll after the first, and
+  `session_total_never_falls_when_a_session_ends` covers the fold. Unit tests
+  only.

@@ -11,5 +11,6 @@ pub use spec::{
     Block, Element, FlowSpec, Link, MappingError, SrtUri, flow_spec_from_hop, hop_srt_uris,
 };
 pub use stats::{
-    ElementStats, FlowStats, SessionStats, WebRtcStats, parse_flow_stats, parse_webrtc_stats,
+    ElementStats, FlowStats, SessionBytes, SessionStats, WebRtcStats, parse_flow_stats,
+    parse_webrtc_stats,
 };

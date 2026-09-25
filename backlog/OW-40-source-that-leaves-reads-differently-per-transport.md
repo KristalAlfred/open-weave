@@ -2,9 +2,9 @@
 id: OW-40
 title: "A source that leaves reads differently over WHIP and over SRT"
 type: bug
-status: todo
+status: done
 depends_on: []
-assignee:
+assignee: claude-webrtc
 ---
 
 ## Evidence
@@ -27,7 +27,7 @@ depending on the transport.
 
 ## Done when
 
-- [ ] A source that leaves gives the same stream status over WHIP and over SRT,
+- [x] A source that leaves gives the same stream status over WHIP and over SRT,
       and `README.md` says which.
 
 ## Unchecked
@@ -39,3 +39,15 @@ depending on the transport.
 ## Log
 
 - 2026-09-25: filed by claude-webrtc from OW-16.
+- 2026-09-25: started by claude-webrtc: WHIP/WHEP follow the stall rule SRT uses.
+- 2026-09-25: ticked. `webrtc_condition` puts a stall first, as
+  `socket_condition` does, and a WHIP or WHEP side with no session feeds the
+  stall tracker an unchanged byte total, so a socket that carried media and has
+  had none for three polls reads `stalled` and the stream `degraded`. Unit test
+  `a_source_that_leaves_stalls_over_whip_and_over_srt` drives a WHIP ingress
+  (recorded `webrtc-stats`) and an SRT listener ingress through the same
+  sequence on a `Playing` flow: flowing, the source leaves, `idle` for two
+  polls, `stalled` on the third, `flowing` when media comes back. `README.md`
+  ("Strom adapter and drift policy") says so. `rist_condition` keeps its old
+  rule, stalled only with the SRT side connected. Unit tests only; the
+  Unchecked question about `Paused` is still open.
