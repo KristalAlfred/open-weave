@@ -368,6 +368,14 @@ async function poll() {
   const el = document.getElementById("poll");
   try {
     const response = await fetch("/view");
+    if (response.status === 503) {
+      const body = await response.json().catch(() => ({}));
+      if (body.code === "not_leader") {
+        el.className = "poll err";
+        el.textContent = "standby: another controller leads";
+        return;
+      }
+    }
     if (!response.ok) throw new Error(response.status);
     const view = await response.json();
     renderHeader(view.report);

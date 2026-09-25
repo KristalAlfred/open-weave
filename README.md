@@ -94,7 +94,9 @@ operator/system
 Requests flow left to right: the CLI calls northbound, adapters call southbound,
 and both of those call the controller. The controller answers no request by
 calling back out; its one outbound call is the webhook below,
-which is fire-and-forget and off unless configured.
+which is fire-and-forget and off unless configured. With Postgres, several
+controllers can share one database, and only the one holding the lease serves
+(see [Controller failover](#controller-failover)).
 
 The core rule is: **wide southbound ecosystem, narrow adapter contract**. A
 southbound implementation may only discover, only report health, or fully
@@ -126,7 +128,8 @@ listing and from the store:
 A node that a stored stream names as its source, a destination or a `via` relay
 is never removed, and stays listed as `offline`. A removed node's next heartbeat
 gets `404 node_not_found`, and both shipped nodes then register again. For a
-node loaded from the store, both intervals count from the controller's start.
+node loaded from the store, both intervals count from the controller's start,
+or from the moment it took the lease.
 
 `GET /nodes/{id}/desired` returns the full list of hops the last reconcile tick
 computed for that node. A node that tick did not cover, because it is unknown or
@@ -641,7 +644,9 @@ capture, while its dial-only attachment shows it exposes no media listener.
 contract. `event_id` is the node id or stream name followed by a number. It is stable
 across retries of one delivery, so a receiver can deduplicate, and it is not
 reused, including by a restarted controller: the number counts up from the
-controller's start time in microseconds.
+controller's start time in microseconds. With `DATABASE_URL` it counts from the
+moment the controller took the lease, on the Postgres clock, so a controller
+taking over from another sends none of its ids either.
 
 ```json
 {
@@ -681,8 +686,8 @@ conditions. `stream` has the stream's `name`, `generation`,
 each destination with its stable `reason` code. It leaves out the stream's nodes
 and every address, which `/status` and `/streams/{name}/endpoints` carry. A tick
 sends at most one event per stream. The first tick after a controller start
-sends one for every stream, because the controller keeps no conditions across a
-restart. A change of `detail`
+or takeover sends one for every stream, because the controller keeps no
+conditions across either (backlog/OW-39). A change of `detail`
 alone sends nothing, and deleting a stream sends nothing. An event follows the
 change it reports by up to one reconcile interval plus an adapter poll.
 
@@ -694,7 +699,9 @@ Emitting never blocks a registration or a reconcile tick. Events are queued and
 delivered by one background worker, in order, retried with backoff on a connect
 error or 5xx and abandoned after four attempts; a 4xx is the receiver rejecting
 the event and is not retried. A full queue drops rather than waits, and the queue is in memory, so
-events do not survive a controller restart.
+events do not survive a controller restart. A controller that loses the lease
+keeps delivering what it queued before, so around a takeover a receiver can get
+the two controllers' events interleaved.
 
 **Delivery is at-least-once and incomplete by design.** A receiver reconciles
 against `GET /nodes` and `/status` on boot and treats events as hints, not truth.
@@ -703,6 +710,51 @@ The bearer token authenticates the controller to the receiver; it does not let
 the receiver tell a genuine event from anyone who has learned the token. A
 receiver outside the trust boundary wants a body signature instead, which is not
 implemented.
+
+## Controller failover
+
+With `DATABASE_URL` set, a controller serves only while it holds a lease, a row
+in Postgres. Any number of controllers can share one database: one leads and
+the others stand by. Without `DATABASE_URL` there is no lease and one
+controller.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WEAVE_LEASE_TTL_SECS` | `10` | Seconds the lease lasts without a renewal. |
+
+- A standby answers `503 not_leader` on every route except `/health`, `/` and
+  `/ui`. It runs no reconcile tick and sends no webhook. `/health` answers `200`
+  on both; `/status` tells them apart.
+- The leader renews the lease every third of the TTL. When no renewal has
+  succeeded for two thirds of the TTL, it stops serving and writing and stands
+  by. The lease runs out on the Postgres clock a third of the TTL after that, so
+  no standby can take over while the old leader still serves.
+- A standby tries for the lease every second, or every third of the TTL if that
+  is shorter. When it gets the lease it loads the stored state, runs one
+  reconcile tick, and then serves. Hops are planned from the streams and node
+  registrations in Postgres, so it serves the hops the old leader served and
+  adapters keep their flows. The exception is an automatic relay: the old
+  leader skipped a node it had marked `offline`, and the new one reads that
+  node's registered status until it goes offline again.
+- Every write checks the lease in its own transaction and fails with
+  `503 not_leader` unless the writer holds it. A takeover waits for a write
+  already past that check, and the new leader loads it.
+- On SIGTERM or SIGINT the leader gives the lease up, and a standby takes over
+  on its next try. A leader that crashes keeps the lease until it runs out, so
+  a lone controller restarting after a crash answers `503 not_leader` until
+  then.
+- Streams, stream sets, node registrations, generations, revisions and ETags
+  live in Postgres and survive a takeover. Heartbeats and conditions do not.
+  The new leader counts every stored node as heard at the takeover and uses the
+  status and hop status the node last registered with, until the node
+  heartbeats. Conditions start over as after a restart (backlog/OW-39).
+- Every controller needs the same `WEAVE_SRT_KEY_SECRET` and
+  `WEAVE_SOUTHBOUND_KEY`. With another SRT key secret, a new leader gives every
+  link a new key and each adapter recreates its flows; with another southbound
+  key it refuses every node's token.
+- Postgres is one instance. While no controller can reach it, none leads.
+
+Northbound and southbound relay a standby's `503 not_leader` as it is.
 
 ## Capabilities and topology
 

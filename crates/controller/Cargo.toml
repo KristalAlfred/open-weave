@@ -31,9 +31,9 @@ sqlx = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 getrandom = { workspace = true }
+tower = { workspace = true }
 
 [dev-dependencies]
-tower = { workspace = true }
 http-body-util = { workspace = true }
 
 [lints]

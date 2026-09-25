@@ -2,6 +2,9 @@
 //! stream and node registries (persisted to Postgres), serves the northbound and
 //! southbound HTTP surfaces, and reconciles desired streams into per-node desired
 //! hops on a fixed interval, entirely from in-memory state.
+//!
+//! With Postgres, any number of controllers can share one database. The one
+//! holding the lease serves; the others answer `503 not_leader` until it lapses.
 
 mod desired;
 #[cfg(test)]
@@ -18,6 +21,7 @@ mod store;
 mod webhook;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -34,6 +38,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use tower::ServiceExt;
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{
     self, Guard, NodeCaller, NodeGuard, refuse_other_node, require_bearer, require_node_token,
@@ -60,7 +65,8 @@ use path::{
     destination_path_status, path_status, stream_endpoints,
 };
 use store::{
-    MemStore, PgStore, StateStore, StoreError, StoredStream, StreamSetMemberAction, StreamSetWrite,
+    LeaseTerm, MemStore, PgStore, StateStore, StoreError, StoredStream, StreamSetMemberAction,
+    StreamSetWrite,
 };
 
 #[derive(Debug, Parser)]
@@ -84,6 +90,10 @@ struct Args {
     /// in-memory store and does not persist state across restarts.
     #[arg(long, env = "DATABASE_URL")]
     database_url: Option<String>,
+    /// With `DATABASE_URL`, how long the controller lease lasts without a
+    /// renewal. A standby takes over at most this long after the leader stops.
+    #[arg(long, env = "WEAVE_LEASE_TTL_SECS", default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
+    lease_ttl_secs: u64,
     /// Absolute URL that receives node and stream events. Webhooks are off when unset.
     #[arg(long, env = "WEAVE_WEBHOOK_URL")]
     webhook_url: Option<String>,
@@ -355,24 +365,6 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let interval = Duration::from_secs(args.interval_secs);
-    let node_ttl = Duration::from_secs(args.node_ttl_secs);
-    let node_forget = Duration::from_secs(args.node_forget_secs);
-
-    let store: Arc<dyn StateStore> = match &args.database_url {
-        Some(url) => {
-            tracing::info!("connecting controller store to postgres");
-            Arc::new(
-                PgStore::connect(url)
-                    .await
-                    .context("opening postgres store")?,
-            )
-        }
-        None => {
-            tracing::warn!("DATABASE_URL unset; using in-memory store (state is not persisted)");
-            Arc::new(MemStore::new())
-        }
-    };
 
     let north = Guard::from_env(auth::NORTHBOUND_TOKEN_VAR)?;
     let south = NodeGuard::from_env(auth::SOUTHBOUND_KEY_VAR)?;
@@ -385,7 +377,7 @@ async fn main() -> Result<()> {
     let (keys, secret_source) = LinkKeys::from_env()?;
     if secret_source == SecretSource::Generated {
         tracing::warn!(
-            "{} unset: generated a random one, so every SRT link key changes when the controller restarts",
+            "{} unset: generated a random one, so every SRT link key changes when the controller restarts or another controller takes over",
             keys::SECRET_VAR
         );
     }
@@ -398,26 +390,368 @@ async fn main() -> Result<()> {
     })
     .map(Arc::new);
 
-    let state = AppState::hydrate(store, node_ttl, node_forget, webhooks, keys).await?;
-    let app = router_after_first_tick(&state, north, south).await;
-    let api = spawn_api_server(args.listen.clone(), app);
-
+    let pg = match &args.database_url {
+        Some(url) => {
+            tracing::info!("connecting controller store to postgres");
+            Some(Arc::new(
+                PgStore::connect(url)
+                    .await
+                    .context("opening postgres store")?,
+            ))
+        }
+        None => {
+            tracing::warn!("DATABASE_URL unset; using in-memory store (state is not persisted)");
+            None
+        }
+    };
+    let controller = Controller {
+        store: match &pg {
+            Some(pg) => pg.clone(),
+            None => Arc::new(MemStore::new()),
+        },
+        node_ttl: Duration::from_secs(args.node_ttl_secs),
+        node_forget: Duration::from_secs(args.node_forget_secs),
+        webhooks,
+        keys,
+        north,
+        south,
+        interval: Duration::from_secs(args.interval_secs),
+    };
     tracing::info!(interval_secs = args.interval_secs, "controller starting");
 
-    loop {
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                result.context("waiting for shutdown signal")?;
-                tracing::info!("controller shutting down");
-                api.abort();
-                return Ok(());
-            }
-            () = async {
-                tokio::time::sleep(interval).await;
-                reconcile_tick(&state).await;
-            } => {}
+    match pg {
+        Some(pg) => {
+            let leadership = Leadership::default();
+            let api = spawn_api_server(
+                bind(&args.listen).await?,
+                leadership_router(leadership.clone()),
+            );
+            let timing = LeaseTiming::new(Duration::from_secs(args.lease_ttl_secs));
+            let result = run_with_lease(pg, &controller, &leadership, timing, shutdown()).await;
+            api.abort();
+            result
+        }
+        None => {
+            let (state, app) = controller.lead().await?;
+            let api = spawn_api_server(bind(&args.listen).await?, app);
+            let result = tokio::select! {
+                result = shutdown() => result,
+                never = tick_every(&state, controller.interval) => match never {},
+            };
+            api.abort();
+            result
         }
     }
+}
+
+/// Everything a controller needs to start leading, whenever it gets to.
+struct Controller {
+    store: Arc<dyn StateStore>,
+    node_ttl: Duration,
+    node_forget: Duration,
+    webhooks: Option<Arc<webhook::Emitter>>,
+    keys: LinkKeys,
+    north: Guard,
+    south: NodeGuard,
+    interval: Duration,
+}
+
+impl Controller {
+    /// Load the stored state and run a first tick over it, giving the state the
+    /// tick loop drives and the router that serves it.
+    async fn lead(&self) -> Result<(AppState, Router)> {
+        let state = AppState::hydrate(
+            self.store.clone(),
+            self.node_ttl,
+            self.node_forget,
+            self.webhooks.clone(),
+            self.keys.clone(),
+        )
+        .await?;
+        let app = router_after_first_tick(&state, self.north.clone(), self.south.clone()).await;
+        Ok((state, app))
+    }
+}
+
+async fn tick_every(state: &AppState, interval: Duration) -> Infallible {
+    loop {
+        tokio::time::sleep(interval).await;
+        reconcile_tick(state).await;
+    }
+}
+
+async fn shutdown() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("waiting for SIGTERM")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.context("waiting for shutdown signal")?,
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for shutdown signal")?;
+    tracing::info!("controller shutting down");
+    Ok(())
+}
+
+/// How often the lease is renewed and how long the leader serves without a
+/// renewal. `hold_for` ends a third of the TTL before the lease can expire, so
+/// a leader cut off from Postgres stops serving before a standby can take over.
+#[derive(Debug, Clone, Copy)]
+struct LeaseTiming {
+    ttl: Duration,
+    renew_every: Duration,
+    hold_for: Duration,
+    retry_every: Duration,
+}
+
+impl LeaseTiming {
+    fn new(ttl: Duration) -> Self {
+        let third = ttl / 3;
+        Self {
+            ttl,
+            renew_every: third,
+            hold_for: ttl - third,
+            retry_every: third.min(Duration::from_secs(1)),
+        }
+    }
+}
+
+/// Which router, if any, a controller on a shared store serves.
+#[derive(Clone, Default)]
+struct Leadership(Arc<std::sync::RwLock<Role>>);
+
+#[derive(Default)]
+enum Role {
+    #[default]
+    Standby,
+    Taking,
+    Leading(Router),
+}
+
+impl Leadership {
+    fn set(&self, role: Role) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = role;
+    }
+
+    fn taking(&self) {
+        self.set(Role::Taking);
+    }
+
+    /// Serve `app`, unless the lease was lost since [`Leadership::taking`].
+    fn lead(&self, app: Router) -> bool {
+        let mut role = self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(*role, Role::Taking) {
+            return false;
+        }
+        *role = Role::Leading(app);
+        true
+    }
+
+    fn stand_by(&self) {
+        self.set(Role::Standby);
+    }
+
+    fn router(&self) -> Option<Router> {
+        match &*self
+            .0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            Role::Leading(app) => Some(app.clone()),
+            Role::Standby | Role::Taking => None,
+        }
+    }
+}
+
+/// Serve the dashboard page and `/health` always, and everything else from the
+/// leader's router, or `503 not_leader` while there is none.
+fn leadership_router(leadership: Leadership) -> Router {
+    Router::new()
+        .route("/", get(ui))
+        .route("/ui", get(ui))
+        .route("/health", get(health))
+        .fallback(serve_if_leading)
+        .with_state(leadership)
+}
+
+async fn serve_if_leading(
+    State(leadership): State<Leadership>,
+    request: axum::extract::Request,
+) -> Response {
+    match leadership.router() {
+        Some(app) => match app.oneshot(request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        },
+        None => not_leader(),
+    }
+}
+
+fn not_leader() -> Response {
+    error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        ApiErrorCode::NotLeader,
+        "this controller does not hold the lease; another controller leads",
+    )
+}
+
+/// Take the lease whenever it is free, lead until it is lost, and stand by
+/// again, until `shutdown` resolves. A lease held at shutdown is released so a
+/// standby takes over at once.
+async fn run_with_lease(
+    pg: Arc<PgStore>,
+    controller: &Controller,
+    leadership: &Leadership,
+    timing: LeaseTiming,
+    shutdown: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    tokio::pin!(shutdown);
+    let holder = holder_id()?;
+    tracing::info!(%holder, "standing by for the controller lease");
+    loop {
+        let (term, asked) = tokio::select! {
+            taken = wait_for_lease(&pg, &holder, timing) => taken,
+            result = &mut shutdown => return result,
+        };
+        tracing::info!(
+            epoch = term.epoch,
+            "took the controller lease; loading state"
+        );
+        leadership.taking();
+        let mut hold = tokio::spawn(hold_lease(pg.clone(), leadership.clone(), asked, timing));
+        if let Some(emitter) = &controller.webhooks {
+            emitter.count_from(term.started_micros);
+        }
+        let led = tokio::select! {
+            led = controller.lead() => led,
+            lost = &mut hold => {
+                tracing::warn!(reason = lost.unwrap_or("renewal task failed"), "lost the controller lease while loading state; standing by");
+                continue;
+            }
+            result = &mut shutdown => {
+                step_down(&pg, leadership, hold).await;
+                return result;
+            }
+        };
+        let state = match led {
+            Ok((state, app)) => {
+                if !leadership.lead(app) {
+                    let lost = hold.await;
+                    tracing::warn!(
+                        reason = lost.unwrap_or("renewal task failed"),
+                        "lost the controller lease while loading state; standing by"
+                    );
+                    continue;
+                }
+                state
+            }
+            Err(err) => {
+                step_down(&pg, leadership, hold).await;
+                return Err(err);
+            }
+        };
+        tracing::info!(epoch = term.epoch, "leading");
+        let lost = tokio::select! {
+            lost = &mut hold => lost,
+            result = &mut shutdown => {
+                step_down(&pg, leadership, hold).await;
+                return result;
+            }
+            never = tick_every(&state, controller.interval) => match never {},
+        };
+        tracing::warn!(
+            epoch = term.epoch,
+            reason = lost.unwrap_or("renewal task failed"),
+            "lost the controller lease; standing by"
+        );
+    }
+}
+
+async fn step_down(pg: &PgStore, leadership: &Leadership, hold: JoinHandle<&'static str>) {
+    hold.abort();
+    leadership.stand_by();
+    if let Err(err) = pg.release_lease().await {
+        tracing::warn!(%err, "releasing the controller lease failed; it expires on its own");
+    }
+}
+
+fn holder_id() -> Result<String> {
+    let mut id = [0u8; 8];
+    getrandom::fill(&mut id)
+        .map_err(|err| anyhow::anyhow!("generating a lease holder id: {err}"))?;
+    Ok(id.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Try for the lease until it is taken. The instant is from before the try
+/// that took it, so a hold counted from it ends no later than the lease.
+async fn wait_for_lease(pg: &PgStore, holder: &str, timing: LeaseTiming) -> (LeaseTerm, Instant) {
+    let mut held_elsewhere = false;
+    loop {
+        let asked = Instant::now();
+        match pg.acquire_lease(holder, timing.ttl).await {
+            Ok(Some(term)) => return (term, asked),
+            Ok(None) if !held_elsewhere => {
+                tracing::info!("another controller holds the lease");
+                held_elsewhere = true;
+            }
+            Ok(None) => {}
+            Err(err) => tracing::warn!(%err, "taking the controller lease failed; retrying"),
+        }
+        tokio::time::sleep(timing.retry_every).await;
+    }
+}
+
+/// Renew the lease until a renewal is refused or none succeeds within
+/// `hold_for` of the last one sent. Then stop serving and writing, before the
+/// lease can expire, and say why.
+async fn hold_lease(
+    pg: Arc<PgStore>,
+    leadership: Leadership,
+    asked: Instant,
+    timing: LeaseTiming,
+) -> &'static str {
+    let mut deadline = asked + timing.hold_for;
+    let mut wait = timing.renew_every;
+    let reason = loop {
+        tokio::time::sleep_until((Instant::now() + wait).min(deadline).into()).await;
+        let sent = Instant::now();
+        if sent >= deadline {
+            break "no renewal succeeded in time";
+        }
+        match tokio::time::timeout_at(deadline.into(), pg.renew_lease(timing.ttl)).await {
+            Ok(Ok(true)) => {
+                deadline = sent + timing.hold_for;
+                wait = timing.renew_every;
+            }
+            Ok(Ok(false)) => break "the lease expired or another controller took it",
+            Ok(Err(err)) => {
+                tracing::warn!(%err, "renewing the controller lease failed; retrying");
+                wait = timing.retry_every;
+            }
+            Err(_) => break "no renewal succeeded in time",
+        }
+    };
+    leadership.stand_by();
+    pg.drop_lease();
+    reason
+}
+
+async fn bind(addr: &str) -> Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding controller listener on {addr}"))
 }
 
 /// The router, built only once a reconcile tick has filled the desired map.
@@ -847,12 +1181,11 @@ async fn require_shared_read_bearer(
     unauthorized()
 }
 
-fn spawn_api_server(addr: String, app: Router) -> JoinHandle<Result<()>> {
+fn spawn_api_server(listener: tokio::net::TcpListener, app: Router) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .with_context(|| format!("binding controller listener on {addr}"))?;
-        tracing::info!(%addr, "controller API listening");
+        if let Ok(addr) = listener.local_addr() {
+            tracing::info!(%addr, "controller API listening");
+        }
         axum::serve(listener, app)
             .await
             .context("controller server error")?;
@@ -1307,6 +1640,7 @@ async fn put_stream_set(
             Err(StoreError::DuplicateStreamName { .. }) => {
                 return invalid_request("stream-set validation failed", Vec::new());
             }
+            Err(StoreError::NotLeader) => return not_leader(),
             Err(err) => {
                 tracing::error!(%err, %owner, "persisting stream set failed");
                 return error(
@@ -1393,6 +1727,7 @@ async fn submit_stream(
                     "stream belongs to a stream set",
                 );
             }
+            Err(StoreError::NotLeader) => return not_leader(),
             Err(err) => {
                 tracing::error!(%err, %name, "persisting stream failed");
                 return error(
@@ -1529,6 +1864,7 @@ async fn delete_stream(
                 "stream belongs to a stream set",
             );
         }
+        Err(StoreError::NotLeader) => return not_leader(),
         Err(err) => {
             tracing::error!(%err, %name, "deleting stream failed");
             return error(
@@ -1675,13 +2011,17 @@ async fn register_node(
     let summary = NodeSummary::from(&registration.node);
     {
         let mut nodes = state.nodes.write().await;
-        if let Err(err) = state.store.upsert_node(&registration).await {
-            tracing::error!(%err, %node_id, "persisting node registration failed");
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiErrorCode::PersistenceFailed,
-                "failed to persist node registration",
-            );
+        match state.store.upsert_node(&registration).await {
+            Ok(()) => {}
+            Err(StoreError::NotLeader) => return not_leader(),
+            Err(err) => {
+                tracing::error!(%err, %node_id, "persisting node registration failed");
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ApiErrorCode::PersistenceFailed,
+                    "failed to persist node registration",
+                );
+            }
         }
         nodes.insert(node_id.clone(), registration);
         state
@@ -4258,9 +4598,300 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a running Postgres via DATABASE_URL"]
     async fn a_restart_on_postgres_serves_the_stored_hops_on_its_first_request() {
-        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set for ignored test");
-        let store: Arc<dyn StateStore> = Arc::new(PgStore::connect(&url).await.expect("connect"));
+        let url = store::tests::fresh_database().await;
+        let store: Arc<dyn StateStore> = Arc::new(store::tests::leading_pg_store(&url).await);
         assert_a_restart_serves_the_stored_hops(store).await;
+    }
+
+    async fn get_ok(app: &Router, uri: &str) -> Value {
+        let (status, body) = send(app, "GET", uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        body
+    }
+
+    #[tokio::test]
+    async fn a_standby_answers_not_leader_on_every_api_route() {
+        let app = leadership_router(Leadership::default());
+        for (method, uri) in [
+            ("GET", "/status"),
+            ("GET", "/streams"),
+            ("POST", "/streams"),
+            ("GET", "/streams/basic"),
+            ("DELETE", "/streams/basic"),
+            ("GET", "/streams/basic/endpoints"),
+            ("POST", "/stream-plans"),
+            ("GET", "/stream-sets"),
+            ("PUT", "/stream-sets/production"),
+            ("GET", "/nodes"),
+            ("POST", "/nodes/register"),
+            ("POST", "/nodes/strom-node-1/heartbeat"),
+            ("GET", "/nodes/strom-node-1/desired"),
+            ("GET", "/endpoints"),
+            ("GET", "/state"),
+            ("GET", "/view"),
+            ("GET", "/v1/status"),
+        ] {
+            let (status, body) = send(&app, method, uri, None).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{method} {uri}");
+            assert_eq!(body["code"], "not_leader", "{method} {uri}");
+        }
+        assert_eq!(get_ok(&app, "/health").await["status"], "ok");
+        for page in ["/", "/ui"] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(page).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{page}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_leader_serves_through_the_gate_until_it_stands_by() {
+        let (state, _mem) = mem_state();
+        two_nodes_and_basic(&state).await;
+        let leadership = Leadership::default();
+        let app = leadership_router(leadership.clone());
+
+        leadership.taking();
+        assert_eq!(
+            desired_hops(&app, "strom-node-1").await.0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "nothing is served while the state loads"
+        );
+        let led = router_after_first_tick(&state, Guard::Disabled, NodeGuard::Disabled).await;
+        assert!(leadership.lead(led));
+        let hops = get_ok(&app, "/nodes/strom-node-1/desired").await;
+        assert_eq!(hops.as_array().map(Vec::len), Some(1), "{hops}");
+
+        leadership.stand_by();
+        let (status, body) = desired_hops(&app, "strom-node-1").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "not_leader");
+    }
+
+    #[test]
+    fn a_lease_lost_while_the_state_loads_is_never_served() {
+        let (state, _mem) = mem_state();
+        let leadership = Leadership::default();
+        leadership.taking();
+        leadership.stand_by();
+
+        assert!(!leadership.lead(open_router(state)));
+        assert!(leadership.router().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_takeover_counts_every_stored_node_as_heard_at_the_takeover() {
+        let store = Arc::new(MemStore::new());
+        seed_restart_case(store.as_ref()).await;
+        store
+            .upsert_node(&node_registration("spare-node", "172.28.0.10"))
+            .await
+            .unwrap();
+        let took_over = Instant::now();
+        let state = AppState::hydrate(
+            store,
+            Duration::from_secs(15),
+            Duration::ZERO,
+            None,
+            LinkKeys::for_tests(),
+        )
+        .await
+        .unwrap();
+        let app = router_after_first_tick(&state, Guard::Disabled, NodeGuard::Disabled).await;
+
+        let nodes: Vec<NodeDescriptor> =
+            serde_json::from_value(get_ok(&app, "/nodes").await).unwrap();
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| (node.id.as_str(), node.status))
+                .collect::<Vec<_>>(),
+            [
+                ("restart-node-1", NodeStatus::Ready),
+                ("restart-node-2", NodeStatus::Ready),
+                ("spare-node", NodeStatus::Ready),
+            ],
+            "the first tick marks nobody offline and forgets nobody, with a zero forget interval"
+        );
+        assert!(
+            state
+                .last_seen
+                .read()
+                .await
+                .values()
+                .all(|seen| *seen >= took_over)
+        );
+    }
+
+    async fn pg_controller(url: &str) -> (Arc<PgStore>, Controller) {
+        let pg = Arc::new(PgStore::connect(url).await.expect("connect"));
+        let controller = Controller {
+            store: pg.clone(),
+            node_ttl: Duration::from_secs(15),
+            node_forget: Duration::from_secs(300),
+            webhooks: None,
+            keys: LinkKeys::for_tests(),
+            north: Guard::Disabled,
+            south: NodeGuard::Disabled,
+            interval: Duration::from_millis(200),
+        };
+        (pg, controller)
+    }
+
+    /// Runs [`run_with_lease`] until the returned sender fires or is dropped.
+    async fn start_controller(
+        url: &str,
+        timing: LeaseTiming,
+    ) -> (
+        Arc<PgStore>,
+        Leadership,
+        tokio::sync::oneshot::Sender<()>,
+        JoinHandle<Result<()>>,
+    ) {
+        let (pg, controller) = pg_controller(url).await;
+        let leadership = Leadership::default();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let run = tokio::spawn({
+            let pg = pg.clone();
+            let leadership = leadership.clone();
+            async move {
+                run_with_lease(pg, &controller, &leadership, timing, async {
+                    let _ = stopped.await;
+                    Ok(())
+                })
+                .await
+            }
+        });
+        (pg, leadership, stop, run)
+    }
+
+    async fn until_leading(leadership: &Leadership, within: Duration) {
+        let deadline = Instant::now() + within;
+        while leadership.router().is_none() {
+            assert!(Instant::now() < deadline, "not leading within {within:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn until_standing_by(leadership: &Leadership, within: Duration) {
+        let deadline = Instant::now() + within;
+        while leadership.router().is_some() {
+            assert!(Instant::now() < deadline, "still leading after {within:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// What a takeover must keep: the hops each node is told to run, and every
+    /// generation and ETag.
+    async fn served_state(app: &Router) -> Value {
+        let (_, stream_headers, stream) =
+            send_with_headers(app, "GET", "/streams/restart", None, &[]).await;
+        let (_, set_headers, _) =
+            send_with_headers(app, "GET", "/stream-sets/production", None, &[]).await;
+        json!({
+            "node-1": get_ok(app, "/nodes/restart-node-1/desired").await,
+            "node-2": get_ok(app, "/nodes/restart-node-2/desired").await,
+            "stream": stream,
+            "stream_etag": response_etag(&stream_headers),
+            "set_etag": response_etag(&set_headers),
+        })
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running Postgres via DATABASE_URL"]
+    async fn a_standby_on_postgres_takes_over_when_the_leader_stops() {
+        let url = store::tests::fresh_database().await;
+        let seed = store::tests::leading_pg_store(&url).await;
+        seed_restart_case(&seed).await;
+        seed.create_stream_set(
+            "production",
+            &[stream_between("owned", "restart-node-2", "restart-node-1")],
+            true,
+        )
+        .await
+        .unwrap();
+        seed.release_lease().await.unwrap();
+        let timing = LeaseTiming::new(Duration::from_secs(1));
+
+        let (first_pg, first, stop_first, first_run) = start_controller(&url, timing).await;
+        until_leading(&first, Duration::from_secs(5)).await;
+        let first_app = leadership_router(first.clone());
+        let before = served_state(&first_app).await;
+        assert_eq!(
+            before["node-1"].as_array().map(Vec::len),
+            Some(2),
+            "{before}"
+        );
+
+        let (_second_pg, second, _stop_second, _second_run) = start_controller(&url, timing).await;
+        let second_app = leadership_router(second.clone());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(second.router().is_none(), "the lease has one holder");
+        assert_eq!(
+            desired_hops(&second_app, "restart-node-1").await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            served_state(&first_app).await,
+            before,
+            "renewals keep it leading"
+        );
+
+        stop_first.send(()).unwrap();
+        first_run.await.unwrap().unwrap();
+        assert_eq!(
+            desired_hops(&first_app, "restart-node-1").await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(matches!(
+            first_pg
+                .upsert_node(&node_registration("late", "172.28.0.10"))
+                .await,
+            Err(StoreError::NotLeader)
+        ));
+
+        until_leading(&second, Duration::from_secs(3)).await;
+        assert_eq!(
+            served_state(&second_app).await,
+            before,
+            "the new leader serves the same hops, generations and ETags"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running Postgres via DATABASE_URL"]
+    async fn a_leader_whose_lease_is_taken_stops_serving_and_stands_by() {
+        let url = store::tests::fresh_database().await;
+        let timing = LeaseTiming::new(Duration::from_secs(1));
+        let (_pg, leadership, _stop, _run) = start_controller(&url, timing).await;
+        until_leading(&leadership, Duration::from_secs(5)).await;
+
+        let other = sqlx::PgPool::connect(&url).await.unwrap();
+        sqlx::query(
+            "UPDATE controller_lease SET holder = 'other', epoch = epoch + 1,
+             expires_at = now() + interval '2 seconds'",
+        )
+        .execute(&other)
+        .await
+        .unwrap();
+        until_standing_by(&leadership, timing.renew_every * 3).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            leadership.router().is_none(),
+            "it waits while the other holder's lease lasts"
+        );
+
+        until_leading(&leadership, Duration::from_secs(3)).await;
+        let epoch: i64 = sqlx::query_scalar("SELECT epoch FROM controller_lease")
+            .fetch_one(&other)
+            .await
+            .unwrap();
+        assert_eq!(
+            epoch, 3,
+            "it took the lease again once the other one lapsed"
+        );
     }
 
     #[tokio::test]

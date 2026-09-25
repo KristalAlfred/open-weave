@@ -21,7 +21,8 @@
         "incompatible_protocol_version",
         "persistence_failed",
         "controller_unreachable",
-        "encoding_failed"
+        "encoding_failed",
+        "not_leader"
       ],
       "type": "string"
     },

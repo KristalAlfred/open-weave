@@ -1,7 +1,11 @@
 //! Persistence for operator stream definitions, stream-set ownership, and node
 //! registrations. Everything else (observed hop status, computed desired hops,
 //! endpoints) is derived in memory and never stored.
+//!
+//! Postgres also holds the controller lease. Only the controller holding it
+//! writes: every write checks the lease in its own transaction.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -55,6 +59,8 @@ pub enum StoreError {
     OwnershipConflict { name: String },
     #[error("stream set contains duplicate stream {name:?}")]
     DuplicateStreamName { name: String },
+    #[error("this controller does not hold the controller lease")]
+    NotLeader,
 }
 
 fn positive_counter(value: i64, field: &'static str) -> Result<u64, StoreError> {
@@ -132,9 +138,21 @@ fn decode_registrations(rows: Vec<(String, serde_json::Value)>) -> Vec<NodeRegis
         .collect()
 }
 
+/// One controller's hold on the lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseTerm {
+    /// One more than the previous holder's. Writes carry it as their fence.
+    pub epoch: u64,
+    /// When the lease was taken, in microseconds since the Unix epoch on the
+    /// Postgres clock, which every controller shares.
+    pub started_micros: u64,
+}
+
 /// Postgres-backed store with its schema created idempotently on connect.
 pub struct PgStore {
     pool: sqlx::PgPool,
+    /// The lease epoch this store holds, or 0 for none.
+    epoch: AtomicU64,
 }
 
 impl PgStore {
@@ -146,7 +164,10 @@ impl PgStore {
     /// window or the schema DDL fails.
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
         let pool = Self::connect_with_retry(url, 30, Duration::from_secs(1)).await?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            epoch: AtomicU64::new(0),
+        };
         store.ensure_schema().await?;
         Ok(store)
     }
@@ -243,8 +264,133 @@ impl PgStore {
         .execute(&mut *transaction)
         .await
         .map_err(StoreError::Query)?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS controller_lease (
+               id BOOLEAN PRIMARY KEY CHECK (id),
+               holder TEXT NOT NULL,
+               epoch BIGINT NOT NULL,
+               expires_at TIMESTAMPTZ NOT NULL
+             )",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(StoreError::Query)?;
         transaction.commit().await.map_err(StoreError::Query)?;
         Ok(())
+    }
+
+    /// Take the lease for `ttl` if nobody holds it or the holder let it
+    /// expire, by the Postgres clock. `None` while another controller holds it.
+    pub async fn acquire_lease(
+        &self,
+        holder: &str,
+        ttl: Duration,
+    ) -> Result<Option<LeaseTerm>, StoreError> {
+        use sqlx::Row;
+
+        let Some(row) = sqlx::query(
+            "INSERT INTO controller_lease (id, holder, epoch, expires_at)
+             VALUES (TRUE, $1, 1, now() + make_interval(secs => $2))
+             ON CONFLICT (id) DO UPDATE SET
+               holder = EXCLUDED.holder,
+               epoch = controller_lease.epoch + 1,
+               expires_at = EXCLUDED.expires_at
+             WHERE controller_lease.expires_at <= now()
+             RETURNING epoch, (extract(epoch FROM now()) * 1000000)::BIGINT AS started_micros",
+        )
+        .bind(holder)
+        .bind(ttl.as_secs_f64())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(StoreError::Query)?
+        else {
+            return Ok(None);
+        };
+        let term = LeaseTerm {
+            epoch: positive_counter(
+                row.try_get::<i64, _>("epoch").map_err(StoreError::Decode)?,
+                "lease epoch",
+            )?,
+            started_micros: positive_counter(
+                row.try_get::<i64, _>("started_micros")
+                    .map_err(StoreError::Decode)?,
+                "lease start",
+            )?,
+        };
+        self.epoch.store(term.epoch, Ordering::SeqCst);
+        Ok(Some(term))
+    }
+
+    /// Extend the held lease by `ttl` from now. `false`, and the store holds no
+    /// lease any more, once it has expired or another controller has taken it.
+    pub async fn renew_lease(&self, ttl: Duration) -> Result<bool, StoreError> {
+        let epoch = self.held_epoch()?;
+        let renewed = sqlx::query(
+            "UPDATE controller_lease SET expires_at = now() + make_interval(secs => $2)
+             WHERE id AND epoch = $1 AND expires_at > now()",
+        )
+        .bind(epoch)
+        .bind(ttl.as_secs_f64())
+        .execute(&self.pool)
+        .await
+        .map_err(StoreError::Query)?
+        .rows_affected()
+            == 1;
+        if !renewed {
+            self.drop_lease();
+        }
+        Ok(renewed)
+    }
+
+    /// Expire the held lease now, so a standby can take it on its next try.
+    pub async fn release_lease(&self) -> Result<(), StoreError> {
+        let epoch = self.epoch.swap(0, Ordering::SeqCst);
+        if epoch == 0 {
+            return Ok(());
+        }
+        sqlx::query(
+            "UPDATE controller_lease SET expires_at = now()
+             WHERE id AND epoch = $1 AND expires_at > now()",
+        )
+        .bind(database_counter(epoch, "lease epoch")?)
+        .execute(&self.pool)
+        .await
+        .map_err(StoreError::Query)?;
+        Ok(())
+    }
+
+    /// Stop writing under the held lease without touching the row, which then
+    /// expires on its own.
+    pub fn drop_lease(&self) {
+        self.epoch.store(0, Ordering::SeqCst);
+    }
+
+    fn held_epoch(&self) -> Result<i64, StoreError> {
+        match self.epoch.load(Ordering::SeqCst) {
+            0 => Err(StoreError::NotLeader),
+            epoch => database_counter(epoch, "lease epoch"),
+        }
+    }
+
+    /// Fail the transaction unless this store holds the current, unexpired
+    /// lease. The row stays share-locked until the transaction ends, so a
+    /// takeover waits for a write already past this check to commit, and the
+    /// new holder then loads it.
+    async fn fence(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<(), StoreError> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT epoch FROM controller_lease
+             WHERE id AND epoch = $1 AND expires_at > now()
+             FOR SHARE",
+        )
+        .bind(self.held_epoch()?)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(StoreError::Query)?
+        .map(|_| ())
+        .ok_or(StoreError::NotLeader)
     }
 
     async fn write_stream_set(
@@ -259,6 +405,7 @@ impl PgStore {
         let desired = streams_by_name(streams)?;
         let desired_names: Vec<String> = desired.keys().cloned().collect();
         let mut transaction = self.pool.begin().await.map_err(StoreError::Query)?;
+        self.fence(&mut transaction).await?;
         let (mut set_revision, created) = match expected_revision {
             None => {
                 let revision = sqlx::query_scalar::<_, i64>(
@@ -552,6 +699,8 @@ impl StateStore for PgStore {
     }
 
     async fn create_stream(&self, stream: &StreamDefinition) -> Result<StoredStream, StoreError> {
+        let mut transaction = self.pool.begin().await.map_err(StoreError::Query)?;
+        self.fence(&mut transaction).await?;
         let row = sqlx::query(
             "INSERT INTO streams (name, definition, generation, revision, owner)
              VALUES ($1, $2, 1, nextval('stream_revision_seq'), NULL)
@@ -560,16 +709,18 @@ impl StateStore for PgStore {
         )
         .bind(&stream.name)
         .bind(sqlx::types::Json(stream))
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(StoreError::Query)?;
         if let Some(row) = row {
-            return stored_stream_from_row(stream, &row);
+            let stored = stored_stream_from_row(stream, &row)?;
+            transaction.commit().await.map_err(StoreError::Query)?;
+            return Ok(stored);
         }
         let owner =
             sqlx::query_scalar::<_, Option<String>>("SELECT owner FROM streams WHERE name = $1")
                 .bind(&stream.name)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *transaction)
                 .await
                 .map_err(StoreError::Query)?;
         match owner.flatten() {
@@ -587,6 +738,7 @@ impl StateStore for PgStore {
     ) -> Result<StoredStream, StoreError> {
         let expected_revision = database_counter(expected_revision, "revision")?;
         let mut transaction = self.pool.begin().await.map_err(StoreError::Query)?;
+        self.fence(&mut transaction).await?;
         let owner = sqlx::query_scalar::<_, Option<String>>(
             "SELECT owner FROM streams WHERE name = $1 FOR UPDATE",
         )
@@ -625,6 +777,7 @@ impl StateStore for PgStore {
     async fn delete_stream(&self, name: &str, expected_revision: u64) -> Result<(), StoreError> {
         let expected_revision = database_counter(expected_revision, "revision")?;
         let mut transaction = self.pool.begin().await.map_err(StoreError::Query)?;
+        self.fence(&mut transaction).await?;
         let owner = sqlx::query_scalar::<_, Option<String>>(
             "SELECT owner FROM streams WHERE name = $1 FOR UPDATE",
         )
@@ -692,24 +845,30 @@ impl StateStore for PgStore {
     }
 
     async fn upsert_node(&self, registration: &NodeRegistration) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await.map_err(StoreError::Query)?;
+        self.fence(&mut transaction).await?;
         sqlx::query(
             "INSERT INTO nodes (id, registration) VALUES ($1, $2)
              ON CONFLICT (id) DO UPDATE SET registration = EXCLUDED.registration",
         )
         .bind(&registration.node.id)
         .bind(sqlx::types::Json(registration))
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(StoreError::Query)?;
+        transaction.commit().await.map_err(StoreError::Query)?;
         Ok(())
     }
 
     async fn delete_node(&self, id: &str) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await.map_err(StoreError::Query)?;
+        self.fence(&mut transaction).await?;
         sqlx::query("DELETE FROM nodes WHERE id = $1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
             .map_err(StoreError::Query)?;
+        transaction.commit().await.map_err(StoreError::Query)?;
         Ok(())
     }
 }
@@ -1059,7 +1218,7 @@ impl StateStore for MemStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use weave_core::{
         NodeCapabilities, NodeDescriptor, NodeStatus, NodeTopology, SrtEndpoint, StreamDestination,
@@ -1537,13 +1696,45 @@ mod tests {
         assert!(store.load_nodes().await.unwrap().is_empty());
     }
 
+    /// A new, empty database on the server `DATABASE_URL` names, so ignored
+    /// tests can run in parallel without sharing the lease row.
+    pub(crate) async fn fresh_database() -> String {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set for ignored test");
+        let mut suffix = [0u8; 8];
+        getrandom::fill(&mut suffix).unwrap();
+        let name = format!(
+            "weave_test_{}",
+            suffix
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        let admin = sqlx::PgPool::connect(&url).await.expect("connect");
+        sqlx::query(&format!("CREATE DATABASE {name}"))
+            .execute(&admin)
+            .await
+            .expect("create test database");
+        admin.close().await;
+        let (server, _) = url.rsplit_once('/').expect("DATABASE_URL names a database");
+        format!("{server}/{name}")
+    }
+
+    pub(crate) async fn leading_pg_store(url: &str) -> PgStore {
+        let store = PgStore::connect(url).await.expect("connect");
+        store
+            .acquire_lease("test", Duration::from_secs(60))
+            .await
+            .expect("acquire")
+            .expect("nobody else holds the lease");
+        store
+    }
+
     /// Round-trips against a real Postgres. Ignored by default so `cargo test`
     /// stays DB-free; run with `DATABASE_URL` set and `--ignored`.
     #[tokio::test]
     #[ignore = "requires a running Postgres via DATABASE_URL"]
     async fn pgstore_round_trips_streams_and_nodes() {
-        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set for ignored test");
-        let store = PgStore::connect(&url).await.expect("connect");
+        let store = leading_pg_store(&fresh_database().await).await;
 
         let stored = store
             .create_stream(&stream("basic"))
@@ -1594,6 +1785,153 @@ mod tests {
                 .expect("load streams")
                 .iter()
                 .any(|s| s.spec.name == "basic")
+        );
+    }
+    #[tokio::test]
+    #[ignore = "requires a running Postgres via DATABASE_URL"]
+    async fn pg_lease_has_one_holder_until_it_expires() {
+        let url = fresh_database().await;
+        let first = PgStore::connect(&url).await.unwrap();
+        let second = PgStore::connect(&url).await.unwrap();
+        let ttl = Duration::from_secs(1);
+
+        let taken = first.acquire_lease("first", ttl).await.unwrap().unwrap();
+        assert_eq!(second.acquire_lease("second", ttl).await.unwrap(), None);
+        assert!(first.renew_lease(ttl).await.unwrap());
+        assert_eq!(second.acquire_lease("second", ttl).await.unwrap(), None);
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let takeover = second.acquire_lease("second", ttl).await.unwrap().unwrap();
+        assert_eq!(takeover.epoch, taken.epoch + 1);
+        assert!(takeover.started_micros > taken.started_micros);
+        assert!(
+            !first.renew_lease(ttl).await.unwrap(),
+            "an expired lease is not renewed once another store took it"
+        );
+        assert!(matches!(
+            first.renew_lease(ttl).await,
+            Err(StoreError::NotLeader)
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running Postgres via DATABASE_URL"]
+    async fn pg_a_released_lease_is_taken_at_once() {
+        let url = fresh_database().await;
+        let first = PgStore::connect(&url).await.unwrap();
+        let second = PgStore::connect(&url).await.unwrap();
+        let ttl = Duration::from_secs(60);
+
+        first.acquire_lease("first", ttl).await.unwrap().unwrap();
+        first.release_lease().await.unwrap();
+        assert!(second.acquire_lease("second", ttl).await.unwrap().is_some());
+        assert!(matches!(
+            first.create_stream(&stream("basic")).await,
+            Err(StoreError::NotLeader)
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running Postgres via DATABASE_URL"]
+    async fn pg_every_write_is_fenced_by_the_lease() {
+        let url = fresh_database().await;
+        let old = PgStore::connect(&url).await.unwrap();
+        let new = PgStore::connect(&url).await.unwrap();
+        let ttl = Duration::from_secs(1);
+
+        old.acquire_lease("old", ttl).await.unwrap().unwrap();
+        let basic = old.create_stream(&stream("basic")).await.unwrap();
+        let set = old
+            .create_stream_set("production", &[stream("owned")], true)
+            .await
+            .unwrap();
+        old.upsert_node(&registration("strom-node-1"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                new.create_stream(&stream("other")).await,
+                Err(StoreError::NotLeader)
+            ),
+            "a store that never took the lease writes nothing"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        new.acquire_lease("new", ttl).await.unwrap().unwrap();
+        let mut changed = stream("basic");
+        changed.enabled = false;
+        let refused = [
+            old.create_stream(&stream("other")).await.err(),
+            old.update_stream(&changed, basic.revision).await.err(),
+            old.delete_stream("basic", basic.revision).await.err(),
+            old.create_stream_set("staging", &[stream("staged")], true)
+                .await
+                .err(),
+            old.update_stream_set("production", &[], true, set.stream_set.revision)
+                .await
+                .err(),
+            old.upsert_node(&registration("strom-node-2")).await.err(),
+            old.delete_node("strom-node-1").await.err(),
+        ];
+        for (index, error) in refused.into_iter().enumerate() {
+            assert!(
+                matches!(error, Some(StoreError::NotLeader)),
+                "write {index}: {error:?}"
+            );
+        }
+
+        assert_eq!(
+            new.load_streams()
+                .await
+                .unwrap()
+                .iter()
+                .map(|stream| (stream.spec.name.as_str(), stream.revision))
+                .collect::<Vec<_>>(),
+            [
+                ("basic", basic.revision),
+                ("owned", set.stream_set.streams[0].revision)
+            ]
+        );
+        assert_eq!(new.load_nodes().await.unwrap().len(), 1);
+        new.update_stream(&changed, basic.revision).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running Postgres via DATABASE_URL"]
+    async fn pg_a_takeover_waits_for_a_write_past_its_fence() {
+        let url = fresh_database().await;
+        let old = PgStore::connect(&url).await.unwrap();
+        let new = std::sync::Arc::new(PgStore::connect(&url).await.unwrap());
+        let ttl = Duration::from_secs(1);
+        old.acquire_lease("old", ttl).await.unwrap().unwrap();
+
+        let mut transaction = old.pool.begin().await.unwrap();
+        old.fence(&mut transaction).await.unwrap();
+        sqlx::query("INSERT INTO nodes (id, registration) VALUES ('late', '{}')")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let takeover = tokio::spawn({
+            let new = new.clone();
+            async move { new.acquire_lease("new", ttl).await }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !takeover.is_finished(),
+            "the takeover waits on the write's share lock"
+        );
+
+        transaction.commit().await.unwrap();
+        assert!(takeover.await.unwrap().unwrap().is_some());
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM nodes")
+            .fetch_all(&new.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids,
+            ["late"],
+            "the new holder reads the write it waited for"
         );
     }
 }

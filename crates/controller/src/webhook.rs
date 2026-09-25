@@ -149,6 +149,12 @@ impl Emitter {
         }
     }
 
+    /// Number the events emitted from here on from `first`, which a controller
+    /// taking over from another sets to the time it took the lease.
+    pub fn count_from(&self, first: u64) {
+        self.seq.store(first, Ordering::Relaxed);
+    }
+
     /// Events discarded because the queue was full. Logged on each transition
     /// into and out of the dropping state; read directly only by the tests.
     #[cfg(test)]
@@ -410,6 +416,18 @@ pub(crate) mod tests {
             .next()
             .and_then(|number| number.parse().ok())
             .expect("an event id ends in a number")
+    }
+
+    #[tokio::test]
+    async fn a_controller_taking_over_numbers_events_from_its_lease() {
+        let mut sink = sink(StatusCode::OK).await;
+        let emitter = Emitter::new(config(&sink.url)).unwrap();
+        emitter.count_from(1_790_330_400_000_000);
+        emitter.emit(EventType::NodeRegistered, node("guest-1"));
+        emitter.emit(EventType::NodeRegistered, node("guest-1"));
+
+        assert_eq!(sink.next().await.event.event_id, "guest-1-1790330400000000");
+        assert_eq!(sink.next().await.event.event_id, "guest-1-1790330400000001");
     }
 
     #[tokio::test]

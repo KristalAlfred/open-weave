@@ -281,6 +281,7 @@ pub enum ApiErrorCode {
     PersistenceFailed,
     ControllerUnreachable,
     EncodingFailed,
+    NotLeader,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

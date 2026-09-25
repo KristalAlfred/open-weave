@@ -24,7 +24,8 @@
               "incompatible_protocol_version",
               "persistence_failed",
               "controller_unreachable",
-              "encoding_failed"
+              "encoding_failed",
+              "not_leader"
             ],
             "type": "string"
           },
@@ -14595,6 +14596,16 @@
               }
             },
             "description": "Controller unavailable"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "No controller holds the lease"
           }
         }
       }
@@ -14632,6 +14643,16 @@
               }
             },
             "description": "Controller unavailable"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "No controller holds the lease"
           }
         }
       }
@@ -14699,6 +14720,16 @@
               }
             },
             "description": "Controller unavailable"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "No controller holds the lease"
           }
         }
       }
@@ -14736,6 +14767,16 @@
               }
             },
             "description": "Controller unavailable"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "No controller holds the lease"
           }
         }
       }
@@ -14814,6 +14855,16 @@
               }
             },
             "description": "Controller unavailable"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "No controller holds the lease"
           }
         }
       },
@@ -14949,6 +15000,16 @@
               }
             },
             "description": "Controller unavailable"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "No controller holds the lease"
           }
         }
       }
@@ -14986,6 +15047,16 @@
               }
             },
             "description": "Controller unavailable"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "No controller holds the lease"
           }
         }
       },
@@ -15110,6 +15181,16 @@
               }
             },
             "description": "Controller unavailable"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "No controller holds the lease"
           }
         }
       }
@@ -15212,6 +15293,16 @@
               }
             },
             "description": "Controller unavailable"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "No controller holds the lease"
           }
         }
       },
@@ -15288,6 +15379,16 @@
               }
             },
             "description": "Controller unavailable"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "No controller holds the lease"
           }
         }
       }
@@ -15367,7 +15468,7 @@
                 }
               }
             },
-            "description": "Stream not placed"
+            "description": "Stream not placed, or no controller holds the lease"
           }
         }
       }
