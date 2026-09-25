@@ -2,9 +2,9 @@
 id: OW-69
 title: "Reconcile time grows faster than the number of streams"
 type: bug
-status: todo
+status: in-progress
 depends_on: []
-assignee:
+assignee: claude-perf
 ---
 
 ## Evidence
@@ -25,3 +25,4 @@ whole tick (`backlog/OW-25`), so stream writes wait for it.
 ## Log
 
 - 2026-09-26: filed by the lead from the OW-58 report.
+- 2026-09-26: started by claude-perf.
