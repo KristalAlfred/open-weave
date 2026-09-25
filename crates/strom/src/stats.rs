@@ -13,7 +13,11 @@ const SEND_RATE_KEYS: &[&str] = &["send_rate_mbps", "mbps_send_rate", "mbpsSendR
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ElementStats {
     pub id: String,
+    /// Strom's `connected`: some peer has carried data, not only shaken hands.
     pub connected: bool,
+    /// Some peer reports a negotiated latency, which libsrt fills in once the SRT
+    /// handshake completes, whether or not data has flowed since.
+    pub handshaken: bool,
     pub connections: usize,
     pub rate_mbps: f64,
     /// Cumulative bytes received across this element's callers. Byte progress over
@@ -124,8 +128,14 @@ pub fn parse_flow_stats(value: &Value) -> FlowStats {
         let mut packets_retransmitted = 0;
         let mut packets_received_lost = 0;
         let mut packets_received_retransmitted = 0;
+        let mut handshaken = false;
         if let Some(callers) = connection.get("callers").and_then(Value::as_array) {
             connections = callers.len();
+            handshaken = callers.iter().any(|caller| {
+                caller
+                    .get("negotiated_latency_ms")
+                    .is_some_and(Value::is_number)
+            });
             for caller in callers {
                 packets_sent_lost += field_i64(caller, "packets_sent_lost");
                 packets_retransmitted += field_i64(caller, "packets_retransmitted");
@@ -141,6 +151,7 @@ pub fn parse_flow_stats(value: &Value) -> FlowStats {
         stats.elements.push(ElementStats {
             id: id.clone(),
             connected,
+            handshaken,
             connections: connections.max(usize::from(connected)),
             rate_mbps,
             bytes_received,
@@ -510,5 +521,22 @@ mod tests {
             parse_flow_stats(&serde_json::json!({ "stats": { "connections": {} } })),
             FlowStats::default()
         );
+    }
+
+    #[test]
+    fn a_negotiated_latency_marks_a_finished_handshake() {
+        let stats = parse_flow_stats(&serde_json::json!({
+            "stats": { "connections": {
+                "srtsrc_0": { "connected": false, "callers": [
+                    { "rtt_ms": 100.0, "negotiated_latency_ms": 1000, "bytes_received": 0 }
+                ]},
+                "srtsink_0": { "connected": false, "callers": [
+                    { "rtt_ms": null, "negotiated_latency_ms": null, "bytes_sent": 0 }
+                ]}
+            }}
+        }));
+        let ingress = stats.ingress().unwrap();
+        assert!(ingress.handshaken && !ingress.connected);
+        assert!(!stats.egress().unwrap().handshaken);
     }
 }

@@ -40,18 +40,27 @@ pub enum Side {
     Egress(usize),
 }
 
-/// Consecutive polls an SRT caller ingress may stay unconnected in a running flow
-/// before the flow is restarted. At the default 5s poll this is ~30s.
+/// Consecutive polls an SRT caller ingress may go without a finished handshake in
+/// a running flow before the flow is first restarted. At the default 5s poll this
+/// is ~30s. Each restart that does not bring the handshake doubles the wait, up
+/// to [`MAX_REDIAL_POLLS`].
 const REDIAL_POLLS: u32 = 6;
+const MAX_REDIAL_POLLS: u32 = 96;
+
+#[derive(Debug)]
+struct CallerWait {
+    polls: u32,
+    due_at: u32,
+}
 
 /// In-memory byte-progress tracker keyed by hop id and side, plus how long each
-/// hop's SRT caller ingress has gone unconnected. Byte progress across polls is
+/// hop's SRT caller ingress has gone without a handshake. Byte progress across polls is
 /// the only reliable signal that a connected socket is truly flowing; no single
 /// instantaneous field separates a dead flow from a live one.
 #[derive(Debug, Default)]
 pub struct StallTracker {
     hops: HashMap<(String, Side), HopProgress>,
-    unconnected_callers: HashMap<String, u32>,
+    unconnected_callers: HashMap<String, CallerWait>,
     sessions: HashMap<(String, Side), SessionTotal>,
 }
 
@@ -127,26 +136,31 @@ impl StallTracker {
             .retain(|id, _| desired.contains(id.as_str()));
     }
 
-    /// Fold one poll of a running flow's SRT caller ingress: whether Strom
-    /// reports it connected.
-    pub fn note_caller(&mut self, hop_id: &str, connected: bool) {
-        if connected {
+    /// Fold one poll of a running flow's SRT caller ingress: whether its SRT
+    /// handshake has finished. A finished handshake forgets the wait and its
+    /// backoff.
+    pub fn note_caller(&mut self, hop_id: &str, handshaken: bool) {
+        if handshaken {
             self.unconnected_callers.remove(hop_id);
         } else {
-            *self
-                .unconnected_callers
+            self.unconnected_callers
                 .entry(hop_id.to_string())
-                .or_default() += 1;
+                .or_insert(CallerWait {
+                    polls: 0,
+                    due_at: REDIAL_POLLS,
+                })
+                .polls += 1;
         }
     }
 
-    /// Whether `hop_id`'s flow is due a restart: its SRT caller ingress has been
-    /// unconnected for [`REDIAL_POLLS`] polls in a row. A due restart starts the
-    /// count again.
+    /// Whether `hop_id`'s flow is due a restart: its SRT caller ingress has gone
+    /// without a handshake for as many polls as it is allowed. A due restart
+    /// starts the count again and doubles the allowance.
     pub fn caller_due_restart(&mut self, hop_id: &str) -> bool {
         match self.unconnected_callers.get_mut(hop_id) {
-            Some(polls) if *polls >= REDIAL_POLLS => {
-                *polls = 0;
+            Some(wait) if wait.polls >= wait.due_at => {
+                wait.polls = 0;
+                wait.due_at = (wait.due_at * 2).min(MAX_REDIAL_POLLS);
                 true
             }
             _ => false,
@@ -781,23 +795,27 @@ mod tests {
     }
 
     #[test]
-    fn an_unconnected_caller_is_due_a_restart_every_redial_polls() {
+    fn a_caller_without_a_handshake_is_restarted_with_backoff() {
         let mut tracker = StallTracker::default();
-        let mut poll = |connected| {
-            tracker.note_caller("weave-a", connected);
+        let mut poll = |handshaken| {
+            tracker.note_caller("weave-a", handshaken);
             tracker.caller_due_restart("weave-a")
         };
-        let due: Vec<bool> = (0..2 * REDIAL_POLLS).map(|_| poll(false)).collect();
-        let expected: Vec<bool> = (1..=2 * REDIAL_POLLS)
-            .map(|polls| polls % REDIAL_POLLS == 0)
-            .collect();
-        assert_eq!(due, expected);
+        let restarts_at: Vec<u32> = (1..=400).filter(|_| poll(false)).collect();
+        assert_eq!(restarts_at, vec![6, 18, 42, 90, 186, 282, 378]);
 
-        for _ in 0..REDIAL_POLLS - 1 {
-            assert!(!poll(false));
+        assert!(!poll(true), "a handshake is not due a restart");
+        let restarts_at: Vec<u32> = (1..=6).filter(|_| poll(false)).collect();
+        assert_eq!(restarts_at, vec![6], "a handshake resets the backoff");
+    }
+
+    #[test]
+    fn a_caller_that_shook_hands_but_carries_nothing_is_never_restarted() {
+        let mut tracker = StallTracker::default();
+        for _ in 0..200 {
+            tracker.note_caller("weave-a", true);
+            assert!(!tracker.caller_due_restart("weave-a"));
         }
-        assert!(!poll(true), "connected");
-        assert!(!poll(false), "a connection starts the count again");
     }
 
     #[test]

@@ -429,11 +429,15 @@ async fn reconcile(
     statuses
 }
 
-/// Restart each running flow whose SRT caller ingress has stayed unconnected.
+/// Restart each running flow whose SRT caller ingress has gone without a
+/// finished handshake, backing off per hop.
 ///
 /// An `srtsrc` caller that its listener refused once, for a wrong passphrase,
 /// never dials again while Strom goes on reporting the flow running
-/// (`backlog/OW-22`). Stopping and starting the flow makes it dial.
+/// (`backlog/OW-22`). Stopping and starting the flow makes it dial. Strom's
+/// `connected` only says data has flowed, so a caller whose peer has nothing to
+/// send yet reads unconnected; the negotiated latency tells it apart
+/// (`backlog/OW-63`).
 async fn redial_unconnected_callers(
     flow_api: &dyn FlowApi,
     desired: &[DesiredHop],
@@ -458,13 +462,13 @@ async fn redial_unconnected_callers(
             Ok(()) => tracing::info!(
                 hop = %hop.id,
                 flow_id = %flow.id,
-                "restarted a flow whose SRT caller stayed unconnected"
+                "restarted a flow whose SRT caller has not finished a handshake"
             ),
             Err(error) => tracing::warn!(
                 hop = %hop.id,
                 flow_id = %flow.id,
                 %error,
-                "restarting a flow whose SRT caller stayed unconnected failed"
+                "restarting a flow whose SRT caller has not finished a handshake failed"
             ),
         }
     }
@@ -532,8 +536,11 @@ async fn hop_statuses(
             }
         };
 
+        let ingress_handshaken = srt
+            .as_ref()
+            .and_then(FlowStats::ingress)
+            .is_some_and(|element| element.handshaken || element.connected);
         let ingress = SocketReading::ingress(&hop.ingress, srt.as_ref(), webrtc.as_ref());
-        let ingress_connected = ingress.connected;
         let ingress = observe(Side::Ingress, &hop.ingress, &ingress);
         let egresses = hop
             .egresses
@@ -552,7 +559,7 @@ async fn hop_statuses(
             && srt.is_some()
             && matches!(hop.ingress, SocketSpec::Srt(SrtSocket::Connect { .. }))
         {
-            tracker.note_caller(&hop.id, ingress_connected);
+            tracker.note_caller(&hop.id, ingress_handshaken);
         }
 
         statuses.push(HopStatus {
@@ -1249,6 +1256,29 @@ mod tests {
                 Op::Start("id-caller".to_string())
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_shook_hands_but_carries_nothing_is_not_restarted() {
+        let idle = json!({
+            "stats": { "connections": {
+                "srtsrc_0": { "mode": "caller", "connected": false, "callers": [
+                    { "rtt_ms": 100.0, "negotiated_latency_ms": 1000,
+                      "packets_received": 0, "bytes_received": 0 }
+                ]},
+                "srtsink_0": { "connected": false, "callers": [] }
+            }}
+        });
+        let mut caller = hop("weave-feed-receiver-studio", 7002);
+        caller.ingress = SocketSpec::srt_connect("10.0.0.1", 7002, 1000);
+        let flows = vec![flow("weave-feed-receiver-studio", "id-caller")];
+        let fake = RecordingFlowApi::default().with_stats(idle);
+        let mut tracker = StallTracker::default();
+        let desired = vec![caller];
+        for _ in 0..50 {
+            let _ = reconcile(&fake, &desired, &flows, None, &mut tracker).await;
+        }
+        assert!(fake.ops().is_empty(), "{:?}", fake.ops());
     }
 
     #[tokio::test]
