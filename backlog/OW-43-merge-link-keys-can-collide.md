@@ -2,9 +2,9 @@
 id: OW-43
 title: "Two streams' second-path merge links can derive the same SRT key"
 type: bug
-status: todo
+status: done
 depends_on: []
-assignee:
+assignee: claude-tests
 ---
 
 ## Evidence
@@ -25,11 +25,31 @@ so no shipped deployment plans a second path.
 
 ## Done when
 
-- [ ] A test shows whether two valid streams that ask for two paths can derive
+- [x] A test shows whether two valid streams that ask for two paths can derive
       the same merge-link key.
-- [ ] If they can, they no longer can, and existing hop ids and keys stay the
+- [x] If they can, they no longer can, and existing hop ids and keys stay the
       same for streams that collide with nothing.
 
 ## Log
 
 - 2026-09-25: filed by claude-tests while working OW-32.
+- 2026-09-25: started by claude-tests.
+- 2026-09-25: box 1.
+  `two_streams_that_spell_one_merge_link_id_never_both_carry_its_key`
+  (`crates/controller/src/redundant_paths_tests.rs`) plans stream `x` to
+  `a-receiver-b` and stream `x-receiver-a` to `b`, both with `paths: 2`.
+  Planned apart with `derive_stream`, their merge links carry the same key.
+  Reconciled together, `x` is placed and `x-receiver-a` is not, and each
+  derived key in the served hops sits on exactly two sockets, the two ends of
+  one link. `shared_hop_id` flags the pair. With the plan-time `HopIds` check
+  switched off, the test fails on the shared key. Unit tests only.
+- 2026-09-25: box 2: no change was needed, and this item's Evidence was wrong.
+  The merge id is `receiver_hop_id(stream, "{destination}.2")`, the stream's
+  receiver id with `.2` appended. `.` is outside the resource-id alphabet, and
+  no hop id ends in `.2`: receivers end in a destination id, senders in
+  `-sender`, bridges in `-{position}`. So a merge id never equals a hop id, and
+  two merge ids are equal only when the two receiver hop ids are, which the
+  plan-time check (OW-21) and the apply-time check (OW-32) already refuse. The
+  example in Evidence is such a pair: its two receivers are both
+  `weave-x-receiver-a-receiver-b`. No hop ids or keys changed.
+  `crates/controller/src/keys.rs` is untouched, so OW-37 is not affected.

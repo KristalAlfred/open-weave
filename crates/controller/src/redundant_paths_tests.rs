@@ -1,8 +1,8 @@
 use weave_core::{
     DesiredHop, EgressStatus, HopEndpointClass, HopProfile, HopState, HopStatus, LinkCondition,
     NetworkAttachment, NetworkListeners, NodeCapabilities, NodeDescriptor, NodeStatus,
-    NodeTopology, ObservedState, PathStatus, PortRange, RoleSet, SocketRole, SocketSpec,
-    SocketStatus, SrtEndpoint, SrtListener, SrtSocket, StreamConditionReason,
+    NodeTopology, ObservedState, Passphrase, PathStatus, PortRange, RoleSet, SocketRole,
+    SocketSpec, SocketStatus, SrtEndpoint, SrtListener, SrtSocket, StreamConditionReason,
     StreamConditionStatus, StreamConditionType, StreamDefinition, StreamDestination,
     StreamTransport, Transport, TransportClass,
 };
@@ -10,7 +10,7 @@ use weave_core::{
 use crate::keys::LinkKeys;
 use crate::path::{
     PlacementError, PlannedStream, PortAllocator, SinglePath, derive_path, derive_stream,
-    destination_nodes, destination_path_status,
+    destination_nodes, destination_path_status, shared_hop_id,
 };
 use crate::reconcile;
 
@@ -537,5 +537,80 @@ async fn a_plan_with_one_path_of_two_gives_the_reason() {
         Some(
             "destination studio has one path of two: node studio-node has no hop profile that merges a second path"
         )
+    );
+}
+
+/// The derived keys a hop's SRT sockets carry. Terminal sockets in these
+/// fixtures set no manifest passphrase, so every key here is a link key.
+fn link_keys(hop: &DesiredHop) -> Vec<Passphrase> {
+    std::iter::once(&hop.ingress)
+        .chain(hop.merge_ingress.as_ref())
+        .chain(hop.egresses.iter().map(|egress| &egress.socket))
+        .filter_map(|socket| match socket {
+            SocketSpec::Srt(
+                SrtSocket::Listen { params, .. } | SrtSocket::Connect { params, .. },
+            ) => params.passphrase.clone(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Stream `x` to `a-receiver-b` and stream `x-receiver-a` to `b` spell the same
+/// receiver id, so their merge links are both fed by
+/// `weave-x-receiver-a-receiver-b.2`.
+#[test]
+fn two_streams_that_spell_one_merge_link_id_never_both_carry_its_key() {
+    let nodes = dual_homed();
+    let first = stream("x", vec![destination("a-receiver-b", "studio-node", 2)]);
+    let second = stream("x-receiver-a", vec![destination("b", "studio-node", 2)]);
+    let merge_key = |definition: &StreamDefinition| {
+        let planned = plan(definition, &nodes);
+        assert!(planned.single_path.is_empty());
+        let receiver = hop(&planned, "weave-x-receiver-a-receiver-b");
+        let merge = receiver.merge_ingress.clone().expect("a merge ingress");
+        link_keys(&DesiredHop {
+            egresses: Vec::new(),
+            merge_ingress: None,
+            ingress: merge,
+            ..receiver.clone()
+        })
+    };
+    assert_eq!(
+        merge_key(&first),
+        merge_key(&second),
+        "planned apart, both merge links derive one key"
+    );
+    assert_eq!(
+        shared_hop_id(&first, &second).as_deref(),
+        Some("weave-x-receiver-a-receiver-b"),
+        "the apply check refuses the pair by its receivers"
+    );
+
+    let feed = stream("feed", vec![destination("studio", "studio-node", 2)]);
+    let outcome = reconcile(
+        vec![second, first, feed],
+        &ObservedState {
+            nodes,
+            endpoints: Vec::new(),
+            hops: Vec::new(),
+        },
+        &LinkKeys::for_tests(),
+    );
+    let mut ends = std::collections::BTreeMap::<Passphrase, usize>::new();
+    for hop in outcome.hops_by_stream.values().flatten() {
+        for key in link_keys(hop) {
+            *ends.entry(key).or_default() += 1;
+        }
+    }
+    assert_eq!(ends.len(), 4, "two links for each placed stream");
+    assert!(
+        ends.values().all(|count| *count == 2),
+        "each derived key sits on the two ends of one link"
+    );
+    assert!(outcome.hops_by_stream.contains_key("x"));
+    assert!(outcome.hops_by_stream.contains_key("feed"));
+    assert!(
+        !outcome.hops_by_stream.contains_key("x-receiver-a"),
+        "the plan-time check leaves the later stream unplaced"
     );
 }
