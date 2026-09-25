@@ -306,7 +306,7 @@ mod tests {
     use tower::ServiceExt;
     use weave_core::auth::NodeKey;
 
-    const KEY: &str = "southbound-test-key";
+    const KEY: &str = "southbound-test-key-0123456789abcdef";
 
     #[derive(Clone, Default)]
     struct Captured {

@@ -15,16 +15,16 @@ page_dir := source_directory() / ".." / "nodes" / "browser"
 # the controller dashboard need no token.
 nb_token := env("WEAVE_NORTHBOUND_TOKEN", "bench-northbound-token")
 nb_auth  := "-H 'Authorization: Bearer " + nb_token + "'"
-sb_key   := env("WEAVE_SOUTHBOUND_KEY", "bench-southbound-key")
+sb_key   := env("WEAVE_SOUTHBOUND_KEY", "bench-southbound-key-for-local-use-only")
 
 # Southbound's inventory reads accept any node's token; these recipes present
 # node 1's, the one docker-compose.yml gives adapter-1 under the default key.
-sb_token := env("WEAVE_ADAPTER_1_TOKEN", "strom-node-1.35e6718c0cdacc8a30175b4036cb8ebf271c7674e59f9b99f2db900b1c8532f7")
+sb_token := env("WEAVE_ADAPTER_1_TOKEN", "strom-node-1.39d5a7c831d6b25a1b017da63efbe888265326986ce5f1bebd6032243609b014")
 sb_auth  := "-H 'Authorization: Bearer " + sb_token + "'"
 
 # The in-bench page takes its node id from its token, so the browser manifests
 # keep naming it across restarts.
-browser_token := env("WEAVE_BROWSER_TOKEN", "browser-bench.e80cca6bc515a183bc4f9f53cb08ecaf3e860bfd47536ffc95e7cda33629f820")
+browser_token := env("WEAVE_BROWSER_TOKEN", "browser-bench.fdc250e325215af4650d4206640d18e0692670a0c83b5b23e16b7c08961c5f8f")
 browser_node  := replace_regex(browser_token, '\..*', '')
 
 # Port `just hook-sink` listens on. docker-compose.yml points the controller's

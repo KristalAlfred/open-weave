@@ -5902,7 +5902,7 @@ mod node_auth_tests {
     use super::tests::{NORTH_ROUTES, SHARED_READ_ROUTES, SOUTH_ROUTES};
 
     const NORTH: &str = "north-test-token";
-    const KEY: &str = "south-test-key";
+    const KEY: &str = "south-test-key-0123456789abcdef0123";
 
     async fn app() -> (Router, AppState) {
         let state = AppState::hydrate(

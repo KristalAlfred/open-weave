@@ -343,7 +343,7 @@ defaults to development values so `just bench up` stays a single command:
 | Variable | Default | Used by |
 |---|---|---|
 | `WEAVE_NORTHBOUND_TOKEN` | `bench-northbound-token` | northbound, controller, CLI, `endpoints.sh` |
-| `WEAVE_SOUTHBOUND_KEY` | `bench-southbound-key` | southbound, controller, `just bench node-token` |
+| `WEAVE_SOUTHBOUND_KEY` | `bench-southbound-key-for-local-use-only` | southbound, controller, `just bench node-token` |
 | `WEAVE_ADAPTER_{1,2,3,4}_TOKEN` | `strom-node-{1,2,3,4}`'s token under the default key | adapter-1 to adapter-4; the recipes present node 1's for southbound reads |
 | `WEAVE_BROWSER_TOKEN` | `browser-bench`'s token under the default key | the in-bench browser page, which takes its node id from it |
 | `WEAVE_SRT_KEY_SECRET` | `bench-srt-key-secret-for-local-use-only` | controller, to derive the keys of SRT links between nodes |

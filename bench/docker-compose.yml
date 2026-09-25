@@ -117,7 +117,7 @@ services:
     environment:
       WEAVE_SOUTHBOUND_ADDR: 0.0.0.0:8081
       WEAVE_CONTROLLER_URL: http://10.97.25.22:8082
-      WEAVE_SOUTHBOUND_KEY: ${WEAVE_SOUTHBOUND_KEY:-bench-southbound-key}
+      WEAVE_SOUTHBOUND_KEY: ${WEAVE_SOUTHBOUND_KEY:-bench-southbound-key-for-local-use-only}
       # The browser node is a web page on another origin. `*` is a development
       # value like the tokens above; a deployment names the page's origin.
       WEAVE_SOUTHBOUND_CORS_ORIGIN: ${WEAVE_SOUTHBOUND_CORS_ORIGIN:-*}
@@ -145,7 +145,7 @@ services:
       WEAVE_RECONCILE_INTERVAL_SECS: "5"
       DATABASE_URL: postgres://weave:weave@10.97.25.23:5432/weave
       WEAVE_NORTHBOUND_TOKEN: ${WEAVE_NORTHBOUND_TOKEN:-bench-northbound-token}
-      WEAVE_SOUTHBOUND_KEY: ${WEAVE_SOUTHBOUND_KEY:-bench-southbound-key}
+      WEAVE_SOUTHBOUND_KEY: ${WEAVE_SOUTHBOUND_KEY:-bench-southbound-key-for-local-use-only}
       WEAVE_SRT_KEY_SECRET: ${WEAVE_SRT_KEY_SECRET:-bench-srt-key-secret-for-local-use-only}
       # Webhooks, delivered to `just bench hook-sink` on this
       # host. Unset WEAVE_WEBHOOK_URL to switch them off.
@@ -322,7 +322,7 @@ services:
     container_name: ow-adapter-1
     command: ["weave-adapter-strom", "--config", "/etc/weave/node.yaml"]
     environment:
-      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_ADAPTER_1_TOKEN:-strom-node-1.35e6718c0cdacc8a30175b4036cb8ebf271c7674e59f9b99f2db900b1c8532f7}
+      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_ADAPTER_1_TOKEN:-strom-node-1.39d5a7c831d6b25a1b017da63efbe888265326986ce5f1bebd6032243609b014}
     volumes:
       - ./config/adapter-1.yaml:/etc/weave/node.yaml:ro
     networks:
@@ -361,7 +361,7 @@ services:
     container_name: ow-adapter-2
     command: ["weave-adapter-strom", "--config", "/etc/weave/node.yaml"]
     environment:
-      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_ADAPTER_2_TOKEN:-strom-node-2.60ea0904cf04d925103eeb5604855ace5de6e2211b56c95f73587ad4a75bf362}
+      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_ADAPTER_2_TOKEN:-strom-node-2.aa792da9a8cc6083ae65c8ff8ef4dac025d3b711def50e1f6cead4da7b3f5f34}
     volumes:
       - ./config/adapter-2.yaml:/etc/weave/node.yaml:ro
     networks:
@@ -403,7 +403,7 @@ services:
     container_name: ow-adapter-3
     command: ["weave-adapter-strom", "--config", "/etc/weave/node.yaml"]
     environment:
-      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_ADAPTER_3_TOKEN:-strom-node-3.7342aab2d514b2e93166dc0493e45e16b09ebe954d680413129fef9ce559864f}
+      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_ADAPTER_3_TOKEN:-strom-node-3.b214cb17c5853c11c304557ff2930142b683e7eda8fd1a86c6d13fd690ac108e}
     volumes:
       - ./config/adapter-3.yaml:/etc/weave/node.yaml:ro
     networks:
@@ -443,7 +443,7 @@ services:
     container_name: ow-adapter-4
     command: ["weave-adapter-strom", "--config", "/etc/weave/node.yaml"]
     environment:
-      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_ADAPTER_4_TOKEN:-strom-node-4.bcf0947c4ca72dc52514efd44cab7a2c5fc7fd18487e1004b5eef85defb3e442}
+      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_ADAPTER_4_TOKEN:-strom-node-4.eb82f4ed3f30f4ae190b269a8fbe2633d40d6afbb54b550347602d32727aef99}
     volumes:
       - ./config/adapter-4.yaml:/etc/weave/node.yaml:ro
     networks:
@@ -470,7 +470,7 @@ services:
     shm_size: "1gb"
     environment:
       WEAVE_SOUTHBOUND_URL: http://10.97.25.21:8081
-      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_BROWSER_TOKEN:-browser-bench.e80cca6bc515a183bc4f9f53cb08ecaf3e860bfd47536ffc95e7cda33629f820}
+      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_BROWSER_TOKEN:-browser-bench.fdc250e325215af4650d4206640d18e0692670a0c83b5b23e16b7c08961c5f8f}
     volumes:
       - ../nodes/browser:/work:ro
       # check.mjs compares the page's PROTOCOL_VERSION with the Rust constant and

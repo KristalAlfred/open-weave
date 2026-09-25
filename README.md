@@ -466,7 +466,10 @@ of its own:
 
 Southbound and the controller hold the key, recompute the MAC, and read the node
 id off the token. They keep no list of nodes, so adding a node needs a new token
-and no restart. `weave node-token <id>` prints a node's token from
+and no restart. The key must be at least 32 characters, for example
+`openssl rand -hex 32`: a token is an id and its MAC, so a leaked one is enough
+to test guesses of a short key offline. Southbound and the controller refuse to
+start with a shorter key, and `weave node-token` refuses one. `weave node-token <id>` prints a node's token from
 `WEAVE_SOUTHBOUND_KEY` (or `--key`) without calling any service. openssl gives
 the same value:
 
@@ -528,7 +531,9 @@ keeps working.
 **Services fail closed.** A service whose secret (`WEAVE_NORTHBOUND_TOKEN`,
 `WEAVE_SOUTHBOUND_KEY`, and for the controller `WEAVE_SRT_KEY_SECRET`, see
 [SRT encryption](#srt-encryption)) is unset or empty refuses to start rather than
-serve unauthenticated traffic, and so does an adapter without a node token. For
+serve unauthenticated traffic, and so does an adapter without a node token. So
+does a service whose `WEAVE_SOUTHBOUND_KEY` or `WEAVE_SRT_KEY_SECRET` is shorter
+than 32 characters. For
 local development set `WEAVE_AUTH_DISABLED=1` to opt out explicitly; only `1` or
 `true` disable it, so `WEAVE_AUTH_DISABLED=0` leaves authentication on.
 

@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::RequestBuilder;
 use reqwest::header::{ETAG, HeaderValue, IF_MATCH, IF_NONE_MATCH};
 use tracing_subscriber::EnvFilter;
-use weave_core::auth::{self, NodeKey, Token};
+use weave_core::auth::{self, MIN_NODE_KEY_LEN, NodeKey, NodeKeyError, Token};
 use weave_core::{
     ApiError, NodeDescriptor, PathStatus, PlanStatus, ReconcileStatus, StatusResponse,
     StreamAccepted, StreamDefinition, StreamEndpoints, StreamPlan, StreamResource,
@@ -180,12 +180,16 @@ fn node_token(key: Option<&str>, id: &str) -> Result<String> {
     if let Err(error) = validate_resource_id(id) {
         bail!("invalid node id: {error}");
     }
-    let key = key.and_then(NodeKey::new).with_context(|| {
-        format!(
+    let key = match NodeKey::new(key.unwrap_or_default()) {
+        Ok(key) => key,
+        Err(NodeKeyError::Blank) => bail!(
             "no southbound key: pass --key or set {}",
             auth::SOUTHBOUND_KEY_VAR
-        )
-    })?;
+        ),
+        Err(NodeKeyError::TooShort) => bail!(
+            "the southbound key must be at least {MIN_NODE_KEY_LEN} characters, as southbound and the controller require"
+        ),
+    };
     Ok(key.token_for(id))
 }
 
@@ -945,13 +949,21 @@ mod tests {
     #[test]
     fn node_token_is_the_node_id_and_its_mac() {
         assert_eq!(
-            node_token(Some("bench-southbound-key"), "strom-node-1").unwrap(),
-            "strom-node-1.35e6718c0cdacc8a30175b4036cb8ebf271c7674e59f9b99f2db900b1c8532f7"
+            node_token(
+                Some("bench-southbound-key-for-local-use-only"),
+                "strom-node-1"
+            )
+            .unwrap(),
+            "strom-node-1.39d5a7c831d6b25a1b017da63efbe888265326986ce5f1bebd6032243609b014"
         );
         assert!(node_token(Some("k"), "Not_An_Id").is_err());
         let error = node_token(None, "strom-node-1").unwrap_err().to_string();
         assert!(error.contains(auth::SOUTHBOUND_KEY_VAR), "{error}");
         assert!(node_token(Some("  "), "strom-node-1").is_err());
+        let error = node_token(Some("bench-southbound-key"), "strom-node-1")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("32 characters"), "{error}");
     }
 
     #[test]

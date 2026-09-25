@@ -9,7 +9,8 @@
 //! another node's id.
 //!
 //! [`Guard::from_env`] and [`NodeGuard::from_env`] error when their variable is
-//! unset or blank, so a service with no secret does not start.
+//! unset or blank, and [`NodeGuard::from_env`] also when the key is shorter than
+//! [`MIN_NODE_KEY_LEN`], so a service with no secret or a weak key does not start.
 //! [`AUTH_DISABLED_VAR`] switches authentication off for local development.
 
 use std::fmt;
@@ -26,6 +27,8 @@ pub const SOUTHBOUND_TOKEN_VAR: &str = "WEAVE_SOUTHBOUND_TOKEN";
 /// Environment variable holding the key southbound and the controller derive
 /// node tokens from.
 pub const SOUTHBOUND_KEY_VAR: &str = "WEAVE_SOUTHBOUND_KEY";
+/// The fewest characters a [`NodeKey`] may have.
+pub const MIN_NODE_KEY_LEN: usize = 32;
 /// Set to `1` or `true` to serve and call without authentication. Local
 /// development only.
 pub const AUTH_DISABLED_VAR: &str = "WEAVE_AUTH_DISABLED";
@@ -144,18 +147,43 @@ impl Guard {
 #[derive(Clone)]
 pub struct NodeKey(Vec<u8>);
 
+/// Why a value is not a [`NodeKey`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum NodeKeyError {
+    #[error("the key is blank")]
+    Blank,
+    #[error("the key must be at least {MIN_NODE_KEY_LEN} characters")]
+    TooShort,
+}
+
 impl NodeKey {
-    /// Wrap a key, trimming surrounding whitespace. `None` when blank.
-    #[must_use]
-    pub fn new(value: &str) -> Option<Self> {
-        let value = value.trim();
-        (!value.is_empty()).then(|| Self(value.as_bytes().to_vec()))
+    /// Wrap a key, trimming surrounding whitespace.
+    ///
+    /// # Errors
+    /// Returns [`NodeKeyError`] when the key is blank or shorter than
+    /// [`MIN_NODE_KEY_LEN`].
+    pub fn new(value: &str) -> Result<Self, NodeKeyError> {
+        match value.trim() {
+            "" => Err(NodeKeyError::Blank),
+            value if value.len() < MIN_NODE_KEY_LEN => Err(NodeKeyError::TooShort),
+            value => Ok(Self(value.as_bytes().to_vec())),
+        }
     }
 
-    /// Read a key from environment variable `var`, `None` when unset or blank.
-    #[must_use]
-    pub fn from_env(var: &str) -> Option<Self> {
-        std::env::var(var).ok().as_deref().and_then(NodeKey::new)
+    /// Read a key from environment variable `var`.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::MissingToken`] when `var` is unset or blank and
+    /// [`AuthError::ShortKey`] when it is shorter than [`MIN_NODE_KEY_LEN`].
+    pub fn from_env(var: &str) -> Result<Self, AuthError> {
+        Self::new(&std::env::var(var).unwrap_or_default()).map_err(|error| match error {
+            NodeKeyError::Blank => AuthError::MissingToken {
+                var: var.to_string(),
+            },
+            NodeKeyError::TooShort => AuthError::ShortKey {
+                var: var.to_string(),
+            },
+        })
     }
 
     /// The token that authenticates as `node_id`: the id, a `.`, and the
@@ -208,17 +236,13 @@ impl NodeGuard {
     /// Resolve the guard from the key in `var`.
     ///
     /// # Errors
-    /// Returns [`AuthError::MissingToken`] when `var` is unset or blank and the
-    /// [`AUTH_DISABLED_VAR`] escape hatch is not engaged.
+    /// Returns the [`NodeKey::from_env`] error when the [`AUTH_DISABLED_VAR`]
+    /// escape hatch is not engaged.
     pub fn from_env(var: &str) -> Result<Self, AuthError> {
         if auth_disabled() {
             return Ok(Self::Disabled);
         }
-        NodeKey::from_env(var)
-            .map(Self::Required)
-            .ok_or_else(|| AuthError::MissingToken {
-                var: var.to_string(),
-            })
+        NodeKey::from_env(var).map(Self::Required)
     }
 
     /// Who a request with this `Authorization` header value is from, `None`
@@ -279,6 +303,10 @@ pub enum AuthError {
         "{var} is unset or empty: set it, or set WEAVE_AUTH_DISABLED=1 to run without authentication (local development only)"
     )]
     MissingToken { var: String },
+    #[error(
+        "{var} must be at least {MIN_NODE_KEY_LEN} characters, for example `openssl rand -hex 32`"
+    )]
+    ShortKey { var: String },
 }
 
 #[cfg(feature = "server")]
@@ -446,7 +474,7 @@ mod tests {
         assert!(guard.token().is_some());
     }
 
-    const KEY: &str = "bench-southbound-key";
+    const KEY: &str = "bench-southbound-key-for-local-use-only";
 
     fn key() -> NodeKey {
         NodeKey::new(KEY).unwrap()
@@ -457,13 +485,13 @@ mod tests {
     }
 
     /// The value `printf %s strom-node-1 | openssl dgst -sha256 -hmac
-    /// bench-southbound-key -r` prints, which the README gives as the way to
-    /// mint a token without this crate.
+    /// bench-southbound-key-for-local-use-only -r` prints, which the README gives
+    /// as the way to mint a token without this crate.
     #[test]
     fn node_token_matches_the_openssl_one_liner() {
         assert_eq!(
             key().token_for("strom-node-1"),
-            "strom-node-1.35e6718c0cdacc8a30175b4036cb8ebf271c7674e59f9b99f2db900b1c8532f7"
+            "strom-node-1.39d5a7c831d6b25a1b017da63efbe888265326986ce5f1bebd6032243609b014"
         );
     }
 
@@ -485,7 +513,7 @@ mod tests {
     fn node_token_rejects_forgeries() {
         let token = key().token_for("strom-node-1");
         let (_, mac) = token.split_once('.').unwrap();
-        let other_key = NodeKey::new("another-key")
+        let other_key = NodeKey::new("another-key-0123456789abcdef0123456789")
             .unwrap()
             .token_for("strom-node-1");
         let mut tampered = token.clone();
@@ -543,9 +571,17 @@ mod tests {
     }
 
     #[test]
-    fn blank_keys_are_treated_as_unset() {
-        assert!(NodeKey::new("").is_none());
-        assert!(NodeKey::new("  ").is_none());
+    fn blank_or_short_keys_are_refused() {
+        assert_eq!(NodeKey::new("").unwrap_err(), NodeKeyError::Blank);
+        assert_eq!(NodeKey::new("  ").unwrap_err(), NodeKeyError::Blank);
+        let short = "k".repeat(MIN_NODE_KEY_LEN - 1);
+        assert_eq!(NodeKey::new(&short).unwrap_err(), NodeKeyError::TooShort);
+        assert_eq!(
+            NodeKey::new(&format!("  {short}  ")).unwrap_err(),
+            NodeKeyError::TooShort,
+            "surrounding space does not count"
+        );
+        assert!(NodeKey::new(&"k".repeat(MIN_NODE_KEY_LEN)).is_ok());
         assert_eq!(
             NodeKey::new(&format!(" {KEY} ")).unwrap().token_for("a"),
             key().token_for("a"),
@@ -567,5 +603,15 @@ mod tests {
         .to_string();
         assert!(message.contains(NORTHBOUND_TOKEN_VAR), "{message}");
         assert!(message.contains(AUTH_DISABLED_VAR), "{message}");
+    }
+
+    #[test]
+    fn short_key_error_names_the_variable_and_the_length() {
+        let message = AuthError::ShortKey {
+            var: SOUTHBOUND_KEY_VAR.to_string(),
+        }
+        .to_string();
+        assert!(message.contains(SOUTHBOUND_KEY_VAR), "{message}");
+        assert!(message.contains("32 characters"), "{message}");
     }
 }
