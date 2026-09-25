@@ -200,6 +200,7 @@ mod tests {
                         }),
                         max_egresses: Some(1),
                         merge: false,
+                        accepts: None,
                     }],
                 },
                 topology: NodeTopology::default(),

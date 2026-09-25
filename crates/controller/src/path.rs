@@ -1724,6 +1724,7 @@ mod contract_tests {
             egress: class(Transport::Srt, weave_core::RoleSet::both()),
             max_egresses: None,
             merge: false,
+            accepts: None,
         }
     }
 
@@ -1886,6 +1887,7 @@ mod contract_tests {
                     ),
                     max_egresses: Some(1),
                     merge: false,
+                    accepts: None,
                 }],
             },
             topology: NodeTopology {
@@ -1908,6 +1910,7 @@ mod contract_tests {
             egress: class(Transport::Srt, weave_core::RoleSet::both()),
             max_egresses: None,
             merge: false,
+            accepts: None,
         });
         let stream = StreamDefinition {
             name: "camera".to_string(),
@@ -1942,6 +1945,7 @@ mod contract_tests {
             egress: class(Transport::Srt, weave_core::RoleSet::both()),
             max_egresses: Some(1),
             merge: false,
+            accepts: None,
         }];
         let definition = StreamDefinition {
             name: "fanout".to_string(),
@@ -1974,6 +1978,7 @@ mod contract_tests {
             ),
             max_egresses: Some(1),
             merge: false,
+            accepts: None,
         }];
         let error = derive_path(
             &stream(vec![destination("studio", "studio-node")]),
@@ -2303,6 +2308,7 @@ mod tests {
             egress,
             max_egresses,
             merge: false,
+            accepts: None,
         }
     }
 

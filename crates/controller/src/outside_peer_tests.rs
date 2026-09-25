@@ -1,9 +1,11 @@
 use weave_core::{
-    HopEndpointClass, HopProfile, NetworkAttachment, NetworkListeners, NodeCapabilities,
-    NodeDescriptor, NodeStatus, NodeTopology, ObservedState, PortRange, RoleSet,
-    SignallingEndpoint, SignallingListener, SocketRole, SocketSpec, SrtEndpoint, SrtListener,
-    StreamConditionType, StreamDefinition, StreamDestination, StreamTransport, Transport,
-    TransportClass, validate_stream,
+    AudioCodec, AudioConstraint, AudioFormat, ChromaSubsampling, Container, FormatConstraint,
+    Framerate, HopEndpointClass, HopProfile, MediaFormat, NetworkAttachment, NetworkListeners,
+    NodeCapabilities, NodeDescriptor, NodeStatus, NodeTopology, ObservedState, PathStatus,
+    PortRange, RoleSet, SignallingEndpoint, SignallingListener, SocketRole, SocketSpec,
+    SrtEndpoint, SrtListener, StreamConditionReason, StreamConditionStatus, StreamConditionType,
+    StreamDefinition, StreamDestination, StreamStatus, StreamTransport, Transport, TransportClass,
+    VideoCodec, VideoConstraint, VideoFormat, validate_stream,
 };
 
 use crate::keys::LinkKeys;
@@ -21,6 +23,21 @@ fn profile(id: &str, ingress: HopEndpointClass, egress: HopEndpointClass) -> Hop
         egress,
         max_egresses: None,
         merge: false,
+        accepts: None,
+    }
+}
+
+fn h264_and_opus() -> FormatConstraint {
+    FormatConstraint {
+        container: None,
+        video: Some(VideoConstraint {
+            codec: Some(vec![VideoCodec::H264]),
+            ..VideoConstraint::default()
+        }),
+        audio: Some(AudioConstraint {
+            codec: Some(vec![AudioCodec::Opus]),
+            ..AudioConstraint::default()
+        }),
     }
 }
 
@@ -57,11 +74,14 @@ fn strom(id: &str, host: &str, lan_port: u16) -> NodeDescriptor {
                     class(Transport::Srt, RoleSet::both()),
                     class(Transport::Srt, RoleSet::both()),
                 ),
-                profile(
-                    "whip-to-srt",
-                    class(Transport::Whip, RoleSet::only(SocketRole::Listen)),
-                    class(Transport::Srt, RoleSet::both()),
-                ),
+                HopProfile {
+                    accepts: Some(h264_and_opus()),
+                    ..profile(
+                        "whip-to-srt",
+                        class(Transport::Whip, RoleSet::only(SocketRole::Listen)),
+                        class(Transport::Srt, RoleSet::both()),
+                    )
+                },
                 profile(
                     "srt-to-whep",
                     class(Transport::Srt, RoleSet::both()),
@@ -342,5 +362,84 @@ fn a_placed_stream_reports_the_urls_outside_peers_call() {
     assert_eq!(
         outcome.endpoints["feed"].ingress, status.ingress,
         "GET /streams/feed/endpoints serves the same addresses"
+    );
+}
+
+fn sender_format(video: VideoCodec) -> MediaFormat {
+    MediaFormat {
+        container: Container::Rtp,
+        video: Some(VideoFormat {
+            codec: video,
+            width: 1280,
+            height: 720,
+            framerate: Framerate::new(30, 1),
+            chroma_subsampling: ChromaSubsampling::Yuv420,
+        }),
+        audio: Some(AudioFormat {
+            codec: AudioCodec::Opus,
+            sample_rate: 48_000,
+            channels: 2,
+        }),
+    }
+}
+
+fn reconciled(format: Option<MediaFormat>) -> StreamStatus {
+    let definition = stream(
+        StreamTransport::Whip(SignallingEndpoint {
+            format,
+            ..signalling("strom-node-1", None)
+        }),
+        vec![("studio", srt("strom-node-2"))],
+    );
+    let outcome = reconcile(
+        vec![definition],
+        &ObservedState {
+            nodes: nodes(),
+            endpoints: Vec::new(),
+            hops: Vec::new(),
+        },
+        &LinkKeys::for_tests(),
+    );
+    outcome.streams.into_iter().next().unwrap()
+}
+
+fn format_compatible(conditions: &[weave_core::StreamCondition]) -> &weave_core::StreamCondition {
+    conditions
+        .iter()
+        .find(|condition| condition.condition_type == StreamConditionType::FormatCompatible)
+        .unwrap()
+}
+
+#[test]
+fn a_whip_sender_declaring_a_codec_the_ingest_cannot_take_is_a_format_mismatch() {
+    let status = reconciled(Some(sender_format(VideoCodec::Vp8)));
+    assert_eq!(status.status, PathStatus::Degraded);
+    assert!(status.conditions.iter().any(|condition| {
+        condition.condition_type == StreamConditionType::PlacementReady
+            && condition.status == StreamConditionStatus::True
+    }));
+    let detail = "node strom-node-1 cannot take the source format through profile whip-to-srt: \
+                  video.codec is vp8 but accepts h264";
+    for conditions in [&status.conditions, &status.destinations[0].conditions] {
+        let condition = format_compatible(conditions);
+        assert_eq!(condition.status, StreamConditionStatus::False);
+        assert_eq!(condition.reason, StreamConditionReason::FormatMismatch);
+        assert_eq!(condition.detail, detail);
+    }
+    assert_eq!(status.destinations[0].status, PathStatus::Degraded);
+}
+
+#[test]
+fn a_whip_sender_declaring_what_the_ingest_takes_is_compatible() {
+    let status = reconciled(Some(sender_format(VideoCodec::H264)));
+    assert_eq!(status.status, PathStatus::Pending);
+    let condition = format_compatible(&status.conditions);
+    assert_eq!(condition.status, StreamConditionStatus::True);
+    assert_eq!(condition.reason, StreamConditionReason::FormatCompatible);
+
+    let undeclared = reconciled(None);
+    assert_eq!(
+        format_compatible(&undeclared.conditions).reason,
+        StreamConditionReason::FormatUnknown
     );
 }

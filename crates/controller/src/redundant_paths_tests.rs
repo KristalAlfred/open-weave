@@ -25,6 +25,7 @@ fn profile(id: &str, ingress: Transport, merge: bool) -> HopProfile {
         egress: class(Transport::Srt, RoleSet::both()),
         max_egresses: None,
         merge,
+        accepts: None,
     }
 }
 

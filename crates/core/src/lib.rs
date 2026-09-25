@@ -1385,6 +1385,10 @@ pub struct HopProfile {
     /// copy of the same media, and merge the two.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub merge: bool,
+    /// The media this profile's ingress takes. Absent takes anything. A
+    /// source `format` it does not accept is reported as a format mismatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepts: Option<FormatConstraint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

@@ -2189,24 +2189,70 @@ fn validate_endpoint_node_ids(endpoints: &[EndpointDescriptor]) -> Result<(), Va
     Ok(())
 }
 
-/// One line naming every destination that cannot accept the declared source
-/// format, or `None` when the manifest declares nothing to check.
+/// The constraint the placed sender's profile puts on the media entering it.
+struct IngressAccepts<'a> {
+    node: &'a str,
+    profile: &'a str,
+    accepts: &'a weave_core::FormatConstraint,
+}
+
+/// The sender hop's profile constraint, when its profile declares one.
+fn ingress_accepts<'a>(
+    path: &'a weave_core::Path,
+    nodes: &'a [NodeDescriptor],
+) -> Option<IngressAccepts<'a>> {
+    let sender = path.hops.first()?;
+    let profile = nodes
+        .iter()
+        .find(|node| node.id == sender.node_id)?
+        .capabilities
+        .hop_profiles
+        .iter()
+        .find(|profile| profile.id == sender.profile_id)?;
+    Some(IngressAccepts {
+        node: &sender.node_id,
+        profile: &profile.id,
+        accepts: profile.accepts.as_ref()?,
+    })
+}
+
+/// One line naming the sender that cannot take the declared source format and
+/// every destination that cannot accept it, or `None` when nothing declared
+/// conflicts.
 ///
 /// Reported, never acted on. The hops are placed and the media flows either way;
 /// what this says is that it will arrive somewhere it cannot be decoded, which is
 /// worth knowing long before anything can convert it.
-fn format_conflict_reason(stream: &StreamDefinition) -> Option<String> {
-    let conflicts = weave_core::stream_format_conflicts(stream);
-    if conflicts.is_empty() {
-        return None;
-    }
-    Some(
-        conflicts
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("; "),
-    )
+fn format_conflict_reason(
+    stream: &StreamDefinition,
+    ingress: Option<&IngressAccepts>,
+) -> Option<String> {
+    let ingress_conflict = ingress
+        .zip(stream.source.format())
+        .and_then(|(ingress, format)| {
+            let mismatches = ingress.accepts.mismatches(format);
+            (!mismatches.is_empty()).then(|| {
+                format!(
+                    "node {} cannot take the source format through profile {}: {}",
+                    ingress.node,
+                    ingress.profile,
+                    mismatches
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            })
+        });
+    let conflicts: Vec<String> = ingress_conflict
+        .into_iter()
+        .chain(
+            weave_core::stream_format_conflicts(stream)
+                .iter()
+                .map(ToString::to_string),
+        )
+        .collect();
+    (!conflicts.is_empty()).then(|| conflicts.join("; "))
 }
 
 fn stream_condition(
@@ -2224,12 +2270,16 @@ fn stream_condition(
     }
 }
 
-fn format_condition(stream: &StreamDefinition) -> StreamCondition {
+fn format_condition(
+    stream: &StreamDefinition,
+    ingress: Option<&IngressAccepts>,
+) -> StreamCondition {
     let source_declared = stream.source.format().is_some();
-    let constrained = stream
-        .destinations
-        .iter()
-        .any(|destination| destination.endpoint.accepts().is_some());
+    let constrained = ingress.is_some()
+        || stream
+            .destinations
+            .iter()
+            .any(|destination| destination.endpoint.accepts().is_some());
     if !source_declared || !constrained {
         return stream_condition(
             StreamConditionType::FormatCompatible,
@@ -2238,7 +2288,7 @@ fn format_condition(stream: &StreamDefinition) -> StreamCondition {
             "source format or destination constraints are not declared",
         );
     }
-    match format_conflict_reason(stream) {
+    match format_conflict_reason(stream, ingress) {
         Some(detail) => stream_condition(
             StreamConditionType::FormatCompatible,
             StreamConditionStatus::False,
@@ -2315,7 +2365,7 @@ fn disabled_conditions(stream: &StreamDefinition) -> Vec<StreamCondition> {
             StreamConditionReason::Disabled,
             "stream is disabled",
         ),
-        format_condition(stream),
+        format_condition(stream, None),
         media_condition(PathStatus::Idle),
     ]
 }
@@ -2355,7 +2405,7 @@ fn placement_failed_conditions(
             StreamConditionReason::NotReady,
             "no desired hops exist until placement succeeds",
         ),
-        format_condition(stream),
+        format_condition(stream, None),
         media_condition(PathStatus::Pending),
     ]
 }
@@ -2377,6 +2427,7 @@ fn single_path_detail<'a>(shortfalls: impl IntoIterator<Item = &'a SinglePath>) 
 
 fn placed_conditions(
     stream: &StreamDefinition,
+    ingress: Option<&IngressAccepts>,
     path_status: PathStatus,
     offline_node: Option<&str>,
     single_path: Option<&str>,
@@ -2433,7 +2484,7 @@ fn placed_conditions(
         placement,
         nodes,
         hops,
-        format_condition(stream),
+        format_condition(stream, ingress),
         media_condition(if offline_node.is_some() {
             PathStatus::Degraded
         } else {
@@ -2550,7 +2601,10 @@ fn reconcile(
                     .iter()
                     .find(|id| offline.contains(id.as_str()))
                     .cloned();
-                let status = if offline_node.is_some() || format_conflict_reason(stream).is_some() {
+                let ingress = ingress_accepts(&path, &observed.nodes);
+                let status = if offline_node.is_some()
+                    || format_conflict_reason(stream, ingress.as_ref()).is_some()
+                {
                     PathStatus::Degraded
                 } else {
                     path_status
@@ -2578,7 +2632,8 @@ fn reconcile(
                             .cloned();
                         let destination_stream = destination_stream(stream, &destination.id);
                         let status = if offline_node.is_some()
-                            || format_conflict_reason(&destination_stream).is_some()
+                            || format_conflict_reason(&destination_stream, ingress.as_ref())
+                                .is_some()
                         {
                             PathStatus::Degraded
                         } else {
@@ -2596,6 +2651,7 @@ fn reconcile(
                             nodes,
                             conditions: placed_conditions(
                                 &destination_stream,
+                                ingress.as_ref(),
                                 branch_status,
                                 offline_node.as_deref(),
                                 single_path.as_deref(),
@@ -2620,6 +2676,7 @@ fn reconcile(
                     destinations: destination_statuses,
                     conditions: placed_conditions(
                         stream,
+                        ingress.as_ref(),
                         path_status,
                         offline_node.as_deref(),
                         single_path_detail(&planned.single_path).as_deref(),
@@ -2749,6 +2806,7 @@ mod tests {
             egress: srt,
             max_egresses: None,
             merge: false,
+            accepts: None,
         }
     }
 
@@ -4093,6 +4151,7 @@ mod tests {
             }),
             max_egresses: Some(1),
             merge: false,
+            accepts: None,
         }];
         browser.node.topology.attachments[0].listeners = NetworkListeners::default();
         let (status, _) = send(
@@ -4117,6 +4176,7 @@ mod tests {
             }),
             max_egresses: None,
             merge: false,
+            accepts: None,
         });
         strom.node.topology.attachments[0].listeners.whip = Some(weave_core::SignallingListener {
             base_url: "http://172.27.0.10:8080/whip".to_string(),
@@ -5847,6 +5907,7 @@ mod key_exposure_tests {
             egress: srt(),
             max_egresses: None,
             merge,
+            accepts: None,
         };
         let mut hop_profiles = vec![profile("srt-forward", false)];
         if merge {

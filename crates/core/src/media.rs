@@ -51,6 +51,7 @@ pub enum VideoCodec {
     H264,
     H265,
     Av1,
+    Vp8,
     Vp9,
 }
 

@@ -15,10 +15,11 @@ use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Token};
 use weave_core::{
-    AdapterDescriptor, AdapterKind, DesiredHop, EgressStatus, EndpointDescriptor, EndpointKind,
-    HopEndpointClass, HopProfile, HopStatus, LinkCondition, LinkStats, NodeCapabilities,
-    NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus, PROTOCOL_VERSION, RoleSet,
-    SocketRole, SocketSpec, SocketStatus, Transport, TransportClass,
+    AdapterDescriptor, AdapterKind, AudioCodec, AudioConstraint, DesiredHop, EgressStatus,
+    EndpointDescriptor, EndpointKind, FormatConstraint, HopEndpointClass, HopProfile, HopStatus,
+    LinkCondition, LinkStats, NodeCapabilities, NodeDescriptor, NodeHeartbeat, NodeRegistration,
+    NodeStatus, PROTOCOL_VERSION, RoleSet, SocketRole, SocketSpec, SocketStatus, Transport,
+    TransportClass, VideoCodec, VideoConstraint,
 };
 use weave_strom::{
     ElementStats, FlowSpec, FlowStats, SessionStats, StromClient, StromError, StromFlow,
@@ -567,6 +568,7 @@ fn strom_hop_profiles() -> Vec<HopProfile> {
             egress: transport_class(Transport::Srt, RoleSet::both()),
             max_egresses: None,
             merge: false,
+            accepts: None,
         },
         HopProfile {
             id: "whip-to-srt".to_string(),
@@ -574,6 +576,7 @@ fn strom_hop_profiles() -> Vec<HopProfile> {
             egress: transport_class(Transport::Srt, RoleSet::both()),
             max_egresses: None,
             merge: false,
+            accepts: Some(whip_input_accepts()),
         },
         HopProfile {
             id: "srt-to-whep".to_string(),
@@ -581,8 +584,25 @@ fn strom_hop_profiles() -> Vec<HopProfile> {
             egress: transport_class(Transport::Whep, RoleSet::only(SocketRole::Listen)),
             max_egresses: None,
             merge: false,
+            accepts: None,
         },
     ]
+}
+
+/// What Strom's `whip_input` negotiates in the `audio_video` mode the gateway
+/// flow uses: H264 video and Opus audio.
+fn whip_input_accepts() -> FormatConstraint {
+    FormatConstraint {
+        container: None,
+        video: Some(VideoConstraint {
+            codec: Some(vec![VideoCodec::H264]),
+            ..VideoConstraint::default()
+        }),
+        audio: Some(AudioConstraint {
+            codec: Some(vec![AudioCodec::Opus]),
+            ..AudioConstraint::default()
+        }),
+    }
 }
 
 /// Registration the control plane will never accept, however long this adapter
@@ -1216,5 +1236,34 @@ mod tests {
             .condition;
         }
         assert_eq!(last, LinkCondition::Stalled);
+    }
+
+    #[test]
+    fn only_the_whip_gateway_constrains_its_ingress() {
+        let profiles = strom_hop_profiles();
+        let constrained: Vec<_> = profiles
+            .iter()
+            .filter(|profile| profile.accepts.is_some())
+            .map(|profile| profile.id.as_str())
+            .collect();
+        assert_eq!(constrained, ["whip-to-srt"]);
+        let accepts = profiles[1].accepts.as_ref().unwrap();
+        let format = |video| weave_core::MediaFormat {
+            container: weave_core::Container::Rtp,
+            video: Some(weave_core::VideoFormat {
+                codec: video,
+                width: 1280,
+                height: 720,
+                framerate: weave_core::Framerate::new(30, 1),
+                chroma_subsampling: weave_core::ChromaSubsampling::Yuv420,
+            }),
+            audio: Some(weave_core::AudioFormat {
+                codec: AudioCodec::Opus,
+                sample_rate: 48_000,
+                channels: 2,
+            }),
+        };
+        assert!(accepts.satisfied_by(&format(VideoCodec::H264)));
+        assert!(!accepts.satisfied_by(&format(VideoCodec::Vp8)));
     }
 }

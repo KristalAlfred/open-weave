@@ -434,6 +434,174 @@
                 "items": {
                   "additionalProperties": false,
                   "properties": {
+                    "accepts": {
+                      "additionalProperties": false,
+                      "description": "The media this profile's ingress takes. Absent takes anything. A\n source `format` it does not accept is reported as a format mismatch.",
+                      "properties": {
+                        "audio": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "channels": {
+                              "items": {
+                                "format": "uint8",
+                                "maximum": 255,
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "minItems": 1,
+                              "type": [
+                                "array",
+                                "null"
+                              ]
+                            },
+                            "codec": {
+                              "items": {
+                                "enum": [
+                                  "aac",
+                                  "opus",
+                                  "mp2",
+                                  "pcm_s16",
+                                  "pcm_s24"
+                                ],
+                                "type": "string"
+                              },
+                              "minItems": 1,
+                              "type": [
+                                "array",
+                                "null"
+                              ]
+                            },
+                            "sample_rate": {
+                              "items": {
+                                "format": "uint32",
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "minItems": 1,
+                              "type": [
+                                "array",
+                                "null"
+                              ]
+                            }
+                          },
+                          "type": [
+                            "object",
+                            "null"
+                          ]
+                        },
+                        "container": {
+                          "items": {
+                            "enum": [
+                              "mpeg_ts",
+                              "rtp"
+                            ],
+                            "type": "string"
+                          },
+                          "minItems": 1,
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "video": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "chroma_subsampling": {
+                              "items": {
+                                "enum": [
+                                  "yuv420",
+                                  "yuv422",
+                                  "yuv444"
+                                ],
+                                "type": "string"
+                              },
+                              "minItems": 1,
+                              "type": [
+                                "array",
+                                "null"
+                              ]
+                            },
+                            "codec": {
+                              "items": {
+                                "enum": [
+                                  "h264",
+                                  "h265",
+                                  "av1",
+                                  "vp8",
+                                  "vp9"
+                                ],
+                                "type": "string"
+                              },
+                              "minItems": 1,
+                              "type": [
+                                "array",
+                                "null"
+                              ]
+                            },
+                            "framerate": {
+                              "items": {
+                                "additionalProperties": false,
+                                "description": "Frames per second as a rational, because broadcast rates are not integers:\n 29.97 is exactly 30000/1001 and rounding it loses the distinction from 30.",
+                                "properties": {
+                                  "denominator": {
+                                    "format": "uint32",
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "numerator": {
+                                    "format": "uint32",
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "numerator",
+                                  "denominator"
+                                ],
+                                "type": "object"
+                              },
+                              "minItems": 1,
+                              "type": [
+                                "array",
+                                "null"
+                              ]
+                            },
+                            "height": {
+                              "items": {
+                                "format": "uint32",
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "minItems": 1,
+                              "type": [
+                                "array",
+                                "null"
+                              ]
+                            },
+                            "width": {
+                              "items": {
+                                "format": "uint32",
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "minItems": 1,
+                              "type": [
+                                "array",
+                                "null"
+                              ]
+                            }
+                          },
+                          "type": [
+                            "object",
+                            "null"
+                          ]
+                        }
+                      },
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
                     "egress": {
                       "anyOf": [
                         {

@@ -68,6 +68,7 @@ fn registration(id: &str, attachments: Vec<NetworkAttachment>) -> NodeRegistrati
                     egress: srt(),
                     max_egresses: None,
                     merge: false,
+                    accepts: None,
                 }],
             },
             topology: NodeTopology { attachments },

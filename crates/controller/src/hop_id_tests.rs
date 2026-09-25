@@ -29,6 +29,7 @@ fn node(id: &str, network: &str) -> NodeDescriptor {
                 egress: srt(),
                 max_egresses: None,
                 merge: false,
+                accepts: None,
             }],
         },
         topology: NodeTopology {

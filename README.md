@@ -781,6 +781,20 @@ not advertise WHIP to WHEP or mixed-transport fan-out. The controller writes the
 selected `profile_id` into every `DesiredHop`; adapters validate and dispatch on
 that id.
 
+A profile may declare `accepts`, the media its ingress takes, in the same shape
+as a destination's `accepts` (see [Media formats](#media-formats)). Strom's
+`whip-to-srt` declares H264 video and Opus audio, the codecs Strom's
+`whip_input` negotiates:
+
+```yaml
+- id: whip-to-srt
+  ingress: { transport: whip, roles: [listen] }
+  egress: { transport: srt, roles: [listen, connect] }
+  accepts:
+    video: { codec: [h264] }
+    audio: { codec: [opus] }
+```
+
 Topology says where a node can dial and what peers can reach. Attachment ids are
 local to one node. Network ids name shared routing domains:
 
@@ -863,7 +877,9 @@ named node with its last egress at the `whep` base. Both URLs end in the hop id:
 A node that declares no base for the transport cannot take the peer, and the
 stream stays unplaced. On Strom the sender uses `whip-to-srt` and the receiver
 `srt-to-whep`, so a WHIP source and a WHEP destination on one node are two hops
-joined over SRT.
+joined over SRT. Strom's `whip_input` takes H264 video and Opus audio and one
+session per endpoint; a `format` on the source outside those codecs is reported
+as a format mismatch.
 
 Strom serves `/whip` and `/whep` without authentication; its source puts those
 routes outside its auth middleware. Anyone who can reach the node and knows an
@@ -973,6 +989,15 @@ decoded. That is reported rather than acted on:
 ```
 degraded — destination studio cannot accept the source format:
            audio.sample_rate is 48000 but accepts 44100
+```
+
+The sender's hop profile is checked the same way. When the profile placed for
+the sender declares `accepts` and the source's `format` falls outside it, the
+mismatch names the node and profile:
+
+```
+degraded — node strom-node-1 cannot take the source format through profile
+           whip-to-srt: video.codec is vp8 but accepts h264
 ```
 
 The mismatch is known at plan time, so it is reported before any media exists.

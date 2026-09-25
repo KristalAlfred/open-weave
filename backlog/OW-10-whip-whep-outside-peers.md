@@ -2,7 +2,7 @@
 id: OW-10
 title: "WHIP and WHEP for outside peers"
 type: feature
-status: in-progress
+status: done
 depends_on: []
 assignee: claude-planner
 ---
@@ -26,7 +26,7 @@ open-weave does not manage.
 - [x] A manifest can take a source from an outside WHIP sender.
 - [x] A manifest can deliver a destination to an outside WHEP player.
 - [x] `GET /streams/{name}/endpoints` returns the URLs.
-- [ ] An outside WHIP sender whose declared `format` the node's WHIP ingest
+- [x] An outside WHIP sender whose declared `format` the node's WHIP ingest
       cannot take is reported as a format mismatch.
 
 ## Easy to break
@@ -68,3 +68,19 @@ open-weave does not manage.
   bench) found its VP8 offer breaks Strom's `whip_input` session and an
   audio-only sender leaves a 0.6.6 gateway flow paused (OW-13, OW-14). A media
   check would fail for those reasons, not for this change.
+- 2026-09-25: box 4. `HopProfile.accepts` (optional, same shape as a
+  destination's `accepts`, checked by `validate_node`). Strom's `whip-to-srt`
+  declares video codec `h264` and audio codec `opus`, which is what `whip_input`
+  sets in the `audio_video` mode the gateway flow uses (`whip.rs` in Strom
+  v0.6.6 and `~/git/strom`, read only). When the sender's selected profile
+  declares `accepts` and the source's `format` falls outside it,
+  `format_compatible` is `false` with `format_mismatch`, naming node and
+  profile, and the stream reads `degraded`, as destination mismatches do. The
+  constraint names both tracks, so a declared format without video or without
+  audio is reported too. `VideoCodec` gains `vp8` so a WebRTC sender's usual
+  codec can be declared. No `PROTOCOL_VERSION` change; it is 5 for the session.
+  Tests: `a_whip_sender_declaring_a_codec_the_ingest_cannot_take_is_a_format_mismatch`,
+  `a_whip_sender_declaring_what_the_ingest_takes_is_compatible`
+  (`outside_peer_tests.rs`, both fail with the check switched off),
+  `only_the_whip_gateway_constrains_its_ingress` (adapter),
+  `a_hop_profile_constraint_follows_the_accepts_rules` (core). Unit tests only.

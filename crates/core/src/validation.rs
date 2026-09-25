@@ -163,6 +163,13 @@ pub fn validate_node(node: &NodeDescriptor) -> Vec<ValidationIssue> {
                 "max_egresses must be at least one",
             ));
         }
+        if let Some(accepts) = &profile.accepts {
+            validate_constraint(
+                accepts,
+                &format!("node.capabilities.hop_profiles[{index}].accepts"),
+                &mut issues,
+            );
+        }
     }
     let mut attachment_ids = HashSet::new();
     for (index, attachment) in node.topology.attachments.iter().enumerate() {
@@ -982,6 +989,45 @@ mod tests {
             }))
             .is_err(),
             "a manifest never carries an address"
+        );
+    }
+
+    #[test]
+    fn a_hop_profile_constraint_follows_the_accepts_rules() {
+        let class = crate::HopEndpointClass::Transport(crate::TransportClass {
+            transport: crate::Transport::Srt,
+            roles: crate::RoleSet::both(),
+        });
+        let node = crate::NodeDescriptor {
+            id: "strom-node-1".to_string(),
+            endpoint: "http://strom-node-1:8091".to_string(),
+            status: crate::NodeStatus::Ready,
+            capabilities: crate::NodeCapabilities {
+                adapters: Vec::new(),
+                hop_profiles: vec![crate::HopProfile {
+                    id: "srt-forward".to_string(),
+                    ingress: class.clone(),
+                    egress: class,
+                    max_egresses: None,
+                    merge: false,
+                    accepts: Some(FormatConstraint {
+                        video: Some(crate::VideoConstraint {
+                            codec: Some(Vec::new()),
+                            ..crate::VideoConstraint::default()
+                        }),
+                        ..FormatConstraint::default()
+                    }),
+                }],
+            },
+            topology: crate::NodeTopology::default(),
+        };
+        assert_eq!(
+            super::validate_node(&node),
+            [issue(
+                "node.capabilities.hop_profiles[0].accepts.video.codec",
+                "empty",
+                "accepts must not contain an empty list of values",
+            )]
         );
     }
 }
