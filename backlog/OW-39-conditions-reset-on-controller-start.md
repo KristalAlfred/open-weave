@@ -2,9 +2,9 @@
 id: OW-39
 title: "Stream conditions start over on every controller start or takeover"
 type: bug
-status: todo
+status: done
 depends_on: []
-assignee:
+assignee: claude-ha
 ---
 
 ## Evidence
@@ -27,11 +27,11 @@ when its status changes.
 
 ## Done when
 
-- [ ] A controller start or takeover keeps each condition's
+- [x] A controller start or takeover keeps each condition's
       `last_transition_time` while its status is unchanged.
-- [ ] Its first tick sends `stream.changed` only for streams whose conditions
+- [x] Its first tick sends `stream.changed` only for streams whose conditions
       differ from the ones last computed before the start or takeover.
-- [ ] A stream whose media keeps flowing through a takeover does not read
+- [x] A stream whose media keeps flowing through a takeover does not read
       `pending` in between.
 
 ## Easy to break
@@ -46,3 +46,19 @@ when its status changes.
   restart already did.
 - 2026-09-25: the stored hop status question checked on `bench/` during OW-9:
   it does make the first tick differ. Moved to Evidence and a box added.
+- 2026-09-25: started by claude-ha, together with OW-44.
+- 2026-09-25: all three boxes checked with unit tests, together with OW-44. The
+  store keeps each stream's status as the last tick that changed its
+  conditions computed it (`stream_status`, removed with its stream), and each
+  node's registration as the last heartbeat that changed its status, a hop's
+  state or a socket's condition left it; rates and addresses alone write
+  nothing (`a_heartbeat_writes_the_store_only_when_its_reports_change`). A
+  tick also stores a node it marks `offline`. `AppState::hydrate` loads the
+  statuses as the previous tick's, so the first tick stamps and compares
+  against them. `a_restart_keeps_unchanged_conditions_and_reports_no_change`
+  runs a flowing stream on one controller, then starts a second from the same
+  `MemStore`: its `/status` equals the first's, transition times included, and
+  its first tick sends no `stream.changed`. Without either half (reports or
+  statuses) the test fails. `pg_stream_statuses_go_with_their_stream_and_are_fenced`
+  covers the Postgres table, run against `postgres:16` in docker. A takeover
+  loads state through the same `hydrate`. Not yet rerun on `bench/`.

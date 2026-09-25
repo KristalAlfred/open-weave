@@ -716,9 +716,11 @@ conditions. `stream` has the stream's `name`, `generation`,
 `observed_generation` and `status`, and every condition on the stream and on
 each destination with its stable `reason` code. It leaves out the stream's nodes
 and every address, which `/status` and `/streams/{name}/endpoints` carry. A tick
-sends at most one event per stream. The first tick after a controller start
-or takeover sends one for every stream, because the controller keeps no
-conditions across either (backlog/OW-39). A change of `detail`
+sends at most one event per stream. The controller stores a stream's
+conditions whenever a tick changes them, and the first tick after a start or
+takeover compares against those, so it sends only what changed since. With the
+in-memory store a restart starts empty, and its first tick sends one for every
+stream. A change of `detail`
 alone sends nothing, and deleting a stream sends nothing. An event follows the
 change it reports by up to one reconcile interval plus an adapter poll.
 
@@ -762,11 +764,9 @@ controller.
   no standby can take over while the old leader still serves.
 - A standby tries for the lease every second, or every third of the TTL if that
   is shorter. When it gets the lease it loads the stored state, runs one
-  reconcile tick, and then serves. Hops are planned from the streams and node
-  registrations in Postgres, so it serves the hops the old leader served and
-  adapters keep their flows. The exception is an automatic relay: the old
-  leader skipped a node it had marked `offline`, and the new one reads that
-  node's registered status until it goes offline again.
+  reconcile tick, and then serves. Hops are planned from the streams, node
+  registrations and node reports in Postgres, so it serves the hops the old
+  leader served and adapters keep their flows.
 - Every write checks the lease in its own transaction and fails with
   `503 not_leader` unless the writer holds it. A takeover waits for a write
   already past that check, and the new leader loads it.
@@ -775,11 +775,15 @@ controller.
   a lone controller restarting after a crash answers `503 not_leader` until
   then.
 - Streams, stream sets, node registrations, generations, revisions and ETags
-  live in Postgres and survive a takeover. Heartbeats and conditions do not.
-  The new leader counts every stored node as heard at the takeover and uses the
-  status and hop status the node last registered with, until the node
-  heartbeats. Conditions start over as after a restart, and a stream can read
-  `pending` until its nodes heartbeat (backlog/OW-39).
+  live in Postgres and survive a takeover, as do what nodes report and what
+  the last tick concluded. A heartbeat writes the node's registration when its
+  status, a hop's state or a socket's condition changes; rates and addresses
+  alone write nothing. A tick writes a node it marks `offline`, and each stream
+  whose conditions changed, with their transition times. The new leader's first
+  tick reads all of it, so a bridge stays on the relay that runs it, a flowing
+  stream keeps reading `flowing`, and each condition keeps its transition time.
+  Heartbeat times are not stored: the new leader counts every stored node as
+  heard at the takeover. A restart with Postgres works the same way.
 - Every controller needs the same `WEAVE_SRT_KEY_SECRET`,
   `WEAVE_SOUTHBOUND_KEY` and `WEAVE_SOUTHBOUND_MIN_EPOCHS`. With another SRT key
   secret, a new leader gives every link a new key and each adapter recreates

@@ -169,7 +169,7 @@ impl AppState {
                 );
             }
         }
-        let streams = loaded_streams
+        let streams: BTreeMap<String, StoredStream> = loaded_streams
             .into_iter()
             .map(|stream| (stream.spec.name.clone(), stream))
             .collect();
@@ -208,6 +208,13 @@ impl AppState {
             })
             .map(|registration| (registration.node.id.clone(), registration))
             .collect::<BTreeMap<String, NodeRegistration>>();
+        let statuses = store
+            .load_stream_statuses()
+            .await
+            .context("hydrating stream statuses")?
+            .into_iter()
+            .filter(|status| streams.contains_key(&status.name))
+            .collect();
         let boot = Instant::now();
         let last_seen = nodes.keys().map(|id| (id.clone(), boot)).collect();
         Ok(Self {
@@ -219,7 +226,10 @@ impl AppState {
             node_ttl,
             node_forget,
             desired: Arc::new(RwLock::new(BTreeMap::new())),
-            view: Arc::new(RwLock::new(ControllerView::default())),
+            view: Arc::new(RwLock::new(ControllerView {
+                streams: statuses,
+                ..ControllerView::default()
+            })),
             webhooks,
             keys,
         })
@@ -771,11 +781,13 @@ async fn reconcile_tick(state: &AppState) {
         let mut last_seen = state.last_seen.write().await;
         let now = Instant::now();
         let transitioned = mark_offline(&mut nodes, &last_seen, now, state.node_ttl);
-        let went_offline: Vec<NodeSummary> = transitioned
-            .iter()
-            .filter_map(|id| nodes.get(id))
-            .map(|registration| NodeSummary::from(&registration.node))
-            .collect();
+        let mut went_offline = Vec::new();
+        for registration in transitioned.iter().filter_map(|id| nodes.get(id)) {
+            if let Err(err) = state.store.upsert_node(registration).await {
+                tracing::warn!(%err, node_id = %registration.node.id, "storing that a node went offline failed");
+            }
+            went_offline.push(NodeSummary::from(&registration.node));
+        }
         let named = named_nodes(streams.values().map(|stream| &stream.spec));
         let mut forgotten = Vec::new();
         for id in forgettable(&nodes, &last_seen, &named, now, state.node_forget) {
@@ -829,8 +841,13 @@ async fn reconcile_tick(state: &AppState) {
     view.hops = outcome.hops_by_stream;
     drop(view);
     drop(streams);
-    for stream in changed {
-        state.emit(EventType::StreamChanged, stream);
+    if !changed.is_empty()
+        && let Err(err) = state.store.save_stream_statuses(&changed).await
+    {
+        tracing::warn!(%err, "storing changed stream statuses failed");
+    }
+    for stream in &changed {
+        state.emit(EventType::StreamChanged, StreamSummary::from(stream));
     }
 }
 
@@ -838,7 +855,7 @@ async fn reconcile_tick(state: &AppState) {
 /// status or reason, on the stream or on any destination. A stream no earlier
 /// tick computed has changed; one only accepted since then has a placeholder
 /// status with no `observed_generation`.
-fn changed_streams(current: &[StreamStatus], previous: &[StreamStatus]) -> Vec<StreamSummary> {
+fn changed_streams(current: &[StreamStatus], previous: &[StreamStatus]) -> Vec<StreamStatus> {
     current
         .iter()
         .filter(|stream| {
@@ -849,7 +866,7 @@ fn changed_streams(current: &[StreamStatus], previous: &[StreamStatus]) -> Vec<S
                 })
                 .is_none_or(|previous| condition_keys(previous) != condition_keys(stream))
         })
-        .map(StreamSummary::from)
+        .cloned()
         .collect()
 }
 
@@ -2125,7 +2142,8 @@ async fn register_node(
         .into_response()
 }
 
-/// Heartbeats update only in-memory observed fields; they never touch the store.
+/// A heartbeat writes the store only when [`reported`] changes, so a controller
+/// that starts or takes over plans from what each node last reported.
 async fn node_heartbeat(
     State(state): State<AppState>,
     Extension(caller): Extension<NodeCaller>,
@@ -2184,9 +2202,20 @@ async fn node_heartbeat(
         );
     };
     let was_offline = registration.node.status == NodeStatus::Offline;
-    registration.node.status = heartbeat.status;
-    registration.endpoints = heartbeat.endpoints;
-    registration.hop_status = heartbeat.hop_status;
+    let mut updated = registration.clone();
+    updated.node.status = heartbeat.status;
+    updated.endpoints = heartbeat.endpoints;
+    updated.hop_status = heartbeat.hop_status;
+    if reported(&updated) != reported(registration) {
+        match state.store.upsert_node(&updated).await {
+            Ok(()) => {}
+            Err(StoreError::NotLeader) => return not_leader(),
+            Err(err) => {
+                tracing::warn!(%err, %node_id, "storing a changed node report failed");
+            }
+        }
+    }
+    *registration = updated;
     let status = registration.node.status;
     let recovered = (was_offline && status != NodeStatus::Offline)
         .then(|| NodeSummary::from(&registration.node));
@@ -2209,6 +2238,38 @@ async fn node_heartbeat(
         }),
     )
         .into_response()
+}
+
+type HopReport<'a> = (
+    &'a str,
+    weave_core::HopState,
+    weave_core::LinkCondition,
+    Option<weave_core::LinkCondition>,
+    Vec<(&'a str, weave_core::LinkCondition)>,
+);
+
+/// What planning and stream conditions read from a node's reports: its status
+/// and each hop's state and socket conditions, without rates or addresses.
+fn reported(registration: &NodeRegistration) -> (NodeStatus, Vec<HopReport<'_>>) {
+    (
+        registration.node.status,
+        registration
+            .hop_status
+            .iter()
+            .map(|hop| {
+                (
+                    hop.id.as_str(),
+                    hop.state,
+                    hop.ingress.condition,
+                    hop.merge_ingress.as_ref().map(|socket| socket.condition),
+                    hop.egresses
+                        .iter()
+                        .map(|egress| (egress.branch_id.as_str(), egress.status.condition))
+                        .collect(),
+                )
+            })
+            .collect(),
+    )
 }
 
 /// Serve the desired hops computed for a node on the last reconcile tick. A
@@ -4378,10 +4439,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heartbeat_updates_memory_but_never_the_store() {
+    async fn a_heartbeat_writes_the_store_only_when_its_reports_change() {
         let (state, mem) = mem_state();
         let app = open_router(state);
-
         send(
             &app,
             "POST",
@@ -4391,29 +4451,82 @@ mod tests {
         .await;
         assert_eq!(mem.upsert_node_calls(), 1);
 
-        let heartbeat = NodeHeartbeat {
-            node_id: "strom-node-1".to_string(),
-            status: NodeStatus::Degraded,
-            endpoints: Vec::new(),
-            hop_status: Vec::new(),
+        let socket = |condition, rate_mbps| weave_core::SocketStatus {
+            condition,
+            resolved: None,
+            stats: Some(weave_core::LinkStats {
+                rate_mbps,
+                ..weave_core::LinkStats::default()
+            }),
         };
-        let (status, _) = send(
-            &app,
-            "POST",
-            "/nodes/strom-node-1/heartbeat",
-            Some(serde_json::to_value(&heartbeat).unwrap()),
-        )
-        .await;
-        assert_eq!(status, StatusCode::ACCEPTED);
-        assert_eq!(
-            mem.upsert_node_calls(),
-            1,
-            "heartbeat must not write through to the store"
-        );
+        let hop = |condition, rate_mbps| HopStatus {
+            id: "weave-basic-sender".to_string(),
+            node_id: "strom-node-1".to_string(),
+            state: weave_core::HopState::Provisioned,
+            ingress: socket(condition, rate_mbps),
+            merge_ingress: None,
+            egresses: vec![weave_core::EgressStatus {
+                branch_id: "studio".to_string(),
+                status: socket(condition, rate_mbps),
+            }],
+        };
+        let heartbeat = |status, hop_status| NodeHeartbeat {
+            node_id: "strom-node-1".to_string(),
+            status,
+            endpoints: Vec::new(),
+            hop_status,
+        };
+        for (step, beat, writes) in [
+            ("unchanged", heartbeat(NodeStatus::Ready, Vec::new()), 1),
+            ("new status", heartbeat(NodeStatus::Degraded, Vec::new()), 2),
+            (
+                "new hop",
+                heartbeat(
+                    NodeStatus::Degraded,
+                    vec![hop(weave_core::LinkCondition::Flowing, 2.5)],
+                ),
+                3,
+            ),
+            (
+                "new rate only",
+                heartbeat(
+                    NodeStatus::Degraded,
+                    vec![hop(weave_core::LinkCondition::Flowing, 2.7)],
+                ),
+                3,
+            ),
+            (
+                "new condition",
+                heartbeat(
+                    NodeStatus::Degraded,
+                    vec![hop(weave_core::LinkCondition::Stalled, 0.0)],
+                ),
+                4,
+            ),
+        ] {
+            let (status, _) = send(
+                &app,
+                "POST",
+                "/nodes/strom-node-1/heartbeat",
+                Some(serde_json::to_value(&beat).unwrap()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{step}");
+            assert_eq!(mem.upsert_node_calls(), writes, "{step}");
+        }
 
+        let stored = mem.load_nodes().await.unwrap();
+        assert_eq!(stored[0].node.status, NodeStatus::Degraded);
+        assert_eq!(
+            stored[0].hop_status[0].ingress.condition,
+            weave_core::LinkCondition::Stalled
+        );
         let (_, body) = send(&app, "GET", "/state", None).await;
         let observed: ObservedState = serde_json::from_value(body).unwrap();
-        assert_eq!(observed.nodes[0].status, NodeStatus::Degraded);
+        assert_eq!(
+            observed.hops[0].ingress.condition,
+            weave_core::LinkCondition::Stalled
+        );
     }
 
     /// A stale adapter is turned away at the handshake, and nothing about it is
@@ -5162,6 +5275,220 @@ mod tests {
 
         assert!(!leadership.lead(open_router(state)));
         assert!(leadership.router().is_none());
+    }
+
+    /// What a node running `hops` with media on every socket reports.
+    fn flowing_reports(hops: &[DesiredHop]) -> Vec<HopStatus> {
+        let flowing = || weave_core::SocketStatus {
+            condition: weave_core::LinkCondition::Flowing,
+            resolved: None,
+            stats: None,
+        };
+        hops.iter()
+            .map(|hop| HopStatus {
+                id: hop.id.clone(),
+                node_id: hop.node_id.clone(),
+                state: weave_core::HopState::Provisioned,
+                ingress: flowing(),
+                merge_ingress: hop.merge_ingress.as_ref().map(|_| flowing()),
+                egresses: hop
+                    .egresses
+                    .iter()
+                    .map(|egress| weave_core::EgressStatus {
+                        branch_id: egress.branch_id.clone(),
+                        status: flowing(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Heartbeat `node_id` with its desired hops all flowing.
+    async fn report_flowing(app: &Router, node_id: &str) {
+        let hops: Vec<DesiredHop> =
+            serde_json::from_value(get_ok(app, &format!("/nodes/{node_id}/desired")).await)
+                .unwrap();
+        let heartbeat = NodeHeartbeat {
+            node_id: node_id.to_string(),
+            status: NodeStatus::Ready,
+            endpoints: Vec::new(),
+            hop_status: flowing_reports(&hops),
+        };
+        let (status, body) = send(
+            app,
+            "POST",
+            &format!("/nodes/{node_id}/heartbeat"),
+            Some(serde_json::to_value(&heartbeat).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{node_id}: {body}");
+    }
+
+    async fn hydrated(store: Arc<MemStore>, webhooks: Option<Arc<webhook::Emitter>>) -> AppState {
+        AppState::hydrate(
+            store,
+            Duration::from_secs(15),
+            Duration::from_secs(300),
+            webhooks,
+            LinkKeys::for_tests(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_restart_keeps_unchanged_conditions_and_reports_no_change() {
+        let mem = Arc::new(MemStore::new());
+        seed_restart_case(mem.as_ref()).await;
+        let before = hydrated(mem.clone(), None).await;
+        let before_app =
+            router_after_first_tick(&before, Guard::Disabled, NodeGuard::Disabled).await;
+        for node in ["restart-node-1", "restart-node-2"] {
+            report_flowing(&before_app, node).await;
+        }
+        reconcile_tick(&before).await;
+        let flowing = before.view.read().await.streams.clone();
+        assert_eq!(flowing[0].status, PathStatus::Flowing, "{flowing:?}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let mut sink = sink(StatusCode::OK).await;
+        let webhooks = webhook::Emitter::new(webhook::Config {
+            url: Some(sink.url.clone()),
+            ..webhook::Config::default()
+        })
+        .map(Arc::new);
+        let restarted = hydrated(mem, webhooks).await;
+        let restarted_app =
+            router_after_first_tick(&restarted, Guard::Disabled, NodeGuard::Disabled).await;
+
+        let RunningStatus { streams, .. } =
+            serde_json::from_value(get_ok(&restarted_app, "/status").await).unwrap();
+        assert_eq!(
+            streams, flowing,
+            "the same status, and every condition keeps its transition time"
+        );
+        assert!(
+            stream_events(&mut sink).await.is_empty(),
+            "nothing changed, so nothing is reported"
+        );
+    }
+
+    fn hop_nodes(app_desired: &[(String, Vec<DesiredHop>)], hop_id: &str) -> Vec<String> {
+        app_desired
+            .iter()
+            .filter(|(_, hops)| hops.iter().any(|hop| hop.id == hop_id))
+            .map(|(node, _)| node.clone())
+            .collect()
+    }
+
+    async fn desired_everywhere(app: &Router, nodes: &[&str]) -> Vec<(String, Vec<DesiredHop>)> {
+        let mut desired = Vec::new();
+        for node in nodes {
+            let hops = get_ok(app, &format!("/nodes/{node}/desired")).await;
+            desired.push(((*node).to_string(), serde_json::from_value(hops).unwrap()));
+        }
+        desired
+    }
+
+    #[tokio::test]
+    async fn a_restart_keeps_a_relayed_stream_on_the_relay_that_runs_it() {
+        const NODES: [&str; 4] = ["relay-a", "relay-b", "source", "studio-node"];
+        let bridge = crate::path::bridge_hop_id("feed", "studio", 0);
+        let mem = Arc::new(MemStore::new());
+        mem.create_stream(&stream_between("feed", "source", "studio-node"))
+            .await
+            .unwrap();
+        for registration in [
+            nat_registration("source", "192.168.1.10"),
+            nat_registration("studio-node", "192.168.2.10"),
+            node_registration("relay-a", "198.51.100.10"),
+            node_registration("relay-b", "198.51.100.20"),
+        ] {
+            mem.upsert_node(&registration).await.unwrap();
+        }
+
+        let before = hydrated(mem.clone(), None).await;
+        let before_app =
+            router_after_first_tick(&before, Guard::Disabled, NodeGuard::Disabled).await;
+        assert_eq!(
+            hop_nodes(&desired_everywhere(&before_app, &NODES).await, &bridge),
+            ["relay-a"]
+        );
+        before.last_seen.write().await.insert(
+            "relay-a".to_string(),
+            Instant::now() - Duration::from_secs(60),
+        );
+        reconcile_tick(&before).await;
+        let moved = desired_everywhere(&before_app, &NODES).await;
+        assert_eq!(
+            hop_nodes(&moved, &bridge),
+            ["relay-b"],
+            "relay-a went offline"
+        );
+        let (status, _) = send(
+            &before_app,
+            "POST",
+            "/nodes/register",
+            Some(serde_json::to_value(node_registration("relay-a", "198.51.100.10")).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        for node in NODES {
+            report_flowing(&before_app, node).await;
+        }
+        reconcile_tick(&before).await;
+        assert_eq!(
+            desired_everywhere(&before_app, &NODES).await,
+            moved,
+            "relay-a is back, and the bridge stays where it runs"
+        );
+
+        let restarted = hydrated(mem, None).await;
+        let restarted_app =
+            router_after_first_tick(&restarted, Guard::Disabled, NodeGuard::Disabled).await;
+        assert_eq!(
+            desired_everywhere(&restarted_app, &NODES).await,
+            moved,
+            "the restarted controller keeps the bridge, and its ports, on relay-b"
+        );
+
+        restarted.last_seen.write().await.insert(
+            "relay-b".to_string(),
+            Instant::now() - Duration::from_secs(60),
+        );
+        reconcile_tick(&restarted).await;
+        assert_eq!(
+            hop_nodes(&desired_everywhere(&restarted_app, &NODES).await, &bridge),
+            ["relay-a"],
+            "a relay that stops heartbeating after the restart still loses the bridge"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_marked_offline_is_still_offline_after_a_restart() {
+        let mem = Arc::new(MemStore::new());
+        seed_restart_case(mem.as_ref()).await;
+        let before = hydrated(mem.clone(), None).await;
+        before.last_seen.write().await.insert(
+            "restart-node-1".to_string(),
+            Instant::now() - Duration::from_secs(60),
+        );
+        reconcile_tick(&before).await;
+
+        let restarted = hydrated(mem, None).await;
+        let app = router_after_first_tick(&restarted, Guard::Disabled, NodeGuard::Disabled).await;
+        let nodes: Vec<NodeDescriptor> =
+            serde_json::from_value(get_ok(&app, "/nodes").await).unwrap();
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| (node.id.as_str(), node.status))
+                .collect::<Vec<_>>(),
+            [
+                ("restart-node-1", NodeStatus::Offline),
+                ("restart-node-2", NodeStatus::Ready),
+            ]
+        );
     }
 
     #[tokio::test]

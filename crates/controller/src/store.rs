@@ -1,6 +1,7 @@
-//! Persistence for operator stream definitions, stream-set ownership, and node
-//! registrations. Everything else (observed hop status, computed desired hops,
-//! endpoints) is derived in memory and never stored.
+//! Persistence for operator stream definitions, stream-set ownership, node
+//! registrations with what each node last reported, and each stream's status as
+//! the last tick that changed it computed it. Desired hops and endpoints are
+//! derived in memory and never stored.
 //!
 //! Postgres also holds the controller lease. Only the controller holding it
 //! writes: every write checks the lease in its own transaction.
@@ -9,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use weave_core::{NodeRegistration, StreamDefinition, protocol_compatible};
+use weave_core::{NodeRegistration, StreamDefinition, StreamStatus, protocol_compatible};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredStream {
@@ -74,8 +75,8 @@ fn database_counter(value: u64, field: &'static str) -> Result<i64, StoreError> 
     i64::try_from(value).map_err(|_| StoreError::CounterTooLarge { field, value })
 }
 
-/// Durable state access. Streams and node registrations are written through on
-/// mutation and hydrated into memory on boot; nothing else is persisted.
+/// Durable state access. Everything is written through on change and hydrated
+/// into memory on boot.
 #[async_trait]
 pub trait StateStore: Send + Sync {
     async fn load_streams(&self) -> Result<Vec<StoredStream>, StoreError>;
@@ -103,6 +104,11 @@ pub trait StateStore: Send + Sync {
     async fn load_nodes(&self) -> Result<Vec<NodeRegistration>, StoreError>;
     async fn upsert_node(&self, registration: &NodeRegistration) -> Result<(), StoreError>;
     async fn delete_node(&self, id: &str) -> Result<(), StoreError>;
+    /// Statuses of streams that still exist.
+    async fn load_stream_statuses(&self) -> Result<Vec<StreamStatus>, StoreError>;
+    /// Replace the stored status of each stream named; a stream that no longer
+    /// exists is skipped. A deleted stream's status goes with it.
+    async fn save_stream_statuses(&self, statuses: &[StreamStatus]) -> Result<(), StoreError>;
 }
 
 /// Decode stored registrations, dropping any a running node will send again.
@@ -260,6 +266,15 @@ impl PgStore {
             .map_err(StoreError::Query)?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS nodes (id TEXT PRIMARY KEY, registration JSONB NOT NULL)",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(StoreError::Query)?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS stream_status (
+               name TEXT PRIMARY KEY REFERENCES streams(name) ON DELETE CASCADE,
+               status JSONB NOT NULL
+             )",
         )
         .execute(&mut *transaction)
         .await
@@ -871,6 +886,47 @@ impl StateStore for PgStore {
         transaction.commit().await.map_err(StoreError::Query)?;
         Ok(())
     }
+
+    async fn load_stream_statuses(&self) -> Result<Vec<StreamStatus>, StoreError> {
+        let rows: Vec<(String, sqlx::types::Json<serde_json::Value>)> =
+            sqlx::query_as("SELECT name, status FROM stream_status ORDER BY name")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(StoreError::Query)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(name, status)| {
+                serde_json::from_value(status.0)
+                    .inspect_err(|error| {
+                        tracing::warn!(
+                            stream = %name,
+                            %error,
+                            "dropping a stored stream status this build cannot read; the next tick computes it afresh"
+                        );
+                    })
+                    .ok()
+            })
+            .collect())
+    }
+
+    async fn save_stream_statuses(&self, statuses: &[StreamStatus]) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await.map_err(StoreError::Query)?;
+        self.fence(&mut transaction).await?;
+        for status in statuses {
+            sqlx::query(
+                "INSERT INTO stream_status (name, status)
+                 SELECT $1, $2 WHERE EXISTS (SELECT 1 FROM streams WHERE name = $1)
+                 ON CONFLICT (name) DO UPDATE SET status = EXCLUDED.status",
+            )
+            .bind(&status.name)
+            .bind(sqlx::types::Json(status))
+            .execute(&mut *transaction)
+            .await
+            .map_err(StoreError::Query)?;
+        }
+        transaction.commit().await.map_err(StoreError::Query)?;
+        Ok(())
+    }
 }
 
 fn stored_stream_from_row(
@@ -911,6 +967,7 @@ struct MemInner {
     stream_sets: std::collections::BTreeMap<String, u64>,
     next_stream_set_revision: u64,
     nodes: std::collections::BTreeMap<String, NodeRegistration>,
+    stream_statuses: std::collections::BTreeMap<String, StreamStatus>,
     #[cfg(test)]
     upsert_stream_calls: usize,
     #[cfg(test)]
@@ -1019,6 +1076,7 @@ impl MemStore {
         }
         for name in &deleted {
             inner.streams.remove(name);
+            inner.stream_statuses.remove(name);
         }
         for (name, stream) in &inner.streams {
             if stream.owner.as_deref() == Some(owner) {
@@ -1173,6 +1231,7 @@ impl StateStore for MemStore {
             return Err(StoreError::PreconditionFailed);
         }
         inner.streams.remove(name);
+        inner.stream_statuses.remove(name);
         Ok(())
     }
 
@@ -1213,6 +1272,22 @@ impl StateStore for MemStore {
 
     async fn delete_node(&self, id: &str) -> Result<(), StoreError> {
         self.lock().nodes.remove(id);
+        Ok(())
+    }
+
+    async fn load_stream_statuses(&self) -> Result<Vec<StreamStatus>, StoreError> {
+        Ok(self.lock().stream_statuses.values().cloned().collect())
+    }
+
+    async fn save_stream_statuses(&self, statuses: &[StreamStatus]) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        for status in statuses {
+            if inner.streams.contains_key(&status.name) {
+                inner
+                    .stream_statuses
+                    .insert(status.name.clone(), status.clone());
+            }
+        }
         Ok(())
     }
 }
@@ -1933,5 +2008,73 @@ pub(crate) mod tests {
             ["late"],
             "the new holder reads the write it waited for"
         );
+    }
+    fn status_of(name: &str) -> StreamStatus {
+        StreamStatus {
+            name: name.to_string(),
+            generation: 1,
+            observed_generation: Some(1),
+            status: weave_core::PathStatus::Flowing,
+            nodes: Vec::new(),
+            conditions: Vec::new(),
+            ingress: None,
+            destinations: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn memstore_stream_statuses_go_with_their_stream() {
+        let store = MemStore::new();
+        let basic = store.create_stream(&stream("basic")).await.unwrap();
+        store
+            .save_stream_statuses(&[status_of("basic"), status_of("gone")])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load_stream_statuses().await.unwrap(),
+            [status_of("basic")]
+        );
+        store.delete_stream("basic", basic.revision).await.unwrap();
+        assert!(store.load_stream_statuses().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running Postgres via DATABASE_URL"]
+    async fn pg_stream_statuses_go_with_their_stream_and_are_fenced() {
+        let url = fresh_database().await;
+        let store = leading_pg_store(&url).await;
+        let basic = store.create_stream(&stream("basic")).await.unwrap();
+        store
+            .create_stream_set("production", &[stream("owned")], true)
+            .await
+            .unwrap();
+        store
+            .save_stream_statuses(&[status_of("basic"), status_of("owned"), status_of("gone")])
+            .await
+            .unwrap();
+        let mut flowing = status_of("basic");
+        flowing.status = weave_core::PathStatus::Degraded;
+        store
+            .save_stream_statuses(std::slice::from_ref(&flowing))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load_stream_statuses().await.unwrap(),
+            [flowing, status_of("owned")]
+        );
+
+        store.delete_stream("basic", basic.revision).await.unwrap();
+        let set = store.load_stream_sets().await.unwrap();
+        store
+            .update_stream_set("production", &[], true, set[0].revision)
+            .await
+            .unwrap();
+        assert!(store.load_stream_statuses().await.unwrap().is_empty());
+
+        store.release_lease().await.unwrap();
+        assert!(matches!(
+            store.save_stream_statuses(&[status_of("basic")]).await,
+            Err(StoreError::NotLeader)
+        ));
     }
 }
