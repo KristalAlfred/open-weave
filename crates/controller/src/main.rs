@@ -16,6 +16,8 @@ mod path;
 #[cfg(test)]
 mod redundant_paths_tests;
 #[cfg(test)]
+mod relay_choice_tests;
+#[cfg(test)]
 mod scale_tests;
 mod store;
 mod webhook;
@@ -1858,9 +1860,8 @@ async fn plan_stream(
         .collect();
     streams.insert(stream.name.clone(), stream.clone());
     let nodes = state.nodes.read().await;
-    let mut observed = observed_state(&nodes);
+    let observed = observed_state(&nodes);
     drop(nodes);
-    observed.hops.clear();
     let mut outcome = reconcile(streams.into_values().collect(), &observed, &state.keys);
     let endpoints = outcome.endpoints.remove(&stream.name);
     let planned = outcome
@@ -4205,6 +4206,60 @@ mod tests {
         assert!(plan.hops.is_empty());
         assert!(plan.reason.is_none());
         assert_eq!(mem.upsert_stream_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_plan_keeps_a_bridge_on_the_relay_that_reports_running_it() {
+        let bridge = "weave-feed-bridge-studio-0";
+        let plan_relay = |relay_b: NodeRegistration| async move {
+            let (state, _mem) = mem_state();
+            let app = open_router(state);
+            for registration in [
+                nat_registration("nat-1", "192.168.0.10"),
+                nat_registration("nat-2", "192.168.0.20"),
+                node_registration("relay-a", "198.51.100.10"),
+                relay_b,
+            ] {
+                let (status, _) = send(
+                    &app,
+                    "POST",
+                    "/nodes/register",
+                    Some(serde_json::to_value(registration).unwrap()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::ACCEPTED);
+            }
+            let (_, body) = send(
+                &app,
+                "POST",
+                "/stream-plans",
+                Some(serde_json::to_value(stream_between("feed", "nat-1", "nat-2")).unwrap()),
+            )
+            .await;
+            let plan: StreamPlan = serde_json::from_value(body).unwrap();
+            plan.hops
+                .iter()
+                .find(|hop| hop.id == bridge)
+                .map(|hop| hop.node_id.clone())
+        };
+
+        let idle = node_registration("relay-b", "198.51.100.20");
+        assert_eq!(plan_relay(idle.clone()).await.as_deref(), Some("relay-a"));
+
+        let mut running = idle;
+        running.hop_status = vec![weave_core::HopStatus {
+            id: bridge.to_string(),
+            node_id: "relay-b".to_string(),
+            state: weave_core::HopState::Provisioned,
+            ingress: weave_core::SocketStatus {
+                condition: weave_core::LinkCondition::Flowing,
+                resolved: None,
+                stats: None,
+            },
+            merge_ingress: None,
+            egresses: Vec::new(),
+        }];
+        assert_eq!(plan_relay(running).await.as_deref(), Some("relay-b"));
     }
 
     #[tokio::test]

@@ -188,8 +188,9 @@ retry a stale write or adopt a name outside the set. See
 no state. It validates the definition, plans it alongside the current desired
 streams against the current nodes, and returns `placed`, `unplaced`, or
 `disabled` with the resolved nodes, desired hops, endpoints, and any placement
-reason. Existing hop observations are excluded, so a preview describes
-placement rather than the runtime state of an older stream with the same name.
+reason. It reads the hops nodes report running, as a reconcile does, so a
+preview keeps a bridge on the relay running it (see
+[Capabilities and topology](#capabilities-and-topology)).
 Use `weave plan -f examples/stream.yaml` or `just plan`.
 
 The adapter contract is the one that matters most: operators attach their own
@@ -877,8 +878,16 @@ attachments carry both halves. Of those, it takes the lowest id that still has a
 free port for each SRT listener the bridge would host, so a fan-out that fills
 one relay's port range moves on to the next. When every such node is out of
 ports, the stream stays unplaced and the reason names the lowest-id one. There
-is no `relay` flag. An explicit `via`
-chain remains an exact node constraint:
+is no `relay` flag.
+
+A bridge stays on the relay that reports running it, as long as that relay is
+online, still qualifies, has the ports, and its report of the bridge is not
+`failed`. So an earlier relay coming back does not move a working stream, and
+a relay that goes offline or fails the bridge loses it. A stream plans the
+destinations some node already carries before new ones, so a new destination
+takes the next relay instead of the ports of an existing bridge. Hops are still
+listed in destination id order. An explicit `via` chain remains an exact node
+constraint:
 
 ```yaml
 destinations:

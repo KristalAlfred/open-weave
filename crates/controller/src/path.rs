@@ -4,10 +4,10 @@ use std::collections::{HashMap, HashSet};
 
 use weave_core::{
     DesiredEgress, DesiredHop, DestinationEndpoint, DeviceKind, EndpointAddr, HOP_ID_PREFIX,
-    HopConditions, HopRole, HopStatus, NetworkAttachment, NodeDescriptor, NodeStatus, Passphrase,
-    Path, PathStatus, PortRange, RemoteAddr, SignallingEndpoint, SignallingTransport, SocketRole,
-    SocketSpec, SrtParams, SrtSocket, StreamDefinition, StreamEndpoints, StreamTransport,
-    Transport, roll_up_path,
+    HopConditions, HopRole, HopState, HopStatus, NetworkAttachment, NodeDescriptor, NodeStatus,
+    Passphrase, Path, PathStatus, PortRange, RemoteAddr, SignallingEndpoint, SignallingTransport,
+    SocketRole, SocketSpec, SrtParams, SrtSocket, StreamDefinition, StreamEndpoints,
+    StreamTransport, Transport, roll_up_path,
 };
 
 use crate::keys::LinkKeys;
@@ -383,7 +383,7 @@ pub fn shared_hop_id(left: &StreamDefinition, right: &StreamDefinition) -> Optio
 pub fn derive_stream(
     stream: &StreamDefinition,
     nodes: &[NodeDescriptor],
-    _observed: &[HopStatus],
+    observed: &[HopStatus],
     committed_ports: &mut PortAllocator,
     keys: &LinkKeys,
 ) -> Result<PlannedStream, PlacementError> {
@@ -408,12 +408,19 @@ pub fn derive_stream(
     let mut downstream = Vec::new();
     let mut first_paths = Vec::new();
     let mut single_path = Vec::new();
-    let mut relays = RelayCache::default();
+    let mut relays = RelayCache::new(observed);
+    let mut branches = Vec::with_capacity(stream.destinations.len());
 
     let mut destinations: Vec<_> = stream.destinations.iter().collect();
-    destinations.sort_by(|left, right| left.id.cmp(&right.id));
+    destinations.sort_by_key(|destination| {
+        (
+            !relays.carries(&stream.name, &destination.id),
+            &destination.id,
+        )
+    });
     for destination in destinations {
         let branch_id = destination.id.clone();
+        let mut branch_egresses = Vec::new();
         let dest = read_endpoint(&destination.endpoint)?;
         let latency = dest.latency.unwrap_or(DEFAULT_SINK_LATENCY);
 
@@ -440,7 +447,7 @@ pub fn derive_stream(
             let (up_socket, hop, attachments) =
                 plan_hop(&upstream, bridge, latency, nodes, &mut ports, keys)?;
             sender_attachments.get_or_insert(attachments.upstream);
-            push_egress(&mut sender_egresses, &mut hops, &branch_id, up_socket);
+            push_egress(&mut branch_egresses, &mut hops, &branch_id, up_socket);
             hops.push(hop);
             upstream = LinkEnd {
                 station: &bridge.station,
@@ -453,21 +460,24 @@ pub fn derive_stream(
             // and no hop is placed for it.
             ChainTerminal::Remote(remote) => {
                 if !can_dial_network(&upstream.station.node_id, &remote.network, nodes)? {
+                    let id = bridge_hop_id(&stream.name, &destination.id, chain.bridges.len());
+                    let keep = relays.running(&id).to_vec();
                     let relay = pick_remote_relay(
                         upstream.station,
                         &remote.network,
                         nodes,
                         &ports,
                         &mut relays,
+                        &keep,
                     )?;
                     let bridge = ChainHop {
                         station: Station::relay(&relay),
-                        id: bridge_hop_id(&stream.name, &destination.id, chain.bridges.len()),
+                        id,
                         role: HopRole::Bridge,
                     };
                     let (up_socket, hop, _) =
                         plan_hop(&upstream, &bridge, latency, nodes, &mut ports, keys)?;
-                    push_egress(&mut sender_egresses, &mut hops, &branch_id, up_socket);
+                    push_egress(&mut branch_egresses, &mut hops, &branch_id, up_socket);
                     hops.push(hop);
                 }
                 let socket = SocketSpec::Srt(SrtSocket::Connect {
@@ -475,7 +485,7 @@ pub fn derive_stream(
                     port: remote.port,
                     params: srt_params(latency, dest.passphrase.cloned()),
                 });
-                push_egress(&mut sender_egresses, &mut hops, &branch_id, socket);
+                push_egress(&mut branch_egresses, &mut hops, &branch_id, socket);
                 if destination.paths > 1 {
                     single_path.push(SinglePath {
                         destination: destination.id.clone(),
@@ -488,7 +498,7 @@ pub fn derive_stream(
             ChainTerminal::Receiver(receiver) => {
                 let (up_socket, mut hop, attachments) =
                     plan_hop(&upstream, receiver, latency, nodes, &mut ports, keys)?;
-                push_egress(&mut sender_egresses, &mut hops, &branch_id, up_socket);
+                push_egress(&mut branch_egresses, &mut hops, &branch_id, up_socket);
                 let socket = match dest.terminal {
                     Terminal::Srt => {
                         let key = consumer_key(&receiver.id);
@@ -535,6 +545,11 @@ pub fn derive_stream(
             }
         }
 
+        branches.push((destination.id.clone(), branch_egresses, hops));
+    }
+    branches.sort_by(|left, right| left.0.cmp(&right.0));
+    for (_, egresses, hops) in branches {
+        sender_egresses.extend(egresses);
         downstream.extend(hops);
     }
 
@@ -556,8 +571,10 @@ pub fn derive_stream(
         hop.profile_id = select_profile(hop, nodes)?;
     }
 
+    let first_path_egresses = hops[0].egresses.len();
+    let mut second_paths = Vec::with_capacity(first_paths.len());
     for first in &first_paths {
-        if let Err(reason) = place_second_path(
+        match place_second_path(
             &stream.name,
             first,
             &source_station,
@@ -567,12 +584,18 @@ pub fn derive_stream(
             keys,
             &mut relays,
         ) {
-            single_path.push(SinglePath {
+            Ok(bridges) => second_paths.push((first.destination.clone(), bridges)),
+            Err(reason) => single_path.push(SinglePath {
                 destination: first.destination.clone(),
                 reason,
-            });
+            }),
         }
     }
+    hops[0].egresses[first_path_egresses..].sort_by(|left, right| {
+        second_path_destination(&left.branch_id).cmp(second_path_destination(&right.branch_id))
+    });
+    second_paths.sort_by(|left, right| left.0.cmp(&right.0));
+    hops.extend(second_paths.into_iter().flat_map(|(_, bridges)| bridges));
     single_path.sort_by(|left, right| left.destination.cmp(&right.destination));
     *committed_ports = ports;
 
@@ -621,6 +644,13 @@ fn second_path_branch_id(destination: &str) -> String {
     format!("{destination}{SECOND_PATH_SUFFIX}")
 }
 
+/// The destination a second path's branch id belongs to.
+fn second_path_destination(branch_id: &str) -> &str {
+    branch_id
+        .strip_suffix(SECOND_PATH_SUFFIX)
+        .unwrap_or(branch_id)
+}
+
 /// Whether an egress with `branch_id` carries media to `destination`, over its
 /// first path or its second.
 fn carries_destination(branch_id: &str, destination: &str) -> bool {
@@ -639,8 +669,8 @@ struct FirstPath {
     relays: Vec<String>,
 }
 
-/// Plan a destination's second path and add it to `hops`: one more sender
-/// egress, the bridges of its own chain, and the receiver's merge ingress.
+/// Plan a destination's second path: add one more sender egress and the
+/// receiver's merge ingress to `hops`, and return the bridges of its own chain.
 ///
 /// The second path uses no relay the first one does, and at the sender and the
 /// receiver no attachment the first one may carry its link on. It is planned
@@ -652,12 +682,12 @@ fn place_second_path<'n>(
     stream: &str,
     first: &FirstPath,
     source: &Station,
-    hops: &mut Vec<DesiredHop>,
+    hops: &mut [DesiredHop],
     nodes: &'n [NodeDescriptor],
     committed_ports: &mut PortAllocator,
     keys: &LinkKeys,
     relays: &mut RelayCache<'n>,
-) -> Result<(), PlacementError> {
+) -> Result<Vec<DesiredHop>, PlacementError> {
     let receiver_node = find_node(nodes, &first.receiver.node_id).ok_or_else(|| {
         PlacementError::NodeNotRegistered {
             node: first.receiver.node_id.clone(),
@@ -687,6 +717,7 @@ fn place_second_path<'n>(
     let mut stations = Vec::new();
     relay_before(
         &mut stations,
+        (stream, &branch_id),
         &sender,
         &receiver,
         nodes,
@@ -762,9 +793,8 @@ fn place_second_path<'n>(
 
     hops[0] = sender_hop;
     hops[receiver_index] = receiver_hop;
-    hops.extend(new_hops);
     *committed_ports = ports;
-    Ok(())
+    Ok(new_hops)
 }
 
 fn can_dial_network(
@@ -788,6 +818,7 @@ fn pick_remote_relay<'n>(
     nodes: &'n [NodeDescriptor],
     ports: &PortAllocator,
     relays: &mut RelayCache<'n>,
+    keep: &[String],
 ) -> Result<String, PlacementError> {
     let candidates = relays
         .reachable_from(upstream, nodes)
@@ -819,7 +850,7 @@ fn pick_remote_relay<'n>(
                     (*node, listeners)
                 })
         });
-    match relay_with_ports(candidates, ports) {
+    match relay_with_ports(candidates, ports, keep) {
         Some(relay) => relay.map(|node| node.id.clone()),
         None => Err(PlacementError::CannotDialNetwork {
             node: upstream.node_id.clone(),
@@ -968,7 +999,16 @@ fn chain_hops<'a, 'n>(
 ) -> Result<Chain<'a>, PlacementError> {
     let mut stations: Vec<Station> = Vec::with_capacity(dest.via.len());
     for station in dest.via.iter().map(|id| Station::relay(id)) {
-        relay_before(&mut stations, source, &station, nodes, &[], ports, relays)?;
+        relay_before(
+            &mut stations,
+            (stream, destination_id),
+            source,
+            &station,
+            nodes,
+            &[],
+            ports,
+            relays,
+        )?;
         stations.push(station);
     }
 
@@ -980,7 +1020,16 @@ fn chain_hops<'a, 'n>(
                 network: dest.network.map(str::to_string),
                 avoid: Vec::new(),
             };
-            relay_before(&mut stations, source, &station, nodes, &[], ports, relays)?;
+            relay_before(
+                &mut stations,
+                (stream, destination_id),
+                source,
+                &station,
+                nodes,
+                &[],
+                ports,
+                relays,
+            )?;
             ChainTerminal::Receiver(ChainHop {
                 station,
                 id: receiver_hop_id(stream, destination_id),
@@ -1004,13 +1053,46 @@ fn chain_hops<'a, 'n>(
 
 /// The online nodes an upstream station can link to as a relay, and how, found
 /// once per upstream for one stream's planning. Without it every relayed
-/// destination rescans every node.
-#[derive(Default)]
+/// destination rescans every node. Also the nodes that report running each hop,
+/// leaving out reports whose state is `failed`.
 struct RelayCache<'n> {
     reachable: HashMap<Station, Vec<(&'n NodeDescriptor, LinkChoice)>>,
+    running: HashMap<String, Vec<String>>,
 }
 
 impl<'n> RelayCache<'n> {
+    fn new(observed: &[HopStatus]) -> Self {
+        let mut running: HashMap<String, Vec<String>> = HashMap::new();
+        for status in observed
+            .iter()
+            .filter(|status| status.state != HopState::Failed)
+        {
+            running
+                .entry(status.id.clone())
+                .or_default()
+                .push(status.node_id.clone());
+        }
+        Self {
+            reachable: HashMap::new(),
+            running,
+        }
+    }
+
+    fn running(&self, hop_id: &str) -> &[String] {
+        self.running.get(hop_id).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether a node reports running the receiver or first bridge of
+    /// `destination`.
+    fn carries(&self, stream: &str, destination: &str) -> bool {
+        !self
+            .running(&receiver_hop_id(stream, destination))
+            .is_empty()
+            || !self
+                .running(&bridge_hop_id(stream, destination, 0))
+                .is_empty()
+    }
+
     fn reachable_from(
         &mut self,
         upstream: &Station,
@@ -1032,14 +1114,18 @@ impl<'n> RelayCache<'n> {
 
 /// Extend `chain` with a relay when no transport carries the link into `next`
 /// from the station before it — the source's own station when the chain is
-/// still empty. The relay is none of `avoid_relays`.
+/// still empty. The relay is none of `avoid_relays`, and is the node that
+/// reports running the bridge `(stream, branch)` would place there when that
+/// node still qualifies.
 ///
 /// A spliced relay is compatible with both halves by construction, so each
 /// resolves under the ordinary rule — the upstream reaches the relay, and the
 /// relay reaches the downstream. One pass is enough; no inserted link can itself
 /// need a relay.
+#[allow(clippy::too_many_arguments)]
 fn relay_before<'n>(
     chain: &mut Vec<Station>,
+    (stream, branch): (&str, &str),
     source: &Station,
     next: &Station,
     nodes: &'n [NodeDescriptor],
@@ -1049,21 +1135,35 @@ fn relay_before<'n>(
 ) -> Result<(), PlacementError> {
     let upstream = chain.last().unwrap_or(source);
     if let Err(failure) = station_link(upstream, next, nodes) {
-        let relay = pick_relay(nodes, upstream, next, failure, avoid_relays, ports, relays)?;
+        let keep = relays
+            .running(&bridge_hop_id(stream, branch, chain.len()))
+            .to_vec();
+        let relay = pick_relay(
+            nodes,
+            upstream,
+            next,
+            failure,
+            avoid_relays,
+            ports,
+            relays,
+            &keep,
+        )?;
         chain.push(relay);
     }
     Ok(())
 }
 
-/// The lowest-id online relay node that can carry both halves of a link no
-/// transport connects directly and has a free port for every SRT listener it
-/// would host. Sorting keeps the choice stable across ticks, so a stream does
-/// not migrate between equally eligible relays.
+/// The online relay node that can carry both halves of a link no transport
+/// connects directly and has a free port for every SRT listener it would host:
+/// one of `keep` when one qualifies, otherwise the lowest-id one. Sorting keeps
+/// the choice stable across ticks, and `keep` keeps a bridge on the relay
+/// running it when an earlier relay comes back.
 ///
 /// When none qualifies the error names why the direct link failed: two ends that
 /// do share a transport but cannot dial each other read as a routing problem,
 /// two that share none as a capability problem. When relays qualify but none has
 /// the ports, it names the lowest-id one as out of ports.
+#[allow(clippy::too_many_arguments)]
 fn pick_relay<'n>(
     nodes: &'n [NodeDescriptor],
     upstream: &Station,
@@ -1072,6 +1172,7 @@ fn pick_relay<'n>(
     avoid: &[String],
     ports: &PortAllocator,
     relays: &mut RelayCache<'n>,
+    keep: &[String],
 ) -> Result<Station, PlacementError> {
     let candidates = relays
         .reachable_from(upstream, nodes)
@@ -1102,7 +1203,7 @@ fn pick_relay<'n>(
                     (*node, listeners)
                 })
         });
-    match relay_with_ports(candidates, ports) {
+    match relay_with_ports(candidates, ports, keep) {
         Some(relay) => relay.map(|node| Station::relay(&node.id)),
         None => Err(failure.into_error(&upstream.node_id, &downstream.node_id)),
     }
@@ -1114,12 +1215,13 @@ fn srt_listener_at(link: &LinkChoice, end: Listener) -> Option<NetworkAttachment
     (link.listener == end && link.transport == Transport::Srt).then(|| link.attachment.clone())
 }
 
-/// The lowest-id candidate with a free port for each SRT listener it would host,
-/// `PortRangeExhausted` for the lowest-id one when none has, or `None` when
-/// there are no candidates.
+/// The candidate with a free port for each SRT listener it would host, one of
+/// `keep` before the lowest-id one; `PortRangeExhausted` for the lowest-id one
+/// when none has, or `None` when there are no candidates.
 fn relay_with_ports<'a>(
     candidates: impl Iterator<Item = (&'a NodeDescriptor, Vec<NetworkAttachment>)>,
     ports: &PortAllocator,
+    keep: &[String],
 ) -> Option<Result<&'a NodeDescriptor, PlacementError>> {
     let mut candidates: Vec<_> = candidates.collect();
     candidates.sort_by(|(left, _), (right, _)| left.id.cmp(&right.id));
@@ -1127,6 +1229,8 @@ fn relay_with_ports<'a>(
     Some(
         candidates
             .iter()
+            .filter(|(node, _)| keep.contains(&node.id))
+            .chain(&candidates)
             .find(|(node, listeners)| ports.can_claim(node, listeners))
             .map(|(node, _)| *node)
             .ok_or_else(|| PlacementError::PortRangeExhausted {
