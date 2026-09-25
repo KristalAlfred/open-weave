@@ -106,6 +106,8 @@ struct AppState {
     streams: Arc<RwLock<BTreeMap<String, StoredStream>>>,
     stream_sets: Arc<RwLock<BTreeMap<String, u64>>>,
     nodes: Arc<RwLock<BTreeMap<String, NodeRegistration>>>,
+    /// Written only while holding the `nodes` write lock, so a tick never sees
+    /// a node's new status beside its old heartbeat time.
     last_seen: Arc<RwLock<BTreeMap<String, Instant>>>,
     node_ttl: Duration,
     node_forget: Duration,
@@ -1682,12 +1684,12 @@ async fn register_node(
             );
         }
         nodes.insert(node_id.clone(), registration);
+        state
+            .last_seen
+            .write()
+            .await
+            .insert(node_id.clone(), Instant::now());
     }
-    state
-        .last_seen
-        .write()
-        .await
-        .insert(node_id.clone(), Instant::now());
     tracing::info!(%node_id, endpoint_count, "node registered");
     state.emit(EventType::NodeRegistered, summary);
     (
@@ -1762,12 +1764,12 @@ async fn node_heartbeat(
     let status = registration.node.status;
     let recovered = (was_offline && status != NodeStatus::Offline)
         .then(|| NodeSummary::from(&registration.node));
-    drop(nodes);
     state
         .last_seen
         .write()
         .await
         .insert(node_id.clone(), Instant::now());
+    drop(nodes);
     if let Some(summary) = recovered {
         state.emit(EventType::NodeOnline, summary);
     }
@@ -4459,6 +4461,84 @@ mod tests {
         let (status, body) = desired_hops(&app, "strom-node-1").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body.as_array().map(Vec::len), Some(1));
+    }
+
+    /// Holds `last_seen` so a request stops at its first wait on it, then plays
+    /// the start of a tick, which takes the nodes lock and then `last_seen`.
+    async fn offline_check_during(
+        state: &AppState,
+        request: impl std::future::Future<Output = (StatusCode, Value)>,
+    ) -> String {
+        let last_seen = state.last_seen.write().await;
+        tokio::pin!(request);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut request)
+                .await
+                .is_err(),
+            "the request waits for last_seen"
+        );
+        let tick_in_the_gap = state
+            .nodes
+            .try_write()
+            .map(|mut nodes| mark_offline(&mut nodes, &last_seen, Instant::now(), state.node_ttl));
+        drop(last_seen);
+        assert_eq!(request.await.0, StatusCode::ACCEPTED);
+        format!("{tick_in_the_gap:?}")
+    }
+
+    #[tokio::test]
+    async fn a_tick_cannot_see_a_heartbeat_half_applied() {
+        let (state, _mem) = mem_state();
+        state.nodes.write().await.insert(
+            "strom-node-1".to_string(),
+            node_registration("strom-node-1", "172.26.0.10"),
+        );
+        state.last_seen.write().await.insert(
+            "strom-node-1".to_string(),
+            Instant::now() - Duration::from_secs(60),
+        );
+        let app = open_router(state.clone());
+
+        let heartbeat = send(
+            &app,
+            "POST",
+            "/nodes/strom-node-1/heartbeat",
+            Some(json!({ "node_id": "strom-node-1", "status": "ready" })),
+        );
+        let seen = offline_check_during(&state, heartbeat).await;
+
+        assert!(seen.starts_with("Err"), "a tick in the gap got {seen}");
+        reconcile_tick(&state).await;
+        assert_eq!(
+            state.nodes.read().await["strom-node-1"].node.status,
+            NodeStatus::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tick_cannot_see_a_registration_half_applied() {
+        let (state, _mem) = mem_state();
+        let registration = node_registration("strom-node-1", "172.26.0.10");
+        state
+            .nodes
+            .write()
+            .await
+            .insert("strom-node-1".to_string(), registration.clone());
+        state.last_seen.write().await.insert(
+            "strom-node-1".to_string(),
+            Instant::now() - Duration::from_secs(60),
+        );
+        let app = open_router(state.clone());
+
+        let register = send(
+            &app,
+            "POST",
+            "/nodes/register",
+            Some(serde_json::to_value(&registration).unwrap()),
+        );
+        let seen = offline_check_during(&state, register).await;
+
+        assert!(seen.starts_with("Err"), "a tick in the gap got {seen}");
     }
 }
 
