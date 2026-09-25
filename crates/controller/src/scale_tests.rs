@@ -22,8 +22,6 @@ use crate::path::{PortAllocator, derive_path};
 use crate::store::MemStore;
 use crate::{AppState, observed_state, reconcile_tick, router};
 
-const RECEIVERS: usize = 300;
-
 fn srt_listener(host: &str) -> NetworkListeners {
     NetworkListeners {
         srt: Some(SrtListener {
@@ -98,7 +96,7 @@ fn receiver_id(index: usize) -> String {
     format!("rx-{index:03}")
 }
 
-fn fan_out_stream() -> StreamDefinition {
+fn fan_out_stream(receivers: usize) -> StreamDefinition {
     let endpoint = |node: &str| {
         StreamTransport::Srt(SrtEndpoint {
             node: Some(node.to_string()),
@@ -115,7 +113,7 @@ fn fan_out_stream() -> StreamDefinition {
         name: "feed".to_string(),
         enabled: true,
         source: endpoint("source"),
-        destinations: (0..RECEIVERS)
+        destinations: (0..receivers)
             .map(|index| StreamDestination {
                 id: receiver_id(index),
                 paths: 1,
@@ -136,7 +134,7 @@ async fn post(app: &Router, uri: &str, body: &impl Serialize, create: bool) -> S
     app.clone().oneshot(request).await.unwrap().status()
 }
 
-async fn fan_out(label: &str, nodes: Vec<NodeRegistration>) -> AppState {
+async fn fan_out(label: &str, nodes: Vec<NodeRegistration>, receivers: usize) -> AppState {
     let state = AppState::hydrate(
         Arc::new(MemStore::new()),
         Duration::from_secs(15),
@@ -153,7 +151,7 @@ async fn fan_out(label: &str, nodes: Vec<NodeRegistration>) -> AppState {
             StatusCode::ACCEPTED
         );
     }
-    let stream = fan_out_stream();
+    let stream = fan_out_stream(receivers);
     assert_eq!(
         post(&app, "/streams", &stream, true).await,
         StatusCode::ACCEPTED
@@ -182,15 +180,15 @@ async fn fan_out(label: &str, nodes: Vec<NodeRegistration>) -> AppState {
 
     let view = state.view.read().await;
     let status = &view.streams[0];
-    assert_eq!(status.destinations.len(), RECEIVERS);
+    assert_eq!(status.destinations.len(), receivers);
     assert!(status.conditions.iter().any(|condition| {
         condition.condition_type == StreamConditionType::PlacementReady
             && condition.status == StreamConditionStatus::True
     }));
     let desired = state.desired.read().await;
     assert_eq!(desired["source"].hops.len(), 1);
-    assert_eq!(desired["source"].hops[0].egresses.len(), RECEIVERS);
-    for index in 0..RECEIVERS {
+    assert_eq!(desired["source"].hops[0].egresses.len(), receivers);
+    for index in 0..receivers {
         let hops = &desired[&receiver_id(index)].hops;
         assert_eq!(hops.len(), 1);
         assert_eq!(hops[0].role, HopRole::Receiver);
@@ -200,30 +198,53 @@ async fn fan_out(label: &str, nodes: Vec<NodeRegistration>) -> AppState {
     state
 }
 
-#[tokio::test]
-async fn direct_fan_out_to_three_hundred_nodes() {
+fn direct_nodes(receivers: usize) -> Vec<NodeRegistration> {
     let mut nodes = vec![public_node("source", "10.0.0.1")];
-    nodes.extend((0..RECEIVERS).map(|index| {
+    nodes.extend((0..receivers).map(|index| {
         public_node(
             &receiver_id(index),
             &format!("10.1.{}.{}", index / 250, index % 250 + 1),
         )
     }));
-    fan_out("direct", nodes).await;
+    nodes
 }
 
-#[tokio::test]
-#[ignore = "about 0.7 s in debug; run with `cargo test -p weave-controller relayed_fan_out -- --ignored --nocapture`"]
-async fn relayed_fan_out_to_three_hundred_nodes() {
+fn relayed_nodes(receivers: usize) -> Vec<NodeRegistration> {
     let mut nodes = vec![
         nat_node("source"),
         public_node("relay-a", "10.0.0.2"),
         public_node("relay-b", "10.0.0.3"),
     ];
-    nodes.extend((0..RECEIVERS).map(|index| nat_node(&receiver_id(index))));
-    let state = fan_out("relayed", nodes).await;
+    nodes.extend((0..receivers).map(|index| nat_node(&receiver_id(index))));
+    nodes
+}
+
+#[tokio::test]
+async fn direct_fan_out_to_three_hundred_nodes() {
+    fan_out("direct", direct_nodes(300), 300).await;
+}
+
+#[tokio::test]
+async fn relayed_fan_out_to_three_hundred_nodes() {
+    let state = fan_out("relayed", relayed_nodes(300), 300).await;
 
     let desired = state.desired.read().await;
-    assert_eq!(desired["relay-a"].hops.len(), RECEIVERS);
+    assert_eq!(desired["relay-a"].hops.len(), 300);
     assert!(desired["relay-b"].hops.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "about a second in debug; run with `cargo test -p weave-controller thousand -- --ignored --nocapture --test-threads=1`"]
+async fn direct_fan_out_to_a_thousand_nodes() {
+    fan_out("direct", direct_nodes(1000), 1000).await;
+}
+
+#[tokio::test]
+#[ignore = "about a second in debug; run with `cargo test -p weave-controller thousand -- --ignored --nocapture --test-threads=1`"]
+async fn relayed_fan_out_to_a_thousand_nodes() {
+    let state = fan_out("relayed", relayed_nodes(1000), 1000).await;
+
+    let desired = state.desired.read().await;
+    assert_eq!(desired["relay-a"].hops.len(), 500);
+    assert_eq!(desired["relay-b"].hops.len(), 500);
 }

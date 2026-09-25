@@ -56,3 +56,5 @@ Nothing measures plan time, desired-state size or heartbeat load at that size.
   target (`debug = "line-tables-only"`) with the OW-5 changes, load average
   14-22, two runs: direct plan 2.7-2.8 ms, reconcile tick 24 ms; relayed plan
   234-246 ms, reconcile tick 271-277 ms.
+- 2026-09-25: after OW-25, relayed 300 plans in 12 ms and ticks in 49 ms
+  (debug), so `relayed_fan_out_to_three_hundred_nodes` is no longer ignored.
