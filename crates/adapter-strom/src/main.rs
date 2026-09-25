@@ -280,10 +280,10 @@ impl FlowApi for StromClient {
 }
 
 /// Pull desired hops for this node, reconcile them into Strom flows, and report
-/// each hop's realised status. Inert when no desired hops are set.
+/// each hop's realised status. Touches no flow unless southbound answers `2xx`.
 async fn provision(
     southbound: &Southbound,
-    strom: &StromClient,
+    strom: &dyn FlowApi,
     node_id: &str,
     flows: &[StromFlow],
     listener_host: Option<&str>,
@@ -696,4 +696,124 @@ fn push_unique(values: &mut Vec<String>, value: &str) {
 
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum Op {
+        Create(String),
+        Start(String),
+        Delete(String),
+    }
+
+    #[derive(Default)]
+    struct RecordingFlowApi {
+        ops: Mutex<Vec<Op>>,
+    }
+
+    impl RecordingFlowApi {
+        fn ops(&self) -> Vec<Op> {
+            self.ops.lock().expect("ops lock").clone()
+        }
+
+        fn record(&self, op: Op) {
+            self.ops.lock().expect("ops lock").push(op);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FlowApi for RecordingFlowApi {
+        async fn list_flows(&self) -> Result<Vec<StromFlow>, StromError> {
+            Ok(Vec::new())
+        }
+        async fn create_flow(&self, spec: &FlowSpec) -> Result<String, StromError> {
+            self.record(Op::Create(spec.name.clone()));
+            Ok(format!("id-{}", spec.name))
+        }
+        async fn start_flow(&self, id: &str) -> Result<(), StromError> {
+            self.record(Op::Start(id.to_string()));
+            Ok(())
+        }
+        async fn delete_flow(&self, id: &str) -> Result<(), StromError> {
+            self.record(Op::Delete(id.to_string()));
+            Ok(())
+        }
+        async fn srt_stats(&self, _id: &str) -> Result<Value, StromError> {
+            Ok(json!({}))
+        }
+    }
+
+    fn flow(name: &str, id: &str) -> StromFlow {
+        serde_json::from_value(json!({ "id": id, "name": name, "running": true }))
+            .expect("flow fixture")
+    }
+
+    /// A southbound whose desired-hops route answers `status` with `body`.
+    async fn southbound_answering(status: StatusCode, body: Value) -> Southbound {
+        let app = Router::new().route(
+            "/nodes/{node_id}/desired",
+            get(move || async move { (status, Json(body)) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Southbound::new(format!("http://{addr}"), None)
+    }
+
+    async fn provision_against(southbound: &Southbound, flows: &[StromFlow]) -> (bool, Vec<Op>) {
+        let strom = RecordingFlowApi::default();
+        let result = provision(
+            southbound,
+            &strom,
+            "strom-node-1",
+            flows,
+            None,
+            &mut StallTracker::default(),
+        )
+        .await;
+        (result.is_ok(), strom.ops())
+    }
+
+    #[tokio::test]
+    async fn a_desired_response_other_than_2xx_leaves_every_flow_alone() {
+        let flows = [flow("weave-basic-sender", "id-managed")];
+        let not_reconciled = json!({ "code": "node_not_found", "message": "no desired state" });
+        for status in [
+            StatusCode::NOT_FOUND,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let southbound = southbound_answering(status, not_reconciled.clone()).await;
+            assert_eq!(
+                provision_against(&southbound, &flows).await,
+                (false, Vec::new()),
+                "{status}"
+            );
+        }
+
+        let unreachable = Southbound::new("http://127.0.0.1:1".to_string(), None);
+        assert_eq!(
+            provision_against(&unreachable, &flows).await,
+            (false, Vec::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_desired_list_deletes_only_managed_flows() {
+        let flows = [
+            flow("weave-basic-sender", "id-managed"),
+            flow("studio-mixer", "id-unmanaged"),
+        ];
+        let southbound = southbound_answering(StatusCode::OK, json!([])).await;
+        assert_eq!(
+            provision_against(&southbound, &flows).await,
+            (true, vec![Op::Delete("id-managed".to_string())])
+        );
+    }
 }

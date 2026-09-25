@@ -571,27 +571,29 @@ mod tests {
 
     #[tokio::test]
     async fn get_desired_forwards_and_relays_status() {
-        let (url, captured) = stub_controller(StatusCode::OK).await;
-        let app = open_app(url);
+        for status in [StatusCode::OK, StatusCode::NOT_FOUND] {
+            let (url, captured) = stub_controller(status).await;
+            let app = open_app(url);
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/nodes/strom-node-1/desired")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/nodes/strom-node-1/desired")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
 
-        let seen = captured
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("controller saw a request");
-        assert_eq!(seen.method, "GET");
-        assert_eq!(seen.path, "/nodes/strom-node-1/desired");
+            let seen = captured
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("controller saw a request");
+            assert_eq!(seen.method, "GET");
+            assert_eq!(seen.path, "/nodes/strom-node-1/desired");
+        }
     }
 
     #[tokio::test]

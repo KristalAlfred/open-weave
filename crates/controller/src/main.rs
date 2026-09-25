@@ -367,7 +367,8 @@ async fn main() -> Result<()> {
     .map(Arc::new);
 
     let state = AppState::hydrate(store, node_ttl, webhooks).await?;
-    let api = spawn_api_server(args.listen.clone(), state.clone(), north, south);
+    let app = router_after_first_tick(&state, north, south).await;
+    let api = spawn_api_server(args.listen.clone(), app);
 
     tracing::info!(interval_secs = args.interval_secs, "controller starting");
 
@@ -380,11 +381,18 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             () = async {
-                reconcile_tick(&state).await;
                 tokio::time::sleep(interval).await;
+                reconcile_tick(&state).await;
             } => {}
         }
     }
+}
+
+/// The router, built only once a reconcile tick has filled the desired map.
+/// Serving any earlier answers a restarted controller's nodes from nothing.
+async fn router_after_first_tick(state: &AppState, north: Guard, south: Guard) -> Router {
+    reconcile_tick(state).await;
+    router(state.clone(), north, south)
 }
 
 async fn reconcile_tick(state: &AppState) {
@@ -702,14 +710,8 @@ async fn require_shared_read_bearer(
         .into_response()
 }
 
-fn spawn_api_server(
-    addr: String,
-    state: AppState,
-    north: Guard,
-    south: Guard,
-) -> JoinHandle<Result<()>> {
+fn spawn_api_server(addr: String, app: Router) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
-        let app = router(state, north, south);
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .with_context(|| format!("binding controller listener on {addr}"))?;
@@ -1628,7 +1630,9 @@ async fn node_heartbeat(
         .into_response()
 }
 
-/// Serve the desired hops computed for a node on the last reconcile tick.
+/// Serve the desired hops computed for a node on the last reconcile tick. A
+/// node that tick did not cover gets `404`, never an empty list: an adapter
+/// removes every hop it runs when told it should run none.
 async fn get_desired(State(state): State<AppState>, Path(node_id): Path<String>) -> Response {
     if let Err(reason) = validate_resource_id(&node_id) {
         return invalid_request(
@@ -1636,16 +1640,14 @@ async fn get_desired(State(state): State<AppState>, Path(node_id): Path<String>)
             vec![resource_id_issue("node_id", "node id", reason)],
         );
     }
-    Json(
-        state
-            .desired
-            .read()
-            .await
-            .get(&node_id)
-            .map(|snapshot| snapshot.hops.clone())
-            .unwrap_or_default(),
-    )
-    .into_response()
+    match state.desired.read().await.get(&node_id) {
+        Some(snapshot) => Json(snapshot.hops.clone()).into_response(),
+        None => error(
+            StatusCode::NOT_FOUND,
+            ApiErrorCode::NodeNotFound,
+            "no desired state for this node yet",
+        ),
+    }
 }
 
 fn error(status: StatusCode, code: ApiErrorCode, message: &str) -> Response {
@@ -2146,5 +2148,869 @@ fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> Re
         endpoints: endpoints_by_stream,
         hops_by_stream,
         desired_by_node,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    use weave_core::{
+        HopEndpointClass, HopProfile, NetworkAttachment, NetworkListeners, NodeCapabilities,
+        NodeTopology, PortRange, RoleSet, SrtEndpoint, SrtListener, StreamDestination,
+        StreamTransport, Transport, TransportClass,
+    };
+
+    use crate::webhook::tests::{Sink, sink};
+
+    fn open_router(state: AppState) -> Router {
+        router(state, Guard::Disabled, Guard::Disabled)
+    }
+
+    fn mem_state() -> (AppState, Arc<MemStore>) {
+        let mem = Arc::new(MemStore::new());
+        let state = AppState {
+            store: mem.clone(),
+            streams: Arc::new(RwLock::new(BTreeMap::new())),
+            stream_sets: Arc::new(RwLock::new(BTreeMap::new())),
+            nodes: Arc::new(RwLock::new(BTreeMap::new())),
+            last_seen: Arc::new(RwLock::new(BTreeMap::new())),
+            node_ttl: Duration::from_secs(15),
+            desired: Arc::new(RwLock::new(BTreeMap::new())),
+            view: Arc::new(RwLock::new(ControllerView::default())),
+            webhooks: None,
+        };
+        (state, mem)
+    }
+
+    fn srt_forward() -> HopProfile {
+        let srt = HopEndpointClass::Transport(TransportClass {
+            transport: Transport::Srt,
+            roles: RoleSet::both(),
+        });
+        HopProfile {
+            id: "srt-forward".to_string(),
+            ingress: srt.clone(),
+            egress: srt,
+            max_egresses: None,
+        }
+    }
+
+    /// A node on the `internet` network that dials out and listens for SRT on
+    /// `host`.
+    fn node_registration(id: &str, host: &str) -> NodeRegistration {
+        NodeRegistration {
+            protocol_version: PROTOCOL_VERSION,
+            node: NodeDescriptor {
+                id: id.to_string(),
+                endpoint: format!("http://{id}:8080"),
+                status: NodeStatus::Ready,
+                capabilities: NodeCapabilities {
+                    adapters: Vec::new(),
+                    hop_profiles: vec![srt_forward()],
+                },
+                topology: NodeTopology {
+                    attachments: vec![NetworkAttachment {
+                        id: "wan".to_string(),
+                        network: "internet".to_string(),
+                        dial: true,
+                        listeners: NetworkListeners {
+                            srt: Some(SrtListener {
+                                host: host.to_string(),
+                                port_range: PortRange {
+                                    start: 7000,
+                                    end: 7999,
+                                },
+                            }),
+                            whip: None,
+                            whep: None,
+                        },
+                    }],
+                },
+            },
+            endpoints: Vec::new(),
+            hop_status: Vec::new(),
+        }
+    }
+
+    /// A node behind NAT: it dials out to `internet`, and listens only on its
+    /// own site network for a local producer or consumer.
+    fn nat_registration(id: &str, host: &str) -> NodeRegistration {
+        let mut registration = node_registration(id, host);
+        let attachments = &mut registration.node.topology.attachments;
+        let mut site = attachments[0].clone();
+        site.id = "site".to_string();
+        site.network = format!("{id}-local");
+        attachments[0].listeners.srt = None;
+        attachments.push(site);
+        registration
+    }
+
+    fn srt_endpoint(node: &str, latency: u32) -> StreamTransport {
+        StreamTransport::Srt(SrtEndpoint {
+            node: Some(node.to_string()),
+            remote: None,
+            via: Vec::new(),
+            format: None,
+            accepts: None,
+            network: None,
+            latency: Some(latency),
+        })
+    }
+
+    fn stream_between(name: &str, source: &str, destination: &str) -> StreamDefinition {
+        StreamDefinition {
+            name: name.to_string(),
+            enabled: true,
+            source: srt_endpoint(source, 200),
+            destinations: vec![StreamDestination {
+                id: "studio".to_string(),
+                endpoint: srt_endpoint(destination, 1000),
+            }],
+        }
+    }
+
+    fn stream(name: &str) -> StreamDefinition {
+        stream_between(name, "strom-node-1", "strom-node-2")
+    }
+
+    fn stored_stream(spec: StreamDefinition) -> StoredStream {
+        StoredStream {
+            spec,
+            generation: 1,
+            revision: 1,
+            owner: None,
+        }
+    }
+
+    async fn send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if method == "POST" && uri == "/streams" {
+            request = request.header("if-none-match", "*");
+        }
+        if method == "DELETE" && uri.starts_with("/streams/") {
+            request = request.header("if-match", "\"revision-1\"");
+        }
+        let request = request
+            .body(body.map_or(Body::empty(), |v| {
+                Body::from(serde_json::to_vec(&v).unwrap())
+            }))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, value)
+    }
+
+    async fn send_with_headers(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, HeaderMap, Value) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                request
+                    .body(body.map_or(Body::empty(), |value| {
+                        Body::from(serde_json::to_vec(&value).unwrap())
+                    }))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, headers, value)
+    }
+
+    fn response_etag(headers: &HeaderMap) -> String {
+        headers
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn desired_hops(app: &Router, node_id: &str) -> (StatusCode, Value) {
+        send(app, "GET", &format!("/nodes/{node_id}/desired"), None).await
+    }
+
+    async fn two_nodes_and_basic(state: &AppState) {
+        let mut nodes = state.nodes.write().await;
+        nodes.insert(
+            "strom-node-1".to_string(),
+            node_registration("strom-node-1", "172.26.0.10"),
+        );
+        nodes.insert(
+            "strom-node-2".to_string(),
+            node_registration("strom-node-2", "172.27.0.10"),
+        );
+        state
+            .streams
+            .write()
+            .await
+            .insert("basic".to_string(), stored_stream(stream("basic")));
+    }
+
+    #[tokio::test]
+    async fn desired_reflects_computed_hops_after_a_reconcile_tick() {
+        let (state, _mem) = mem_state();
+        two_nodes_and_basic(&state).await;
+
+        reconcile_tick(&state).await;
+
+        let app = open_router(state);
+        let (status, body) = desired_hops(&app, "strom-node-1").await;
+        assert_eq!(status, StatusCode::OK);
+        let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
+        assert_eq!(hops.len(), 1, "sender hop placed on node 1");
+        assert_eq!(hops[0].id, "weave-basic-sender");
+
+        let (_, body) = desired_hops(&app, "strom-node-2").await;
+        let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
+        assert_eq!(hops.len(), 1, "receiver hop placed on node 2");
+        assert_eq!(hops[0].id, "weave-basic-receiver-studio");
+    }
+
+    #[tokio::test]
+    async fn status_distinguishes_current_and_observed_generations() {
+        let (state, _mem) = mem_state();
+        let app = open_router(state.clone());
+        let definition = stream("basic");
+        let (_, headers, _) = send_with_headers(
+            &app,
+            "POST",
+            "/streams",
+            Some(serde_json::to_value(&definition).unwrap()),
+            &[("if-none-match", "*")],
+        )
+        .await;
+        let etag = response_etag(&headers);
+        reconcile_tick(&state).await;
+        {
+            let view = state.view.read().await;
+            assert_eq!(view.streams[0].generation, 1);
+            assert_eq!(view.streams[0].observed_generation, Some(1));
+            assert_eq!(view.streams[0].conditions.len(), 5);
+            for condition in &view.streams[0].conditions {
+                time::OffsetDateTime::parse(
+                    &condition.last_transition_time,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .unwrap();
+            }
+        }
+
+        let mut changed = definition;
+        changed.enabled = false;
+        let (status, _, _) = send_with_headers(
+            &app,
+            "POST",
+            "/streams",
+            Some(serde_json::to_value(&changed).unwrap()),
+            &[("if-match", &etag)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        {
+            let view = state.view.read().await;
+            assert_eq!(view.streams[0].generation, 2);
+            assert_eq!(view.streams[0].observed_generation, Some(1));
+        }
+
+        reconcile_tick(&state).await;
+        let view = state.view.read().await;
+        assert_eq!(view.streams[0].generation, 2);
+        assert_eq!(view.streams[0].observed_generation, Some(2));
+        assert_eq!(
+            view.streams[0].conditions[0].reason,
+            StreamConditionReason::Disabled
+        );
+    }
+
+    #[test]
+    fn condition_transition_time_changes_only_when_status_changes() {
+        let mut previous = StreamStatus {
+            name: "basic".to_string(),
+            generation: 1,
+            observed_generation: Some(1),
+            status: PathStatus::Pending,
+            nodes: Vec::new(),
+            conditions: vec![stream_condition(
+                StreamConditionType::PlacementReady,
+                StreamConditionStatus::False,
+                StreamConditionReason::PlacementFailed,
+                "missing node",
+            )],
+            ingress: None,
+            destinations: Vec::new(),
+        };
+        previous.conditions[0].last_transition_time = "2026-09-18T10:00:00Z".to_string();
+        let mut current = previous.clone();
+        current.conditions[0].reason = StreamConditionReason::Disabled;
+        stamp_condition_transition_times(
+            std::slice::from_mut(&mut current),
+            std::slice::from_ref(&previous),
+            "2026-09-18T10:01:00Z",
+        );
+        assert_eq!(
+            current.conditions[0].last_transition_time,
+            "2026-09-18T10:00:00Z"
+        );
+
+        current.conditions[0].status = StreamConditionStatus::True;
+        stamp_condition_transition_times(
+            std::slice::from_mut(&mut current),
+            std::slice::from_ref(&previous),
+            "2026-09-18T10:02:00Z",
+        );
+        assert_eq!(
+            current.conditions[0].last_transition_time,
+            "2026-09-18T10:02:00Z"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydration_drops_persisted_nodes_with_invalid_ids() {
+        let mem = Arc::new(MemStore::new());
+        let registration = node_registration("node/one", "172.26.0.10");
+        mem.upsert_node(&registration).await.unwrap();
+
+        let state = AppState::hydrate(mem, Duration::from_secs(15), None)
+            .await
+            .expect("invalid cached nodes must not prevent startup");
+
+        assert!(state.nodes.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_updates_memory_but_never_the_store() {
+        let (state, mem) = mem_state();
+        let app = open_router(state);
+
+        send(
+            &app,
+            "POST",
+            "/nodes/register",
+            Some(serde_json::to_value(node_registration("strom-node-1", "172.26.0.10")).unwrap()),
+        )
+        .await;
+        assert_eq!(mem.upsert_node_calls(), 1);
+
+        let heartbeat = NodeHeartbeat {
+            node_id: "strom-node-1".to_string(),
+            status: NodeStatus::Degraded,
+            endpoints: Vec::new(),
+            hop_status: Vec::new(),
+        };
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/nodes/strom-node-1/heartbeat",
+            Some(serde_json::to_value(&heartbeat).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            mem.upsert_node_calls(),
+            1,
+            "heartbeat must not write through to the store"
+        );
+
+        let (_, body) = send(&app, "GET", "/state", None).await;
+        let observed: ObservedState = serde_json::from_value(body).unwrap();
+        assert_eq!(observed.nodes[0].status, NodeStatus::Degraded);
+    }
+
+    #[test]
+    fn mark_offline_marks_stale_preserves_fresh_and_spares_exact_ttl() {
+        let mut nodes = BTreeMap::from([
+            (
+                "stale".to_string(),
+                node_registration("stale", "172.26.0.10"),
+            ),
+            (
+                "fresh".to_string(),
+                node_registration("fresh", "172.27.0.10"),
+            ),
+            ("edge".to_string(), node_registration("edge", "172.28.0.10")),
+        ]);
+        nodes.get_mut("fresh").unwrap().node.status = NodeStatus::Degraded;
+
+        let ttl = Duration::from_secs(15);
+        let now = Instant::now();
+        let last_seen = BTreeMap::from([
+            ("stale".to_string(), now - Duration::from_secs(20)),
+            ("fresh".to_string(), now - Duration::from_secs(5)),
+            ("edge".to_string(), now - ttl),
+        ]);
+
+        mark_offline(&mut nodes, &last_seen, now, ttl);
+
+        assert_eq!(nodes["stale"].node.status, NodeStatus::Offline);
+        assert_eq!(
+            nodes["fresh"].node.status,
+            NodeStatus::Degraded,
+            "fresh node keeps its reported status"
+        );
+        assert_eq!(
+            nodes["edge"].node.status,
+            NodeStatus::Ready,
+            "age == ttl is not yet offline"
+        );
+    }
+
+    #[test]
+    fn mark_offline_reports_only_the_nodes_it_transitioned() {
+        let mut nodes = BTreeMap::from([
+            (
+                "stale".to_string(),
+                node_registration("stale", "172.26.0.10"),
+            ),
+            (
+                "fresh".to_string(),
+                node_registration("fresh", "172.27.0.10"),
+            ),
+        ]);
+
+        let ttl = Duration::from_secs(15);
+        let now = Instant::now();
+        let last_seen = BTreeMap::from([
+            ("stale".to_string(), now - Duration::from_secs(20)),
+            ("fresh".to_string(), now - Duration::from_secs(5)),
+        ]);
+
+        assert_eq!(
+            mark_offline(&mut nodes, &last_seen, now, ttl),
+            vec!["stale".to_string()]
+        );
+        assert!(
+            mark_offline(&mut nodes, &last_seen, now, ttl).is_empty(),
+            "a node already offline does not transition again"
+        );
+    }
+
+    fn webhook_state(sink: &Sink) -> AppState {
+        let (mut state, _mem) = mem_state();
+        state.webhooks = webhook::Emitter::new(webhook::Config {
+            url: Some(sink.url.clone()),
+            ..webhook::Config::default()
+        })
+        .map(Arc::new);
+        state
+    }
+
+    #[tokio::test]
+    async fn registering_a_node_emits_node_registered() {
+        let mut sink = sink(StatusCode::OK).await;
+        let app = open_router(webhook_state(&sink));
+
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/nodes/register",
+            Some(serde_json::to_value(node_registration("guest-1", "172.26.0.10")).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let event = sink.next().await.event;
+        assert_eq!(event.event_type, EventType::NodeRegistered);
+        assert_eq!(event.node.id, "guest-1");
+        assert_eq!(event.node.endpoint, "http://guest-1:8080");
+        assert_eq!(event.node.status, NodeStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn a_node_past_its_ttl_emits_node_offline_once() {
+        let mut sink = sink(StatusCode::OK).await;
+        let state = webhook_state(&sink);
+        state.nodes.write().await.insert(
+            "guest-1".to_string(),
+            node_registration("guest-1", "172.26.0.10"),
+        );
+        state.last_seen.write().await.insert(
+            "guest-1".to_string(),
+            Instant::now() - Duration::from_secs(60),
+        );
+
+        reconcile_tick(&state).await;
+        reconcile_tick(&state).await;
+
+        let event = sink.next().await.event;
+        assert_eq!(event.event_type, EventType::NodeOffline);
+        assert_eq!(event.node.id, "guest-1");
+        assert_eq!(event.node.status, NodeStatus::Offline);
+        sink.expect_idle().await;
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_from_an_offline_node_emits_node_online() {
+        let mut sink = sink(StatusCode::OK).await;
+        let state = webhook_state(&sink);
+        let mut registration = node_registration("guest-1", "172.26.0.10");
+        registration.node.status = NodeStatus::Offline;
+        state
+            .nodes
+            .write()
+            .await
+            .insert("guest-1".to_string(), registration);
+        let app = open_router(state);
+
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/nodes/guest-1/heartbeat",
+            Some(json!({ "node_id": "guest-1", "status": "ready" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let event = sink.next().await.event;
+        assert_eq!(event.event_type, EventType::NodeOnline);
+        assert_eq!(event.node.status, NodeStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_from_a_live_node_emits_nothing() {
+        let mut sink = sink(StatusCode::OK).await;
+        let state = webhook_state(&sink);
+        state.nodes.write().await.insert(
+            "guest-1".to_string(),
+            node_registration("guest-1", "172.26.0.10"),
+        );
+        let app = open_router(state);
+
+        send(
+            &app,
+            "POST",
+            "/nodes/guest-1/heartbeat",
+            Some(json!({ "node_id": "guest-1", "status": "ready" })),
+        )
+        .await;
+
+        sink.expect_idle().await;
+    }
+
+    #[tokio::test]
+    async fn registration_is_accepted_while_the_receiver_refuses_connections() {
+        let (mut state, _mem) = mem_state();
+        state.webhooks = webhook::Emitter::new(webhook::Config {
+            // Reserved for documentation; nothing listens there.
+            url: Some("http://192.0.2.1:1/hook".to_string()),
+            timeout: Duration::from_millis(50),
+            ..webhook::Config::default()
+        })
+        .map(Arc::new);
+        let app = open_router(state);
+
+        let accepted = tokio::time::timeout(
+            Duration::from_secs(2),
+            send(
+                &app,
+                "POST",
+                "/nodes/register",
+                Some(serde_json::to_value(node_registration("guest-1", "172.26.0.10")).unwrap()),
+            ),
+        )
+        .await
+        .expect("registration must not wait on the webhook receiver");
+
+        assert_eq!(accepted.0, StatusCode::ACCEPTED);
+    }
+
+    #[test]
+    fn reconcile_degrades_stream_when_a_hop_node_is_offline() {
+        let mut nodes = BTreeMap::from([
+            (
+                "strom-node-1".to_string(),
+                node_registration("strom-node-1", "172.26.0.10"),
+            ),
+            (
+                "strom-node-2".to_string(),
+                node_registration("strom-node-2", "172.27.0.10"),
+            ),
+        ]);
+        nodes.get_mut("strom-node-1").unwrap().node.status = NodeStatus::Offline;
+        let observed = observed_state(&nodes);
+
+        let mut definition = stream("basic");
+        let StreamTransport::Srt(source) = &mut definition.source else {
+            unreachable!()
+        };
+        source.format = Some(weave_core::MediaFormat {
+            container: weave_core::Container::MpegTs,
+            video: None,
+            audio: None,
+        });
+        let StreamTransport::Srt(destination) = &mut definition.destinations[0].endpoint else {
+            unreachable!()
+        };
+        destination.accepts = Some(weave_core::FormatConstraint {
+            container: Some(vec![weave_core::Container::Rtp]),
+            ..Default::default()
+        });
+        let outcome = reconcile(vec![definition], &observed);
+
+        let basic = outcome.streams.iter().find(|s| s.name == "basic").unwrap();
+        assert_eq!(basic.status, PathStatus::Degraded);
+        let nodes = basic
+            .conditions
+            .iter()
+            .find(|condition| condition.condition_type == StreamConditionType::NodesAvailable)
+            .unwrap();
+        assert_eq!(nodes.reason, StreamConditionReason::NodeOffline);
+        assert_eq!(nodes.detail, "node strom-node-1 is offline");
+        let format = basic
+            .conditions
+            .iter()
+            .find(|condition| condition.condition_type == StreamConditionType::FormatCompatible)
+            .unwrap();
+        assert_eq!(format.status, StreamConditionStatus::False);
+        assert_eq!(format.reason, StreamConditionReason::FormatMismatch);
+        assert!(
+            !outcome.desired_by_node["strom-node-1"].is_empty(),
+            "desired hops for the offline node are still computed"
+        );
+    }
+
+    #[test]
+    fn reconcile_replans_a_stream_off_an_offline_relay() {
+        let mut nodes = BTreeMap::from([
+            (
+                "strom-node-1".to_string(),
+                nat_registration("strom-node-1", "172.26.0.10"),
+            ),
+            (
+                "strom-node-2".to_string(),
+                nat_registration("strom-node-2", "172.27.0.10"),
+            ),
+            (
+                "relay-a".to_string(),
+                node_registration("relay-a", "198.51.100.10"),
+            ),
+            (
+                "relay-b".to_string(),
+                node_registration("relay-b", "198.51.100.20"),
+            ),
+        ]);
+        let observed = observed_state(&nodes);
+        let outcome = reconcile(vec![stream("basic")], &observed);
+        let basic = outcome.streams.iter().find(|s| s.name == "basic").unwrap();
+        assert!(
+            basic.nodes.contains(&"relay-a".to_string()),
+            "the lowest-id relay carries the stream while it is online: {:?}",
+            basic.nodes
+        );
+
+        nodes.get_mut("relay-a").unwrap().node.status = NodeStatus::Offline;
+        let observed = observed_state(&nodes);
+        let outcome = reconcile(vec![stream("basic")], &observed);
+
+        let basic = outcome.streams.iter().find(|s| s.name == "basic").unwrap();
+        assert!(basic.nodes.contains(&"relay-b".to_string()));
+        assert!(!basic.nodes.contains(&"relay-a".to_string()));
+        assert_ne!(basic.status, PathStatus::Degraded);
+        assert!(basic.conditions.iter().all(|condition| {
+            condition.condition_type != StreamConditionType::NodesAvailable
+                || condition.status == StreamConditionStatus::True
+        }));
+    }
+
+    #[tokio::test]
+    async fn tick_marks_offline_node_but_still_serves_its_desired_hops() {
+        let (state, _mem) = mem_state();
+        two_nodes_and_basic(&state).await;
+        {
+            let now = Instant::now();
+            let mut seen = state.last_seen.write().await;
+            seen.insert("strom-node-1".to_string(), now - Duration::from_secs(60));
+            seen.insert("strom-node-2".to_string(), now);
+        }
+
+        reconcile_tick(&state).await;
+
+        let app = open_router(state);
+        let (status, body) = send(&app, "GET", "/nodes", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let nodes: Vec<NodeDescriptor> = serde_json::from_value(body).unwrap();
+        let node1 = nodes.iter().find(|n| n.id == "strom-node-1").unwrap();
+        assert_eq!(node1.status, NodeStatus::Offline);
+
+        let (status, body) = desired_hops(&app, "strom-node-1").await;
+        assert_eq!(status, StatusCode::OK);
+        let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
+        assert!(
+            !hops.is_empty(),
+            "offline node still receives its desired hops"
+        );
+    }
+
+    async fn seed_restart_case(store: &dyn StateStore) {
+        if let Some(existing) = store
+            .load_streams()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|stored| stored.spec.name == "restart")
+        {
+            store
+                .delete_stream("restart", existing.revision)
+                .await
+                .unwrap();
+        }
+        store
+            .create_stream(&stream_between(
+                "restart",
+                "restart-node-1",
+                "restart-node-2",
+            ))
+            .await
+            .unwrap();
+        for (id, host) in [
+            ("restart-node-1", "172.26.0.10"),
+            ("restart-node-2", "172.27.0.10"),
+        ] {
+            store
+                .upsert_node(&node_registration(id, host))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Two controllers hydrated from one store, one after the other, stand in
+    /// for a restart. The second answers before any tick but the one it runs
+    /// on the way up.
+    async fn assert_a_restart_serves_the_stored_hops(store: Arc<dyn StateStore>) {
+        seed_restart_case(store.as_ref()).await;
+        let before = AppState::hydrate(store.clone(), Duration::from_secs(15), None)
+            .await
+            .unwrap();
+        let before = router_after_first_tick(&before, Guard::Disabled, Guard::Disabled).await;
+        let after = AppState::hydrate(store, Duration::from_secs(15), None)
+            .await
+            .unwrap();
+        let after = router_after_first_tick(&after, Guard::Disabled, Guard::Disabled).await;
+
+        for node in ["restart-node-1", "restart-node-2"] {
+            let (status, served) = desired_hops(&before, node).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(served.as_array().map(Vec::len), Some(1), "{node}: {served}");
+            assert_eq!(
+                desired_hops(&after, node).await,
+                (StatusCode::OK, served),
+                "{node} gets the same hops from the restarted controller"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restart_serves_the_stored_hops_on_its_first_request() {
+        assert_a_restart_serves_the_stored_hops(Arc::new(MemStore::new())).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running Postgres via DATABASE_URL"]
+    async fn a_restart_on_postgres_serves_the_stored_hops_on_its_first_request() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set for ignored test");
+        let store: Arc<dyn StateStore> = Arc::new(PgStore::connect(&url).await.expect("connect"));
+        assert_a_restart_serves_the_stored_hops(store).await;
+    }
+
+    #[tokio::test]
+    async fn a_node_the_last_tick_did_not_cover_gets_404_for_its_desired_hops() {
+        let (state, _mem) = mem_state();
+        let app = router_after_first_tick(&state, Guard::Disabled, Guard::Disabled).await;
+
+        let (status, body) = desired_hops(&app, "strom-node-1").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "node_not_found");
+
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/nodes/register",
+            Some(serde_json::to_value(node_registration("strom-node-1", "172.26.0.10")).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            desired_hops(&app, "strom-node-1").await.0,
+            StatusCode::NOT_FOUND,
+            "registered after the last tick"
+        );
+
+        reconcile_tick(&state).await;
+        assert_eq!(
+            desired_hops(&app, "strom-node-1").await,
+            (StatusCode::OK, json!([])),
+            "a reconciled node with nothing to run is told so"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_the_last_stream_tells_its_nodes_to_run_nothing() {
+        let (state, _mem) = mem_state();
+        {
+            let mut nodes = state.nodes.write().await;
+            for (id, host) in [
+                ("strom-node-1", "172.26.0.10"),
+                ("strom-node-2", "172.27.0.10"),
+            ] {
+                nodes.insert(id.to_string(), node_registration(id, host));
+            }
+        }
+        let app = open_router(state.clone());
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/streams",
+            Some(serde_json::to_value(stream("basic")).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        reconcile_tick(&state).await;
+        let (_, body) = desired_hops(&app, "strom-node-1").await;
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
+
+        let (status, _) = send(&app, "DELETE", "/streams/basic", None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        reconcile_tick(&state).await;
+        assert_eq!(
+            desired_hops(&app, "strom-node-1").await,
+            (StatusCode::OK, json!([]))
+        );
     }
 }

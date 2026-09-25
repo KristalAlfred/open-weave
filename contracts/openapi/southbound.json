@@ -2463,6 +2463,16 @@
             },
             "description": "Authentication failed"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Node not reconciled yet"
+          },
           "502": {
             "content": {
               "application/json": {

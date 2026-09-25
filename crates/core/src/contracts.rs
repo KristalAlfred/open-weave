@@ -387,6 +387,7 @@ pub fn southbound_openapi() -> Value {
                         "200": response("Desired hops", Some(schema_ref("DesiredHopList"))),
                         "400": error_response("Invalid node id"),
                         "401": error_response("Authentication failed"),
+                        "404": error_response("Node not reconciled yet"),
                         "502": error_response("Controller unavailable")
                     }
                 }

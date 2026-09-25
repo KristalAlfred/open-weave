@@ -114,6 +114,17 @@ versions without aliases or a deprecation window.
 
 `GET /nodes` lists registered nodes for operator and adapter reads.
 
+`GET /nodes/{id}/desired` returns the full list of hops the last reconcile tick
+computed for that node. A node that tick did not cover, because it is unknown or
+registered after the tick, gets `404 node_not_found`. A reconciled node with
+nothing to run gets `200 []`, and its adapter removes every hop it manages. Only
+a `2xx` is an answer: an adapter keeps what it runs on any other response, or
+when southbound cannot be reached, and asks again on its next poll. Both shipped
+nodes do this. The controller runs its first tick before it serves requests, so
+after a restart with `DATABASE_URL` set it serves the stored hops from the first
+request. The in-memory store starts empty, so after a restart without
+`DATABASE_URL` each node is told to run nothing once it has re-registered.
+
 `GET /streams` lists stream resources. `GET /streams/{name}` returns one
 or `404 stream_not_found`. A resource contains its desired definition under
 `spec`, its current `generation`, and an `owner` when it belongs to a stream

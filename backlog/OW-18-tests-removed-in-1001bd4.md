@@ -62,3 +62,27 @@ Status section and the header of `bench/manifests/nat-relay.yaml` still cite.
   `NetworkListeners`, which has no setter). `crates/core/src/validation.rs`: 9
   of 9 back; the id-grammar test also covers destination and network ids. No
   ported test failed. Checked with `cargo test -p weave-core`, unit tests only.
+- 2026-09-25: claude-lifecycle restored these `crates/controller/src/main.rs`
+  tests with OW-1: `desired_reflects_computed_hops_after_a_reconcile_tick`,
+  `status_distinguishes_current_and_observed_generations`,
+  `condition_transition_time_changes_only_when_status_changes`,
+  `hydration_drops_persisted_nodes_with_invalid_ids`,
+  `heartbeat_updates_memory_but_never_the_store`,
+  `mark_offline_marks_stale_preserves_fresh_and_spares_exact_ttl`,
+  `mark_offline_reports_only_the_nodes_it_transitioned`,
+  `registering_a_node_emits_node_registered`,
+  `a_node_past_its_ttl_emits_node_offline_once`,
+  `a_heartbeat_from_an_offline_node_emits_node_online`,
+  `a_heartbeat_from_a_live_node_emits_nothing`,
+  `registration_is_accepted_while_the_receiver_refuses_connections`,
+  `reconcile_degrades_stream_when_a_hop_node_is_offline`,
+  `reconcile_replans_a_stream_off_an_offline_relay` and
+  `tick_marks_offline_node_but_still_serves_its_desired_hops`. Helpers back:
+  `open_router`, `mem_state`, `node_registration`, `nat_registration`,
+  `stream`, `stored_stream`, `send`, `send_with_headers`, `response_etag`,
+  `webhook_state`. Not back: `guarded_router`, `send_auth`, the token
+  constants, and `relay_registration`, since a relay is now any node with a
+  matching hop profile. Adapted to current types: the receiver id is
+  `weave-basic-receiver-studio`, and a NAT'd node is a dial-only `internet`
+  attachment plus a site listener. The relay test also checks that `relay-a`
+  carries the stream while it is online. All 15 pass on the current code.
