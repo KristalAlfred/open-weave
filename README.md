@@ -757,6 +757,10 @@ possible when one end offers `connect`, has a dialing attachment, and the other
 offers `listen` with a listener on the same network. Transport support comes
 only from hop profiles. The controller chooses the lowest deterministic
 transport, network, attachment, address, URL, and port that satisfies both.
+A producer's or consumer's SRT socket, and the address
+`GET /streams/{name}/endpoints` reports for it, use the same order: the
+node's SRT listener on the lowest network, then the lowest attachment id,
+among those on the endpoint's `network` when it names one.
 
 Planning first tries a direct link. If none works, it tries one online transit
 node whose profile supports the required ingress-to-egress shape and whose

@@ -1404,7 +1404,7 @@ fn srt_listener_attachment<'a>(
         .filter(|attachment| network.is_none_or(|network| attachment.network == network))
         .filter(|attachment| attachment.listeners.srt.is_some())
         .collect();
-    candidates.sort_by(|left, right| (&left.id, &left.network).cmp(&(&right.id, &right.network)));
+    candidates.sort_by(|left, right| (&left.network, &left.id).cmp(&(&right.network, &right.id)));
     candidates.into_iter().next().ok_or_else(|| {
         network.map_or_else(
             || PlacementError::NoPortRange {
@@ -3294,9 +3294,9 @@ mod tests {
         );
     }
 
-    #[test]
-    #[ignore = "OW-33: link planning and consumer endpoints order attachments differently"]
-    fn link_and_consumer_endpoint_pick_the_same_attachment() {
+    /// Node 2 listens on two networks whose order by network differs from their
+    /// order by attachment id; node 1 dials both.
+    fn nodes_with_two_srt_listeners() -> Vec<NodeDescriptor> {
         let mut nodes = nodes();
         nodes[0].topology.attachments = vec![
             attachment("lan", "alpha", true, NetworkListeners::default()),
@@ -3306,7 +3306,49 @@ mod tests {
             attachment("a-site", "zeta", true, srt_listener("10.9.0.2", 7000, 7099)),
             attachment("z-lan", "alpha", true, srt_listener("10.1.0.2", 8000, 8099)),
         ];
+        nodes
+    }
 
+    /// Whether `node` has one SRT listener at `host` whose range holds `port`.
+    fn listens_at(node: &NodeDescriptor, host: &str, port: u16) -> bool {
+        node.topology.attachments.iter().any(|attachment| {
+            attachment.listeners.srt.as_ref().is_some_and(|srt| {
+                srt.host == host && (srt.port_range.start..=srt.port_range.end).contains(&port)
+            })
+        })
+    }
+
+    #[test]
+    fn every_srt_address_handed_out_pairs_a_listener_host_with_its_own_range() {
+        let nodes = nodes_with_two_srt_listeners();
+        let stream = contribution();
+        let path = derive(&stream, &nodes).expect("derive");
+        let endpoints = stream_endpoints(&stream, &path, &nodes).expect("endpoints");
+        let (source, studio) = (&nodes[0], &nodes[1]);
+
+        let SocketSpec::Srt(SrtSocket::Connect { host, port, .. }) =
+            &path.hops[0].egresses[0].socket
+        else {
+            panic!("the sender dials the receiver");
+        };
+        assert_eq!(srt(&path.hops[1].ingress).port(), *port);
+        assert!(
+            listens_at(studio, host, *port),
+            "the link dials {host}:{port}"
+        );
+
+        let consumer = addr(&endpoints.destinations[0].endpoint);
+        assert_eq!(srt(&path.hops[1].egresses[0]).port(), consumer.port);
+        assert!(listens_at(studio, &consumer.host, consumer.port));
+
+        let producer = addr(&endpoints.ingress);
+        assert_eq!(srt(&path.hops[0].ingress).port(), producer.port);
+        assert!(listens_at(source, &producer.host, producer.port));
+    }
+
+    #[test]
+    fn link_and_consumer_endpoint_pick_the_same_attachment() {
+        let nodes = nodes_with_two_srt_listeners();
         let stream = contribution();
         let path = derive(&stream, &nodes).expect("derive");
         let endpoints = stream_endpoints(&stream, &path, &nodes).expect("endpoints");
