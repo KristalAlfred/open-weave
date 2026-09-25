@@ -46,6 +46,7 @@ not measured.
 | `nat-egress` | NAT'd node-3 contributes out to node-1 | `awaiting_input` | — | `flowing` |
 | `nat-ingress` | node-1 delivers into NAT'd node-3 (link reverses) | `awaiting_input` | — | `flowing` |
 | `nat-relay` | both ends on NAT'd node-3; bridged via node-1 | `awaiting_input` | — | `flowing` |
+| `nat-transit` | NAT'd node-3 → NAT'd node-4, no `via`; the controller bridges via node-1 | — | — | `flowing` |
 | `format-ok` | declared source format the destination accepts | `awaiting_input` | — | `flowing` |
 | `format-mismatch` | 48 kHz source into a 44.1 kHz-only destination | `degraded` | — | `degraded` |
 | `browser-cam` | page camera → node-1 over WHIP, consumer pulls SRT | `degraded` (see note) | — | `degraded` (see note) |
@@ -79,11 +80,13 @@ Notes:
   endpoint that cannot use them. Nothing converts anything yet; the diagnosis is
   the feature.
 
-- **`nat-*`**: node 3 sits behind a real NAT — router-3 masquerades its outbound
-  traffic and nothing outside net_node3 is given a route back in. Verified
-  directly, not assumed: a TCP connect from the controller and from node 1 to
-  `10.97.29.10:8080` both fail, while node 3 reaches `10.97.26.10:8080` and its
-  adapter registers through the same path.
+- **`nat-*`**: nodes 3 and 4 each sit behind a real NAT — router-3 and router-4
+  masquerade their outbound traffic and nothing outside net_node3 or net_node4
+  is given a route back in. Verified directly, not assumed: TCP connects to
+  `10.97.29.10:8080` and `10.97.30.10:8080` from the controller, node 1 and
+  node 2 all fail, as do node 3 to node 4 and node 4 to node 3, while nodes 3
+  and 4 both reach `10.97.26.10:8080` and `10.97.27.10:8080` and their adapters
+  register through the same path.
   - **`nat-egress`** needs no relay and no reversal: the destination is dialable,
     so the sender calls out, which is the direction a NAT allows anyway.
   - **`nat-ingress`** is the reversal. Observed sockets: the sender's egress on
@@ -92,17 +95,22 @@ Notes:
   - **`nat-relay`** pins node 1 as transit. Observed:
     `weave-nat-relay-bridge-output-0` on node 1 listens on both sockets while
     both node-3 hops dial out to it.
+  - **`nat-transit`** has no `via`: nodes 3 and 4 cannot dial each other, so the
+    controller inserts the relay. Observed: `weave-nat-transit-bridge-output-0`
+    on node 1 listens on both sockets, node 3's sender egress is `connect` to
+    `10.97.26.10`, and node 4's receiver ingress is `connect` to `10.97.26.10`.
+    With `ow-adapter-1` stopped, node 1 went offline after the 15 s node TTL and
+    the bridge moved to node 2 (both ends then dial `10.97.27.10`); the stream
+    read `pending`, then `awaiting_input`, and was `flowing` again about 12 s
+    later. When `ow-adapter-1` came back, the bridge moved back to node 1 with
+    the same sequence, and node 2's bridge flow was removed.
 
-  Source and destination are the same node in `nat-relay` because the bench has
-  one NAT'd site. The media still crosses the NAT twice, outbound each time,
-  which is the mechanism two separate NAT'd sites would rely on — but two sites
-  genuinely unable to reach each other is not what this covers.
-
-  Media endpoints for these live *inside* net_node3 (`producer-3`,
-  `consumer-3`). That is not a bench workaround: a socket on a NAT'd node can
-  only be dialled from inside its network, which is why such a site runs its own
-  encoder and decoder. `producer-up`/`consumer-up` pick the right container from
-  the resolved address via `scripts/inside.sh`.
+  Media endpoints for these live *inside* the NAT'd subnets (`producer-3` and
+  `consumer-3` on net_node3, `producer-4` and `consumer-4` on net_node4). That
+  is not a bench workaround: a socket on a NAT'd node can only be dialled from
+  inside its network, which is why such a site runs its own encoder and decoder.
+  `producer-up`/`consumer-up` pick the right container from the resolved address
+  via `scripts/inside.sh`.
 
 - **`encrypted`**: `stream-up` dials with the manifest's passphrases. A producer
   given another passphrase (`just bench producer-up encrypted <other>`) is
@@ -116,9 +124,8 @@ Notes:
   routers twice. Observed with every hop `flowing` on both sockets. The bridge is
   an ordinary Strom flow (`srtsrc` listener → `srtsink` caller); relaying needed
   no adapter change. Both nodes here are dialable, so this covers a `via` pin
-  rather than the NAT case that makes the controller insert a relay by itself —
-  that one needs a node the bench cannot dial, which the topology does not yet
-  have.
+  rather than the NAT case where the controller inserts a relay by itself, which
+  `nat-transit` covers.
 - **`browser-*`**: templates, `browser-placeholder` is the page's node id and
   `just bench browser-stream` fills it in; applying one directly leaves it
   `pending` on an unregistered node. The media for `browser-cam` comes from the

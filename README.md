@@ -53,10 +53,8 @@ Built: the three control-plane services, the `weave` CLI, one southbound adapter
 the controller plans NAT traversal through relay nodes. SRT links between nodes
 are encrypted with keys the controller derives. All of it is verified on
 the docker-compose bench in `bench/`, which runs real Strom instances behind
-per-node `netem` routers, and nowhere else. Automatic relay insertion is the
-exception: the bench has one NAT'd site, so only planner tests cover it.
-Redundant paths are another: no shipped node merges two paths, so only planner
-and status tests cover them.
+per-node `netem` routers, and nowhere else. Redundant paths are the exception:
+no shipped node merges two paths, so only planner and status tests cover them.
 
 Not built: TLS, controller HA, format conversion, and any adapter other than
 Strom. The items in `backlog/` list the known gaps with the
@@ -916,7 +914,7 @@ or whose WHIP/WHEP endpoint id does, is deleted and created again.
 ## Quickstart
 
 The fastest way to see open-weave work is the bench: a docker-compose stack with
-three Strom nodes behind emulated routers, which starts empty and takes stream
+four Strom nodes behind emulated routers, which starts empty and takes stream
 manifests. `just bench up` then `just bench stream-up basic` drives a stream end
 to end. See [`bench/README.md`](bench/README.md).
 

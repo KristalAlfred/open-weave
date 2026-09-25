@@ -29,14 +29,15 @@ sock="${DOCKER_SOCK:-/var/run/docker.sock}"
 # core reaches each node subnet via that node's router; a node subnet reaches
 # everything else via its own router's leg on that subnet.
 #
-# Node 3 is the deliberate exception. It gets routes *out* to every other subnet,
-# and no other group gets a route to 10.97.29.0/24 — not core, not node 1, not
-# node 2. Docker's inter-network isolation blocks the bridge-level path, so with
-# no route installed nothing outside net_node3 can open a connection to it, while
-# router-3's MASQUERADE lets node 3 reach out and get answered. That asymmetry is
-# the NAT the bench tests against: adding a 10.97.29.0/24 route to any group
-# below silently removes the boundary and the NAT manifests start passing for the
-# wrong reason.
+# Nodes 3 and 4 are the deliberate exception. Each gets routes *out* to core,
+# node 1 and node 2, and no other group gets a route to 10.97.29.0/24 or
+# 10.97.30.0/24 — not core, not node 1, not node 2, and not the other NAT'd
+# node. Docker's inter-network isolation blocks the bridge-level path, so with
+# no route installed nothing outside a NAT'd subnet can open a connection into
+# it, while its router's MASQUERADE lets the node reach out and get answered.
+# That asymmetry is the NAT the bench tests against: adding a route to either
+# subnet to any group below silently removes the boundary and the NAT manifests
+# start passing for the wrong reason.
 # ow-open-live-strom is not a service here: open-live's own docker-compose.yml
 # joins its Strom to net_core under that name so it can dial node 1's SRT
 # outputs. Renaming it there silently drops its routes.
@@ -51,6 +52,9 @@ node2_routes="10.97.25.0/24=10.97.27.2 10.97.26.0/24=10.97.27.2"
 
 node3_containers="ow-strom-3 ow-adapter-3 ow-producer-3 ow-consumer-3"
 node3_routes="10.97.25.0/24=10.97.29.2 10.97.26.0/24=10.97.29.2 10.97.27.0/24=10.97.29.2"
+
+node4_containers="ow-strom-4 ow-adapter-4 ow-producer-4 ow-consumer-4"
+node4_routes="10.97.25.0/24=10.97.30.2 10.97.26.0/24=10.97.30.2 10.97.27.0/24=10.97.30.2"
 
 # PID of a running container, or empty if it is absent or stopped. Profiled
 # services (producer/consumer) legitimately do not exist most of the time.
@@ -87,5 +91,6 @@ while :; do
   for c in $node1_containers; do assert_routes "$c" $node1_routes; done
   for c in $node2_containers; do assert_routes "$c" $node2_routes; done
   for c in $node3_containers; do assert_routes "$c" $node3_routes; done
+  for c in $node4_containers; do assert_routes "$c" $node4_routes; done
   sleep "$interval"
 done

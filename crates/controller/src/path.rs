@@ -3062,6 +3062,84 @@ mod tests {
         );
     }
 
+    fn bench_nodes() -> Vec<NodeDescriptor> {
+        let routed = |host| srt_listener(host, 20_000, 20_999);
+        vec![
+            node_with(
+                "strom-node-1",
+                vec![
+                    attachment("a-routed", SHARED, true, routed("10.97.26.10")),
+                    attachment("z-docker-host", "docker-host", true, routed("10.97.26.10")),
+                ],
+            ),
+            node_with(
+                "strom-node-2",
+                vec![attachment("routed", SHARED, true, routed("10.97.27.10"))],
+            ),
+            node_with(
+                "strom-node-3",
+                vec![
+                    attachment("outbound", SHARED, true, NetworkListeners::default()),
+                    attachment("site", "node-3-local", true, routed("10.97.29.10")),
+                ],
+            ),
+            node_with(
+                "strom-node-4",
+                vec![
+                    attachment("outbound", SHARED, true, NetworkListeners::default()),
+                    attachment("site", "node-4-local", true, routed("10.97.30.10")),
+                ],
+            ),
+        ]
+    }
+
+    fn assert_bridged_through(path: &Path, relay: &str, relay_host: &str) {
+        let [sender, bridge, receiver] = path.hops.as_slice() else {
+            panic!("expected sender, bridge and receiver, got {:?}", path.hops);
+        };
+        assert_eq!(
+            (sender.role, sender.node_id.as_str()),
+            (HopRole::Sender, "strom-node-3")
+        );
+        assert_eq!(
+            (bridge.role, bridge.node_id.as_str()),
+            (HopRole::Bridge, relay)
+        );
+        assert_eq!(
+            (receiver.role, receiver.node_id.as_str()),
+            (HopRole::Receiver, "strom-node-4")
+        );
+
+        assert_eq!(srt(&sender.ingress).role(), SocketRole::Listen);
+        assert_eq!(host(&sender.egresses[0]), Some(relay_host));
+        assert_eq!(srt(&bridge.ingress).role(), SocketRole::Listen);
+        assert_eq!(srt(&bridge.ingress).port(), srt(&sender.egresses[0]).port());
+        assert_eq!(srt(&bridge.egresses[0]).role(), SocketRole::Listen);
+        assert_eq!(host(&receiver.ingress), Some(relay_host));
+        assert_eq!(
+            srt(&receiver.ingress).port(),
+            srt(&bridge.egresses[0]).port()
+        );
+        assert_eq!(srt(&receiver.egresses[0]).role(), SocketRole::Listen);
+    }
+
+    #[test]
+    fn bench_nat_sites_bridge_through_the_lowest_online_node_both_dial() {
+        let stream = StreamDefinition {
+            name: "nat-transit".to_string(),
+            enabled: true,
+            source: StreamTransport::Srt(node_ref("strom-node-3", 200)),
+            destinations: vec![dest("output", node_ref("strom-node-4", 1000))],
+        };
+        let mut nodes = bench_nodes();
+        let path = derive(&stream, &nodes).expect("derive");
+        assert_bridged_through(&path, "strom-node-1", "10.97.26.10");
+
+        nodes[0].status = NodeStatus::Offline;
+        let path = derive(&stream, &nodes).expect("derive");
+        assert_bridged_through(&path, "strom-node-2", "10.97.27.10");
+    }
+
     #[test]
     fn via_pins_a_bridge_on_an_otherwise_direct_link() {
         let mut stream = contribution();

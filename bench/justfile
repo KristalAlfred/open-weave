@@ -7,6 +7,7 @@ ctrl    := "http://localhost:29082"
 strom1  := "http://localhost:28080"
 strom2  := "http://localhost:28081"
 strom3  := "http://localhost:28082"
+strom4  := "http://localhost:28083"
 page_dir := source_directory() / ".." / "nodes" / "browser"
 
 # Northbound's bearer token, and the key southbound derives node tokens from.
@@ -52,6 +53,7 @@ wait:
         curl -sf {{strom1}}/api/version >/dev/null 2>&1 && \
         curl -sf {{strom2}}/api/version >/dev/null 2>&1 && \
         curl -sf {{strom3}}/api/version >/dev/null 2>&1 && \
+        curl -sf {{strom4}}/api/version >/dev/null 2>&1 && \
         { echo "stack ready"; exit 0; }; \
         sleep 2; \
     done; echo "timeout waiting for stack" >&2; {{compose}} ps; exit 1
@@ -81,6 +83,7 @@ status:
     @printf "strom-1:     "; curl -sf {{strom1}}/api/version >/dev/null && echo ok || echo DOWN
     @printf "strom-2:     "; curl -sf {{strom2}}/api/version >/dev/null && echo ok || echo DOWN
     @printf "strom-3:     "; curl -sf {{strom3}}/api/version >/dev/null && echo ok || echo DOWN
+    @printf "strom-4:     "; curl -sf {{strom4}}/api/version >/dev/null && echo ok || echo DOWN
     @echo "== registered nodes (southbound) =="
     @curl -sf {{sb_auth}} {{sb}}/nodes | (jq . 2>/dev/null || cat)
     @echo "== controller /status =="
@@ -216,7 +219,7 @@ stream-rm name:
     @curl -sf {{nb_auth}} -X DELETE {{nb}}/streams/{{name}} && echo "deleted {{name}}" || echo "not found: {{name}}"
 
 # Restart the controller while <stream> flows. Fails if any `weave-` flow on the
-# three Stroms was deleted, recreated or stopped moving bytes, if an adapter
+# four Stroms was deleted, recreated or stopped moving bytes, if an adapter
 # logged a delete, if a producer or consumer restarted ffmpeg, or if the stream
 # does not read `flowing` again. `how=kill` sends SIGKILL instead of a clean stop.
 [doc("Restart the controller with <stream> flowing and check that no Strom flow dropped.")]
@@ -229,7 +232,7 @@ controller-restart stream="basic" how="restart":
         exit 1
     }
     snapshot() {
-        for strom in {{strom1}} {{strom2}} {{strom3}}; do
+        for strom in {{strom1}} {{strom2}} {{strom3}} {{strom4}}; do
             curl -sf "$strom/api/flows" \
                 | jq -r '.flows[] | select(.name | startswith("weave-")) | "\(.name) \(.id)"' \
                 | while read -r name id; do
@@ -269,13 +272,13 @@ controller-restart stream="basic" how="restart":
             failed=1
         fi
     done <<<"$before"
-    for adapter in ow-adapter-1 ow-adapter-2 ow-adapter-3; do
+    for adapter in ow-adapter-1 ow-adapter-2 ow-adapter-3 ow-adapter-4; do
         if docker logs --since "$since" "$adapter" 2>&1 | grep "deleted undesired managed flow"; then
             echo "FAIL: $adapter deleted a flow" >&2
             failed=1
         fi
     done
-    for endpoint in ow-producer ow-producer-3 ow-consumer ow-consumer-2 ow-consumer-3; do
+    for endpoint in ow-producer ow-producer-3 ow-producer-4 ow-consumer ow-consumer-2 ow-consumer-3 ow-consumer-4; do
         if docker logs --since "$since" "$endpoint" 2>/dev/null | grep "ffmpeg exited"; then
             echo "FAIL: $endpoint restarted ffmpeg" >&2
             failed=1
@@ -289,9 +292,10 @@ controller-restart stream="basic" how="restart":
 # discovery API. A passphrase, when given, goes into the producer's SRT URL.
 # Verification endpoint only — not part of the system under test.
 #
-# A socket on node 3 can only be dialled from inside net_node3, so the endpoint
-# is picked from the address: 10.97.29.x means the `-3` container, anything else
-# the net_core one. The recipe obeys the same reachability the planner does.
+# A socket on node 3 or 4 can only be dialled from inside that node's subnet, so
+# the endpoint is picked from the address: 10.97.29.x means the `-3` container,
+# 10.97.30.x the `-4` one, anything else the net_core one. The recipe obeys the
+# same reachability the planner does.
 [doc("Start the external ffmpeg producer (SRT caller into a source ingress).")]
 [group("media")]
 producer-up stream="basic" passphrase="":
@@ -306,7 +310,7 @@ producer-up stream="basic" passphrase="":
 # Stop and remove the external producer, whichever subnet it was started in.
 [group("media")]
 producer-down:
-    -@{{compose}} --profile producer rm -sf producer producer-3
+    -@{{compose}} --profile producer rm -sf producer producer-3 producer-4
 
 # Pass a stream name; the first output address is resolved via discovery. A
 # passphrase, when given, goes into the consumer's SRT URL.
@@ -324,7 +328,7 @@ consumer-up stream="basic" destination="output" passphrase="":
 # Stop and remove the external consumer, whichever subnet it was started in.
 [group("media")]
 consumer-down:
-    -@{{compose}} --profile consumer rm -sf consumer consumer-3
+    -@{{compose}} --profile consumer rm -sf consumer consumer-3 consumer-4
 
 # For fan-out: one consumer per receiver output, so every receiver hop can flow.
 # Pass a stream name; the second output address is resolved via discovery.

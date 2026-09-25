@@ -1,7 +1,7 @@
 # open-weave bench
 
 A full-system docker-compose stack: the three control-plane services, a
-Postgres, and three Strom media nodes each sitting behind its own emulated
+Postgres, and four Strom media nodes each sitting behind its own emulated
 router, so any node's network can be impaired with `netem`. It starts **empty**
 — you drive it with stream manifests and watch what the control plane does.
 
@@ -65,6 +65,7 @@ recipes take a bare name:
 just bench stream-ls           # list them with one-line descriptions
 just bench stream-up fanout    # one source, two destinations
 just bench stream-up nat-relay # both ends behind NAT, bridged through node 1
+just bench stream-up nat-transit # two NAT'd sites, relay chosen by the controller
 ```
 
 `manifests/README.md` describes each one and records the status it was observed
@@ -127,7 +128,7 @@ just bench controller-restart basic          # docker compose restart
 just bench controller-restart basic kill     # SIGKILL, then start
 ```
 
-It records every `weave-` flow on the three Stroms with its id and SRT byte
+It records every `weave-` flow on the four Stroms with its id and SRT byte
 count, restarts the controller, and waits 20 s for every adapter to poll it. It
 fails if a flow was deleted or recreated (Strom gives a recreated flow a new
 id), if a flow moved no bytes, if an adapter logged a delete, if a producer or
@@ -137,17 +138,18 @@ bench controller keeps its state in Postgres.
 ## Topology
 
 ```
-        net_core 10.97.25.0/24
-   northbound  southbound  controller
-        |          |           |          \
-   router-1     router-2       |        router-3  (NAT)
-  (10.97.25.11) (10.97.25.12)  |       (10.97.25.13)
-        |            |                      |
-  net_node1      net_node2            net_node3
-  10.97.26.0/24  10.97.27.0/24        10.97.29.0/24
-  strom-1        strom-2              strom-3
-  adapter-1      adapter-2            adapter-3
-  (relay)                             (outbound-only)
+                     net_core 10.97.25.0/24
+               northbound  southbound  controller
+     +---------------+-----------------+------------------+
+     |               |                 |                  |
+  router-1        router-2         router-3 (NAT)     router-4 (NAT)
+  10.97.25.11     10.97.25.12      10.97.25.13        10.97.25.14
+     |               |                 |                  |
+  net_node1       net_node2        net_node3          net_node4
+  10.97.26.0/24   10.97.27.0/24    10.97.29.0/24      10.97.30.0/24
+  strom-1         strom-2          strom-3            strom-4
+  adapter-1       adapter-2        adapter-3          adapter-4
+  (dialable)      (dialable)       (outbound-only)    (outbound-only)
 ```
 
 The subnets are `/24`s in `10.97.0.0/16`, outside Docker's default address
@@ -158,21 +160,25 @@ Each node subnet reaches everything else only through its router. Applying netem
 on a router impairs both directions of that node's traffic: SRT media between
 Stroms, adapter heartbeats, and controller→Strom API calls.
 
-**Node 3 sits behind a NAT.** Its router masquerades outbound traffic, and no
-route to `10.97.29.0/24` is installed anywhere outside net_node3 — not in the
-core containers, not in routers 1 and 2. Docker's inter-network isolation blocks
-the bridge-level path, so node 3 can open connections outward and nothing can
-open one toward it. That asymmetry is load-bearing: adding a return route would
-silently delete the boundary and the `nat-*` manifests would start passing for
-the wrong reason.
+**Nodes 3 and 4 each sit behind a NAT.** Their routers masquerade outbound
+traffic, and no route to `10.97.29.0/24` or `10.97.30.0/24` is installed
+anywhere outside that subnet — not in the core containers, not in routers 1 and
+2, and not on the other NAT'd site. Docker's inter-network isolation blocks the
+bridge-level path, so each of nodes 3 and 4 can open connections outward and
+nothing can open one toward it, including the other. That asymmetry is
+load-bearing: adding a return route would silently delete the boundary and the
+`nat-*` manifests would start passing for the wrong reason.
 
-Node 1 has the SRT profile and network attachments needed to carry transit.
+Nodes 1 and 2 declare SRT listeners on the `internet` network that nodes 3 and 4
+dial out on, so either can carry transit between the two NAT'd sites. The
+controller picks the eligible node with the lowest id, so node 1 unless it is
+offline.
 
 Because a NAT'd node's sockets can only be dialled from inside its network, the
-bench carries a second pair of media endpoints (`producer-3`, `consumer-3`) on
-net_node3. The producer/consumer recipes choose between them and the net_core
-pair from the resolved address, so `just bench stream-up <name>` works
-uniformly.
+bench carries a pair of media endpoints on each NAT'd subnet (`producer-3` and
+`consumer-3` on net_node3, `producer-4` and `consumer-4` on net_node4). The
+producer/consumer recipes choose between them and the net_core pair from the
+resolved address, so `just bench stream-up <name>` works uniformly.
 
 Those cross-subnet routes are installed by the `route-manager` service, which
 re-asserts them every few seconds inside each container's network namespace
@@ -191,7 +197,7 @@ just bench netem-show node1
 just bench netem-clear node1
 ```
 
-Nodes are `node1`, `node2`, `node3`. The spec is applied to both legs of that
+Nodes are `node1`, `node2`, `node3`, `node4`. The spec is applied to both legs of that
 node's router, so it impairs the node's traffic in both directions.
 
 ## External verification endpoints
@@ -324,6 +330,7 @@ payload and the delivery guarantees.
 | 28080 | strom-1 API |
 | 28081 | strom-2 API |
 | 28082 | strom-3 API (host→container; grants no route into net_node3) |
+| 28083 | strom-4 API (host→container; grants no route into net_node4) |
 | 29099 | `just bench hook-sink` on this host, where the controller delivers webhooks |
 
 ## Authentication
@@ -337,14 +344,14 @@ defaults to development values so `just bench up` stays a single command:
 |---|---|---|
 | `WEAVE_NORTHBOUND_TOKEN` | `bench-northbound-token` | northbound, controller, CLI, `endpoints.sh` |
 | `WEAVE_SOUTHBOUND_KEY` | `bench-southbound-key` | southbound, controller, `just bench node-token` |
-| `WEAVE_ADAPTER_{1,2,3}_TOKEN` | `strom-node-{1,2,3}`'s token under the default key | adapter-1, 2 and 3; the recipes present node 1's for southbound reads |
+| `WEAVE_ADAPTER_{1,2,3,4}_TOKEN` | `strom-node-{1,2,3,4}`'s token under the default key | adapter-1 to adapter-4; the recipes present node 1's for southbound reads |
 | `WEAVE_BROWSER_TOKEN` | `browser-bench`'s token under the default key | the in-bench browser page, which takes its node id from it |
 | `WEAVE_SRT_KEY_SECRET` | `bench-srt-key-secret-for-local-use-only` | controller, to derive the keys of SRT links between nodes |
 
 `docker-compose.yml` passes each adapter its token as `WEAVE_SOUTHBOUND_TOKEN`.
 The adapter configs leave `node.southbound_token` unset and inherit it. The node
 tokens are written out in `docker-compose.yml` and the bench `justfile`, so
-exporting `WEAVE_SOUTHBOUND_KEY` means exporting the four token variables too;
+exporting `WEAVE_SOUTHBOUND_KEY` means exporting the five token variables too;
 `just bench node-token <id>` prints each one under the exported key.
 
 The `just` recipes add the right header for you. Calling the APIs by hand needs
@@ -400,12 +407,12 @@ to attach the producer and consumer too.
 **A stream reads `degraded` after driving another one.** The producer and
 consumer are singletons, so `stream-up <other>` took them from the first stream.
 
-**Ports already in use.** The bench publishes 29080–29082, 28080–28082 and
+**Ports already in use.** The bench publishes 29080–29082, 28080–28083 and
 29099. Another stack holding one of those makes `up` fail; stop it or change the
 `ports:` entries in `docker-compose.yml`.
 
 **`Pool overlaps with other one on this address space`.** Another Docker network
-holds part of `10.97.25.0/24`–`10.97.29.0/24`. `docker network inspect` on each
+holds part of `10.97.25.0/24`–`10.97.30.0/24`. `docker network inspect` on each
 network in `docker network ls` shows which.
 
 **A container came back with no route to another subnet.** `route-manager`

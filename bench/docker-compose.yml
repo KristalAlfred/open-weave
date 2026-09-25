@@ -63,13 +63,18 @@ networks:
     ipam:
       config:
         - subnet: 10.97.27.0/24
-  # Node 3 sits behind a NAT: its router masquerades outbound traffic and nothing
-  # outside is given a route back in. See router-3.
+  # Nodes 3 and 4 each sit behind a NAT: their router masquerades outbound
+  # traffic and nothing outside is given a route back in. See router-3.
   net_node3:
     driver: bridge
     ipam:
       config:
         - subnet: 10.97.29.0/24
+  net_node4:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.97.30.0/24
 
 services:
   # --- control plane (net_core) ---
@@ -79,8 +84,9 @@ services:
   # from WEAVE_SRT_KEY_SECRET. Every service refuses to start without its secret.
   # The bench defaults below keep `just up` a single command, and the
   # node tokens are the ones the default key gives: exporting WEAVE_SOUTHBOUND_KEY
-  # means exporting WEAVE_ADAPTER_{1,2,3}_TOKEN and WEAVE_BROWSER_TOKEN too. They
-  # are development values, not secrets — the bench sits on a private subnet.
+  # means exporting WEAVE_ADAPTER_{1,2,3,4}_TOKEN and WEAVE_BROWSER_TOKEN too.
+  # They are development values, not secrets — the bench sits on a private
+  # subnet.
   northbound:
     <<: *weave
     container_name: ow-northbound
@@ -205,6 +211,8 @@ services:
         condition: service_started
       router-3:
         condition: service_started
+      router-4:
+        condition: service_started
 
   # --- routers (L3 hop per node; netem is applied on these) ---
   router-1:
@@ -239,21 +247,23 @@ services:
       - -c
       - "ip route replace 10.97.26.0/24 via 10.97.25.11 || true; for d in $$(ls /sys/class/net | grep -v lo); do tc qdisc del dev $$d root 2>/dev/null; done; exec sleep infinity"
 
-  # Node 3's router is a NAT gateway, not a plain L3 hop like routers 1 and 2.
-  # Two things make it one, and both matter:
+  # Node 3's router is a NAT gateway, not a plain L3 hop like routers 1 and 2,
+  # and router-4 is the same for node 4. Two things make one, and both matter:
   #
   #   * MASQUERADE rewrites node-3's source address to this router's core-side
   #     IP, so replies come back here and conntrack returns them. Without it,
   #     node-3's outbound traffic would be answered to an address nobody routes.
   #   * Nothing outside net_node3 is ever given a route to 10.97.29.0/24 — not
-  #     the core containers, not routers 1 and 2 (see scripts/route-manager.sh).
-  #     Docker's inter-network isolation blocks the bridge-level path, so with no
-  #     route installed there is genuinely no way to dial in.
+  #     the core containers, not routers 1, 2 and 4, not node 4
+  #     (see scripts/route-manager.sh). Docker's inter-network isolation blocks
+  #     the bridge-level path, so with no route installed there is genuinely no
+  #     way to dial in.
   #
   # That is the whole NAT: node-3 can open connections outward and nothing can
   # open one toward it. The routes out are one-way on purpose; do not "fix" the
   # asymmetry by adding a return route, which would quietly delete the boundary
-  # every NAT test here depends on.
+  # every NAT test here depends on. The same holds for node 4 and 10.97.30.0/24,
+  # so neither NAT'd site can reach the other directly.
   router-3:
     image: nicolaka/netshoot:latest
     container_name: ow-router-3
@@ -269,6 +279,22 @@ services:
       - sh
       - -c
       - "ip route replace 10.97.26.0/24 via 10.97.25.11 || true; ip route replace 10.97.27.0/24 via 10.97.25.12 || true; iptables -t nat -C POSTROUTING -s 10.97.29.0/24 ! -d 10.97.29.0/24 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.97.29.0/24 ! -d 10.97.29.0/24 -j MASQUERADE; for d in $$(ls /sys/class/net | grep -v lo); do tc qdisc del dev $$d root 2>/dev/null; done; exec sleep infinity"
+
+  router-4:
+    image: nicolaka/netshoot:latest
+    container_name: ow-router-4
+    cap_add: [NET_ADMIN]
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      net_core:
+        ipv4_address: 10.97.25.14
+      net_node4:
+        ipv4_address: 10.97.30.2
+    command:
+      - sh
+      - -c
+      - "ip route replace 10.97.26.0/24 via 10.97.25.11 || true; ip route replace 10.97.27.0/24 via 10.97.25.12 || true; iptables -t nat -C POSTROUTING -s 10.97.30.0/24 ! -d 10.97.30.0/24 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.97.30.0/24 ! -d 10.97.30.0/24 -j MASQUERADE; for d in $$(ls /sys/class/net | grep -v lo); do tc qdisc del dev $$d root 2>/dev/null; done; exec sleep infinity"
 
   # --- node 1 (net_node1) ---
   strom-1:
@@ -390,6 +416,46 @@ services:
       retries: 10
       start_period: 5s
 
+  # --- node 4 (net_node4, behind its own NAT) ---
+  strom-4:
+    image: eyevinntechnology/strom:latest
+    container_name: ow-strom-4
+    environment:
+      STROM_PORT: "8080"
+      STROM_DATA_DIR: /data
+    volumes:
+      - strom4-data:/data
+    # Published for debugging from the host, like strom-3's.
+    ports:
+      - "28083:8080"
+    networks:
+      net_node4:
+        ipv4_address: 10.97.30.10
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
+  adapter-4:
+    <<: *weave
+    container_name: ow-adapter-4
+    command: ["weave-adapter-strom", "--config", "/etc/weave/node.yaml"]
+    environment:
+      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_ADAPTER_4_TOKEN:-strom-node-4.bcf0947c4ca72dc52514efd44cab7a2c5fc7fd18487e1004b5eef85defb3e442}
+    volumes:
+      - ./config/adapter-4.yaml:/etc/weave/node.yaml:ro
+    networks:
+      net_node4:
+        ipv4_address: 10.97.30.11
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8091/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
   # --- browser node (net_core, profile) ---
   # On net_core so its WebRTC media reaches Strom's ICE candidates on the node
   # subnets; a browser on a macOS host has no route there. See bench/README.md.
@@ -424,9 +490,9 @@ services:
   # recipes so status transitions can be demonstrated.
   #
   # The net_core pair act as real external peers, routing to node subnets through
-  # the netem routers. The net_node3 pair exist because node 3 is behind NAT: its
-  # sockets listen, but nothing outside can dial them, so a peer that drives them
-  # has to sit inside the site. That is not a bench workaround — it is the same
+  # the netem routers. The net_node3 and net_node4 pairs exist because nodes 3
+  # and 4 are behind NAT: their sockets listen, but nothing outside can dial
+  # them, so a peer that drives them has to sit inside the site. That is not a bench workaround — it is the same
   # constraint that makes a NAT'd site run its own encoder and decoder.
   producer:
     <<: *media
@@ -490,8 +556,33 @@ services:
         ipv4_address: 10.97.29.31
     command: *consumer-command
 
+  producer-4:
+    <<: *media
+    container_name: ow-producer-4
+    profiles: ["producer"]
+    environment:
+      - PRODUCER_TARGET
+      - PRODUCER_PASSPHRASE
+    networks:
+      net_node4:
+        ipv4_address: 10.97.30.30
+    command: *producer-command
+
+  consumer-4:
+    <<: *media
+    container_name: ow-consumer-4
+    profiles: ["consumer"]
+    environment:
+      - CONSUMER_SOURCE
+      - CONSUMER_PASSPHRASE
+    networks:
+      net_node4:
+        ipv4_address: 10.97.30.31
+    command: *consumer-command
+
 volumes:
   strom1-data:
   strom2-data:
   strom3-data:
+  strom4-data:
   pgdata:

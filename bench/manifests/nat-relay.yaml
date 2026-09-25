@@ -1,9 +1,6 @@
 # Both ends on the same NAT'd node, pinned through node 1.
-# Both node-3 hops call out to node 1. Automatic transit is covered by planner
-# tests with two separate dial-only routing domains.
-# are the same node because the bench has one NAT'd site; the media still
-# crosses the NAT twice, outbound each time, which is the mechanism two separate
-# NAT'd sites would rely on.
+# Both node-3 hops call out to node 1, so the media crosses the NAT twice,
+# outbound each time. `nat-transit` is the unpinned case between two NAT'd sites.
 name: nat-relay
 enabled: true
 source:
