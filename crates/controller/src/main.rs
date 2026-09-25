@@ -5,6 +5,8 @@
 
 mod desired;
 mod path;
+#[cfg(test)]
+mod scale_tests;
 mod store;
 mod webhook;
 

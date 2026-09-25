@@ -2,7 +2,7 @@
 id: OW-12
 title: "Nothing runs at distribution scale"
 type: verification
-status: in-progress
+status: done
 depends_on: []
 assignee: claude-planner
 ---
@@ -17,9 +17,9 @@ Nothing measures plan time, desired-state size or heartbeat load at that size.
 
 ## Done when
 
-- [ ] A test registers a few hundred nodes and fans one stream out to all of
+- [x] A test registers a few hundred nodes and fans one stream out to all of
       them.
-- [ ] Plan and reconcile times at that size are recorded in this item's Log.
+- [x] Plan and reconcile times at that size are recorded in this item's Log.
 
 ## Easy to break
 
@@ -35,3 +35,18 @@ Nothing measures plan time, desired-state size or heartbeat load at that size.
 
 - 2026-09-25: filed from broadcaster research.
 - 2026-09-25: started by claude-planner.
+- 2026-09-25: `crates/controller/src/scale_tests.rs` registers every node
+  through `POST /nodes/register`, applies one stream to 300 destinations through
+  `POST /streams`, times `derive_path` and one `reconcile_tick`, and asserts
+  placement, 300 sender egresses and one receiver hop per receiver node.
+  `direct_fan_out_to_three_hundred_nodes` (301 nodes on one network) runs by
+  default. `relayed_fan_out_to_three_hundred_nodes` (NAT'd source and receivers,
+  two public relays, 303 nodes) takes about 0.7 s, so it is `#[ignore]` and its
+  reason says how to run it. Unit tests only.
+- 2026-09-25: times from `cargo test -p weave-controller scale_tests --
+  --include-ignored --nocapture --test-threads=1`, debug build, Apple M4 Pro
+  (12 cores), other builds running (load average 10-22), four runs. Direct 300,
+  301 hops: plan 3.3-4.3 ms, reconcile tick 28-34 ms. Relayed 300, 601 hops:
+  plan 315-320 ms, reconcile tick 350-356 ms; every bridge lands on `relay-a`.
+  A scratch copy at 500 and 1000 receivers found relayed planning cubic (OW-25)
+  and the relay out of ports at 501 destinations (OW-26).
