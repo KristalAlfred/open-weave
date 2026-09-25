@@ -553,6 +553,30 @@ mod tests {
     }
 
     #[test]
+    fn a_flow_whose_srt_mode_was_edited_is_recreated() {
+        let desired = vec![hop("weave-a")];
+        for (ingress, egress) in [
+            (
+                "srt://:7001?mode=rendezvous&latency=200",
+                "srt://10.0.0.2:7002?mode=caller&latency=1000",
+            ),
+            (
+                "srt://:7001?mode=listener&latency=200",
+                "srt://10.0.0.2:7002?mode=rendezvous&latency=1000",
+            ),
+            (
+                "srt://:7001?latency=200",
+                "srt://10.0.0.2:7002?mode=caller&latency=1000",
+            ),
+        ] {
+            let flows = vec![flow_with_uris("weave-a", "id-a", ingress, egress)];
+            let plan = diff_hops(&desired, &flows);
+            assert_eq!(plan.delete, vec!["id-a".to_string()], "{ingress} {egress}");
+            assert_eq!(plan.create.len(), 1, "{ingress} {egress}");
+        }
+    }
+
+    #[test]
     fn matching_flow_uris_are_adopted_not_recreated() {
         let desired = vec![hop("weave-a")];
         let flows = vec![flow_with_uris(

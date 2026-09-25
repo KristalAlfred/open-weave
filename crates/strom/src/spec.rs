@@ -665,6 +665,8 @@ pub struct SrtUri {
     /// Empty for a listener.
     pub host: String,
     pub port: u16,
+    /// The `mode` query value: `listener` or `caller` in URIs open-weave builds.
+    pub mode: Option<String>,
     pub latency: Option<u32>,
     pub passphrase: Option<Passphrase>,
     pub pbkeylen: Option<u8>,
@@ -676,13 +678,14 @@ impl SrtUri {
     #[must_use]
     pub fn new(socket: &SrtSocket, default_latency: u32) -> Self {
         let params = socket.params();
-        let host = match socket {
-            SrtSocket::Listen { .. } => String::new(),
-            SrtSocket::Connect { host, .. } => host.clone(),
+        let (host, mode) = match socket {
+            SrtSocket::Listen { .. } => (String::new(), "listener"),
+            SrtSocket::Connect { host, .. } => (host.clone(), "caller"),
         };
         Self {
             host,
             port: socket.port(),
+            mode: Some(mode.to_string()),
             latency: Some(params.latency.unwrap_or(default_latency)),
             pbkeylen: params.passphrase.as_ref().and(params.pbkeylen),
             passphrase: params.passphrase.clone(),
@@ -700,6 +703,7 @@ impl SrtUri {
         let mut parsed = Self {
             host: host.to_string(),
             port: port.parse().ok()?,
+            mode: None,
             latency: None,
             passphrase: None,
             pbkeylen: None,
@@ -708,6 +712,7 @@ impl SrtUri {
             let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
             let value = percent_decode_str(value).decode_utf8_lossy();
             match key {
+                "mode" => parsed.mode = Some(value.into_owned()),
                 "latency" => parsed.latency = value.parse().ok(),
                 "passphrase" => parsed.passphrase = Some(Passphrase::new(value)),
                 "pbkeylen" => parsed.pbkeylen = value.parse().ok(),
@@ -720,22 +725,26 @@ impl SrtUri {
     /// The URI string. It carries the passphrase in the clear.
     #[must_use]
     pub fn to_uri(&self) -> String {
-        let mut uri = if self.host.is_empty() {
-            format!("srt://:{}?mode=listener", self.port)
-        } else {
-            format!("srt://{}:{}?mode=caller", self.host, self.port)
-        };
+        let mut query = Vec::new();
+        if let Some(mode) = &self.mode {
+            query.push(format!(
+                "mode={}",
+                utf8_percent_encode(mode, NON_ALPHANUMERIC)
+            ));
+        }
         if let Some(latency) = self.latency {
-            uri.push_str(&format!("&latency={latency}"));
+            query.push(format!("latency={latency}"));
         }
         if let Some(passphrase) = &self.passphrase {
-            uri.push_str("&passphrase=");
-            uri.extend(utf8_percent_encode(passphrase.expose(), NON_ALPHANUMERIC));
+            query.push(format!(
+                "passphrase={}",
+                utf8_percent_encode(passphrase.expose(), NON_ALPHANUMERIC)
+            ));
             if let Some(pbkeylen) = self.pbkeylen {
-                uri.push_str(&format!("&pbkeylen={pbkeylen}"));
+                query.push(format!("pbkeylen={pbkeylen}"));
             }
         }
-        uri
+        format!("srt://{}:{}?{}", self.host, self.port, query.join("&"))
     }
 }
 
@@ -1017,6 +1026,7 @@ mod tests {
     fn srt_uri_parse_reads_address_and_parameters() {
         let listener = SrtUri::parse("srt://:7001?mode=listener").unwrap();
         assert_eq!((listener.host.as_str(), listener.port), ("", 7001));
+        assert_eq!(listener.mode.as_deref(), Some("listener"));
         assert_eq!(listener.latency, None);
         assert_eq!(listener.passphrase, None);
 
