@@ -2,7 +2,7 @@
 id: OW-2
 title: "SRT hops carry no encryption"
 type: feature
-status: in-progress
+status: done
 depends_on: []
 assignee: claude-transport
 ---
@@ -26,7 +26,7 @@ The controller plans both ends of every hop, so it can give both the same key.
 - [x] Each planned SRT hop carries a key, the same in both ends' desired hops.
 - [x] The Strom adapter sets it on both ends.
 - [x] A `remote` destination takes its key from the manifest.
-- [ ] A bench caller with the wrong key is refused.
+- [x] A bench caller with the wrong key is refused.
 
 ## Easy to break
 
@@ -75,3 +75,17 @@ The controller plans both ends of every hop, so it can give both the same key.
   `terminal_sockets_carry_the_manifest_passphrase_or_none` in `path.rs` covers
   the remote egress, the source ingress and the consumer socket. Unit tests only.
   `PROTOCOL_VERSION` is 5.
+- 2026-09-25: ticked "A bench caller with the wrong key is refused", on
+  `bench/`. `just bench stream-up encrypted` (new manifest with a passphrase on
+  the ingress and the output; `stream-up` now passes each endpoint the passphrase
+  northbound returns for it) read `flowing`. `just bench producer-up encrypted
+  wrong-producer-passphrase`: ffmpeg logged `ERROR:BADSECRET` / `Incorrect
+  passphrase` on every retry and the stream went `awaiting_input`, then
+  `degraded` as the ingress stalled. The right passphrase again: `flowing`.
+  `basic` also read `flowing`; `weave-basic-sender`'s `srtsink_0` and
+  `weave-basic-receiver-output`'s `srtsrc_0` carried the same 64-hex key with
+  `pbkeylen=32` in their URIs on strom-1 and strom-2. That key appeared in none
+  of `/view`, `/status`, northbound `/streams/basic/endpoints`, northbound
+  `/stream-plans` (which showed `{"latency":1000,"pbkeylen":32}`), or the logs of
+  the controller, southbound, adapter-1 and strom-1. `nat-ingress`, where the
+  receiver dials, read `flowing` with a keyed link.

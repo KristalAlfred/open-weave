@@ -88,7 +88,9 @@ just bench down        # tear down (containers, networks, volumes)
 `stream-up` is the one to reach for: it applies the manifest, attaches the
 producer to the stream's ingress and **one consumer per receiver output**, and
 waits until the controller reports `flowing`. It reads the output count from
-discovery, so fan-out gets the right number of consumers without being told.
+discovery, so fan-out gets the right number of consumers without being told, and
+reads each endpoint's `passphrase` from the stream as northbound returns it, so a
+keyed manifest such as `encrypted` is driven with the keys it declares.
 
 The lower-level pieces are there when a scenario wants them separately —
 applying a stream without media, or detaching a producer mid-run to watch the
@@ -99,6 +101,7 @@ just bench stream basic         # control plane only: placed but unfed -> `await
 just bench stream-rm basic      # delete the stream; controller tears down its hops
 
 just bench producer-up basic    # feed a stream's source ingress
+just bench producer-up encrypted some-passphrase  # the same, with a passphrase in its URL
 just bench producer-down        # stop it (drives source -> no-source transitions)
 just bench consumer-up basic    # pull output 0
 just bench consumer-2-up fanout # pull output 1 (fan-out's second destination)

@@ -26,7 +26,7 @@ x-producer-command: &producer-command
         -f lavfi -i sine=frequency=1000:sample_rate=48000 \
         -c:v libx264 -preset veryfast -tune zerolatency -b:v 2500k -pix_fmt yuv420p -g 60 \
         -c:a aac -b:a 128k \
-        -f mpegts "srt://$${PRODUCER_TARGET:?PRODUCER_TARGET is required (resolve via scripts/endpoints.sh)}?mode=caller&latency=200&streamid=producer" &
+        -f mpegts "srt://$${PRODUCER_TARGET:?PRODUCER_TARGET is required (resolve via scripts/endpoints.sh)}?mode=caller&latency=200&streamid=producer$${PRODUCER_PASSPHRASE:+&passphrase=$$PRODUCER_PASSPHRASE}" &
       child=$$!
       wait "$$child" || true
       [ "$$running" = 1 ] && { echo "producer ffmpeg exited; retrying in 2s" >&2; sleep 2; }
@@ -39,7 +39,7 @@ x-consumer-command: &consumer-command
     trap 'running=0; kill -TERM "$$child" 2>/dev/null' TERM INT
     while [ "$$running" = 1 ]; do
       ffmpeg -hide_banner -loglevel warning \
-        -i "srt://$${CONSUMER_SOURCE:?CONSUMER_SOURCE is required (resolve via scripts/endpoints.sh)}?mode=caller&latency=200" \
+        -i "srt://$${CONSUMER_SOURCE:?CONSUMER_SOURCE is required (resolve via scripts/endpoints.sh)}?mode=caller&latency=200$${CONSUMER_PASSPHRASE:+&passphrase=$$CONSUMER_PASSPHRASE}" \
         -f null - &
       child=$$!
       wait "$$child" || true
@@ -434,6 +434,7 @@ services:
     profiles: ["producer"]
     environment:
       - PRODUCER_TARGET
+      - PRODUCER_PASSPHRASE
     networks:
       net_core:
         ipv4_address: 10.97.25.30
@@ -445,6 +446,7 @@ services:
     profiles: ["consumer"]
     environment:
       - CONSUMER_SOURCE
+      - CONSUMER_PASSPHRASE
     networks:
       net_core:
         ipv4_address: 10.97.25.31
@@ -458,6 +460,7 @@ services:
     profiles: ["consumer"]
     environment:
       CONSUMER_SOURCE: ${CONSUMER_SOURCE_2:-}
+      CONSUMER_PASSPHRASE: ${CONSUMER_PASSPHRASE_2:-}
     networks:
       net_core:
         ipv4_address: 10.97.25.32
@@ -469,6 +472,7 @@ services:
     profiles: ["producer"]
     environment:
       - PRODUCER_TARGET
+      - PRODUCER_PASSPHRASE
     networks:
       net_node3:
         ipv4_address: 10.97.29.30
@@ -480,6 +484,7 @@ services:
     profiles: ["consumer"]
     environment:
       - CONSUMER_SOURCE
+      - CONSUMER_PASSPHRASE
     networks:
       net_node3:
         ipv4_address: 10.97.29.31

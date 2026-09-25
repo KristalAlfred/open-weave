@@ -1,0 +1,15 @@
+# Keyed contribution: basic with a passphrase on the producer's ingress and the
+# consumer's output. The controller keys the link between the nodes itself.
+name: encrypted
+enabled: true
+source:
+  srt:
+    node: strom-node-1
+    latency: 200
+    passphrase: bench-producer-passphrase
+destinations:
+  - id: output
+    srt:
+      node: strom-node-2
+      latency: 1000
+      passphrase: bench-consumer-passphrase

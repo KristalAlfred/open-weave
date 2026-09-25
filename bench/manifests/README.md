@@ -41,6 +41,7 @@ not measured.
 | `unplaceable` | `source.node: strom-node-404` (never registers) | `pending` | `pending` | `pending` |
 | `disabled` | `enabled: false` | `idle` | `idle` | `idle` |
 | `srt-latency` | non-default SRT latency (120ms / 2000ms) | `awaiting_input` | `degraded` | `flowing` |
+| `encrypted` | `basic` with a passphrase on the ingress and the output | — | — | `flowing` |
 | `via` | pinned transit: node-1 → bridge on node-2 → node-1 | `awaiting_input` | — | `flowing` |
 | `nat-egress` | NAT'd node-3 contributes out to node-1 | `awaiting_input` | — | `flowing` |
 | `nat-ingress` | node-1 delivers into NAT'd node-3 (link reverses) | `awaiting_input` | — | `flowing` |
@@ -103,6 +104,12 @@ Notes:
   encoder and decoder. `producer-up`/`consumer-up` pick the right container from
   the resolved address via `scripts/inside.sh`.
 
+- **`encrypted`**: `stream-up` dials with the manifest's passphrases. A producer
+  given another passphrase (`just bench producer-up encrypted <other>`) is
+  refused: ffmpeg logs `ERROR:BADSECRET` / `Incorrect passphrase` and the stream
+  reads `degraded`. Given the manifest's passphrase again it reads `flowing`
+  within a few polls. The link between the nodes carries a key the controller
+  derives, the same in both Strom flows' URIs.
 - **`via`**: three hops — `weave-via-sender` on node-1,
   `weave-via-bridge-output-0` on node-2, `weave-via-receiver-output` back on
   node-1 — so the media crosses both

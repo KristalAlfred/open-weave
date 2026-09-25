@@ -2,7 +2,7 @@
 id: OW-29
 title: "SRT latency set as an element property is lost on raw-element flows"
 type: bug
-status: in-progress
+status: done
 depends_on: []
 assignee: claude-transport
 ---
@@ -29,7 +29,7 @@ block flows are not affected.
 
 ## Done when
 
-- [ ] Raw-element SRT flows run with the latency their desired hop carries,
+- [x] Raw-element SRT flows run with the latency their desired hop carries,
       read back from the live element on the bench.
 
 ## Log
@@ -37,3 +37,8 @@ block flows are not affected.
 - 2026-09-25: filed from work on OW-2 and started by claude-transport. OW-2
   moves the latency into the `srt://` URI query with the key, which is the fix;
   the bench check is pending.
+- 2026-09-25: ticked, on `bench/`. With `basic` and `srt-latency` flowing,
+  `GET /api/flows/{id}/elements/{element}/properties` on strom-1 and strom-2
+  read back the latency in each element's URI for all 8 `srtsrc`/`srtsink`
+  elements: 200/1000 and 1000/200 for `basic`, 120/2000 and 2000/200 for
+  `srt-latency`.
