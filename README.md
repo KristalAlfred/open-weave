@@ -896,9 +896,9 @@ here is the simple profile: the receiver binds an even port for RTP and the port
 after it for RTCP, and the sender pushes to both. Only the downstream end of a
 link can host it, so a receiver behind NAT cannot take RIST. The planner tries
 RIST after SRT, WHIP and WHEP, so it carries a link only where none of those
-can, and a link that planned before RIST existed keeps its transport. Give RIST
-its own port range: in a range it shares with SRT, an SRT port can take one half
-of the last free pair. A RIST link carries no key (`backlog/OW-41`).
+can, and a link that planned before RIST existed keeps its transport. SRT and
+RIST can share a port range: an SRT port takes half of a free RIST pair only when
+no other port in its range is free. A RIST link carries no key (`backlog/OW-41`).
 
 Planning first tries a direct link. If none works, it tries one online transit
 node whose profile supports the required ingress-to-egress shape and whose

@@ -200,7 +200,9 @@ fn signalled(endpoint: &SignallingEndpoint, transport: SignallingTransport) -> E
 /// Per-tick, per-node port occupancy. Assigns every port a path needs from the
 /// node's declared range, preferring a deterministic FNV offset then linear
 /// probing forward (wrapping within the range) to the first free port, so a
-/// given stream set always resolves to the same collision-free assignment.
+/// given stream set always resolves to the same collision-free assignment. An
+/// SRT port passes over half of a free RIST pair while the range has another
+/// free port.
 #[derive(Debug, Clone, Default)]
 pub struct PortAllocator {
     used: HashMap<String, HashSet<u16>>,
@@ -228,18 +230,28 @@ impl PortAllocator {
             })?;
         let count = u32::from(range.span()) + 1;
         let preferred = preferred_offset(range, key);
+        let rist: Vec<PortRange> = node
+            .topology
+            .attachments
+            .iter()
+            .filter_map(|attachment| attachment.listeners.rist.as_ref())
+            .map(|listener| listener.port_range)
+            .collect();
         let occupied = self.used.entry(node.id.clone()).or_default();
-        for step in 0..count {
-            let offset = (preferred + step) % count;
+        let probe = (0..count).map(|step| {
             #[allow(clippy::cast_possible_truncation)]
-            let port = range.start.saturating_add(offset as u16);
-            if occupied.insert(port) {
-                return Ok(port);
-            }
-        }
-        Err(PlacementError::PortRangeExhausted {
-            node: node.id.clone(),
-        })
+            let offset = ((preferred + step) % count) as u16;
+            range.start.saturating_add(offset)
+        });
+        let port = probe
+            .clone()
+            .find(|&port| !occupied.contains(&port) && !splits_rist_pair(port, &rist, occupied))
+            .or_else(|| probe.clone().find(|port| !occupied.contains(port)))
+            .ok_or_else(|| PlacementError::PortRangeExhausted {
+                node: node.id.clone(),
+            })?;
+        occupied.insert(port);
+        Ok(port)
     }
 
     /// Whether `node` has a free port for each of `listeners`, taken in turn.
@@ -286,6 +298,15 @@ impl PortAllocator {
             node: node.id.clone(),
         })
     }
+}
+
+/// Whether taking `port` would leave one fewer free RIST pair in `rist`.
+fn splits_rist_pair(port: u16, rist: &[PortRange], occupied: &HashSet<u16>) -> bool {
+    let pair = port - port % 2;
+    rist.iter()
+        .any(|range| range.start <= pair && pair < range.end)
+        && !occupied.contains(&pair)
+        && !occupied.contains(&(pair + 1))
 }
 
 /// The hop ids placed streams hold in one tick, each with the stream holding it.
@@ -2706,6 +2727,56 @@ mod contract_tests {
         assert!(ports.can_claim(&relay, &listeners));
         assert_eq!(ports.claim_rist(&relay, &listener, "hop"), Ok(21_000));
         assert!(!ports.can_claim(&relay, &listeners));
+    }
+
+    #[test]
+    fn srt_ports_leave_rist_pairs_whole_while_other_ports_are_free() {
+        let srt = PortRange {
+            start: 20_000,
+            end: 20_004,
+        };
+        let rist = RistListener {
+            host: "192.0.2.9".to_string(),
+            port_range: PortRange {
+                start: 20_000,
+                end: 20_003,
+            },
+        };
+        let mut studio = node("studio", vec![attachment("wan", "internet", true, None)]);
+        studio.topology.attachments[0].listeners = NetworkListeners {
+            srt: Some(SrtListener {
+                host: "192.0.2.9".to_string(),
+                port_range: srt,
+            }),
+            whip: None,
+            whep: None,
+            rist: Some(rist.clone()),
+        };
+        let wan = studio.topology.attachments[0].clone();
+        let preferring = |port: u16| {
+            (0..)
+                .map(|i| format!("hop-{i}"))
+                .find(|key| srt.start + preferred_offset(srt, key) as u16 == port)
+                .unwrap()
+        };
+
+        let mut ports = PortAllocator::new();
+        assert_eq!(ports.claim(&studio, &wan, &preferring(20_004)), Ok(20_004));
+        let mut ports = PortAllocator::new();
+        for (preferred, claimed) in [(20_001, 20_004), (20_003, 20_003), (20_001, 20_002)] {
+            assert_eq!(
+                ports.claim(&studio, &wan, &preferring(preferred)),
+                Ok(claimed),
+                "preferring {preferred}"
+            );
+        }
+        assert_eq!(ports.claim_rist(&studio, &rist, "hop"), Ok(20_000));
+        assert_eq!(
+            ports.claim(&studio, &wan, "hop"),
+            Err(PlacementError::PortRangeExhausted {
+                node: "studio".to_string()
+            })
+        );
     }
 }
 

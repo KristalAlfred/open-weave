@@ -255,3 +255,23 @@ fn rist_takes_even_port_pairs_that_srt_never_shares() {
     }
     assert_eq!(taken.len(), 6);
 }
+
+#[test]
+fn rist_and_srt_can_fill_a_range_they_share() {
+    let shared = range(20_000, 20_008);
+    let studio = rist_only_studio(shared, shared);
+    let hops = plan(&stream(&["a", "b", "c"]), &[source(), studio]).unwrap();
+
+    let mut taken = BTreeSet::new();
+    for hop in hops.iter().filter(|hop| hop.node_id == "studio") {
+        let SocketSpec::Rist(RistSocket::Listen { port }) = hop.ingress else {
+            panic!("a studio receiver listens for RIST: {:?}", hop.ingress);
+        };
+        assert!(taken.insert(port) && taken.insert(port + 1));
+        let SocketSpec::Srt(SrtSocket::Listen { port, .. }) = hop.egresses[0].socket else {
+            panic!("the consumer socket is SRT");
+        };
+        assert!(taken.insert(port), "SRT port {port} is already taken");
+    }
+    assert_eq!(taken, (20_000..=20_008).collect());
+}
