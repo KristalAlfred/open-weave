@@ -743,6 +743,14 @@ fn strom_hop_profiles() -> Vec<HopProfile> {
             accepts: None,
         },
         HopProfile {
+            id: "whip-to-whep".to_string(),
+            ingress: transport_class(Transport::Whip, RoleSet::only(SocketRole::Listen)),
+            egress: transport_class(Transport::Whep, RoleSet::only(SocketRole::Listen)),
+            max_egresses: None,
+            merge: false,
+            accepts: Some(whip_input_accepts()),
+        },
+        HopProfile {
             id: "srt-to-rist".to_string(),
             ingress: transport_class(Transport::Srt, RoleSet::both()),
             egress: transport_class(Transport::Rist, RoleSet::only(SocketRole::Connect)),
@@ -761,8 +769,7 @@ fn strom_hop_profiles() -> Vec<HopProfile> {
     ]
 }
 
-/// What Strom's `whip_input` negotiates in the `audio_video` mode the gateway
-/// flow uses: H264 video and Opus audio.
+/// What Strom's `whip_input` negotiates: H264 video and Opus audio.
 fn whip_input_accepts() -> FormatConstraint {
     FormatConstraint {
         container: None,
@@ -1107,6 +1114,7 @@ mod tests {
                 branch_id: "studio".to_string(),
                 socket: SocketSpec::srt_connect("10.0.0.2", port + 1, 1000),
             }],
+            tracks: None,
         }
     }
 
@@ -1305,6 +1313,7 @@ mod tests {
                 branch_id: "output".to_string(),
                 socket: SocketSpec::srt_listen(7003, 1000),
             }],
+            tracks: None,
         }
     }
 
@@ -1323,6 +1332,7 @@ mod tests {
                     "weave-browser-return-receiver-display",
                 ),
             }],
+            tracks: None,
         }
     }
 
@@ -1375,6 +1385,41 @@ mod tests {
                 LinkCondition::Flowing,
                 LinkCondition::Flowing,
                 LinkCondition::Idle,
+            ]
+        );
+    }
+
+    /// The recordings come from this shape: a page sending WHIP into `whip_in`
+    /// and a page playing `whep_out_0`.
+    #[tokio::test]
+    async fn a_whip_to_whep_hop_reads_each_side_from_its_own_block() {
+        let mut hop = whip_to_srt_hop();
+        hop.profile_id = "whip-to-whep".to_string();
+        hop.egresses[0].socket =
+            signalling(SignallingTransport::Whep, "weave-b2b-receiver-display");
+        let mut tracker = StallTracker::default();
+        let mut conditions = Vec::new();
+        for recording in ["poll-0", "poll-1", "poll-2", "ended"] {
+            let status = poll(
+                &hop,
+                flow_in_state(&hop.id, "Playing"),
+                json!({}),
+                recorded_webrtc(recording),
+                &mut tracker,
+            )
+            .await;
+            conditions.push((
+                status.ingress.condition,
+                status.egresses[0].status.condition,
+            ));
+        }
+        assert_eq!(
+            conditions,
+            [
+                (LinkCondition::Connected, LinkCondition::Connected),
+                (LinkCondition::Flowing, LinkCondition::Flowing),
+                (LinkCondition::Flowing, LinkCondition::Flowing),
+                (LinkCondition::Idle, LinkCondition::Idle),
             ]
         );
     }
@@ -1451,14 +1496,14 @@ mod tests {
     }
 
     #[test]
-    fn only_the_whip_gateway_constrains_its_ingress() {
+    fn only_the_whip_ingests_constrain_their_ingress() {
         let profiles = strom_hop_profiles();
         let constrained: Vec<_> = profiles
             .iter()
             .filter(|profile| profile.accepts.is_some())
             .map(|profile| profile.id.as_str())
             .collect();
-        assert_eq!(constrained, ["whip-to-srt"]);
+        assert_eq!(constrained, ["whip-to-srt", "whip-to-whep"]);
         let accepts = profiles[1].accepts.as_ref().unwrap();
         let format = |video| weave_core::MediaFormat {
             container: weave_core::Container::Rtp,

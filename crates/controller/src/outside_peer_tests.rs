@@ -4,8 +4,8 @@ use weave_core::{
     NodeCapabilities, NodeDescriptor, NodeStatus, NodeTopology, ObservedState, PathStatus,
     PortRange, RoleSet, SignallingEndpoint, SignallingListener, SocketRole, SocketSpec,
     SrtEndpoint, SrtListener, StreamConditionReason, StreamConditionStatus, StreamConditionType,
-    StreamDefinition, StreamDestination, StreamStatus, StreamTransport, Transport, TransportClass,
-    VideoCodec, VideoConstraint, VideoFormat, validate_stream,
+    StreamDefinition, StreamDestination, StreamStatus, StreamTransport, Track, Transport,
+    TransportClass, VideoCodec, VideoConstraint, VideoFormat, validate_stream,
 };
 
 use crate::keys::LinkKeys;
@@ -385,6 +385,14 @@ fn sender_format(video: VideoCodec) -> MediaFormat {
 }
 
 fn reconciled(format: Option<MediaFormat>) -> StreamStatus {
+    reconcile_whip_source(format)
+        .streams
+        .into_iter()
+        .next()
+        .unwrap()
+}
+
+fn reconcile_whip_source(format: Option<MediaFormat>) -> crate::ReconcileOutcome {
     let definition = stream(
         StreamTransport::Whip(SignallingEndpoint {
             format,
@@ -392,7 +400,7 @@ fn reconciled(format: Option<MediaFormat>) -> StreamStatus {
         }),
         vec![("studio", srt("strom-node-2"))],
     );
-    let outcome = reconcile(
+    reconcile(
         vec![definition],
         &ObservedState {
             nodes: nodes(),
@@ -400,8 +408,7 @@ fn reconciled(format: Option<MediaFormat>) -> StreamStatus {
             hops: Vec::new(),
         },
         &LinkKeys::for_tests(),
-    );
-    outcome.streams.into_iter().next().unwrap()
+    )
 }
 
 fn format_compatible(conditions: &[weave_core::StreamCondition]) -> &weave_core::StreamCondition {
@@ -442,5 +449,46 @@ fn a_whip_sender_declaring_what_the_ingest_takes_is_compatible() {
     assert_eq!(
         format_compatible(&undeclared.conditions).reason,
         StreamConditionReason::FormatUnknown
+    );
+}
+
+#[test]
+fn a_whip_sender_declaring_one_track_is_built_and_checked_for_that_track() {
+    let video_only = MediaFormat {
+        audio: None,
+        ..sender_format(VideoCodec::H264)
+    };
+    let audio_only = MediaFormat {
+        video: None,
+        ..sender_format(VideoCodec::H264)
+    };
+    for (format, tracks) in [
+        (video_only.clone(), vec![Track::Video]),
+        (audio_only, vec![Track::Audio]),
+    ] {
+        let outcome = reconcile_whip_source(Some(format));
+        let condition = format_compatible(&outcome.streams[0].conditions);
+        assert_eq!(
+            condition.reason,
+            StreamConditionReason::FormatCompatible,
+            "{tracks:?}: {}",
+            condition.detail
+        );
+        for hop in outcome.desired_by_node.values().flatten() {
+            assert_eq!(hop.tracks.as_ref(), Some(&tracks), "{}", hop.id);
+        }
+    }
+
+    let vp8_only = MediaFormat {
+        video: video_only.video.map(|video| VideoFormat {
+            codec: VideoCodec::Vp8,
+            ..video
+        }),
+        ..video_only
+    };
+    assert_eq!(
+        format_compatible(&reconciled(Some(vp8_only)).conditions).reason,
+        StreamConditionReason::FormatMismatch,
+        "the track that is sent is still checked"
     );
 }

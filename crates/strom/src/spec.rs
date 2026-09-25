@@ -3,7 +3,9 @@
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use weave_core::{DesiredHop, Passphrase, RistSocket, SignallingSocket, SocketSpec, SrtSocket};
+use weave_core::{
+    DesiredHop, Passphrase, RistSocket, SignallingSocket, SocketSpec, SrtSocket, Track,
+};
 
 const PLACEHOLDER_ID: &str = "00000000-0000-0000-0000-000000000000";
 const DEFAULT_SRC_LATENCY: u32 = 200;
@@ -86,6 +88,11 @@ pub enum MappingError {
 ///   payloaded into RTP. Several egresses tee after the capsfilter.
 /// - `rist → srt`: ristsrc→rtpmp2tdepay→queue→srtsink. Several egresses tee after
 ///   the depayloader.
+/// - `whip → whep`: `whip_input(decode) → whep_output`, from a WHIP ingest hosted
+///   here to WHEP players. Several egresses tee the decoded video and audio.
+///
+/// The `whip` and `whep` shapes build only the tracks a hop's `tracks` names:
+/// no audio pads for video alone, no encoder for audio alone.
 ///
 /// Every egress of a hop must ask for one shape; a hop asked to fan out over two
 /// is [`MappingError::MixedEgress`]. No shape merges two ingresses, so a hop
@@ -104,13 +111,13 @@ pub fn flow_spec_from_hop(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
         "srt-to-whep" if shapes == (Shape::Srt, Shape::Whep) => srt_to_whep_flow(hop),
         "srt-to-rist" if shapes == (Shape::Srt, Shape::Rist) => srt_to_rist_flow(hop),
         "rist-to-srt" if shapes == (Shape::Rist, Shape::Srt) => rist_to_srt_flow(hop),
-        "srt-forward" | "whip-to-srt" | "srt-to-whep" | "srt-to-rist" | "rist-to-srt" => {
-            Err(MappingError::ProfileMismatch {
-                profile: hop.profile_id.clone(),
-                ingress: hop.ingress.to_string(),
-                egress: egress.to_string(),
-            })
-        }
+        "whip-to-whep" if shapes == (Shape::Whip, Shape::Whep) => whip_to_whep_flow(hop),
+        "srt-forward" | "whip-to-srt" | "srt-to-whep" | "whip-to-whep" | "srt-to-rist"
+        | "rist-to-srt" => Err(MappingError::ProfileMismatch {
+            profile: hop.profile_id.clone(),
+            ingress: hop.ingress.to_string(),
+            egress: egress.to_string(),
+        }),
         _ => Err(MappingError::UnknownProfile(hop.profile_id.clone())),
     }
 }
@@ -193,13 +200,16 @@ fn signalling_socket(spec: &SocketSpec) -> Result<&SignallingSocket, MappingErro
     }
 }
 
-fn whip_input_block(id: &str, socket: &SignallingSocket) -> Block {
+fn whip_input_block(id: &str, socket: &SignallingSocket, carried: Carried) -> Block {
     let mut props = Map::new();
     props.insert(
         "endpoint_id".to_string(),
         Value::String(socket.endpoint_id.clone()),
     );
-    props.insert("mode".to_string(), Value::String("audio_video".to_string()));
+    props.insert(
+        "mode".to_string(),
+        Value::String(carried.whip_mode().to_string()),
+    );
     props.insert("decode".to_string(), Value::Bool(true));
     props.insert("max_sessions".to_string(), Value::from(1));
     block(
@@ -422,34 +432,114 @@ fn rist_to_srt_flow(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
     Ok(chain_flow(&hop.id, head, branches))
 }
 
-/// A decoded video and audio pair fanned out to `count` consumers. One consumer
-/// links straight; more go through a tee and a queue per branch, since a src pad
-/// links once and tee branches need a queue each to run independently. Returns
-/// the `(video, audio)` pad to link each consumer's inputs from.
-fn fan_out(
-    spec: &mut FlowSpec,
-    video_src: &str,
-    audio_src: &str,
-    count: usize,
-) -> Vec<(String, String)> {
-    if count <= 1 {
-        return vec![(video_src.to_string(), audio_src.to_string())];
+/// Which tracks a hop carries: the ones its `tracks` names, or both when it
+/// names none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Carried {
+    video: bool,
+    audio: bool,
+}
+
+impl Carried {
+    fn of(hop: &DesiredHop) -> Self {
+        match hop.tracks.as_deref() {
+            Some(tracks) if !tracks.is_empty() => Self {
+                video: tracks.contains(&Track::Video),
+                audio: tracks.contains(&Track::Audio),
+            },
+            _ => Self {
+                video: true,
+                audio: true,
+            },
+        }
     }
-    spec.elements.push(element("tee_v", "tee", [450.0, 200.0]));
-    spec.elements.push(element("tee_a", "tee", [450.0, 350.0]));
-    spec.links.push(link(video_src, "tee_v:sink"));
-    spec.links.push(link(audio_src, "tee_a:sink"));
+
+    fn whip_mode(self) -> &'static str {
+        match (self.video, self.audio) {
+            (true, false) => "video",
+            (false, true) => "audio",
+            _ => "audio_video",
+        }
+    }
+
+    /// Give a block no pad for a track the hop does not carry. Strom's SRT and
+    /// WHEP blocks have one video and one audio track unless told otherwise.
+    fn limit(self, mut block: Block) -> Block {
+        for (carried, key) in [
+            (self.video, "num_video_tracks"),
+            (self.audio, "num_audio_tracks"),
+        ] {
+            if !carried {
+                block.properties.insert(key.to_string(), Value::from(0));
+            }
+        }
+        block
+    }
+}
+
+/// Decoded pads, one for each track a hop carries.
+#[derive(Debug, Clone)]
+struct MediaPads {
+    video: Option<String>,
+    audio: Option<String>,
+}
+
+impl MediaPads {
+    fn new(carried: Carried, video: &str, audio: &str) -> Self {
+        Self {
+            video: carried.video.then(|| video.to_string()),
+            audio: carried.audio.then(|| audio.to_string()),
+        }
+    }
+
+    /// Link these pads into `block`'s `video_in` and `audio_in` pads.
+    fn link_into(&self, spec: &mut FlowSpec, block: &str, video_in: &str, audio_in: &str) {
+        for (pad, input) in [(&self.video, video_in), (&self.audio, audio_in)] {
+            if let Some(pad) = pad {
+                spec.links.push(link(pad, &format!("{block}:{input}")));
+            }
+        }
+    }
+}
+
+/// Decoded media fanned out to `count` consumers. One consumer links straight;
+/// more go through a tee and a queue per branch and track, since a src pad links
+/// once and tee branches need a queue each to run independently. Returns the
+/// pads to link each consumer's inputs from.
+fn fan_out(spec: &mut FlowSpec, source: MediaPads, count: usize) -> Vec<MediaPads> {
+    if count <= 1 {
+        return vec![source];
+    }
+    let tracks = [
+        ("v", source.video.as_deref(), 200.0),
+        ("a", source.audio.as_deref(), 350.0),
+    ];
+    for (kind, pad, y) in tracks {
+        if let Some(pad) = pad {
+            let tee = format!("tee_{kind}");
+            spec.elements.push(element(&tee, "tee", [450.0, y]));
+            spec.links.push(link(pad, &format!("{tee}:sink")));
+        }
+    }
     (0..count)
         .map(|i| {
             let y = 200.0 + (i as f64) * 150.0;
-            let (qv, qa) = (format!("queue_v{i}"), format!("queue_a{i}"));
-            spec.elements.push(element(&qv, "queue", [600.0, y]));
-            spec.elements.push(element(&qa, "queue", [600.0, y + 50.0]));
-            spec.links
-                .push(link(&format!("tee_v:src_{i}"), &format!("{qv}:sink")));
-            spec.links
-                .push(link(&format!("tee_a:src_{i}"), &format!("{qa}:sink")));
-            (format!("{qv}:src"), format!("{qa}:src"))
+            let mut branch = |kind: &str, pad: Option<&str>, offset: f64| {
+                pad.map(|_| {
+                    let queue = format!("queue_{kind}{i}");
+                    spec.elements
+                        .push(element(&queue, "queue", [600.0, y + offset]));
+                    spec.links.push(link(
+                        &format!("tee_{kind}:src_{i}"),
+                        &format!("{queue}:sink"),
+                    ));
+                    format!("{queue}:src")
+                })
+            };
+            MediaPads {
+                video: branch("v", source.video.as_deref(), 0.0),
+                audio: branch("a", source.audio.as_deref(), 50.0),
+            }
         })
         .collect()
 }
@@ -466,56 +556,77 @@ fn empty_flow(name: &str) -> FlowSpec {
 
 /// `whip_input → videoenc → mpegtssrt_output`, audio straight into the muxer.
 fn whip_to_srt_flow(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
+    let carried = Carried::of(hop);
     let mut spec = empty_flow(&hop.id);
     spec.blocks.push(whip_input_block(
         "whip_in",
         signalling_socket(&hop.ingress)?,
+        carried,
     ));
-    spec.blocks.push(videoenc_block("venc", [300.0, 200.0]));
-    spec.links.push(link("whip_in:video_out", "venc:video_in"));
+    if carried.video {
+        spec.blocks.push(videoenc_block("venc", [300.0, 200.0]));
+        spec.links.push(link("whip_in:video_out", "venc:video_in"));
+    }
 
-    let branches = fan_out(
-        &mut spec,
-        "venc:encoded_out",
-        "whip_in:audio_out",
-        hop.egresses.len(),
-    );
-    for (i, (egress, (video, audio))) in hop.egresses.iter().zip(branches).enumerate() {
+    let source = MediaPads::new(carried, "venc:encoded_out", "whip_in:audio_out");
+    let branches = fan_out(&mut spec, source, hop.egresses.len());
+    for (i, (egress, pads)) in hop.egresses.iter().zip(branches).enumerate() {
         let id = format!("srt_out_{i}");
         let y = 200.0 + (i as f64) * 150.0;
-        spec.blocks.push(mpegtssrt_output_block(
+        spec.blocks.push(carried.limit(mpegtssrt_output_block(
             &id,
             srt_socket(&egress.socket)?,
             [800.0, y],
-        ));
-        spec.links.push(link(&video, &format!("{id}:video_in")));
-        spec.links.push(link(&audio, &format!("{id}:audio_in_0")));
+        )));
+        pads.link_into(&mut spec, &id, "video_in", "audio_in_0");
     }
     Ok(spec)
 }
 
 /// `mpegtssrt_input(decode) → whep_output`.
 fn srt_to_whep_flow(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
+    let carried = Carried::of(hop);
     let mut spec = empty_flow(&hop.id);
     spec.blocks
-        .push(mpegtssrt_input_block("srt_in", srt_socket(&hop.ingress)?));
-    let branches = fan_out(
-        &mut spec,
-        "srt_in:video_out",
-        "srt_in:audio_out_0",
-        hop.egresses.len(),
-    );
-    for (i, (egress, (video, audio))) in hop.egresses.iter().zip(branches).enumerate() {
+        .push(carried.limit(mpegtssrt_input_block("srt_in", srt_socket(&hop.ingress)?)));
+    let source = MediaPads::new(carried, "srt_in:video_out", "srt_in:audio_out_0");
+    let branches = fan_out(&mut spec, source, hop.egresses.len());
+    push_whep_outputs(&mut spec, hop, carried, branches)?;
+    Ok(spec)
+}
+
+/// One `whep_output` per egress of `hop`, fed from its branch of the fan-out.
+fn push_whep_outputs(
+    spec: &mut FlowSpec,
+    hop: &DesiredHop,
+    carried: Carried,
+    branches: Vec<MediaPads>,
+) -> Result<(), MappingError> {
+    for (i, (egress, pads)) in hop.egresses.iter().zip(branches).enumerate() {
         let id = format!("whep_out_{i}");
         let y = 200.0 + (i as f64) * 150.0;
-        spec.blocks.push(whep_output_block(
+        spec.blocks.push(carried.limit(whep_output_block(
             &id,
             signalling_socket(&egress.socket)?,
             [800.0, y],
-        ));
-        spec.links.push(link(&video, &format!("{id}:video_in")));
-        spec.links.push(link(&audio, &format!("{id}:audio_in")));
+        )));
+        pads.link_into(spec, &id, "video_in", "audio_in");
     }
+    Ok(())
+}
+
+/// `whip_input(decode) → whep_output`.
+fn whip_to_whep_flow(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
+    let carried = Carried::of(hop);
+    let mut spec = empty_flow(&hop.id);
+    spec.blocks.push(whip_input_block(
+        "whip_in",
+        signalling_socket(&hop.ingress)?,
+        carried,
+    ));
+    let source = MediaPads::new(carried, "whip_in:video_out", "whip_in:audio_out");
+    let branches = fan_out(&mut spec, source, hop.egresses.len());
+    push_whep_outputs(&mut spec, hop, carried, branches)?;
     Ok(spec)
 }
 
@@ -772,6 +883,7 @@ mod tests {
                 "studio",
                 SocketSpec::srt_connect("172.31.0.10", 7002, 1000),
             )],
+            tracks: None,
         }
     }
 
@@ -784,6 +896,7 @@ mod tests {
             ingress: SocketSpec::srt_listen(7002, 1000),
             merge_ingress: None,
             egresses: vec![egress("studio", SocketSpec::srt_listen(7003, 200))],
+            tracks: None,
         }
     }
 
@@ -1035,6 +1148,7 @@ mod tests {
             ingress: whip_socket(SocketRole::Listen, "weave-alice-cam-receiver-studio"),
             merge_ingress: None,
             egresses: vec![egress("studio", SocketSpec::srt_listen(7003, 200))],
+            tracks: None,
         }
     }
 
@@ -1052,6 +1166,7 @@ mod tests {
                 "studio",
                 whep_socket(SocketRole::Listen, "weave-alice-return-receiver-studio"),
             )],
+            tracks: None,
         }
     }
 
@@ -1084,6 +1199,79 @@ mod tests {
     }
 
     #[test]
+    fn a_video_only_whip_gateway_builds_no_audio_track() {
+        let mut hop = whip_gateway_hop();
+        hop.tracks = Some(vec![Track::Video]);
+        let spec = flow_spec_from_hop(&hop).expect("map");
+        let produced = serde_json::to_value(&spec).expect("serialize");
+        let golden: Value = serde_json::from_str(include_str!("testdata/whip-srt-video.json"))
+            .expect("parse whip-srt-video.json");
+        assert_eq!(
+            produced,
+            golden,
+            "{}",
+            serde_json::to_string_pretty(&produced).unwrap()
+        );
+    }
+
+    #[test]
+    fn an_audio_only_whip_gateway_encodes_no_video() {
+        let mut hop = whip_gateway_hop();
+        hop.tracks = Some(vec![Track::Audio]);
+        let spec = flow_spec_from_hop(&hop).expect("map");
+        let blocks: Vec<&str> = spec.blocks.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(blocks, ["whip_in", "srt_out_0"]);
+        assert_eq!(spec.blocks[0].properties["mode"], Value::from("audio"));
+        assert_eq!(
+            spec.blocks[1].properties["num_video_tracks"],
+            Value::from(0)
+        );
+        let links: Vec<(&str, &str)> = spec
+            .links
+            .iter()
+            .map(|l| (l.from.as_str(), l.to.as_str()))
+            .collect();
+        assert_eq!(links, [("whip_in:audio_out", "srt_out_0:audio_in_0")]);
+    }
+
+    #[test]
+    fn a_hop_naming_both_tracks_or_none_builds_both() {
+        let unnamed = flow_spec_from_hop(&whip_gateway_hop()).expect("map");
+        let mut both = whip_gateway_hop();
+        both.tracks = Some(vec![Track::Video, Track::Audio]);
+        assert_eq!(flow_spec_from_hop(&both).expect("map"), unnamed);
+    }
+
+    #[test]
+    fn a_video_only_whep_fanout_tees_video_alone() {
+        let mut hop = whep_gateway_hop();
+        hop.tracks = Some(vec![Track::Video]);
+        hop.egresses.push(egress(
+            "preview",
+            whep_socket(SocketRole::Listen, "weave-alice-return-receiver-preview"),
+        ));
+        let spec = flow_spec_from_hop(&hop).expect("map");
+
+        let elements: Vec<&str> = spec.elements.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(elements, ["tee_v", "queue_v0", "queue_v1"]);
+        for block in &spec.blocks {
+            assert_eq!(
+                block.properties["num_audio_tracks"],
+                Value::from(0),
+                "{}",
+                block.id
+            );
+        }
+        assert!(
+            spec.links
+                .iter()
+                .all(|l| !l.from.contains("audio") && !l.to.contains("audio")),
+            "{:?}",
+            spec.links
+        );
+    }
+
+    #[test]
     fn whip_block_endpoint_id_comes_from_the_carried_field_not_the_url() {
         let mut hop = whip_gateway_hop();
         hop.ingress = SocketSpec::Whip(SignallingSocket {
@@ -1098,13 +1286,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_hop_with_webrtc_on_both_sides_is_refused() {
+    /// The Strom side of a browser-to-browser stream: a page pushes WHIP in, a
+    /// page pulls WHEP out.
+    fn whip_to_whep_hop() -> DesiredHop {
         let mut hop = whip_gateway_hop();
+        hop.id = "weave-b2b-bridge-display-0".to_string();
+        hop.profile_id = "whip-to-whep".to_string();
+        hop.role = HopRole::Bridge;
+        hop.ingress = whip_socket(SocketRole::Listen, "weave-b2b-bridge-display-0");
         hop.egresses = vec![egress(
-            "studio",
-            whep_socket(SocketRole::Listen, "weave-relayed-receiver-output"),
+            "display",
+            whep_socket(SocketRole::Listen, "weave-b2b-receiver-display"),
         )];
+        hop
+    }
+
+    #[test]
+    fn maps_whip_ingress_to_whep_payload() {
+        let spec = flow_spec_from_hop(&whip_to_whep_hop()).expect("map");
+        let produced = serde_json::to_value(&spec).expect("serialize");
+        let golden: Value = serde_json::from_str(include_str!("testdata/whip-whep.json"))
+            .expect("parse whip-whep.json");
+        assert_eq!(
+            produced,
+            golden,
+            "{}",
+            serde_json::to_string_pretty(&produced).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_webrtc_hop_under_another_profile_is_refused() {
+        let mut hop = whip_to_whep_hop();
+        hop.profile_id = "whip-to-srt".to_string();
         assert!(matches!(
             flow_spec_from_hop(&hop),
             Err(MappingError::ProfileMismatch { .. })
@@ -1177,6 +1391,7 @@ mod tests {
                     port: 7100,
                 }),
             )],
+            tracks: None,
         }
     }
 
@@ -1189,6 +1404,7 @@ mod tests {
             ingress: SocketSpec::Rist(RistSocket::Listen { port: 7100 }),
             merge_ingress: None,
             egresses: vec![egress("studio", SocketSpec::srt_listen(7003, 200))],
+            tracks: None,
         }
     }
 

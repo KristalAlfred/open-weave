@@ -1,0 +1,30 @@
+{
+  "id": "00000000-0000-0000-0000-000000000000",
+  "name": "weave-b2b-bridge-display-0",
+  "elements": [],
+  "blocks": [
+    {
+      "id": "whip_in",
+      "block_definition_id": "builtin.whip_input",
+      "name": "WHIP ingest",
+      "properties": {
+        "endpoint_id": "weave-b2b-bridge-display-0",
+        "mode": "audio_video",
+        "decode": true,
+        "max_sessions": 1
+      },
+      "position": [100.0, 200.0]
+    },
+    {
+      "id": "whep_out_0",
+      "block_definition_id": "builtin.whep_output",
+      "name": "WHEP playback",
+      "properties": { "endpoint_id": "weave-b2b-receiver-display" },
+      "position": [800.0, 200.0]
+    }
+  ],
+  "links": [
+    { "from": "whip_in:video_out", "to": "whep_out_0:video_in" },
+    { "from": "whip_in:audio_out", "to": "whep_out_0:audio_in" }
+  ]
+}

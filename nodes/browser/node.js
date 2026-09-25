@@ -87,7 +87,7 @@ function registration() {
         hop_profiles: [
           {
             id: "camera-to-whip",
-            ingress: { device: "capture" },
+            ingress: { device: "capture", tracks: Object.keys(config.media).sort() },
             egress: { transport: "whip", roles: ["connect"] },
             max_egresses: 1,
           },

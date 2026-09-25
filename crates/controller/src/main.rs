@@ -2364,10 +2364,11 @@ fn refuse_other_nodes_endpoints(
 struct IngressAccepts<'a> {
     node: &'a str,
     profile: &'a str,
-    accepts: &'a weave_core::FormatConstraint,
+    accepts: weave_core::FormatConstraint,
 }
 
-/// The sender hop's profile constraint, when its profile declares one.
+/// The sender hop's profile constraint, when its profile declares one, on the
+/// tracks the hop carries: a hop built for video alone does not need audio.
 fn ingress_accepts<'a>(
     path: &'a weave_core::Path,
     nodes: &'a [NodeDescriptor],
@@ -2380,10 +2381,19 @@ fn ingress_accepts<'a>(
         .hop_profiles
         .iter()
         .find(|profile| profile.id == sender.profile_id)?;
+    let mut accepts = profile.accepts.clone()?;
+    if let Some(tracks) = &sender.tracks {
+        if !tracks.contains(&weave_core::Track::Video) {
+            accepts.video = None;
+        }
+        if !tracks.contains(&weave_core::Track::Audio) {
+            accepts.audio = None;
+        }
+    }
     Some(IngressAccepts {
         node: &sender.node_id,
         profile: &profile.id,
-        accepts: profile.accepts.as_ref()?,
+        accepts,
     })
 }
 
@@ -4782,6 +4792,7 @@ mod tests {
             id: "camera-to-whip".to_string(),
             ingress: HopEndpointClass::Device(weave_core::DeviceClass {
                 device: weave_core::DeviceKind::Capture,
+                tracks: None,
             }),
             egress: HopEndpointClass::Transport(TransportClass {
                 transport: Transport::Whip,

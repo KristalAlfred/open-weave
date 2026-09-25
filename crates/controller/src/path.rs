@@ -3,11 +3,12 @@
 use std::collections::{HashMap, HashSet};
 
 use weave_core::{
-    DesiredEgress, DesiredHop, DestinationEndpoint, DeviceKind, EndpointAddr, HOP_ID_PREFIX,
-    HopConditions, HopRole, HopState, HopStatus, NetworkAttachment, NodeDescriptor, NodeStatus,
-    Passphrase, Path, PathStatus, PortRange, RemoteAddr, RistListener, RistSocket,
-    SignallingEndpoint, SignallingTransport, SocketRole, SocketSpec, SrtParams, SrtSocket,
-    StreamDefinition, StreamEndpoints, StreamTransport, Transport, roll_up_path,
+    DesiredEgress, DesiredHop, DestinationEndpoint, DeviceClass, DeviceKind, EndpointAddr,
+    HOP_ID_PREFIX, HopConditions, HopEndpointClass, HopRole, HopState, HopStatus,
+    NetworkAttachment, NodeDescriptor, NodeStatus, Passphrase, Path, PathStatus, PortRange,
+    RemoteAddr, RistListener, RistSocket, SignallingEndpoint, SignallingTransport, SocketRole,
+    SocketSpec, SrtParams, SrtSocket, StreamDefinition, StreamEndpoints, StreamTransport, Track,
+    Transport, roll_up_path,
 };
 
 use crate::keys::LinkKeys;
@@ -619,6 +620,7 @@ pub fn derive_stream(
         ingress: source_socket(&source, sender_node, &sender_id, nodes, &mut ports)?,
         merge_ingress: None,
         egresses: sender_egresses,
+        tracks: None,
     };
 
     let mut hops = Vec::with_capacity(1 + downstream.len());
@@ -654,6 +656,10 @@ pub fn derive_stream(
     });
     second_paths.sort_by(|left, right| left.0.cmp(&right.0));
     hops.extend(second_paths.into_iter().flat_map(|(_, bridges)| bridges));
+    let tracks = source_tracks(&stream.source, &hops[0], nodes);
+    for hop in &mut hops {
+        hop.tracks.clone_from(&tracks);
+    }
     single_path.sort_by(|left, right| left.destination.cmp(&right.destination));
     *committed_ports = ports;
 
@@ -917,6 +923,38 @@ fn pick_remote_relay<'n>(
     }
 }
 
+/// The tracks the source sends: those an outside WHIP sender's declared format
+/// carries, or those the sender's capture profile declares.
+fn source_tracks(
+    source: &StreamTransport,
+    sender: &DesiredHop,
+    nodes: &[NodeDescriptor],
+) -> Option<Vec<Track>> {
+    if let StreamTransport::Whip(endpoint) = source {
+        let format = endpoint.format.as_ref()?;
+        let tracks: Vec<Track> = [
+            (format.audio.is_some(), Track::Audio),
+            (format.video.is_some(), Track::Video),
+        ]
+        .into_iter()
+        .filter_map(|(present, track)| present.then_some(track))
+        .collect();
+        return (!tracks.is_empty()).then_some(tracks);
+    }
+    let profile = find_node(nodes, &sender.node_id)?
+        .capabilities
+        .hop_profiles
+        .iter()
+        .find(|profile| profile.id == sender.profile_id)?;
+    match &profile.ingress {
+        HopEndpointClass::Device(DeviceClass {
+            device: DeviceKind::Capture,
+            tracks,
+        }) => tracks.clone(),
+        _ => None,
+    }
+}
+
 fn select_profile(hop: &DesiredHop, nodes: &[NodeDescriptor]) -> Result<String, PlacementError> {
     let node = find_node(nodes, &hop.node_id).ok_or_else(|| PlacementError::NodeNotRegistered {
         node: hop.node_id.clone(),
@@ -975,6 +1013,7 @@ fn plan_hop(
             ingress: link.downstream,
             merge_ingress: None,
             egresses: Vec::new(),
+            tracks: None,
         },
         link.attachments,
     ))
@@ -2266,8 +2305,7 @@ mod contract_tests {
         );
     }
 
-    #[test]
-    fn dial_only_browser_attachment_reaches_a_listener() {
+    fn camera_to_studio(tracks: Option<Vec<Track>>) -> Path {
         let browser = NodeDescriptor {
             id: "browser".to_string(),
             endpoint: "browser://browser".to_string(),
@@ -2278,6 +2316,7 @@ mod contract_tests {
                     id: "camera-to-whip".to_string(),
                     ingress: HopEndpointClass::Device(DeviceClass {
                         device: DeviceKind::Capture,
+                        tracks,
                     }),
                     egress: class(
                         Transport::Whip,
@@ -2319,15 +2358,34 @@ mod contract_tests {
             }),
             destinations: vec![destination("studio", "studio-node")],
         };
-        let path = derive_path(
+        derive_path(
             &stream,
             &[browser, strom],
             &[],
             &mut PortAllocator::new(),
             &keys(),
         )
-        .unwrap();
-        assert_eq!(path.hops[0].profile_id, "camera-to-whip");
+        .unwrap()
+    }
+
+    #[test]
+    fn dial_only_browser_attachment_reaches_a_listener() {
+        assert_eq!(camera_to_studio(None).hops[0].profile_id, "camera-to-whip");
+    }
+
+    #[test]
+    fn the_capture_profiles_tracks_travel_on_every_hop() {
+        let path = camera_to_studio(Some(vec![Track::Video]));
+        assert_eq!(path.hops.len(), 2);
+        for hop in &path.hops {
+            assert_eq!(hop.tracks, Some(vec![Track::Video]), "{}", hop.id);
+        }
+        assert!(
+            camera_to_studio(None)
+                .hops
+                .iter()
+                .all(|hop| hop.tracks.is_none())
+        );
     }
 
     #[test]
@@ -2339,6 +2397,7 @@ mod contract_tests {
             id: "capture-to-srt".to_string(),
             ingress: HopEndpointClass::Device(DeviceClass {
                 device: DeviceKind::Capture,
+                tracks: None,
             }),
             egress: class(Transport::Srt, weave_core::RoleSet::both()),
             max_egresses: Some(1),
@@ -2817,7 +2876,10 @@ mod tests {
     }
 
     fn device(kind: DeviceKind) -> HopEndpointClass {
-        HopEndpointClass::Device(DeviceClass { device: kind })
+        HopEndpointClass::Device(DeviceClass {
+            device: kind,
+            tracks: None,
+        })
     }
 
     fn profile(
@@ -4527,6 +4589,71 @@ mod tests {
                 endpoint: None,
             }],
             "a screen has nothing to dial"
+        );
+    }
+
+    #[test]
+    fn browser_to_browser_relays_through_strom_whip_to_whep() {
+        let b2b = StreamDefinition {
+            name: "b2b".to_string(),
+            enabled: true,
+            source: device_ref("browser-a1b2"),
+            destinations: vec![device_dest("display", "browser-c3d4")],
+        };
+        let mut strom = webrtc_node("strom-node-2", "172.27.0.10");
+        let without_profile = vec![
+            browser_node("browser-a1b2"),
+            browser_node("browser-c3d4"),
+            strom.clone(),
+        ];
+        assert!(
+            derive(&b2b, &without_profile).is_err(),
+            "a relay needs a profile taking WHIP in and WHEP out"
+        );
+
+        strom.capabilities.hop_profiles.push(profile(
+            "whip-to-whep",
+            class(Transport::Whip, RoleSet::only(SocketRole::Listen)),
+            class(Transport::Whep, RoleSet::only(SocketRole::Listen)),
+            None,
+        ));
+        let nodes = vec![
+            browser_node("browser-a1b2"),
+            browser_node("browser-c3d4"),
+            strom,
+        ];
+        let path = derive(&b2b, &nodes).expect("derive");
+        let placed: Vec<(&str, &str)> = path
+            .hops
+            .iter()
+            .map(|hop| (hop.node_id.as_str(), hop.profile_id.as_str()))
+            .collect();
+        assert_eq!(
+            placed,
+            [
+                ("browser-a1b2", "camera-to-whip"),
+                ("strom-node-2", "whip-to-whep"),
+                ("browser-c3d4", "whep-to-display"),
+            ]
+        );
+        let relay = &path.hops[1];
+        assert_eq!(
+            relay.ingress,
+            SocketSpec::signalling(
+                SignallingTransport::Whip,
+                SocketRole::Listen,
+                "http://172.27.0.10:8080/ingest",
+                &relay.id,
+            )
+        );
+        assert_eq!(
+            relay.egresses[0].socket,
+            SocketSpec::signalling(
+                SignallingTransport::Whep,
+                SocketRole::Listen,
+                "http://172.27.0.10:8080/playback",
+                "weave-b2b-receiver-display",
+            )
         );
     }
 

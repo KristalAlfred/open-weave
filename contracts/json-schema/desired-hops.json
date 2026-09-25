@@ -322,6 +322,21 @@
           "receiver"
         ],
         "type": "string"
+      },
+      "tracks": {
+        "description": "The tracks the stream's source sends, copied onto every hop of its path:\n a capture device's declared tracks, or those an outside WHIP sender's\n declared `format` carries. Absent when the source declares neither.",
+        "items": {
+          "description": "A kind of media track a capture device sends.",
+          "enum": [
+            "audio",
+            "video"
+          ],
+          "type": "string"
+        },
+        "type": [
+          "array",
+          "null"
+        ]
       }
     },
     "required": [

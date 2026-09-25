@@ -662,6 +662,21 @@
                                 "display"
                               ],
                               "type": "string"
+                            },
+                            "tracks": {
+                              "description": "The tracks a capture device sends. Absent means unknown.",
+                              "items": {
+                                "description": "A kind of media track a capture device sends.",
+                                "enum": [
+                                  "audio",
+                                  "video"
+                                ],
+                                "type": "string"
+                              },
+                              "type": [
+                                "array",
+                                "null"
+                              ]
                             }
                           },
                           "required": [
@@ -737,6 +752,21 @@
                                 "display"
                               ],
                               "type": "string"
+                            },
+                            "tracks": {
+                              "description": "The tracks a capture device sends. Absent means unknown.",
+                              "items": {
+                                "description": "A kind of media track a capture device sends.",
+                                "enum": [
+                                  "audio",
+                                  "video"
+                                ],
+                                "type": "string"
+                              },
+                              "type": [
+                                "array",
+                                "null"
+                              ]
                             }
                           },
                           "required": [

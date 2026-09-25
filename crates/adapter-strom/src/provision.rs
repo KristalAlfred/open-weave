@@ -7,7 +7,7 @@ use weave_core::{
     DesiredHop, HopState, LinkCondition, ResolvedAddr, RistSocket, SocketRole, SocketSpec,
     SrtSocket, is_managed_hop_id,
 };
-use weave_strom::{SrtUri, StromFlow, hop_srt_uris};
+use weave_strom::{FlowSpec, SrtUri, StromFlow, flow_spec_from_hop, hop_srt_uris};
 
 /// Consecutive polls without byte progress on one side before a running,
 /// ever-flowed hop is judged stalled there. At the default 5s poll this is ~15s
@@ -188,9 +188,10 @@ pub fn diff_hops(desired: &[DesiredHop], flows: &[StromFlow]) -> HopPlan {
 
 /// Whether an adopted flow's sockets diverge from the desired hop: its SRT
 /// sockets (element `uri`s and block `srt_uri`s, with every parameter in them),
-/// its RIST addresses (`ristsrc` port, `ristsink` address and port) or its
-/// WHIP/WHEP endpoint ids (block `endpoint_id`s). A flow exposing none of these
-/// cannot be compared, so it is adopted rather than recreated.
+/// its RIST addresses (`ristsrc` port, `ristsink` address and port), its
+/// WHIP/WHEP endpoint ids (block `endpoint_id`s), or the block properties set
+/// from the hop's tracks. A flow exposing no socket cannot be compared, so it is
+/// adopted rather than recreated.
 fn flow_drifted(flow: &StromFlow, hop: &DesiredHop) -> bool {
     let actual_srt = sorted(flow_srt_uris(flow));
     let actual_rist = sorted(flow_rist_endpoints(flow));
@@ -201,6 +202,38 @@ fn flow_drifted(flow: &StromFlow, hop: &DesiredHop) -> bool {
     actual_srt != sorted(hop_srt_uris(hop))
         || actual_rist != sorted(hop_rist_endpoints(hop))
         || actual_ids != sorted(hop_endpoint_ids(hop))
+        || flow_spec_from_hop(hop)
+            .is_ok_and(|spec| flow_track_settings(flow) != spec_track_settings(&spec))
+}
+
+/// Block properties the adapter sets from a hop's `tracks`.
+const TRACK_PROPERTIES: [&str; 3] = ["mode", "num_video_tracks", "num_audio_tracks"];
+
+type TrackSetting = (String, &'static str, String);
+
+fn flow_track_settings(flow: &StromFlow) -> Vec<TrackSetting> {
+    sorted(
+        flow.blocks
+            .iter()
+            .flat_map(|block| track_values(&block.id, |key| block.properties.get(key)))
+            .collect(),
+    )
+}
+
+fn spec_track_settings(spec: &FlowSpec) -> Vec<TrackSetting> {
+    sorted(
+        spec.blocks
+            .iter()
+            .flat_map(|block| track_values(&block.id, |key| block.properties.get(key)))
+            .collect(),
+    )
+}
+
+fn track_values<'a>(block: &str, get: impl Fn(&str) -> Option<&'a Value>) -> Vec<TrackSetting> {
+    TRACK_PROPERTIES
+        .into_iter()
+        .filter_map(|key| get(key).map(|value| (block.to_string(), key, value.to_string())))
+        .collect()
 }
 
 fn sorted<T: Ord>(mut values: Vec<T>) -> Vec<T> {
@@ -376,7 +409,7 @@ pub fn resolved_addr(spec: &SocketSpec, listener_host: Option<&str>) -> Option<R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weave_core::{DesiredEgress, HopRole, SignallingTransport};
+    use weave_core::{DesiredEgress, HopRole, SignallingTransport, Track};
 
     fn hop(id: &str) -> DesiredHop {
         DesiredHop {
@@ -390,6 +423,7 @@ mod tests {
                 branch_id: "studio".to_string(),
                 socket: SocketSpec::srt_connect("10.0.0.2", 7002, 1000),
             }],
+            tracks: None,
         }
     }
 
@@ -935,6 +969,7 @@ mod tests {
                 branch_id: "studio".to_string(),
                 socket: SocketSpec::srt_listen(7003, 200),
             }],
+            tracks: None,
         }
     }
 
@@ -945,7 +980,7 @@ mod tests {
             "running": true,
             "blocks": [
                 { "id": "whip_in", "block_definition_id": "builtin.whip_input",
-                  "properties": { "endpoint_id": endpoint_id } },
+                  "properties": { "endpoint_id": endpoint_id, "mode": "audio_video" } },
                 { "id": "srt_out_0", "block_definition_id": "builtin.mpegtssrt_output",
                   "properties": { "srt_uri": srt_uri } },
             ],
@@ -990,6 +1025,47 @@ mod tests {
             );
             assert_eq!(plan.create.len(), 1);
         }
+    }
+
+    #[test]
+    fn a_flow_built_for_other_tracks_drifts() {
+        let mut video_only = whip_gateway_hop();
+        video_only.tracks = Some(vec![Track::Video]);
+        let both = block_flow(
+            "weave-alice-cam-receiver-studio",
+            "weave-alice-cam-receiver-studio",
+            "srt://:7003?mode=listener&latency=200",
+        );
+        let plan = diff_hops(std::slice::from_ref(&video_only), &[both]);
+        assert_eq!(plan.delete, vec!["id-a".to_string()]);
+
+        let mut built: StromFlow = serde_json::from_value(serde_json::json!({
+            "id": "id-a",
+            "name": "weave-alice-cam-receiver-studio",
+            "running": true,
+            "blocks": [
+                { "id": "whip_in", "properties": {
+                    "endpoint_id": "weave-alice-cam-receiver-studio", "mode": "video" } },
+                { "id": "srt_out_0", "properties": {
+                    "srt_uri": "srt://:7003?mode=listener&latency=200", "num_audio_tracks": 0 } },
+            ],
+        }))
+        .unwrap();
+        assert!(
+            diff_hops(
+                std::slice::from_ref(&video_only),
+                std::slice::from_ref(&built)
+            )
+            .is_empty()
+        );
+
+        built.blocks[1].properties.remove("num_audio_tracks");
+        let plan = diff_hops(&[video_only], &[built]);
+        assert_eq!(
+            plan.delete,
+            vec!["id-a".to_string()],
+            "the muxer still waits on audio"
+        );
     }
 
     #[test]

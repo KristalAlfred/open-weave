@@ -48,6 +48,7 @@ mod tests {
                 branch_id: branch_id.to_string(),
                 socket: SocketSpec::Device(DeviceKind::Display),
             }],
+            tracks: None,
         }
     }
 

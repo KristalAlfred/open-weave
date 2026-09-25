@@ -4,8 +4,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    FormatConstraint, MediaFormat, NodeDescriptor, Passphrase, SignallingEndpoint, SrtEndpoint,
-    StreamDefinition, StreamDestination, StreamTransport,
+    DeviceClass, DeviceKind, FormatConstraint, HopEndpointClass, MediaFormat, NodeDescriptor,
+    Passphrase, SignallingEndpoint, SrtEndpoint, StreamDefinition, StreamDestination,
+    StreamTransport,
 };
 
 pub const RESOURCE_ID_MAX_LEN: usize = 63;
@@ -170,6 +171,15 @@ pub fn validate_node(node: &NodeDescriptor) -> Vec<ValidationIssue> {
                 &mut issues,
             );
         }
+        for (end, class) in [("ingress", &profile.ingress), ("egress", &profile.egress)] {
+            if let HopEndpointClass::Device(device) = class {
+                validate_tracks(
+                    device,
+                    &format!("node.capabilities.hop_profiles[{index}].{end}.tracks"),
+                    &mut issues,
+                );
+            }
+        }
     }
     let mut attachment_ids = HashSet::new();
     for (index, attachment) in node.topology.attachments.iter().enumerate() {
@@ -227,6 +237,24 @@ pub fn validate_node(node: &NodeDescriptor) -> Vec<ValidationIssue> {
         }
     }
     issues
+}
+
+fn validate_tracks(device: &DeviceClass, field: &str, issues: &mut Vec<ValidationIssue>) {
+    let Some(tracks) = &device.tracks else {
+        return;
+    };
+    let problem = if device.device != DeviceKind::Capture {
+        Some(("not_allowed", "only a capture device declares tracks"))
+    } else if tracks.is_empty() {
+        Some(("empty", "tracks must name at least one track"))
+    } else if tracks.iter().collect::<HashSet<_>>().len() != tracks.len() {
+        Some(("duplicate", "each track may be named once"))
+    } else {
+        None
+    };
+    if let Some((code, message)) = problem {
+        issues.push(ValidationIssue::new(field, code, message));
+    }
 }
 
 fn validate_transport(
@@ -489,12 +517,13 @@ fn validate_constraint(accepts: &FormatConstraint, path: &str, issues: &mut Vec<
 #[cfg(test)]
 mod tests {
     use crate::{
-        AudioConstraint, Container, FormatConstraint, MediaFormat, NodeEndpoint, RemoteAddr,
-        SrtEndpoint, StreamDefinition, StreamDestination, StreamTransport, VideoConstraint,
+        AudioConstraint, Container, DeviceClass, DeviceKind, FormatConstraint, MediaFormat,
+        NodeDescriptor, NodeEndpoint, RemoteAddr, SrtEndpoint, StreamDefinition, StreamDestination,
+        StreamTransport, Track, VideoConstraint,
     };
 
     use super::{
-        RESOURCE_ID_MAX_LEN, ResourceIdError, ValidationIssue, validate_resource_id,
+        RESOURCE_ID_MAX_LEN, ResourceIdError, ValidationIssue, validate_node, validate_resource_id,
         validate_stream,
     };
 
@@ -1044,6 +1073,47 @@ mod tests {
                 "empty",
                 "accepts must not contain an empty list of values",
             )]
+        );
+    }
+
+    fn node_capturing(device: DeviceKind, tracks: Option<Vec<Track>>) -> NodeDescriptor {
+        serde_json::from_value(serde_json::json!({
+            "id": "browser-1",
+            "endpoint": "browser://browser-1",
+            "status": "ready",
+            "capabilities": { "adapters": [], "hop_profiles": [{
+                "id": "camera-to-whip",
+                "ingress": DeviceClass { device, tracks },
+                "egress": { "transport": "whip", "roles": ["connect"] },
+            }]},
+            "topology": { "attachments": [] },
+        }))
+        .expect("node fixture")
+    }
+
+    #[test]
+    fn a_capture_device_declares_each_track_once() {
+        let codes = |device, tracks| {
+            validate_node(&node_capturing(device, tracks))
+                .into_iter()
+                .map(|issue| (issue.field, issue.code))
+                .collect::<Vec<_>>()
+        };
+        let field = "node.capabilities.hop_profiles[0].ingress.tracks".to_string();
+        assert!(codes(DeviceKind::Capture, None).is_empty());
+        assert!(codes(DeviceKind::Capture, Some(vec![Track::Video])).is_empty());
+        assert!(codes(DeviceKind::Capture, Some(vec![Track::Audio, Track::Video])).is_empty());
+        assert_eq!(
+            codes(DeviceKind::Capture, Some(Vec::new())),
+            [(field.clone(), "empty".to_string())]
+        );
+        assert_eq!(
+            codes(DeviceKind::Capture, Some(vec![Track::Video, Track::Video])),
+            [(field.clone(), "duplicate".to_string())]
+        );
+        assert_eq!(
+            codes(DeviceKind::Display, Some(vec![Track::Video])),
+            [(field, "not_allowed".to_string())]
         );
     }
 }

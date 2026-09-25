@@ -193,6 +193,7 @@ mod tests {
                         id: "camera-to-whip".to_string(),
                         ingress: HopEndpointClass::Device(DeviceClass {
                             device: DeviceKind::Capture,
+                            tracks: None,
                         }),
                         egress: HopEndpointClass::Transport(TransportClass {
                             transport: Transport::Whip,

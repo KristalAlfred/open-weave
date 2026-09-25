@@ -251,9 +251,10 @@ SRT socket `params` carry a `passphrase` and `pbkeylen` (see
 build its end of every keyed link in the clear, which the other end refuses.
 The same version adds a hop profile's `merge`, a desired hop's
 `merge_ingress`, and the hop status that reports it (see
-[Redundant paths](#redundant-paths)), and the `rist` transport and socket (see
+[Redundant paths](#redundant-paths)), the `rist` transport and socket (see
 [Capabilities and topology](#capabilities-and-topology)), which an adapter at
-`4` cannot read.
+`4` cannot read, and a capture device's `tracks` with the desired hop's copy of
+them (see [Capabilities and topology](#capabilities-and-topology)).
 
 ### Hop status and fan-out
 
@@ -834,22 +835,29 @@ capabilities:
       ingress: { transport: srt, roles: [listen, connect] }
       egress: { transport: srt, roles: [listen, connect] }
     - id: camera-to-whip
-      ingress: { device: capture }
+      ingress: { device: capture, tracks: [video] }
       egress: { transport: whip, roles: [connect] }
       max_egresses: 1
 ```
 
-Strom advertises `srt-forward`, `whip-to-srt`, `srt-to-whep`, `srt-to-rist`
-and `rist-to-srt`. The browser
-advertises `camera-to-whip` and `whep-to-display`, both with one egress. It does
-not advertise WHIP to WHEP or mixed-transport fan-out. The controller writes the
-selected `profile_id` into every `DesiredHop`; adapters validate and dispatch on
-that id.
+A capture device may list the `tracks` it sends, `audio` and `video`, each at
+most once. The controller copies the source's list onto every hop of the
+stream's path as the desired hop's `tracks`, and the Strom adapter builds only
+those tracks: a video-only sender gets a flow with no audio pads. An outside
+WHIP sender's tracks are the ones its declared `format` carries. Absent means
+unknown, and a hop then carries both.
+
+Strom advertises `srt-forward`, `whip-to-srt`, `srt-to-whep`, `whip-to-whep`,
+`srt-to-rist` and `rist-to-srt`. The browser advertises `camera-to-whip` and
+`whep-to-display`, both with one egress, so a stream from one page to another is
+relayed through a Strom node's `whip-to-whep`. Strom does not advertise
+mixed-transport fan-out. The controller writes the selected `profile_id` into
+every `DesiredHop`; adapters validate and dispatch on that id.
 
 A profile may declare `accepts`, the media its ingress takes, in the same shape
 as a destination's `accepts` (see [Media formats](#media-formats)). Strom's
-`whip-to-srt` declares H264 video and Opus audio, the codecs Strom's
-`whip_input` negotiates:
+`whip-to-srt` and `whip-to-whep` declare H264 video and Opus audio, the codecs
+Strom's `whip_input` negotiates:
 
 ```yaml
 - id: whip-to-srt
@@ -1078,9 +1086,10 @@ degraded — destination studio cannot accept the source format:
            audio.sample_rate is 48000 but accepts 44100
 ```
 
-The sender's hop profile is checked the same way. When the profile placed for
-the sender declares `accepts` and the source's `format` falls outside it, the
-mismatch names the node and profile:
+The sender's hop profile is checked the same way, on the tracks the sender's
+hop carries: a source that sends video alone is not checked for audio. When the
+profile placed for the sender declares `accepts` and the source's `format` falls
+outside it, the mismatch names the node and profile:
 
 ```
 degraded — node strom-node-1 cannot take the source format through profile
@@ -1120,7 +1129,13 @@ redials.
 The adapter writes each SRT socket's latency and key into its `srt://` URI, since
 setting an srt element's `uri` resets both and Strom sets element properties in no
 fixed order. A flow whose SRT address, latency or key differs from its desired hop,
-or whose WHIP/WHEP endpoint id does, is deleted and created again.
+or whose WHIP/WHEP endpoint id or tracks do, is deleted and created again.
+
+The adapter reads an SRT socket's condition from Strom's `srt-stats` and a WHIP
+or WHEP socket's from `webrtc-stats`, which counts each session's RTP bytes. A
+WHIP or WHEP socket with no session carrying RTP is `idle`; with one, it is
+`flowing` while the bytes advance between polls and `connected` while they do
+not.
 
 ## Quickstart
 

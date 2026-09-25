@@ -584,6 +584,11 @@ pub struct DesiredHop {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_ingress: Option<SocketSpec>,
     pub egresses: Vec<DesiredEgress>,
+    /// The tracks the stream's source sends, copied onto every hop of its path:
+    /// a capture device's declared tracks, or those an outside WHIP sender's
+    /// declared `format` carries. Absent when the source declares neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracks: Option<Vec<Track>>,
 }
 
 impl DesiredHop {
@@ -598,6 +603,7 @@ impl DesiredHop {
             ingress,
             merge_ingress,
             egresses,
+            tracks: _,
         } = self;
         std::iter::once(ingress)
             .chain(merge_ingress)
@@ -614,6 +620,7 @@ impl DesiredHop {
             ingress,
             merge_ingress,
             egresses,
+            tracks: _,
         } = self;
         std::iter::once(ingress)
             .chain(merge_ingress)
@@ -1588,6 +1595,19 @@ pub struct TransportClass {
 #[serde(deny_unknown_fields)]
 pub struct DeviceClass {
     pub device: DeviceKind,
+    /// The tracks a capture device sends. Absent means unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracks: Option<Vec<Track>>,
+}
+
+/// A kind of media track a capture device sends.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Track {
+    Audio,
+    Video,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
@@ -2120,6 +2140,7 @@ mod tests {
                 branch_id: "studio".to_string(),
                 socket: SocketSpec::srt_connect("172.31.0.10", 7002, 1000),
             }],
+            tracks: None,
         }
     }
 
