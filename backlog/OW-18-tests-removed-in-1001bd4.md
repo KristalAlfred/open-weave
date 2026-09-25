@@ -86,3 +86,17 @@ Status section and the header of `bench/manifests/nat-relay.yaml` still cite.
   `weave-basic-receiver-studio`, and a NAT'd node is a dial-only `internet`
   attachment plus a site listener. The relay test also checks that `relay-a`
   carries the stream while it is online. All 15 pass on the current code.
+- 2026-09-25: `crates/adapter-strom/src/main.rs`: 2 of 5 back
+  (`hop_status_reports_each_fanout_branch_independently`,
+  `reconcile_deletes_before_creating_on_same_ports`), ported to `profile_id`
+  and destination branch ids. The other 3 tested removed behaviour: the adapter
+  expanded `strom.signalling_base` into Strom's `/whip` and `/whep` routes and
+  advertised signalling only for offered WebRTC transports. Now the operator
+  writes each `base_url` on a topology attachment, `registration` copies the
+  topology verbatim, and Strom always advertises the three fixed hop profiles.
+  The Evidence table misses `crates/adapter-strom/src/config.rs`, which
+  `1001bd4` also took from 9 tests to 0: 5 are back; the other 4 tested removed
+  behaviour (`signalling_base` parsing, its alias check and default, the node
+  `transports` list, and the required `default` data-plane alias). No ported
+  test failed. Checked with `cargo test -p weave-adapter-strom`, unit tests
+  only.

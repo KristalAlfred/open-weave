@@ -70,3 +70,106 @@ impl AdapterConfig {
         Ok(config)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VALID: &str = r"
+node:
+  id: strom-node-1
+  southbound_url: http://127.0.0.1:8081
+  listen: 0.0.0.0:8091
+  topology:
+    attachments:
+      - id: lan
+        network: studio-lan
+        dial: true
+        listeners:
+          srt:
+            host: 172.26.0.10
+            port_range: { start: 20000, end: 20999 }
+strom:
+  url: http://172.26.0.10:8080
+";
+
+    #[test]
+    fn parses_valid_config_and_defaults_poll_interval() {
+        let config: AdapterConfig = serde_norway::from_str(VALID).expect("parse");
+        assert_eq!(config.node.id, "strom-node-1");
+        let attachment = &config.node.topology.attachments[0];
+        assert_eq!(attachment.network, "studio-lan");
+        assert!(attachment.dial);
+        assert_eq!(
+            attachment
+                .listeners
+                .srt
+                .as_ref()
+                .map(|srt| srt.host.as_str()),
+            Some("172.26.0.10")
+        );
+        assert_eq!(config.strom.url, "http://172.26.0.10:8080");
+        assert_eq!(config.strom.poll_interval_secs, 5);
+        assert_eq!(config.node.validate(), Ok(()));
+    }
+
+    /// The token may live in the node YAML instead of the environment. Which
+    /// source wins is [`NodeConfig::resolve_southbound_token`]'s job and depends
+    /// on process env, so it is covered on the bench rather than here.
+    #[test]
+    fn accepts_an_inline_southbound_token() {
+        let config: AdapterConfig = serde_norway::from_str(VALID).expect("parse");
+        assert_eq!(
+            config.node.southbound_token, None,
+            "the field is optional; deployments may use the env var instead"
+        );
+
+        let yaml = VALID.replace(
+            "southbound_url: http://127.0.0.1:8081",
+            "southbound_url: http://127.0.0.1:8081\n  southbound_token: from-yaml",
+        );
+        let config: AdapterConfig = serde_norway::from_str(&yaml).expect("parse");
+        assert_eq!(config.node.southbound_token.as_deref(), Some("from-yaml"));
+    }
+
+    #[test]
+    fn strom_token_is_optional_and_parses_when_present() {
+        let config: AdapterConfig = serde_norway::from_str(VALID).expect("parse");
+        assert_eq!(
+            config.strom.token, None,
+            "an unauthenticated Strom needs no token"
+        );
+
+        let yaml = VALID.replace(
+            "url: http://172.26.0.10:8080",
+            "url: http://172.26.0.10:8080\n  token: from-yaml",
+        );
+        let config: AdapterConfig = serde_norway::from_str(&yaml).expect("parse");
+        assert_eq!(config.strom.token.as_deref(), Some("from-yaml"));
+    }
+
+    /// Precedence without mutating process env, which parallel tests share.
+    /// [`StromSection::resolve_token`] adds only the [`STROM_TOKEN_VAR`] lookup.
+    #[test]
+    fn config_token_wins_over_the_environment() {
+        assert_eq!(
+            pick_token(Some("from-yaml"), Some("from-env")),
+            Token::new("from-yaml")
+        );
+        assert_eq!(pick_token(None, Some("from-env")), Token::new("from-env"));
+        assert_eq!(pick_token(None, None), None);
+        assert_eq!(
+            pick_token(Some("  "), Some("from-env")),
+            Token::new("from-env"),
+            "a blank config value counts as absent"
+        );
+        assert_eq!(pick_token(Some("  "), Some("")), None);
+    }
+
+    #[test]
+    fn rejects_unknown_fields() {
+        let yaml = format!("{VALID}  bogus: true\n");
+        let result: Result<AdapterConfig, _> = serde_norway::from_str(&yaml);
+        assert!(result.is_err(), "deny_unknown_fields rejects typos");
+    }
+}

@@ -2019,6 +2019,8 @@ mod tests {
 
     #[test]
     fn srt_endpoint_serde_allows_node_or_remote_and_denies_unknown_fields() {
+        // node is now optional; the node-XOR-remote rule is enforced at
+        // validation, not by serde, so a bare endpoint still parses.
         let bare: SrtEndpoint =
             serde_json::from_value(serde_json::json!({ "network": "wan" })).expect("parse bare");
         assert_eq!(bare.node, None);
@@ -2210,6 +2212,7 @@ mod tests {
 
     #[test]
     fn an_undeclared_format_or_constraint_conflicts_with_nothing() {
+        // Absence means unknown, not wrong: nothing is inferred either way.
         assert!(stream_format_conflicts(&stream_with_formats(None, Some(wants_44k()))).is_empty());
         assert!(stream_format_conflicts(&stream_with_formats(Some(aac_48k()), None)).is_empty());
         assert!(stream_format_conflicts(&stream_with_formats(None, None)).is_empty());
@@ -2394,6 +2397,7 @@ mod tests {
         }
     }
 
+    /// A socket stored before `params` was optional on the wire.
     #[test]
     fn an_srt_socket_parses_with_empty_params() {
         let stored: SocketSpec = serde_json::from_value(serde_json::json!({

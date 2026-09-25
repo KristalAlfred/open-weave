@@ -702,6 +702,7 @@ async fn health() -> Json<Value> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use weave_core::{DesiredEgress, HopRole};
 
     #[derive(Debug, Clone, PartialEq)]
     enum Op {
@@ -713,9 +714,26 @@ mod tests {
     #[derive(Default)]
     struct RecordingFlowApi {
         ops: Mutex<Vec<Op>>,
+        flows_after: Vec<(String, String)>,
+        stats: Value,
     }
 
     impl RecordingFlowApi {
+        fn listing(flows_after: &[(&str, &str)]) -> Self {
+            Self {
+                flows_after: flows_after
+                    .iter()
+                    .map(|(name, id)| ((*name).to_string(), (*id).to_string()))
+                    .collect(),
+                ..Self::default()
+            }
+        }
+
+        fn with_stats(mut self, stats: Value) -> Self {
+            self.stats = stats;
+            self
+        }
+
         fn ops(&self) -> Vec<Op> {
             self.ops.lock().expect("ops lock").clone()
         }
@@ -728,7 +746,11 @@ mod tests {
     #[async_trait::async_trait]
     impl FlowApi for RecordingFlowApi {
         async fn list_flows(&self) -> Result<Vec<StromFlow>, StromError> {
-            Ok(Vec::new())
+            Ok(self
+                .flows_after
+                .iter()
+                .map(|(name, id)| flow(name, id))
+                .collect())
         }
         async fn create_flow(&self, spec: &FlowSpec) -> Result<String, StromError> {
             self.record(Op::Create(spec.name.clone()));
@@ -743,7 +765,7 @@ mod tests {
             Ok(())
         }
         async fn srt_stats(&self, _id: &str) -> Result<Value, StromError> {
-            Ok(json!({}))
+            Ok(self.stats.clone())
         }
     }
 
@@ -814,6 +836,139 @@ mod tests {
         assert_eq!(
             provision_against(&southbound, &flows).await,
             (true, vec![Op::Delete("id-managed".to_string())])
+        );
+    }
+
+    fn hop(id: &str, port: u16) -> DesiredHop {
+        DesiredHop {
+            id: id.to_string(),
+            node_id: "strom-node-1".to_string(),
+            profile_id: "srt-forward".to_string(),
+            role: HopRole::Sender,
+            ingress: SocketSpec::srt_listen(port, 200),
+            egresses: vec![DesiredEgress {
+                branch_id: "studio".to_string(),
+                socket: SocketSpec::srt_connect("10.0.0.2", port + 1, 1000),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn hop_status_reports_each_fanout_branch_independently() {
+        let mut desired = hop("weave-fanout-sender", 7001);
+        desired.egresses.push(DesiredEgress {
+            branch_id: "preview".to_string(),
+            socket: SocketSpec::srt_connect("10.0.0.3", 7003, 1000),
+        });
+        let flows = vec![flow("weave-fanout-sender", "id-fanout")];
+        let fake = RecordingFlowApi::default().with_stats(json!({
+            "stats": { "connections": {
+                "srtsrc_0": { "connected": true, "callers": [
+                    { "recv_rate_mbps": 4.5, "bytes_received": 1000 }
+                ]},
+                "srtsink_0": { "connected": true, "callers": [
+                    { "send_rate_mbps": 4.4, "bytes_sent": 900,
+                      "packets_sent_lost": 2 }
+                ]},
+                "srtsink_1": { "connected": false, "callers": [] }
+            }}
+        }));
+        let mut tracker = StallTracker::default();
+
+        let statuses = hop_statuses(
+            &fake,
+            &[desired],
+            &flows,
+            Some("10.0.0.1"),
+            &std::collections::HashSet::new(),
+            &mut tracker,
+        )
+        .await;
+
+        let status = &statuses[0];
+        assert_eq!(status.ingress.condition, LinkCondition::Flowing);
+        assert_eq!(
+            status.ingress.stats.as_ref().map(|stats| stats.rate_mbps),
+            Some(4.5)
+        );
+        assert_eq!(status.egresses.len(), 2);
+        assert_eq!(status.egresses[0].branch_id, "studio");
+        assert_eq!(status.egresses[0].status.condition, LinkCondition::Flowing);
+        assert_eq!(
+            status.egresses[0]
+                .status
+                .resolved
+                .as_ref()
+                .map(|address| (address.host.as_str(), address.port)),
+            Some(("10.0.0.2", 7002))
+        );
+        assert_eq!(
+            status.egresses[0]
+                .status
+                .stats
+                .as_ref()
+                .map(|stats| (stats.rate_mbps, stats.packets_sent_lost)),
+            Some((4.4, 2))
+        );
+        assert_eq!(status.egresses[1].branch_id, "preview");
+        assert_eq!(
+            status.egresses[1].status.condition,
+            LinkCondition::Connecting
+        );
+        assert_eq!(
+            status.egresses[1]
+                .status
+                .resolved
+                .as_ref()
+                .map(|address| (address.host.as_str(), address.port)),
+            Some(("10.0.0.3", 7003))
+        );
+        assert_eq!(
+            status.egresses[1]
+                .status
+                .stats
+                .as_ref()
+                .map(|stats| stats.rate_mbps),
+            Some(0.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_deletes_before_creating_on_same_ports() {
+        // Old flows on ports 7001/7002; a differently-named stream re-applied on
+        // the same ports. Every delete must precede every create so the listener
+        // ports are freed before the new flows are created and started.
+        let desired = vec![
+            hop("weave-srt-latency-sender", 7001),
+            hop("weave-srt-latency-receiver-studio", 7002),
+        ];
+        let flows = vec![
+            flow("weave-basic-sender", "id-basic-sender"),
+            flow("weave-basic-receiver-studio", "id-basic-receiver-studio"),
+        ];
+        let fake = RecordingFlowApi::listing(&[
+            ("weave-srt-latency-sender", "id-weave-srt-latency-sender"),
+            (
+                "weave-srt-latency-receiver-studio",
+                "id-weave-srt-latency-receiver-studio",
+            ),
+        ]);
+
+        let mut tracker = StallTracker::default();
+        let _ = reconcile(&fake, &desired, &flows, None, &mut tracker).await;
+
+        let ops = fake.ops();
+        let last_delete = ops
+            .iter()
+            .rposition(|op| matches!(op, Op::Delete(_)))
+            .expect("a delete was recorded");
+        let first_create = ops
+            .iter()
+            .position(|op| matches!(op, Op::Create(_)))
+            .expect("a create was recorded");
+        assert!(
+            last_delete < first_create,
+            "all deletes must precede all creates within one cycle: {ops:?}"
         );
     }
 }
