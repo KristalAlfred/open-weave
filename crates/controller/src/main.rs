@@ -28,7 +28,7 @@ mod second_path_tests;
 mod store;
 mod webhook;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1366,6 +1366,12 @@ async fn get_view(State(state): State<AppState>) -> Json<SystemView> {
                     let status = observed
                         .get(&(hop.id.as_str(), hop.node_id.as_str()))
                         .copied();
+                    let mut reported_egresses = HashMap::new();
+                    for reported in status.into_iter().flat_map(|status| &status.egresses) {
+                        reported_egresses
+                            .entry(reported.branch_id.as_str())
+                            .or_insert(&reported.status);
+                    }
                     HopView {
                         id: hop.id.clone(),
                         node: hop.node_id.clone(),
@@ -1376,19 +1382,15 @@ async fn get_view(State(state): State<AppState>) -> Json<SystemView> {
                             .egresses
                             .iter()
                             .map(|egress| {
-                                let observed = status.and_then(|status| {
-                                    status
-                                        .egresses
-                                        .iter()
-                                        .find(|reported| reported.branch_id == egress.branch_id)
-                                });
+                                let observed =
+                                    reported_egresses.get(egress.branch_id.as_str()).copied();
                                 EgressView {
                                     branch_id: egress.branch_id.clone(),
                                     socket: SocketView::from(&egress.socket),
-                                    condition: observed.map(|reported| reported.status.condition),
+                                    condition: observed.map(|reported| reported.condition),
                                     resolved: observed
-                                        .and_then(|reported| reported.status.resolved.clone()),
-                                    stats: observed.and_then(|reported| reported.status.stats),
+                                        .and_then(|reported| reported.resolved.clone()),
+                                    stats: observed.and_then(|reported| reported.stats),
                                 }
                             })
                             .collect(),
@@ -4022,6 +4024,64 @@ mod tests {
             receiver.get("state").is_none(),
             "unreported hop carries no observed fields"
         );
+    }
+
+    #[tokio::test]
+    async fn view_shows_the_first_report_of_a_branch_reported_twice() {
+        let (state, _mem) = mem_state();
+        {
+            let mut nodes = state.nodes.write().await;
+            nodes.insert(
+                "strom-node-1".to_string(),
+                node_registration("strom-node-1", "172.26.0.10"),
+            );
+            nodes.insert(
+                "strom-node-2".to_string(),
+                node_registration("strom-node-2", "172.27.0.10"),
+            );
+            state
+                .streams
+                .write()
+                .await
+                .insert("basic".to_string(), stored_stream(stream("basic")));
+        }
+        reconcile_tick(&state).await;
+        let egress = |condition| weave_core::EgressStatus {
+            branch_id: "studio".to_string(),
+            status: weave_core::SocketStatus {
+                condition,
+                resolved: None,
+                stats: None,
+            },
+        };
+        state
+            .nodes
+            .write()
+            .await
+            .get_mut("strom-node-1")
+            .unwrap()
+            .hop_status = vec![HopStatus {
+            id: "weave-basic-sender".to_string(),
+            node_id: "strom-node-1".to_string(),
+            state: weave_core::HopState::Provisioned,
+            ingress: weave_core::SocketStatus {
+                condition: weave_core::LinkCondition::Flowing,
+                resolved: None,
+                stats: None,
+            },
+            merge_ingress: None,
+            egresses: vec![
+                egress(weave_core::LinkCondition::Connecting),
+                egress(weave_core::LinkCondition::Flowing),
+            ],
+        }];
+
+        let (status, body) = send(&open_router(state), "GET", "/view", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let sender = &body["streams"][0]["hops"][0];
+        assert_eq!(sender["id"], "weave-basic-sender");
+        assert_eq!(sender["egresses"].as_array().unwrap().len(), 1);
+        assert_eq!(sender["egresses"][0]["condition"], "connecting");
     }
 
     #[tokio::test]

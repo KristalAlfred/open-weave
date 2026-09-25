@@ -312,6 +312,44 @@ fn running(hops: &[DesiredHop]) -> Vec<HopStatus> {
         .collect()
 }
 
+/// Sends each node's heartbeat reporting every hop it was given running.
+async fn report_every_hop_running(state: &AppState, app: &Router) -> usize {
+    let desired: Vec<(String, Vec<DesiredHop>)> = state
+        .desired
+        .read()
+        .await
+        .iter()
+        .map(|(node, snapshot)| (node.clone(), snapshot.hops.clone()))
+        .collect();
+    let mut reports = 0;
+    for (node, hops) in &desired {
+        let heartbeat = NodeHeartbeat {
+            node_id: node.clone(),
+            status: NodeStatus::Ready,
+            endpoints: Vec::new(),
+            hop_status: running(hops),
+        };
+        reports += heartbeat.hop_status.len();
+        assert_eq!(
+            post(app, &format!("/nodes/{node}/heartbeat"), &heartbeat, false).await,
+            StatusCode::ACCEPTED
+        );
+    }
+    reports
+}
+
+async fn timed_view(app: &Router) -> (serde_json::Value, Duration) {
+    let started = Instant::now();
+    let response = app
+        .clone()
+        .oneshot(Request::get("/view").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let elapsed = started.elapsed();
+    (serde_json::from_slice(&body).unwrap(), elapsed)
+}
+
 /// Times `GET /view` with `count` streams from `source` to `studio`, placed and
 /// reported running by both nodes.
 async fn time_the_view_with_reports(count: usize) {
@@ -335,39 +373,11 @@ async fn time_the_view_with_reports(count: usize) {
         );
     }
     reconcile_tick(&state).await;
-    let desired: Vec<(String, Vec<DesiredHop>)> = state
-        .desired
-        .read()
-        .await
-        .iter()
-        .map(|(node, snapshot)| (node.clone(), snapshot.hops.clone()))
-        .collect();
-    let mut reports = 0;
-    for (node, hops) in &desired {
-        let heartbeat = NodeHeartbeat {
-            node_id: node.clone(),
-            status: NodeStatus::Ready,
-            endpoints: Vec::new(),
-            hop_status: running(hops),
-        };
-        reports += heartbeat.hop_status.len();
-        assert_eq!(
-            post(&app, &format!("/nodes/{node}/heartbeat"), &heartbeat, false).await,
-            StatusCode::ACCEPTED
-        );
-    }
+    let reports = report_every_hop_running(&state, &app).await;
 
-    let started = Instant::now();
-    let response = app
-        .clone()
-        .oneshot(Request::get("/view").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let elapsed = started.elapsed();
+    let (view, elapsed) = timed_view(&app).await;
     eprintln!("{count} streams, {reports} reports: view {elapsed:?}");
 
-    let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let streams = view["streams"].as_array().unwrap();
     assert_eq!(streams.len(), count);
     for stream in streams {
@@ -385,4 +395,31 @@ async fn time_the_view_with_reports(count: usize) {
 async fn the_view_with_reports_at_one_and_two_thousand_streams() {
     time_the_view_with_reports(1000).await;
     time_the_view_with_reports(2000).await;
+}
+
+/// Times `GET /view` with one stream from `source` to `receivers` direct
+/// receivers, every hop reported running.
+async fn time_the_view_of_a_fan_out(receivers: usize) {
+    let state = fan_out("direct", direct_nodes(receivers), receivers).await;
+    let app = router(state.clone(), Guard::Disabled, NodeGuard::Disabled);
+    report_every_hop_running(&state, &app).await;
+
+    let (view, elapsed) = timed_view(&app).await;
+    eprintln!("{receivers} egresses on the sender: view {elapsed:?}");
+
+    let sender = &view["streams"][0]["hops"][0];
+    let egresses = sender["egresses"].as_array().unwrap();
+    assert_eq!(egresses.len(), receivers);
+    assert!(
+        egresses
+            .iter()
+            .all(|egress| egress["condition"] == "flowing")
+    );
+}
+
+#[tokio::test]
+#[ignore = "timing; run with `cargo test -p weave-controller view_of_a_fan_out -- --ignored --nocapture --test-threads=1`"]
+async fn the_view_of_a_fan_out_to_one_and_two_thousand_receivers() {
+    time_the_view_of_a_fan_out(1000).await;
+    time_the_view_of_a_fan_out(2000).await;
 }
