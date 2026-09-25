@@ -20,6 +20,8 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum ControllersError {
     #[error("{CONTROLLER_URL_VAR} names no controller")]
     Empty,
+    #[error("{CONTROLLER_URL_VAR} entry {url:?} is not an http or https URL with a host")]
+    InvalidUrl { url: String },
     #[error("building the controller HTTP client")]
     Client(#[source] reqwest::Error),
 }
@@ -111,6 +113,13 @@ impl Controllers {
             .collect();
         if urls.is_empty() {
             return Err(ControllersError::Empty);
+        }
+        if let Some(url) = urls.iter().find(|url| {
+            reqwest::Url::parse(url).map_or(true, |parsed| {
+                !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none()
+            })
+        }) {
+            return Err(ControllersError::InvalidUrl { url: url.clone() });
         }
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
@@ -289,6 +298,26 @@ mod tests {
             StatusCode::ACCEPTED
         );
         assert_eq!(leader.hits(), 1, "the next request went to the other first");
+    }
+
+    #[test]
+    fn every_entry_must_be_an_http_url_with_a_host() {
+        for list in [
+            "controller-a:8082,http://b:8082",
+            "http://a:8082,b:8082",
+            "ftp://a:8082",
+            "http://",
+            "a b",
+        ] {
+            assert!(
+                matches!(
+                    Controllers::new(list),
+                    Err(ControllersError::InvalidUrl { .. })
+                ),
+                "{list}"
+            );
+        }
+        assert!(Controllers::new("https://a.example,http://10.0.0.1:8082").is_ok());
     }
 
     #[test]

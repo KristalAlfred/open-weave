@@ -824,8 +824,9 @@ controller.
 - Postgres is one instance. While no controller can reach it, none leads.
 
 Northbound and southbound take every controller in `WEAVE_CONTROLLER_URL`,
-comma-separated; unset means `http://127.0.0.1:8082`. A request goes first to
-the controller that answered last. The proxy moves to the next one
+comma-separated; unset means `http://127.0.0.1:8082`. Each entry needs an
+`http` or `https` scheme and a host, or the proxy refuses to start. A request
+goes first to the controller that answered last. The proxy moves to the next one
 when it cannot connect within two seconds or gets `503 not_leader`: neither
 controller has acted on the request, so a write is never sent twice. A request
 waits at most ten seconds for its answer. A `GET` that gets none, or fails after
