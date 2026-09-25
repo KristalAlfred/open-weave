@@ -102,6 +102,7 @@
                         "description": "Encrypts the socket. Both ends of a link carry the same passphrase.",
                         "maxLength": 80,
                         "minLength": 10,
+                        "pattern": "^[ -~]*$",
                         "type": [
                           "string",
                           "null"
@@ -205,6 +206,7 @@
                       "description": "Encrypts the socket. Both ends of a link carry the same passphrase.",
                       "maxLength": 80,
                       "minLength": 10,
+                      "pattern": "^[ -~]*$",
                       "type": [
                         "string",
                         "null"
@@ -302,6 +304,7 @@
                       "description": "Encrypts the socket. Both ends of a link carry the same passphrase.",
                       "maxLength": 80,
                       "minLength": 10,
+                      "pattern": "^[ -~]*$",
                       "type": [
                         "string",
                         "null"

@@ -489,7 +489,10 @@ pub struct SrtEndpoint {
     /// leaves that socket in the clear. Links between nodes are keyed by the
     /// controller whether or not this is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(min = Passphrase::MIN_LEN, max = Passphrase::MAX_LEN))]
+    #[schemars(
+        length(min = Passphrase::MIN_LEN, max = Passphrase::MAX_LEN),
+        regex(pattern = Passphrase::PATTERN)
+    )]
     pub passphrase: Option<Passphrase>,
     /// What the producer feeding this endpoint sends. Sources only.
     ///
@@ -1212,7 +1215,10 @@ pub struct SrtParams {
     pub latency: Option<u32>,
     /// Encrypts the socket. Both ends of a link carry the same passphrase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(min = Passphrase::MIN_LEN, max = Passphrase::MAX_LEN))]
+    #[schemars(
+        length(min = Passphrase::MIN_LEN, max = Passphrase::MAX_LEN),
+        regex(pattern = Passphrase::PATTERN)
+    )]
     pub passphrase: Option<Passphrase>,
     /// AES key length in bytes, 16, 24 or 32, used with `passphrase`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1231,6 +1237,9 @@ impl Passphrase {
     pub const MIN_LEN: usize = 10;
     /// Most bytes libsrt accepts in a passphrase.
     pub const MAX_LEN: usize = 80;
+    /// Printable ASCII, space to `~`, where a character is one byte, so the
+    /// schema's character lengths are libsrt's byte lengths.
+    pub const PATTERN: &str = "^[ -~]*$";
 
     #[must_use]
     pub fn new(value: impl Into<String>) -> Self {

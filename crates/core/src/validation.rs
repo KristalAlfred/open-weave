@@ -411,11 +411,11 @@ fn validate_passphrase(passphrase: &Passphrase, field: &str, issues: &mut Vec<Va
             ),
         ));
     }
-    if value.chars().any(char::is_control) {
+    if !value.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
         issues.push(ValidationIssue::new(
             field,
             "invalid_characters",
-            "passphrase must not contain control characters",
+            "passphrase must be printable ASCII, space to ~",
         ));
     }
 }
@@ -1103,5 +1103,23 @@ mod passphrase_tests {
 
         let issues = validate_stream(&keyed("line\nbreak-in-key"));
         assert_eq!(issues[0].code, "invalid_characters");
+    }
+
+    #[test]
+    fn a_passphrase_is_printable_ascii_so_its_characters_are_its_bytes() {
+        for valid in [" spaced out ~", "0123456789", &"~".repeat(80)] {
+            assert!(validate_stream(&keyed(valid)).is_empty(), "{valid}");
+        }
+        let accented = "é".repeat(40);
+        assert_eq!(accented.chars().count(), 40);
+        let codes: Vec<_> = validate_stream(&keyed(&accented))
+            .into_iter()
+            .map(|issue| issue.code)
+            .collect();
+        assert_eq!(codes, ["invalid_characters"]);
+        let tab = validate_stream(&keyed("tab\tin-the-key"));
+        assert_eq!(tab[0].code, "invalid_characters");
+        let delete = validate_stream(&keyed("delete\u{7f}-in-key"));
+        assert_eq!(delete[0].code, "invalid_characters");
     }
 }

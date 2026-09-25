@@ -611,8 +611,10 @@ destinations:
       passphrase: far-end-shared-passphrase
 ```
 
-A passphrase is 10 to 80 bytes, the range libsrt accepts, with no control
-characters. A socket without one runs in the clear. The peer must use the same
+A passphrase is 10 to 80 characters of printable ASCII, space to `~`. Each is
+one byte, so this is the byte range libsrt accepts, and the JSON Schema's
+`minLength`, `maxLength` and `pattern` state the same rule. A socket without one
+runs in the clear. The peer must use the same
 passphrase; its key length may differ, since SRT settles on one at connect.
 
 Where keys appear:

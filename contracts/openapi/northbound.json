@@ -1382,6 +1382,7 @@
                           "description": "Encrypts this endpoint's own socket: the ingress a producer dials, the\n output a consumer dials, or the remote listener the stream dials. Absent\n leaves that socket in the clear. Links between nodes are keyed by the\n controller whether or not this is set.",
                           "maxLength": 80,
                           "minLength": 10,
+                          "pattern": "^[ -~]*$",
                           "type": [
                             "string",
                             "null"
@@ -2472,6 +2473,7 @@
                         "description": "Encrypts this endpoint's own socket: the ingress a producer dials, the\n output a consumer dials, or the remote listener the stream dials. Absent\n leaves that socket in the clear. Links between nodes are keyed by the\n controller whether or not this is set.",
                         "maxLength": 80,
                         "minLength": 10,
+                        "pattern": "^[ -~]*$",
                         "type": [
                           "string",
                           "null"
@@ -3665,6 +3667,7 @@
                                 "description": "Encrypts this endpoint's own socket: the ingress a producer dials, the\n output a consumer dials, or the remote listener the stream dials. Absent\n leaves that socket in the clear. Links between nodes are keyed by the\n controller whether or not this is set.",
                                 "maxLength": 80,
                                 "minLength": 10,
+                                "pattern": "^[ -~]*$",
                                 "type": [
                                   "string",
                                   "null"
@@ -4755,6 +4758,7 @@
                               "description": "Encrypts this endpoint's own socket: the ingress a producer dials, the\n output a consumer dials, or the remote listener the stream dials. Absent\n leaves that socket in the clear. Links between nodes are keyed by the\n controller whether or not this is set.",
                               "maxLength": 80,
                               "minLength": 10,
+                              "pattern": "^[ -~]*$",
                               "type": [
                                 "string",
                                 "null"
@@ -5649,6 +5653,7 @@
                             "description": "Encrypts the socket. Both ends of a link carry the same passphrase.",
                             "maxLength": 80,
                             "minLength": 10,
+                            "pattern": "^[ -~]*$",
                             "type": [
                               "string",
                               "null"
@@ -5752,6 +5757,7 @@
                           "description": "Encrypts the socket. Both ends of a link carry the same passphrase.",
                           "maxLength": 80,
                           "minLength": 10,
+                          "pattern": "^[ -~]*$",
                           "type": [
                             "string",
                             "null"
@@ -5849,6 +5855,7 @@
                           "description": "Encrypts the socket. Both ends of a link carry the same passphrase.",
                           "maxLength": 80,
                           "minLength": 10,
+                          "pattern": "^[ -~]*$",
                           "type": [
                             "string",
                             "null"
@@ -6334,6 +6341,7 @@
                               "description": "Encrypts this endpoint's own socket: the ingress a producer dials, the\n output a consumer dials, or the remote listener the stream dials. Absent\n leaves that socket in the clear. Links between nodes are keyed by the\n controller whether or not this is set.",
                               "maxLength": 80,
                               "minLength": 10,
+                              "pattern": "^[ -~]*$",
                               "type": [
                                 "string",
                                 "null"
@@ -7424,6 +7432,7 @@
                             "description": "Encrypts this endpoint's own socket: the ingress a producer dials, the\n output a consumer dials, or the remote listener the stream dials. Absent\n leaves that socket in the clear. Links between nodes are keyed by the\n controller whether or not this is set.",
                             "maxLength": 80,
                             "minLength": 10,
+                            "pattern": "^[ -~]*$",
                             "type": [
                               "string",
                               "null"
@@ -8585,6 +8594,7 @@
                                 "description": "Encrypts this endpoint's own socket: the ingress a producer dials, the\n output a consumer dials, or the remote listener the stream dials. Absent\n leaves that socket in the clear. Links between nodes are keyed by the\n controller whether or not this is set.",
                                 "maxLength": 80,
                                 "minLength": 10,
+                                "pattern": "^[ -~]*$",
                                 "type": [
                                   "string",
                                   "null"
@@ -9675,6 +9685,7 @@
                               "description": "Encrypts this endpoint's own socket: the ingress a producer dials, the\n output a consumer dials, or the remote listener the stream dials. Absent\n leaves that socket in the clear. Links between nodes are keyed by the\n controller whether or not this is set.",
                               "maxLength": 80,
                               "minLength": 10,
+                              "pattern": "^[ -~]*$",
                               "type": [
                                 "string",
                                 "null"
@@ -10785,6 +10796,7 @@
                                       "description": "Encrypts this endpoint's own socket: the ingress a producer dials, the\n output a consumer dials, or the remote listener the stream dials. Absent\n leaves that socket in the clear. Links between nodes are keyed by the\n controller whether or not this is set.",
                                       "maxLength": 80,
                                       "minLength": 10,
+                                      "pattern": "^[ -~]*$",
                                       "type": [
                                         "string",
                                         "null"
@@ -11875,6 +11887,7 @@
                                     "description": "Encrypts this endpoint's own socket: the ingress a producer dials, the\n output a consumer dials, or the remote listener the stream dials. Absent\n leaves that socket in the clear. Links between nodes are keyed by the\n controller whether or not this is set.",
                                     "maxLength": 80,
                                     "minLength": 10,
+                                    "pattern": "^[ -~]*$",
                                     "type": [
                                       "string",
                                       "null"
@@ -12994,6 +13007,7 @@
                                     "description": "Encrypts this endpoint's own socket: the ingress a producer dials, the\n output a consumer dials, or the remote listener the stream dials. Absent\n leaves that socket in the clear. Links between nodes are keyed by the\n controller whether or not this is set.",
                                     "maxLength": 80,
                                     "minLength": 10,
+                                    "pattern": "^[ -~]*$",
                                     "type": [
                                       "string",
                                       "null"
@@ -14084,6 +14098,7 @@
                                   "description": "Encrypts this endpoint's own socket: the ingress a producer dials, the\n output a consumer dials, or the remote listener the stream dials. Absent\n leaves that socket in the clear. Links between nodes are keyed by the\n controller whether or not this is set.",
                                   "maxLength": 80,
                                   "minLength": 10,
+                                  "pattern": "^[ -~]*$",
                                   "type": [
                                     "string",
                                     "null"
