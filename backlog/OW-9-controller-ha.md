@@ -2,7 +2,7 @@
 id: OW-9
 title: "One controller, no failover"
 type: feature
-status: in-progress
+status: done
 depends_on: [OW-1]
 assignee: claude-ha
 ---
@@ -17,8 +17,8 @@ stations
 
 ## Done when
 
-- [ ] A second controller takes over when the first stops, with no operator step.
-- [ ] Nodes and running media carry on through the switch, shown on the bench.
+- [x] A second controller takes over when the first stops, with no operator step.
+- [x] Nodes and running media carry on through the switch, shown on the bench.
 
 ## Easy to break
 
@@ -59,3 +59,23 @@ stations
   `503` passed back without trying the next; each proxy has a test sending a
   request past a standby to the leader. The Strom adapter and the browser node
   call only southbound, so neither changed.
+- 2026-09-25: both boxes checked on `bench/`, which now runs `controller` and
+  `controller-2` on one Postgres, with northbound and southbound listing both.
+  With `basic` flowing, `just bench controller-restart basic stop` stopped the
+  leader, controller-2. Controller-1 took the lease 111 ms after the SIGTERM
+  and no adapter logged a failed sync. Both `weave-basic-*` flows kept their
+  Strom ids and kept moving bytes (sender 10.1 MB before, 24.9 MB after), no
+  Strom node read `offline`, generation 1 and ETag `"revision-1"` were
+  unchanged, re-applying the manifest gave `changed: false`, and controller-2
+  came back answering `503 not_leader`. `kill` (SIGKILL, then start):
+  controller-2 took the lease 8 s after the kill, once it ran out; the adapters
+  got `503 not_leader` for two polls, kept their flows and registered again,
+  and the same checks passed. `restart`: the leader gave the lease up on
+  SIGTERM and took it back 220 ms later, before the standby's next try; the
+  same checks passed. The first kill run failed in the recipe itself, whose
+  wait loop ended on empty output; fixed and rerun. Webhooks from the new
+  leader counted from its lease start (`basic-1790338795338185`), and its
+  first tick sent `stream.changed` with `basic` `pending` (`hops_pending`,
+  from the hop status stored at registration), then `flowing` 5 s later;
+  recorded on OW-39. The standby's dashboard read "standby: another controller
+  leads" (Playwright).

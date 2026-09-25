@@ -60,9 +60,6 @@ only by planner and status tests: redundant paths, since no shipped node merges
 two paths, and WHIP senders and WHEP players outside open-weave, since the bench
 has no such peer.
 
-Controller failover is not verified on the bench yet: tests against a real
-Postgres cover the lease, and unit tests cover the proxies moving to the leader.
-
 Not built: TLS, Postgres HA, format conversion, and any adapter other than
 Strom. The items in `backlog/` list the known gaps with the
 evidence behind each one.
@@ -781,11 +778,13 @@ controller.
   live in Postgres and survive a takeover. Heartbeats and conditions do not.
   The new leader counts every stored node as heard at the takeover and uses the
   status and hop status the node last registered with, until the node
-  heartbeats. Conditions start over as after a restart (backlog/OW-39).
-- Every controller needs the same `WEAVE_SRT_KEY_SECRET` and
-  `WEAVE_SOUTHBOUND_KEY`. With another SRT key secret, a new leader gives every
-  link a new key and each adapter recreates its flows; with another southbound
-  key it refuses every node's token.
+  heartbeats. Conditions start over as after a restart, and a stream can read
+  `pending` until its nodes heartbeat (backlog/OW-39).
+- Every controller needs the same `WEAVE_SRT_KEY_SECRET`,
+  `WEAVE_SOUTHBOUND_KEY` and `WEAVE_SOUTHBOUND_MIN_EPOCHS`. With another SRT key
+  secret, a new leader gives every link a new key and each adapter recreates
+  its flows; with another southbound key it refuses every node's token; with
+  other minimum epochs it accepts tokens the old leader refused, or the reverse.
 - Postgres is one instance. While no controller can reach it, none leads.
 
 Northbound and southbound take every controller in `WEAVE_CONTROLLER_URL`,

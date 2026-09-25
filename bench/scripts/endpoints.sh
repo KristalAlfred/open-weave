@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Resolve a placed stream's concrete SRT data-plane address via the controller's
-# discovery API. Polls until the stream is placed, then prints host:port for the
-# producer ingress or a consumer output. Used by the bench producer/consumer
-# recipes so no addresses are hardcoded.
+# Resolve a placed stream's concrete SRT data-plane address via northbound's
+# discovery API, which the leading controller answers. Polls until the stream is
+# placed, then prints host:port for the producer ingress or a consumer output.
+# Used by the bench producer/consumer recipes so no addresses are hardcoded.
 set -euo pipefail
 
-ctrl="${WEAVE_CONTROLLER_URL:-http://localhost:29082}"
+northbound="${WEAVE_NORTHBOUND_URL:-http://localhost:29080}"
 interval=2
 attempts=30
 
@@ -43,7 +43,7 @@ case "$role" in
   *) usage ;;
 esac
 
-url="$ctrl/streams/$stream/endpoints"
+url="$northbound/streams/$stream/endpoints"
 
 for _ in $(seq 1 "$attempts"); do
   body="$(curl -s -o - -w '\n%{http_code}' "${auth[@]}" "$url" 2>/dev/null || true)"
@@ -51,9 +51,9 @@ for _ in $(seq 1 "$attempts"); do
   json="${body%$'\n'*}"
   # Retrying a rejected token never converges, so fail fast and say why.
   if [ "$code" = "401" ]; then
-    echo "controller rejected the bearer token (401) for $url" >&2
+    echo "northbound rejected the bearer token (401) for $url" >&2
     if [ -n "${WEAVE_NORTHBOUND_TOKEN:-}" ]; then
-      echo "WEAVE_NORTHBOUND_TOKEN does not match the controller's" >&2
+      echo "WEAVE_NORTHBOUND_TOKEN does not match northbound's" >&2
     else
       echo "WEAVE_NORTHBOUND_TOKEN is unset" >&2
     fi

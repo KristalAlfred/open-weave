@@ -93,7 +93,7 @@ services:
     command: ["weave-northbound"]
     environment:
       WEAVE_NORTHBOUND_ADDR: 0.0.0.0:9080
-      WEAVE_CONTROLLER_URL: http://10.97.25.22:8082
+      WEAVE_CONTROLLER_URL: http://10.97.25.22:8082,http://10.97.25.24:8082
       WEAVE_NORTHBOUND_TOKEN: ${WEAVE_NORTHBOUND_TOKEN:-bench-northbound-token}
     ports:
       - "29080:9080"
@@ -102,6 +102,8 @@ services:
         ipv4_address: 10.97.25.20
     depends_on:
       controller:
+        condition: service_healthy
+      controller-2:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:9080/health"]
@@ -116,7 +118,7 @@ services:
     command: ["weave-southbound"]
     environment:
       WEAVE_SOUTHBOUND_ADDR: 0.0.0.0:8081
-      WEAVE_CONTROLLER_URL: http://10.97.25.22:8082
+      WEAVE_CONTROLLER_URL: http://10.97.25.22:8082,http://10.97.25.24:8082
       WEAVE_SOUTHBOUND_KEY: ${WEAVE_SOUTHBOUND_KEY:-bench-southbound-key-for-local-use-only}
       WEAVE_SOUTHBOUND_MIN_EPOCHS: ${WEAVE_SOUTHBOUND_MIN_EPOCHS:-}
       # The browser node is a web page on another origin. `*` is a development
@@ -130,6 +132,8 @@ services:
     depends_on:
       controller:
         condition: service_healthy
+      controller-2:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:8081/health"]
       interval: 5s
@@ -137,7 +141,9 @@ services:
       retries: 10
       start_period: 5s
 
-  controller:
+  # Two controllers share one Postgres. The one holding the lease serves; the
+  # other answers `503 not_leader` until it can take the lease over.
+  controller: &controller
     <<: *weave
     container_name: ow-controller
     command: ["weave-controller"]
@@ -169,6 +175,15 @@ services:
       timeout: 3s
       retries: 10
       start_period: 5s
+
+  controller-2:
+    <<: *controller
+    container_name: ow-controller-2
+    ports:
+      - "29083:8082"
+    networks:
+      net_core:
+        ipv4_address: 10.97.25.24
 
   postgres:
     image: postgres:16

@@ -38,9 +38,11 @@ the controller placed a two-hop path across Strom nodes 1 and 2, both adapters
 provisioned their flows, an ffmpeg producer is pushing SRT into the source, and
 an ffmpeg consumer is pulling the receiver output.
 
-Open <http://localhost:29082/ui> to watch it live: registered nodes, each
-stream's path across them with per-hop link conditions and rates, and the
-addresses external peers dial.
+Open the leading controller's dashboard, <http://localhost:29082/ui> or
+<http://localhost:29083/ui> (`just bench leader` says which), to watch it live:
+registered nodes, each stream's path across them with per-hop link conditions
+and rates, and the addresses external peers dial. The other one reads
+"standby".
 
 Then take it apart:
 
@@ -81,6 +83,7 @@ exits `0`, `unplaceable` reports that nothing matched its hops and exits `1`.
 just bench up          # build + start + wait for healthy
 just bench status      # health, registered nodes, controller view, streams
 just bench auth-check  # a node token is refused for another node's id
+just bench leader      # which controller holds the lease
 just bench ps          # container states
 just bench logs controller   # follow one service's logs
 just bench down        # tear down (containers, networks, volumes)
@@ -119,27 +122,38 @@ re-points them, and the previously driven stream loses its source — it reports
 that never received input, which is `awaiting_input`). Applying several streams
 at once is fine; only the media endpoints are shared.
 
-`controller-restart` restarts the controller under a flowing stream and checks
-that nothing on the media side noticed:
+The bench runs two controllers on one Postgres, `controller` and
+`controller-2`. One holds the lease and serves; the other answers
+`503 not_leader`. Northbound and southbound list both and send each request to
+the one that leads. `controller-restart` restarts, kills or stops the leading
+controller under a flowing stream and checks that nothing on the media side
+noticed:
 
 ```sh
 just bench stream-up basic
 just bench controller-restart basic          # docker compose restart
 just bench controller-restart basic kill     # SIGKILL, then start
+just bench controller-restart basic stop     # stop it, check, start it again
 ```
 
 It records every `weave-` flow on the four Stroms with its id and SRT byte
-count, restarts the controller, and waits 20 s for every adapter to poll it. It
-fails if a flow was deleted or recreated (Strom gives a recreated flow a new
-id), if a flow moved no bytes, if an adapter logged a delete, if a producer or
-consumer restarted ffmpeg, or if the stream does not read `flowing` again. The
-bench controller keeps its state in Postgres.
+count, and the stream's generation and ETag. It then acts on the leader, waits
+until a controller leads, and waits 20 s for every adapter to poll it. It fails
+if a flow was deleted or recreated (Strom gives a recreated flow a new id), if a
+flow moved no bytes, if an adapter logged a delete, if a producer or consumer
+restarted ffmpeg, if a Strom node reads `offline`, if the generation or ETag
+changed, if re-applying the manifest fails, or if the stream does not read
+`flowing` again. With `stop`, the old leader stays down through the checks, the
+other controller must be the one leading, and the old one must come back as a
+standby. A restarted or killed leader can take the lease again: after `kill`
+both controllers wait for the lease to run out (`WEAVE_LEASE_TTL_SECS`, 10 s)
+and either may get it.
 
 ## Topology
 
 ```
                      net_core 10.97.25.0/24
-               northbound  southbound  controller
+        northbound  southbound  controller  controller-2  postgres
      +---------------+-----------------+------------------+
      |               |                 |                  |
   router-1        router-2         router-3 (NAT)     router-4 (NAT)
@@ -216,11 +230,11 @@ their SRT traffic crosses the same impaired hops as real external peers.
   from discovery; `consumer-2-up <stream>` resolves the second output (fan-out).
 
 Data-plane addresses are never hardcoded in the recipes: they are resolved from
-the controller's discovery API.
+the discovery API, through northbound.
 
 ```sh
 curl -s -H "Authorization: Bearer bench-northbound-token" \
-  localhost:29082/streams/basic/endpoints | jq
+  localhost:29080/streams/basic/endpoints | jq
 # { "ingress": {node,host,port,url}, "destinations": [{id,endpoint}] }
 ```
 
@@ -292,9 +306,10 @@ destination that does not.
 
 ## Webhooks
 
-The `controller` service sets `WEAVE_WEBHOOK_URL` to
+Both controller services set `WEAVE_WEBHOOK_URL` to
 `http://host.docker.internal:29099` and `WEAVE_WEBHOOK_TOKEN` to
-`bench-webhook-token`, so it delivers every event type to a sink on this host.
+`bench-webhook-token`, so the leading one delivers every event type to a sink on
+this host.
 `just bench hook-sink` is that sink: a few lines of Python that print each event
 and the `Authorization` header it arrived with. Export `WEAVE_WEBHOOK_URL=`
 (empty) before `just bench up` to switch webhooks off.
@@ -317,7 +332,7 @@ waiting `WEAVE_NODE_TTL_SECS` (15) gives `node.offline`, and waiting
 tick, and another each time its conditions change.
 
 `host.docker.internal` resolves through the `extra_hosts: host-gateway` entry on
-the controller service. See the root README's "Webhooks" for the
+the controller services. See the root README's "Webhooks" for the
 payload and the delivery guarantees.
 
 ## Host ports
@@ -327,6 +342,7 @@ payload and the delivery guarantees.
 | 29080 | northbound (`WEAVE_NORTHBOUND_URL=http://localhost:29080 weave ...`) |
 | 29081 | southbound (`/nodes` shows registered capabilities) |
 | 29082 | controller: dashboard at `/ui`, `/view`; API at `/status`, `/streams/{name}/endpoints` |
+| 29083 | controller-2, the same routes; whichever does not lead answers `503 not_leader` |
 | 28080 | strom-1 API |
 | 28081 | strom-2 API |
 | 28082 | strom-3 API (host→container; grants no route into net_node3) |
@@ -342,12 +358,12 @@ defaults to development values so `just bench up` stays a single command:
 
 | Variable | Default | Used by |
 |---|---|---|
-| `WEAVE_NORTHBOUND_TOKEN` | `bench-northbound-token` | northbound, controller, CLI, `endpoints.sh` |
-| `WEAVE_SOUTHBOUND_KEY` | `bench-southbound-key-for-local-use-only` | southbound, controller, `just bench node-token` |
+| `WEAVE_NORTHBOUND_TOKEN` | `bench-northbound-token` | northbound, both controllers, CLI, `endpoints.sh` |
+| `WEAVE_SOUTHBOUND_KEY` | `bench-southbound-key-for-local-use-only` | southbound, both controllers, `just bench node-token` |
 | `WEAVE_ADAPTER_{1,2,3,4}_TOKEN` | `strom-node-{1,2,3,4}`'s epoch-0 token under the default key | adapter-1 to adapter-4; the recipes present node 1's for southbound reads |
 | `WEAVE_BROWSER_TOKEN` | `browser-bench`'s epoch-0 token under the default key | the in-bench browser page, which takes its node id from it |
-| `WEAVE_SRT_KEY_SECRET` | `bench-srt-key-secret-for-local-use-only` | controller, to derive the keys of SRT links between nodes |
-| `WEAVE_SOUTHBOUND_MIN_EPOCHS` | unset | southbound, controller: `<id>=<epoch>` pairs that revoke a node's older tokens |
+| `WEAVE_SRT_KEY_SECRET` | `bench-srt-key-secret-for-local-use-only` | both controllers, to derive the keys of SRT links between nodes |
+| `WEAVE_SOUTHBOUND_MIN_EPOCHS` | unset | southbound, both controllers: `<id>=<epoch>` pairs that revoke a node's older tokens |
 
 `docker-compose.yml` passes each adapter its token as `WEAVE_SOUTHBOUND_TOKEN`.
 The adapter configs leave `node.southbound_token` unset and inherit it. The node
@@ -366,14 +382,14 @@ curl -s -H "Authorization: Bearer bench-northbound-token" localhost:29080/stream
 
 Without a valid token these return `401` and `WWW-Authenticate: Bearer`. A node
 token used for another node's id gets `403`; `just bench auth-check` tries that
-against southbound and the controller. Every service **refuses to start** if its
+against southbound and the leading controller. Every service **refuses to start** if its
 secret is missing, so a `docker compose up` that exits immediately with a
 `WEAVE_... is unset` error is the fail-closed default working, not a bug.
 `WEAVE_AUTH_DISABLED=1` opts out for local runs.
 
 `/health` on all three services, the controller's dashboard (`/ui`, `/view`),
-and the `/status` rollup need no token, so anyone who can reach port 29082
-can read the full topology and allocated ports. Compose publishes it on all
+and the `/status` rollup need no token, so anyone who can reach port 29082 or
+29083 can read the full topology and allocated ports. Compose publishes it on all
 interfaces: fine on a laptop, but **do not expose a controller port on a shared
 or public host.**
 
@@ -409,7 +425,7 @@ to attach the producer and consumer too.
 **A stream reads `degraded` after driving another one.** The producer and
 consumer are singletons, so `stream-up <other>` took them from the first stream.
 
-**Ports already in use.** The bench publishes 29080–29082, 28080–28083 and
+**Ports already in use.** The bench publishes 29080–29083, 28080–28083 and
 29099. Another stack holding one of those makes `up` fail; stop it or change the
 `ports:` entries in `docker-compose.yml`.
 
