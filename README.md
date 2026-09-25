@@ -381,7 +381,10 @@ The controller is the authority for stream validation. Northbound runs the same
 shared validator to give early feedback, but a client that posts directly to the
 controller cannot bypass the rules. Invalid submissions return `400` and are not
 stored. If persisted desired state no longer passes the current contract, the
-controller refuses to start and names the stream, field, and validation error.
+controller names the stream, field, and validation error and does not serve.
+With `DATABASE_URL` it gives the lease up, stands by, and tries again every
+second; a load that fails for another reason, such as Postgres going away, is
+handled the same way.
 
 Validation returns every issue as a field-addressed detail. Top-level and
 endpoint payloads reject unknown fields. A valid stream can still be refused

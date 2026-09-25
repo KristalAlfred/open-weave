@@ -666,8 +666,9 @@ fn not_leader() -> Response {
 }
 
 /// Take the lease whenever it is free, lead until it is lost, and stand by
-/// again, until `shutdown` resolves. A lease held at shutdown is released so a
-/// standby takes over at once.
+/// again, until `shutdown` resolves. A lease held at shutdown, or when the
+/// stored state cannot be loaded, is released so a standby can take over at
+/// once.
 async fn run_with_lease(
     pg: Arc<PgStore>,
     controller: &Controller,
@@ -717,7 +718,11 @@ async fn run_with_lease(
             }
             Err(err) => {
                 step_down(&pg, leadership, hold).await;
-                return Err(err);
+                tracing::error!(err = %format!("{err:#}"), "loading state after taking the controller lease failed; standing by");
+                tokio::select! {
+                    () = tokio::time::sleep(timing.retry_every) => continue,
+                    result = &mut shutdown => return result,
+                }
             }
         };
         tracing::info!(epoch = term.epoch, "leading");
@@ -5985,6 +5990,38 @@ mod tests {
         assert_eq!(stored, ["x"]);
         assert_eq!(
             send(&current, "GET", "/streams/x", None).await.0,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running Postgres via DATABASE_URL"]
+    async fn a_controller_that_cannot_load_its_state_stands_by_and_tries_again() {
+        let url = store::tests::fresh_database().await;
+        let seed = store::tests::leading_pg_store(&url).await;
+        seed.create_stream(&stream("basic")).await.unwrap();
+        seed.release_lease().await.unwrap();
+        let other = sqlx::PgPool::connect(&url).await.unwrap();
+        let set_name = |name: &'static str| {
+            sqlx::query(
+                "UPDATE streams SET definition = jsonb_set(definition, '{name}', to_jsonb($1::text))",
+            )
+            .bind(name)
+            .execute(&other)
+        };
+        set_name("Not A Stream Name").await.unwrap();
+
+        let timing = LeaseTiming::new(Duration::from_secs(3));
+        let (_pg, leadership, _stop, run) = start_controller(&url, timing).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!run.is_finished(), "the controller is still running");
+        assert!(leadership.router().is_none());
+
+        set_name("basic").await.unwrap();
+        until_leading(&leadership, Duration::from_secs(8)).await;
+        let app = leadership_router(leadership.clone());
+        assert_eq!(
+            send(&app, "GET", "/streams/basic", None).await.0,
             StatusCode::OK
         );
     }
