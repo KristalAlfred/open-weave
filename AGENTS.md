@@ -73,7 +73,7 @@ docker-compose stack of real Strom instances behind per-node `netem` routers.
   `BACKLOG.md` opens with the full scope.
 - **The controller owns all state.** Northbound and southbound are stateless
   proxies that call into it. The controller answers no request by calling out;
-  its one outbound call is the node lifecycle webhook, which is fire-and-forget
+  its one outbound call is the node and stream webhook, which is fire-and-forget
   and off unless `WEAVE_WEBHOOK_URL` is set.
 - **Protocol mismatches are refused, not smoothed over.** `PROTOCOL_VERSION`
   marks the southbound adapter protocol. A registration carrying the wrong
