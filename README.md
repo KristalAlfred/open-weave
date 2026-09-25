@@ -139,7 +139,10 @@ registered after the tick, gets `404 node_not_found`. A reconciled node with
 nothing to run gets `200 []`, and its adapter removes every hop it manages. Only
 a `2xx` is an answer: an adapter keeps what it runs on any other response, or
 when southbound cannot be reached, and asks again on its next poll. Both shipped
-nodes do this. The controller runs its first tick before it serves requests, so
+nodes do this, and keep reporting the hops they run in the meantime: the
+controller reads an empty `hop_status` as a node running nothing. When the
+Strom adapter cannot list Strom's flows, it reports the hops it last fetched as
+`pending`. The controller runs its first tick before it serves requests, so
 after a restart with `DATABASE_URL` set it serves the stored hops from the first
 request. The in-memory store starts empty, so after a restart without
 `DATABASE_URL` each node is told to run nothing once it has re-registered.

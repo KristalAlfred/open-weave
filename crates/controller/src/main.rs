@@ -4300,6 +4300,95 @@ mod tests {
         assert_eq!(mem.upsert_stream_calls(), 0);
     }
 
+    /// The heartbeat a relay's adapter sends after it misses a desired fetch
+    /// reports the hops of its last desired set (the Strom adapter's
+    /// `hop_status`). The bridge stays; an empty report would move it.
+    #[tokio::test]
+    async fn a_relay_that_misses_one_desired_fetch_keeps_its_bridge() {
+        let bridge = "weave-feed-bridge-studio-0";
+        let (state, _mem) = mem_state();
+        let app = open_router(state.clone());
+        let register = |registration: NodeRegistration| {
+            let app = app.clone();
+            async move {
+                let (status, _) = send(
+                    &app,
+                    "POST",
+                    "/nodes/register",
+                    Some(serde_json::to_value(registration).unwrap()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::ACCEPTED);
+            }
+        };
+        register(nat_registration("nat-1", "192.168.0.10")).await;
+        register(nat_registration("nat-2", "192.168.0.20")).await;
+        register(node_registration("relay-b", "198.51.100.20")).await;
+        state.streams.write().await.insert(
+            "feed".to_string(),
+            stored_stream(stream_between("feed", "nat-1", "nat-2")),
+        );
+        reconcile_tick(&state).await;
+        let (_, body) = desired_hops(&app, "relay-b").await;
+        let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
+        assert_eq!(hops[0].id, bridge);
+        register(node_registration("relay-a", "198.51.100.10")).await;
+
+        let heartbeat = |hop_status: Vec<weave_core::HopStatus>| NodeHeartbeat {
+            node_id: "relay-b".to_string(),
+            status: NodeStatus::Ready,
+            endpoints: Vec::new(),
+            hop_status,
+        };
+        let running = hops
+            .iter()
+            .map(|hop| weave_core::HopStatus {
+                id: hop.id.clone(),
+                node_id: hop.node_id.clone(),
+                state: weave_core::HopState::Provisioned,
+                ingress: weave_core::SocketStatus {
+                    condition: weave_core::LinkCondition::Flowing,
+                    resolved: None,
+                    stats: None,
+                },
+                merge_ingress: None,
+                egresses: hop
+                    .egresses
+                    .iter()
+                    .map(|egress| weave_core::EgressStatus {
+                        branch_id: egress.branch_id.clone(),
+                        status: weave_core::SocketStatus {
+                            condition: weave_core::LinkCondition::Flowing,
+                            resolved: None,
+                            stats: None,
+                        },
+                    })
+                    .collect(),
+            })
+            .collect();
+        let relay_of_bridge = |state: AppState| async move {
+            reconcile_tick(&state).await;
+            state.view.read().await.hops["feed"]
+                .iter()
+                .find(|hop| hop.id == bridge)
+                .unwrap()
+                .node_id
+                .clone()
+        };
+
+        for (hop_status, relay) in [(running, "relay-b"), (Vec::new(), "relay-a")] {
+            let (status, _) = send(
+                &app,
+                "POST",
+                "/nodes/relay-b/heartbeat",
+                Some(serde_json::to_value(heartbeat(hop_status)).unwrap()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            assert_eq!(relay_of_bridge(state.clone()).await, relay);
+        }
+    }
+
     #[tokio::test]
     async fn a_plan_keeps_a_bridge_on_the_relay_that_reports_running_it() {
         let bridge = "weave-feed-bridge-studio-0";

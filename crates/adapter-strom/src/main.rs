@@ -16,10 +16,10 @@ use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Token};
 use weave_core::{
     AdapterDescriptor, AdapterKind, AudioCodec, AudioConstraint, DesiredHop, EgressStatus,
-    EndpointDescriptor, EndpointKind, FormatConstraint, HopEndpointClass, HopProfile, HopStatus,
-    LinkCondition, LinkStats, NodeCapabilities, NodeDescriptor, NodeHeartbeat, NodeRegistration,
-    NodeStatus, PROTOCOL_VERSION, RoleSet, SocketRole, SocketSpec, SocketStatus, SrtSocket,
-    Transport, TransportClass, VideoCodec, VideoConstraint,
+    EndpointDescriptor, EndpointKind, FormatConstraint, HopEndpointClass, HopProfile, HopState,
+    HopStatus, LinkCondition, LinkStats, NodeCapabilities, NodeDescriptor, NodeHeartbeat,
+    NodeRegistration, NodeStatus, PROTOCOL_VERSION, RoleSet, SocketRole, SocketSpec, SocketStatus,
+    SrtSocket, Transport, TransportClass, VideoCodec, VideoConstraint,
 };
 use weave_strom::{
     ElementStats, FlowSpec, FlowStats, SessionStats, StromClient, StromError, StromFlow,
@@ -155,6 +155,7 @@ async fn sync_loop(
 ) -> Result<()> {
     let mut registered = false;
     let mut tracker = StallTracker::default();
+    let mut last_desired = Vec::new();
     let interval = Duration::from_secs(config.strom.poll_interval_secs);
 
     loop {
@@ -165,6 +166,7 @@ async fn sync_loop(
             public_endpoint,
             registered,
             &mut tracker,
+            &mut last_desired,
         )
         .await
         {
@@ -194,16 +196,17 @@ async fn sync_once(
     public_endpoint: &str,
     registered: bool,
     tracker: &mut StallTracker,
+    last_desired: &mut Vec<DesiredHop>,
 ) -> Result<bool> {
     let node_id = &config.node.id;
     let (status, flows) = match strom.list_flows().await {
-        Ok(flows) => (NodeStatus::Ready, flows),
+        Ok(flows) => (NodeStatus::Ready, Some(flows)),
         Err(error) => {
             tracing::warn!(%error, "Strom observation failed");
-            (NodeStatus::Degraded, Vec::new())
+            (NodeStatus::Degraded, None)
         }
     };
-    let endpoints = strom_endpoints(node_id, &flows);
+    let endpoints = strom_endpoints(node_id, flows.as_deref().unwrap_or_default());
     let listener_host = config
         .node
         .topology
@@ -212,17 +215,16 @@ async fn sync_once(
         .find_map(|attachment| attachment.listeners.srt.as_ref())
         .map(|listener| listener.host.as_str());
 
-    let hop_status = if status == NodeStatus::Ready {
-        match provision(southbound, strom, node_id, &flows, listener_host, tracker).await {
-            Ok(hop_status) => hop_status,
-            Err(error) => {
-                tracing::warn!(%error, "provisioning desired hops failed");
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
+    let hop_status = hop_status(
+        southbound,
+        strom,
+        node_id,
+        flows.as_deref(),
+        listener_host,
+        tracker,
+        last_desired,
+    )
+    .await;
 
     let registration = registration(
         config,
@@ -289,8 +291,80 @@ impl FlowApi for StromClient {
     }
 }
 
+/// This poll's hop status, never an empty list standing in for hops the node
+/// may still run, since the controller reads an empty list as running nothing
+/// and places those hops elsewhere. `flows` is `None` when Strom could not be
+/// listed; then the hops of `last_desired` are reported `pending`. When the
+/// desired fetch fails, nothing is provisioned and `last_desired` is reported
+/// as Strom shows it now.
+async fn hop_status(
+    southbound: &Southbound,
+    strom: &dyn FlowApi,
+    node_id: &str,
+    flows: Option<&[StromFlow]>,
+    listener_host: Option<&str>,
+    tracker: &mut StallTracker,
+    last_desired: &mut Vec<DesiredHop>,
+) -> Vec<HopStatus> {
+    let Some(flows) = flows else {
+        return pending_statuses(last_desired);
+    };
+    match provision(
+        southbound,
+        strom,
+        node_id,
+        flows,
+        listener_host,
+        tracker,
+        last_desired,
+    )
+    .await
+    {
+        Ok(hop_status) => hop_status,
+        Err(error) => {
+            tracing::warn!(%error, "provisioning desired hops failed; reporting the last desired hops");
+            hop_statuses(
+                strom,
+                last_desired,
+                flows,
+                listener_host,
+                &std::collections::HashSet::new(),
+                tracker,
+            )
+            .await
+        }
+    }
+}
+
+fn pending_statuses(desired: &[DesiredHop]) -> Vec<HopStatus> {
+    let idle = || SocketStatus {
+        condition: LinkCondition::Idle,
+        resolved: None,
+        stats: None,
+    };
+    desired
+        .iter()
+        .map(|hop| HopStatus {
+            id: hop.id.clone(),
+            node_id: hop.node_id.clone(),
+            state: HopState::Pending,
+            ingress: idle(),
+            merge_ingress: None,
+            egresses: hop
+                .egresses
+                .iter()
+                .map(|egress| EgressStatus {
+                    branch_id: egress.branch_id.clone(),
+                    status: idle(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 /// Pull desired hops for this node, reconcile them into Strom flows, and report
 /// each hop's realised status. Touches no flow unless southbound answers `2xx`.
+/// The fetched hops replace `last_desired`.
 async fn provision(
     southbound: &Southbound,
     strom: &dyn FlowApi,
@@ -298,9 +372,12 @@ async fn provision(
     flows: &[StromFlow],
     listener_host: Option<&str>,
     tracker: &mut StallTracker,
+    last_desired: &mut Vec<DesiredHop>,
 ) -> Result<Vec<HopStatus>> {
     let desired = fetch_desired(southbound, node_id).await?;
-    Ok(reconcile(strom, &desired, flows, listener_host, tracker).await)
+    let hop_status = reconcile(strom, &desired, flows, listener_host, tracker).await;
+    *last_desired = desired;
+    Ok(hop_status)
 }
 
 /// Reconcile desired hops against observed flows in one poll cycle.
@@ -975,6 +1052,7 @@ mod tests {
             flows,
             None,
             &mut StallTracker::default(),
+            &mut Vec::new(),
         )
         .await;
         (result.is_ok(), strom.ops())
@@ -1399,5 +1477,105 @@ mod tests {
         };
         assert!(accepts.satisfied_by(&format(VideoCodec::H264)));
         assert!(!accepts.satisfied_by(&format(VideoCodec::Vp8)));
+    }
+
+    #[tokio::test]
+    async fn a_missed_desired_fetch_or_strom_listing_still_reports_the_last_desired_hops() {
+        let desired = hop("weave-feed-bridge-studio-0", 7001);
+        let fetched = southbound_answering(StatusCode::OK, json!([desired])).await;
+        let missed = southbound_answering(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "code": "not_leader", "message": "no leader" }),
+        )
+        .await;
+        let running = [flow(&desired.id, "id-bridge")];
+        let strom = RecordingFlowApi::default();
+        let mut tracker = StallTracker::default();
+        let mut last_desired = Vec::new();
+        let states = |statuses: &[HopStatus]| {
+            statuses
+                .iter()
+                .map(|status| {
+                    (
+                        status.id.clone(),
+                        status.state,
+                        status
+                            .egresses
+                            .iter()
+                            .map(|egress| egress.branch_id.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let first = hop_status(
+            &missed,
+            &strom,
+            "strom-node-1",
+            Some(&running),
+            None,
+            &mut tracker,
+            &mut last_desired,
+        )
+        .await;
+        assert!(
+            first.is_empty(),
+            "before any desired fetch there is nothing to report"
+        );
+
+        hop_status(
+            &fetched,
+            &strom,
+            "strom-node-1",
+            Some(&running),
+            None,
+            &mut tracker,
+            &mut last_desired,
+        )
+        .await;
+        assert_eq!(last_desired, std::slice::from_ref(&desired));
+        let ops = strom.ops().len();
+
+        let reported = hop_status(
+            &missed,
+            &strom,
+            "strom-node-1",
+            Some(&running),
+            None,
+            &mut tracker,
+            &mut last_desired,
+        )
+        .await;
+        assert_eq!(strom.ops().len(), ops, "a missed fetch touches no flow");
+        assert_eq!(
+            states(&reported),
+            [(
+                desired.id.clone(),
+                HopState::Provisioned,
+                vec!["studio".to_string()]
+            )],
+            "the hop Strom still runs is reported"
+        );
+
+        let unlisted = hop_status(
+            &fetched,
+            &strom,
+            "strom-node-1",
+            None,
+            None,
+            &mut tracker,
+            &mut last_desired,
+        )
+        .await;
+        assert_eq!(
+            states(&unlisted),
+            [(
+                desired.id.clone(),
+                HopState::Pending,
+                vec!["studio".to_string()]
+            )],
+            "with Strom unlisted, the last desired hops are reported pending"
+        );
     }
 }
