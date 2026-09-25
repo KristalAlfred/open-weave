@@ -52,3 +52,7 @@ polling `/status` or `GET /streams`.
   an example, the trigger rule and what an empty `WEAVE_WEBHOOK_EVENTS` now
   delivers. `contracts/json-schema/webhook-event.json` is new, generated from
   `webhook::Event` by `just contracts`.
+- 2026-09-25: seen on `bench/` as well, with `just bench hook-sink` running:
+  `producer-down` and `producer-up` on a flowing `basic` gave three
+  `stream.changed` events, `awaiting_input`, then `degraded` (a reason-only
+  change to `media_degraded`), then `flowing`. None carried an address.

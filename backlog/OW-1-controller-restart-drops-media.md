@@ -2,7 +2,7 @@
 id: OW-1
 title: "A controller restart probably tears down running media"
 type: bug
-status: in-progress
+status: done
 depends_on: []
 assignee: claude-lifecycle
 ---
@@ -25,7 +25,7 @@ before the first tick finishes. None of this has been run.
 - [x] A test shows whether a controller restart deletes running Strom flows,
       with the in-memory store and with Postgres.
 - [x] If a restart with the Postgres store does, it no longer does.
-- [ ] A bench case restarts the controller with media flowing and no flow drops.
+- [x] A bench case restarts the controller with media flowing and no flow drops.
 
 ## Easy to break
 
@@ -66,3 +66,12 @@ before the first tick finishes. None of this has been run.
   throws on any non-2xx and keeps its hops (`nodes/browser/node.js`); read, not
   run. No `PROTOCOL_VERSION` bump: both shipped nodes already treated a
   non-2xx this way.
+- 2026-09-25: box 3 checked on `bench/`, with the Postgres store the bench
+  runs. `just bench controller-restart basic` (`docker compose restart`) and
+  `just bench controller-restart basic kill` (SIGKILL, then start), each after
+  `just bench stream-up basic`: both `weave-basic-*` flows kept their Strom ids
+  and kept moving bytes (sender 9.27 MB before, 32.5 MB after the restart),
+  no adapter logged a delete, neither ffmpeg endpoint restarted, and the
+  stream read `flowing` again. The recipe was not run against the code before
+  the fix; there the gap is only the moment between the listener binding and
+  the first tick, which an adapter poll need not hit.

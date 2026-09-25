@@ -31,3 +31,5 @@ deduplicate by id, and a receiver that does can drop new events.
   emits three events from one emitter, drops it, and checks that a new emitter's
   first id is above all three; with the old counter it would send `-0` again.
   README "Webhooks" says so. Unit tests only.
+- 2026-09-25: on `bench/`, the restarted controller's events carried ids like
+  `basic-1790327125992038`, counted from its start time.
