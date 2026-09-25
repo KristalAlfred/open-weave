@@ -81,13 +81,13 @@ Notes:
 - **`nat-*`**: node 3 sits behind a real NAT — router-3 masquerades its outbound
   traffic and nothing outside net_node3 is given a route back in. Verified
   directly, not assumed: a TCP connect from the controller and from node 1 to
-  `172.29.0.10:8080` both fail, while node 3 reaches `172.26.0.10:8080` and its
+  `10.97.29.10:8080` both fail, while node 3 reaches `10.97.26.10:8080` and its
   adapter registers through the same path.
   - **`nat-egress`** needs no relay and no reversal: the destination is dialable,
     so the sender calls out, which is the direction a NAT allows anyway.
   - **`nat-ingress`** is the reversal. Observed sockets: the sender's egress on
     node 1 is `listen`, and node 3's receiver ingress is `connect` to
-    `172.26.0.10`. Delivery into a NAT'd site costs a socket role, not a relay.
+    `10.97.26.10`. Delivery into a NAT'd site costs a socket role, not a relay.
   - **`nat-relay`** pins node 1 as transit. Observed:
     `weave-nat-relay-bridge-output-0` on node 1 listens on both sockets while
     both node-3 hops dial out to it.
@@ -126,7 +126,7 @@ Notes:
 - **`browser-cam-host`**: `browser-cam` for a page in a browser on the docker
   host, which `just bench host-cam <seat>` fills in. Its destination names node
   1's `docker-host` attachment, so the page is told to signal at `localhost:28080`
-  while the SRT output stays on `172.26.0.10` (`bench/README.md`, "A page in
+  while the SRT output stays on `10.97.26.10` (`bench/README.md`, "A page in
   your own browser"). Applied for the in-bench page it stays `pending`: that
   page's hop fails with `Failed to fetch`, because `localhost` in its container
   is itself. From the host, Google Chrome put H264 640x480 and AAC on the SRT

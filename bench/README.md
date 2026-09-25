@@ -117,25 +117,29 @@ at once is fine; only the media endpoints are shared.
 ## Topology
 
 ```
-        net_core 172.25.0.0/24
+        net_core 10.97.25.0/24
    northbound  southbound  controller
         |          |           |          \
    router-1     router-2       |        router-3  (NAT)
-  (172.25.0.11) (172.25.0.12)  |       (172.25.0.13)
+  (10.97.25.11) (10.97.25.12)  |       (10.97.25.13)
         |            |                      |
   net_node1      net_node2            net_node3
-  172.26.0.0/24  172.27.0.0/24        172.29.0.0/24
+  10.97.26.0/24  10.97.27.0/24        10.97.29.0/24
   strom-1        strom-2              strom-3
   adapter-1      adapter-2            adapter-3
   (relay)                             (outbound-only)
 ```
+
+The subnets are `/24`s in `10.97.0.0/16`, outside Docker's default address
+pools (`172.17.0.0/16`–`172.31.0.0/16` and `192.168.0.0/16`), so a compose
+project that lets Docker pick its subnet does not take one of them.
 
 Each node subnet reaches everything else only through its router. Applying netem
 on a router impairs both directions of that node's traffic: SRT media between
 Stroms, adapter heartbeats, and controller→Strom API calls.
 
 **Node 3 sits behind a NAT.** Its router masquerades outbound traffic, and no
-route to `172.29.0.0/24` is installed anywhere outside net_node3 — not in the
+route to `10.97.29.0/24` is installed anywhere outside net_node3 — not in the
 core containers, not in routers 1 and 2. Docker's inter-network isolation blocks
 the bridge-level path, so node 3 can open connections outward and nothing can
 open one toward it. That asymmetry is load-bearing: adding a return route would
@@ -251,7 +255,7 @@ just bench host-cam-down       # delete it again
 pointing at it. Unpinned, every tab is a new node. Pass
 `just bench page 8000 guest-2` for a second, concurrent guest.
 
-A browser on the host generally cannot reach `172.26.0.10:8080`, so node 1
+A browser on the host generally cannot reach `10.97.26.10:8080`, so node 1
 advertises a second attachment on the `docker-host` network, with the same SRT
 address and signalling at `localhost:28080`. The
 `browser-cam-host` manifest selects it with `network: docker-host` on the
@@ -369,6 +373,10 @@ consumer are singletons, so `stream-up <other>` took them from the first stream.
 **Ports already in use.** The bench publishes 29080–29082, 28080–28082 and
 29099. Another stack holding one of those makes `up` fail; stop it or change the
 `ports:` entries in `docker-compose.yml`.
+
+**`Pool overlaps with other one on this address space`.** Another Docker network
+holds part of `10.97.25.0/24`–`10.97.29.0/24`. `docker network inspect` on each
+network in `docker network ls` shows which.
 
 **A container came back with no route to another subnet.** `route-manager`
 repairs it within a few seconds; `just bench logs route-manager` shows a line

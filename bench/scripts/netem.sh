@@ -19,9 +19,9 @@ EOF
 
 node="${1:-}"; shift || usage
 case "$node" in
-  node1) router="ow-router-1"; ips="172.26.0.2 172.25.0.11" ;;
-  node2) router="ow-router-2"; ips="172.27.0.2 172.25.0.12" ;;
-  node3) router="ow-router-3"; ips="172.29.0.2 172.25.0.13" ;;
+  node1) router="ow-router-1"; ips="10.97.26.2 10.97.25.11" ;;
+  node2) router="ow-router-2"; ips="10.97.27.2 10.97.25.12" ;;
+  node3) router="ow-router-3"; ips="10.97.29.2 10.97.25.13" ;;
   *) usage ;;
 esac
 

@@ -178,7 +178,7 @@ stream-rm name:
 # discovery API. Verification endpoint only — not part of the system under test.
 #
 # A socket on node 3 can only be dialled from inside net_node3, so the endpoint
-# is picked from the address: 172.29.x means the `-3` container, anything else
+# is picked from the address: 10.97.29.x means the `-3` container, anything else
 # the net_core one. The recipe obeys the same reachability the planner does.
 [doc("Start the external ffmpeg producer (SRT caller into a source ingress).")]
 [group("media")]

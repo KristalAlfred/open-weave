@@ -52,24 +52,24 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.25.0.0/24
+        - subnet: 10.97.25.0/24
   net_node1:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.26.0.0/24
+        - subnet: 10.97.26.0/24
   net_node2:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.27.0.0/24
+        - subnet: 10.97.27.0/24
   # Node 3 sits behind a NAT: its router masquerades outbound traffic and nothing
   # outside is given a route back in. See router-3.
   net_node3:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.29.0.0/24
+        - subnet: 10.97.29.0/24
 
 services:
   # --- control plane (net_core) ---
@@ -83,13 +83,13 @@ services:
     command: ["weave-northbound"]
     environment:
       WEAVE_NORTHBOUND_ADDR: 0.0.0.0:9080
-      WEAVE_CONTROLLER_URL: http://172.25.0.22:8082
+      WEAVE_CONTROLLER_URL: http://10.97.25.22:8082
       WEAVE_NORTHBOUND_TOKEN: ${WEAVE_NORTHBOUND_TOKEN:-bench-northbound-token}
     ports:
       - "29080:9080"
     networks:
       net_core:
-        ipv4_address: 172.25.0.20
+        ipv4_address: 10.97.25.20
     depends_on:
       controller:
         condition: service_healthy
@@ -106,7 +106,7 @@ services:
     command: ["weave-southbound"]
     environment:
       WEAVE_SOUTHBOUND_ADDR: 0.0.0.0:8081
-      WEAVE_CONTROLLER_URL: http://172.25.0.22:8082
+      WEAVE_CONTROLLER_URL: http://10.97.25.22:8082
       WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_SOUTHBOUND_TOKEN:-bench-southbound-token}
       # The browser node is a web page on another origin. `*` is a development
       # value like the tokens above; a deployment names the page's origin.
@@ -115,7 +115,7 @@ services:
       - "29081:8081"
     networks:
       net_core:
-        ipv4_address: 172.25.0.21
+        ipv4_address: 10.97.25.21
     depends_on:
       controller:
         condition: service_healthy
@@ -133,7 +133,7 @@ services:
     environment:
       WEAVE_CONTROLLER_ADDR: 0.0.0.0:8082
       WEAVE_RECONCILE_INTERVAL_SECS: "5"
-      DATABASE_URL: postgres://weave:weave@172.25.0.23:5432/weave
+      DATABASE_URL: postgres://weave:weave@10.97.25.23:5432/weave
       WEAVE_NORTHBOUND_TOKEN: ${WEAVE_NORTHBOUND_TOKEN:-bench-northbound-token}
       WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_SOUTHBOUND_TOKEN:-bench-southbound-token}
       # Node lifecycle webhooks, delivered to `just bench hook-sink` on this
@@ -146,7 +146,7 @@ services:
       - "29082:8082"
     networks:
       net_core:
-        ipv4_address: 172.25.0.22
+        ipv4_address: 10.97.25.22
     depends_on:
       postgres:
         condition: service_healthy
@@ -169,7 +169,7 @@ services:
       - pgdata:/var/lib/postgresql/data
     networks:
       net_core:
-        ipv4_address: 172.25.0.23
+        ipv4_address: 10.97.25.23
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U weave -d weave"]
       interval: 5s
@@ -210,13 +210,13 @@ services:
       - net.ipv4.ip_forward=1
     networks:
       net_core:
-        ipv4_address: 172.25.0.11
+        ipv4_address: 10.97.25.11
       net_node1:
-        ipv4_address: 172.26.0.2
+        ipv4_address: 10.97.26.2
     command:
       - sh
       - -c
-      - "ip route replace 172.27.0.0/24 via 172.25.0.12 || true; for d in $$(ls /sys/class/net | grep -v lo); do tc qdisc del dev $$d root 2>/dev/null; done; exec sleep infinity"
+      - "ip route replace 10.97.27.0/24 via 10.97.25.12 || true; for d in $$(ls /sys/class/net | grep -v lo); do tc qdisc del dev $$d root 2>/dev/null; done; exec sleep infinity"
 
   router-2:
     image: nicolaka/netshoot:latest
@@ -226,13 +226,13 @@ services:
       - net.ipv4.ip_forward=1
     networks:
       net_core:
-        ipv4_address: 172.25.0.12
+        ipv4_address: 10.97.25.12
       net_node2:
-        ipv4_address: 172.27.0.2
+        ipv4_address: 10.97.27.2
     command:
       - sh
       - -c
-      - "ip route replace 172.26.0.0/24 via 172.25.0.11 || true; for d in $$(ls /sys/class/net | grep -v lo); do tc qdisc del dev $$d root 2>/dev/null; done; exec sleep infinity"
+      - "ip route replace 10.97.26.0/24 via 10.97.25.11 || true; for d in $$(ls /sys/class/net | grep -v lo); do tc qdisc del dev $$d root 2>/dev/null; done; exec sleep infinity"
 
   # Node 3's router is a NAT gateway, not a plain L3 hop like routers 1 and 2.
   # Two things make it one, and both matter:
@@ -240,7 +240,7 @@ services:
   #   * MASQUERADE rewrites node-3's source address to this router's core-side
   #     IP, so replies come back here and conntrack returns them. Without it,
   #     node-3's outbound traffic would be answered to an address nobody routes.
-  #   * Nothing outside net_node3 is ever given a route to 172.29.0.0/24 — not
+  #   * Nothing outside net_node3 is ever given a route to 10.97.29.0/24 — not
   #     the core containers, not routers 1 and 2 (see scripts/route-manager.sh).
   #     Docker's inter-network isolation blocks the bridge-level path, so with no
   #     route installed there is genuinely no way to dial in.
@@ -257,13 +257,13 @@ services:
       - net.ipv4.ip_forward=1
     networks:
       net_core:
-        ipv4_address: 172.25.0.13
+        ipv4_address: 10.97.25.13
       net_node3:
-        ipv4_address: 172.29.0.2
+        ipv4_address: 10.97.29.2
     command:
       - sh
       - -c
-      - "ip route replace 172.26.0.0/24 via 172.25.0.11 || true; ip route replace 172.27.0.0/24 via 172.25.0.12 || true; iptables -t nat -C POSTROUTING -s 172.29.0.0/24 ! -d 172.29.0.0/24 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 172.29.0.0/24 ! -d 172.29.0.0/24 -j MASQUERADE; for d in $$(ls /sys/class/net | grep -v lo); do tc qdisc del dev $$d root 2>/dev/null; done; exec sleep infinity"
+      - "ip route replace 10.97.26.0/24 via 10.97.25.11 || true; ip route replace 10.97.27.0/24 via 10.97.25.12 || true; iptables -t nat -C POSTROUTING -s 10.97.29.0/24 ! -d 10.97.29.0/24 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.97.29.0/24 ! -d 10.97.29.0/24 -j MASQUERADE; for d in $$(ls /sys/class/net | grep -v lo); do tc qdisc del dev $$d root 2>/dev/null; done; exec sleep infinity"
 
   # --- node 1 (net_node1) ---
   strom-1:
@@ -278,7 +278,7 @@ services:
       - "28080:8080"
     networks:
       net_node1:
-        ipv4_address: 172.26.0.10
+        ipv4_address: 10.97.26.10
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
       interval: 5s
@@ -296,7 +296,7 @@ services:
       - ./config/adapter-1.yaml:/etc/weave/node.yaml:ro
     networks:
       net_node1:
-        ipv4_address: 172.26.0.11
+        ipv4_address: 10.97.26.11
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:8091/health"]
       interval: 5s
@@ -317,7 +317,7 @@ services:
       - "28081:8080"
     networks:
       net_node2:
-        ipv4_address: 172.27.0.10
+        ipv4_address: 10.97.27.10
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
       interval: 5s
@@ -335,7 +335,7 @@ services:
       - ./config/adapter-2.yaml:/etc/weave/node.yaml:ro
     networks:
       net_node2:
-        ipv4_address: 172.27.0.11
+        ipv4_address: 10.97.27.11
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:8091/health"]
       interval: 5s
@@ -359,7 +359,7 @@ services:
       - "28082:8080"
     networks:
       net_node3:
-        ipv4_address: 172.29.0.10
+        ipv4_address: 10.97.29.10
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
       interval: 5s
@@ -377,7 +377,7 @@ services:
       - ./config/adapter-3.yaml:/etc/weave/node.yaml:ro
     networks:
       net_node3:
-        ipv4_address: 172.29.0.11
+        ipv4_address: 10.97.29.11
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:8091/health"]
       interval: 5s
@@ -398,7 +398,7 @@ services:
     restart: "no"
     shm_size: "1gb"
     environment:
-      WEAVE_SOUTHBOUND_URL: http://172.25.0.21:8081
+      WEAVE_SOUTHBOUND_URL: http://10.97.25.21:8081
       WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_SOUTHBOUND_TOKEN:-bench-southbound-token}
     volumes:
       - ../nodes/browser:/work:ro
@@ -408,7 +408,7 @@ services:
       - ../crates/core/src/lib.rs:/crates/core/src/lib.rs:ro
     networks:
       net_core:
-        ipv4_address: 172.25.0.40
+        ipv4_address: 10.97.25.40
     # The node id is pinned so the browser manifests keep naming the same node
     # across restarts; the `browser-id` recipe reads the same default.
     command: ["node", "/work/check.mjs", "--serve", "8000", "--stay", "--node", "${WEAVE_BROWSER_NODE_ID:-browser-bench}"]
@@ -430,7 +430,7 @@ services:
       - PRODUCER_TARGET
     networks:
       net_core:
-        ipv4_address: 172.25.0.30
+        ipv4_address: 10.97.25.30
     command: *producer-command
 
   consumer:
@@ -441,7 +441,7 @@ services:
       - CONSUMER_SOURCE
     networks:
       net_core:
-        ipv4_address: 172.25.0.31
+        ipv4_address: 10.97.25.31
     command: *consumer-command
 
   # Second consumer for fan-out: attach one consumer per receiver output so all
@@ -454,7 +454,7 @@ services:
       CONSUMER_SOURCE: ${CONSUMER_SOURCE_2:-}
     networks:
       net_core:
-        ipv4_address: 172.25.0.32
+        ipv4_address: 10.97.25.32
     command: *consumer-command
 
   producer-3:
@@ -465,7 +465,7 @@ services:
       - PRODUCER_TARGET
     networks:
       net_node3:
-        ipv4_address: 172.29.0.30
+        ipv4_address: 10.97.29.30
     command: *producer-command
 
   consumer-3:
@@ -476,7 +476,7 @@ services:
       - CONSUMER_SOURCE
     networks:
       net_node3:
-        ipv4_address: 172.29.0.31
+        ipv4_address: 10.97.29.31
     command: *consumer-command
 
 volumes:

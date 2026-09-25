@@ -30,27 +30,27 @@ sock="${DOCKER_SOCK:-/var/run/docker.sock}"
 # everything else via its own router's leg on that subnet.
 #
 # Node 3 is the deliberate exception. It gets routes *out* to every other subnet,
-# and no other group gets a route to 172.29.0.0/24 — not core, not node 1, not
+# and no other group gets a route to 10.97.29.0/24 — not core, not node 1, not
 # node 2. Docker's inter-network isolation blocks the bridge-level path, so with
 # no route installed nothing outside net_node3 can open a connection to it, while
 # router-3's MASQUERADE lets node 3 reach out and get answered. That asymmetry is
-# the NAT the bench tests against: adding a 172.29.0.0/24 route to any group
+# the NAT the bench tests against: adding a 10.97.29.0/24 route to any group
 # below silently removes the boundary and the NAT manifests start passing for the
 # wrong reason.
 # ow-open-live-strom is not a service here: open-live's own docker-compose.yml
 # joins its Strom to net_core under that name so it can dial node 1's SRT
 # outputs. Renaming it there silently drops its routes.
 core_containers="ow-controller ow-southbound ow-browser ow-open-live-strom ow-producer ow-consumer ow-consumer-2"
-core_routes="172.26.0.0/24=172.25.0.11 172.27.0.0/24=172.25.0.12"
+core_routes="10.97.26.0/24=10.97.25.11 10.97.27.0/24=10.97.25.12"
 
 node1_containers="ow-strom-1 ow-adapter-1"
-node1_routes="172.25.0.0/24=172.26.0.2 172.27.0.0/24=172.26.0.2"
+node1_routes="10.97.25.0/24=10.97.26.2 10.97.27.0/24=10.97.26.2"
 
 node2_containers="ow-strom-2 ow-adapter-2"
-node2_routes="172.25.0.0/24=172.27.0.2 172.26.0.0/24=172.27.0.2"
+node2_routes="10.97.25.0/24=10.97.27.2 10.97.26.0/24=10.97.27.2"
 
 node3_containers="ow-strom-3 ow-adapter-3 ow-producer-3 ow-consumer-3"
-node3_routes="172.25.0.0/24=172.29.0.2 172.26.0.0/24=172.29.0.2 172.27.0.0/24=172.29.0.2"
+node3_routes="10.97.25.0/24=10.97.29.2 10.97.26.0/24=10.97.29.2 10.97.27.0/24=10.97.29.2"
 
 # PID of a running container, or empty if it is absent or stopped. Profiled
 # services (producer/consumer) legitimately do not exist most of the time.

@@ -19,6 +19,6 @@ if [ -z "$addr" ]; then
 fi
 
 case "${addr%%:*}" in
-  172.29.0.*) echo "-3" ;;
+  10.97.29.*) echo "-3" ;;
   *) echo "" ;;
 esac
