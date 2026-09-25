@@ -1,7 +1,7 @@
 //! Pure derivation of a per-stream [`Path`] from operator intent and observed state.
 
-use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::borrow::{Borrow, Cow};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use weave_core::{
@@ -205,7 +205,7 @@ fn signalled(endpoint: &SignallingEndpoint, transport: SignallingTransport) -> E
 }
 
 /// Where a listening socket sits in the hop that owns it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Slot {
     Ingress,
     MergeIngress,
@@ -213,7 +213,7 @@ enum Slot {
 }
 
 /// A listening socket: the hop that owns it and where it sits in that hop.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct SocketAt {
     hop: String,
     slot: Slot,
@@ -252,7 +252,7 @@ impl SocketAt {
 #[derive(Debug, Default)]
 pub struct HopReports {
     running: HashMap<String, Vec<String>>,
-    by_socket: HashMap<(String, SocketAt), u16>,
+    by_socket: BTreeMap<SocketAt, HashMap<String, u16>>,
     held: HashMap<String, HashSet<u16>>,
 }
 
@@ -311,7 +311,10 @@ impl HopReports {
                     hop: report.id.clone(),
                     slot,
                 };
-                held.by_socket.insert((node.id.clone(), at), resolved.port);
+                held.by_socket
+                    .entry(at)
+                    .or_default()
+                    .insert(node.id.clone(), resolved.port);
                 let ports = held.held.entry(node.id.clone()).or_default();
                 ports.insert(resolved.port);
                 if rist
@@ -326,7 +329,10 @@ impl HopReports {
     }
 
     fn port(&self, node: &str, at: &SocketAt) -> Option<u16> {
-        self.by_socket.get(&(node.to_string(), at.clone())).copied()
+        self.by_socket
+            .get(at)
+            .and_then(|nodes| nodes.get(node))
+            .copied()
     }
 
     fn running(&self, hop_id: &str) -> &[String] {
@@ -339,12 +345,34 @@ impl HopReports {
             .is_some_and(|ports| ports.contains(&port))
     }
 
-    /// The ports held by sockets `holds` picks, per node.
-    fn held_by(&self, holds: impl Fn(&SocketAt) -> bool) -> HashMap<String, HashSet<u16>> {
+    /// The ports held by the second paths of `stream`'s destinations that ask
+    /// for two, per node: their sender egresses, their bridges, and their
+    /// receivers' merge ingresses.
+    fn second_path_held(&self, stream: &StreamDefinition) -> HashMap<String, HashSet<u16>> {
         let mut ports: HashMap<String, HashSet<u16>> = HashMap::new();
-        for ((node, at), port) in &self.by_socket {
-            if holds(at) {
-                ports.entry(node.clone()).or_default().insert(*port);
+        for destination in stream
+            .destinations
+            .iter()
+            .filter(|destination| destination.paths > 1)
+        {
+            let branch = second_path_branch_id(&destination.id);
+            let bridges = bridge_hop_id_prefix(&stream.name, &branch);
+            let bridge_sockets = self
+                .by_socket
+                .range(SocketAt::ingress(&bridges)..)
+                .take_while(|(at, _)| at.hop.starts_with(&bridges))
+                .filter(|(at, _)| is_bridge_position(&at.hop[bridges.len()..]));
+            let ends = [
+                SocketAt::egress(&sender_hop_id(&stream.name), &branch),
+                SocketAt::merge_ingress(&receiver_hop_id(&stream.name, &destination.id)),
+            ];
+            let end_sockets = ends
+                .iter()
+                .filter_map(|at| self.by_socket.get_key_value(at));
+            for (_, held) in bridge_sockets.chain(end_sockets) {
+                for (node, port) in held {
+                    ports.entry(node.clone()).or_default().insert(*port);
+                }
             }
         }
         ports
@@ -785,7 +813,7 @@ fn derive_on(
     let mut first_paths = Vec::new();
     let mut single_path = Vec::new();
     let mut relays = RelayCache::new(Arc::clone(&ports.held));
-    ports.yielding = Arc::new(ports.held.held_by(|at| is_second_path_socket(stream, at)));
+    ports.yielding = Arc::new(ports.held.second_path_held(stream));
 
     let mut destinations: Vec<_> = stream.destinations.iter().collect();
     destinations.sort_by(|left, right| left.id.cmp(&right.id));
@@ -1019,28 +1047,6 @@ const SECOND_PATH_SUFFIX: &str = ".2";
 /// bridges.
 fn second_path_branch_id(destination: &str) -> String {
     format!("{destination}{SECOND_PATH_SUFFIX}")
-}
-
-/// Whether `at` is a socket of the second path of one of `stream`'s
-/// destinations that ask for two: its sender egress, one of its bridges, or the
-/// receiver's merge ingress.
-fn is_second_path_socket(stream: &StreamDefinition, at: &SocketAt) -> bool {
-    stream
-        .destinations
-        .iter()
-        .filter(|destination| destination.paths > 1)
-        .any(|destination| {
-            let branch = second_path_branch_id(&destination.id);
-            let bridge = at
-                .hop
-                .strip_prefix(&bridge_hop_id_prefix(&stream.name, &branch))
-                .is_some_and(is_bridge_position);
-            let merge = at.slot == Slot::MergeIngress
-                && at.hop == receiver_hop_id(&stream.name, &destination.id);
-            let egress = at.hop == sender_hop_id(&stream.name)
-                && matches!(&at.slot, Slot::Egress(egress) if *egress == branch);
-            bridge || merge || egress
-        })
 }
 
 /// Whether an egress with `branch_id` carries media to `destination`, over its
@@ -2085,15 +2091,41 @@ fn resolve_station<'a>(
     Ok(ResolvedEnd { node, station })
 }
 
+/// Each hop's first report, by hop id and node.
+#[must_use]
+pub fn reports_by_hop(reports: &[HopStatus]) -> HashMap<(&str, &str), &HopStatus> {
+    let mut by_hop = HashMap::new();
+    for report in reports {
+        by_hop
+            .entry((report.id.as_str(), report.node_id.as_str()))
+            .or_insert(report);
+    }
+    by_hop
+}
+
+/// The reports in `by_hop` for `path`'s hops.
+#[must_use]
+pub fn path_reports<'a>(
+    path: &Path,
+    by_hop: &HashMap<(&str, &str), &'a HopStatus>,
+) -> Vec<&'a HopStatus> {
+    path.hops
+        .iter()
+        .filter_map(|hop| by_hop.get(&(hop.id.as_str(), hop.node_id.as_str())))
+        .copied()
+        .collect()
+}
+
 /// Roll the path's hops up into one end-to-end status via observed hop conditions.
 #[must_use]
-pub fn path_status(path: &Path, observed: &[HopStatus]) -> PathStatus {
+pub fn path_status(path: &Path, observed: &[impl Borrow<HopStatus>]) -> PathStatus {
     let conditions: Vec<Option<HopConditions>> = path
         .hops
         .iter()
         .map(|hop| {
             observed
                 .iter()
+                .map(Borrow::<HopStatus>::borrow)
                 .find(|status| status.id == hop.id && status.node_id == hop.node_id)
                 .and_then(|status| status.conditions(hop))
         })
@@ -2105,7 +2137,7 @@ pub fn path_status(path: &Path, observed: &[HopStatus]) -> PathStatus {
 pub fn destination_path_status(
     path: &Path,
     destination_id: &str,
-    observed: &[HopStatus],
+    observed: &[impl Borrow<HopStatus>],
 ) -> PathStatus {
     let hops: Vec<Option<HopConditions>> = path
         .hops
@@ -2125,6 +2157,7 @@ pub fn destination_path_status(
             Some(
                 observed
                     .iter()
+                    .map(Borrow::<HopStatus>::borrow)
                     .find(|status| status.id == branch.id && status.node_id == branch.node_id)
                     .and_then(|status| {
                         let mut branch_status = status.clone();

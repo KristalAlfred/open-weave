@@ -70,7 +70,8 @@ use weave_core::{
 use keys::{LinkKeys, SecretSource};
 use path::{
     HopIds, HopReports, PlacementError, PortAllocator, SinglePath, derive_stream,
-    destination_nodes, destination_path_status, path_status, shared_hop_id, stream_endpoints,
+    destination_nodes, destination_path_status, path_reports, path_status, reports_by_hop,
+    shared_hop_id, stream_endpoints,
 };
 use store::{
     LeaseTerm, MemStore, PgStore, StateStore, StoreError, StoredStream, StreamSetMemberAction,
@@ -2790,6 +2791,7 @@ fn reconcile(
     let mut flowing = 0usize;
     let mut ports =
         PortAllocator::holding(HopReports::from_reports(&observed.hops, &observed.nodes));
+    let reports = reports_by_hop(&observed.hops);
     let mut hop_ids = HopIds::default();
 
     for stream in &streams {
@@ -2846,7 +2848,8 @@ fn reconcile(
                         .or_default()
                         .push(hop.clone());
                 }
-                let path_status = path_status(&path, &observed.hops);
+                let reported = path_reports(&path, &reports);
+                let path_status = path_status(&path, &reported);
                 let offline_node = nodes
                     .iter()
                     .find(|id| offline.contains(id.as_str()))
@@ -2875,7 +2878,7 @@ fn reconcile(
                     .map(|destination| {
                         let nodes = destination_nodes(&path, &destination.id);
                         let branch_status =
-                            destination_path_status(&path, &destination.id, &observed.hops);
+                            destination_path_status(&path, &destination.id, &reported);
                         let offline_node = nodes
                             .iter()
                             .find(|id| offline.contains(id.as_str()))
