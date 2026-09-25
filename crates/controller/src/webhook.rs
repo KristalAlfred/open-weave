@@ -11,7 +11,7 @@
 //! `GET /nodes` and `GET /status` rather than treating the events as complete.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
 use tokio::sync::mpsc;
@@ -99,7 +99,7 @@ impl Emitter {
         Some(Self {
             tx,
             allowed,
-            seq: AtomicU64::new(0),
+            seq: AtomicU64::new(first_sequence()),
             dropped: AtomicU64::new(0),
             dropping: AtomicBool::new(false),
         })
@@ -155,6 +155,17 @@ impl Emitter {
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
+}
+
+/// Event ids count up from the controller's start time in microseconds, so a
+/// restarted controller sends none of the ids an earlier run sent unless that
+/// run averaged more than one event per microsecond, or the clock went back.
+fn first_sequence() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+        })
 }
 
 /// The configured types, or all of them when none are named.
@@ -390,6 +401,40 @@ pub(crate) mod tests {
         assert_eq!(delivery.event.subject.id(), "guest-1");
         assert!(delivery.event.event_id.starts_with("guest-1-"));
         assert!(!delivery.event.occurred_at.is_empty());
+    }
+
+    fn sequence(event: &Event) -> u64 {
+        event
+            .event_id
+            .rsplit('-')
+            .next()
+            .and_then(|number| number.parse().ok())
+            .expect("an event id ends in a number")
+    }
+
+    #[tokio::test]
+    async fn a_restarted_emitter_sends_ids_the_earlier_one_did_not() {
+        let mut sink = sink(StatusCode::OK).await;
+        let earlier = Emitter::new(config(&sink.url)).unwrap();
+        for _ in 0..3 {
+            earlier.emit(EventType::NodeRegistered, node("guest-1"));
+        }
+        let mut sent = Vec::new();
+        for _ in 0..3 {
+            sent.push(sequence(&sink.next().await.event));
+        }
+        drop(earlier);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let restarted = Emitter::new(config(&sink.url)).unwrap();
+        restarted.emit(EventType::NodeRegistered, node("guest-1"));
+        let first = sequence(&sink.next().await.event);
+
+        assert!(sent.windows(2).all(|pair| pair[0] < pair[1]), "{sent:?}");
+        assert!(
+            sent.iter().all(|earlier| *earlier < first),
+            "{first} repeats or precedes {sent:?}"
+        );
     }
 
     #[tokio::test]

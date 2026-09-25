@@ -593,7 +593,7 @@ or `degraded`, rather than polling `/nodes` and `/status`.
 
 ```json
 {
-  "event_id": "guest-1-3",
+  "event_id": "guest-1-1788520800000003",
   "event_type": "node.registered",
   "occurred_at": "2026-09-04T11:22:33.123456789Z",
   "node": {
@@ -621,12 +621,14 @@ capture, while its dial-only attachment shows it exposes no media listener.
 
 `node` is the registering node's descriptor and nothing else: `endpoints` and
 `hop_status` describe hops rather than the node, and are not part of this
-contract. `event_id` is stable across retries of one delivery, so a receiver can
-deduplicate.
+contract. `event_id` is the node id or stream name followed by a number. It is stable
+across retries of one delivery, so a receiver can deduplicate, and it is not
+reused, including by a restarted controller: the number counts up from the
+controller's start time in microseconds.
 
 ```json
 {
-  "event_id": "basic-7",
+  "event_id": "basic-1790330400000007",
   "event_type": "stream.changed",
   "occurred_at": "2026-09-25T10:15:02.412345678Z",
   "stream": {
