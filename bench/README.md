@@ -2,7 +2,8 @@
 
 A full-system docker-compose stack: the three control-plane services, a
 Postgres, and four Strom media nodes each sitting behind its own emulated
-router, so any node's network can be impaired with `netem`. It starts **empty**
+router, so any node's network can be impaired with `netem`. The Stroms run
+`eyevinntechnology/strom:0.6.10`. It starts **empty**
 — you drive it with stream manifests and watch what the control plane does.
 
 This is where open-weave is verified. If you want to see the system work, start
@@ -259,12 +260,18 @@ attach. It reads `WEAVE_NORTHBOUND_TOKEN` from its environment and fails fast on
 A web page can be a node (`nodes/browser/`). The bench runs one as a headless
 Chromium inside `net_core`, because WebRTC media has to reach Strom's ICE
 candidates on the node subnets and a browser on a macOS host generally has no
-route there. The service is off by default (profile `browser`):
+route there. The Chromium is Debian's `chromium` package, driven by Playwright
+(`Dockerfile.browser`): Playwright's own Chromium and Firefox builds have no
+H264 encoder on arm64, and Strom's `whip_input` takes H264 video only. The
+services are off by default (profile `browser`):
 
 ```sh
-just bench browser-up      # build + start the page as node `browser-bench`
-just bench browser-stream  # apply browser-cam + browser-return, drive both
-just bench browser-down    # detach, delete both streams, stop the page
+just bench browser-up        # build + start the page as node `browser-bench`
+just bench browser-up video  # the same, sending the camera without the microphone
+just bench browser-stream    # apply browser-cam + browser-return, drive both
+just bench browser-2-up      # start a second page as node `browser-bench-2`
+just bench browser-b2b       # the first page's camera to the second page's screen
+just bench browser-down      # detach, delete the browser streams, stop the pages
 ```
 
 `browser-cam` sends the page's camera to node-1 (the planner picks WHIP hosted
@@ -274,16 +281,27 @@ Strom). Both manifests are templates: `browser-stream` fills in the node id.
 The page takes that id from its token, which `docker-compose.yml` sets to
 `browser-bench`'s, so the manifests keep pointing at the page across restarts.
 
-`browser-return` reaches `flowing`. **`browser-cam` does not** — Strom's
-`whip_input` accepts only H264 and the Playwright image's Chromium has no H264
-encoder on arm64, so only Opus audio negotiates and the gateway flow stalls.
-`browser-stream` prints its status rather than waiting on it.
-`backlog/OW-13-browser-cam-no-video.md` has the item and what would fix it.
+Both reach `flowing`. browser-cam's SRT output carries H264 640x480 and AAC;
+with `browser-up video` the page declares video alone, node 1 builds its gateway
+flow without audio, and the output carries H264 only. On Strom 0.6.6 the gateway
+flow never decoded this Chromium's H264 (no video pad linked, the flow stayed
+`Paused`), so the output carried audio alone.
 
-Node 1 advertises `whip-to-srt` and `srt-to-whep` profiles and declares the
-signalling listener bases in `config/adapter-1.yaml`. Southbound allows
-the page's origin with `WEAVE_SOUTHBOUND_CORS_ORIGIN=*`, a development value
-like the tokens.
+A page restart (`docker restart -t 0 ow-browser`) reconnects without a `503`
+when the page sends audio: Strom 0.6.10 displaces the dead session after about
+3 s without media. A video-only page is refused until Strom's inactivity monitor
+frees the slot after about 10 s (`backlog/OW-46-video-only-page-restart-waits.md`).
+
+`browser-b2b` names two pages and no Strom node. Neither page listens, so the
+planner places node 1, the one node declaring WHIP and WHEP listeners, between
+them with its `whip-to-whep` profile: the first
+page sends WHIP to node 1 and the second pulls WHEP from it. It reaches
+`flowing`, with H264 and Opus arriving on the second page.
+
+Node 1 advertises `whip-to-srt`, `srt-to-whep` and `whip-to-whep` profiles and
+declares the signalling listener bases in `config/adapter-1.yaml`. Southbound
+allows the page's origin with `WEAVE_SOUTHBOUND_CORS_ORIGIN=*`, a development
+value like the tokens.
 
 `just bench logs browser` shows one line per 5 s with every hop's conditions and
 negotiated codecs.
@@ -372,13 +390,14 @@ defaults to development values so `just bench up` stays a single command:
 | `WEAVE_SOUTHBOUND_KEY` | `bench-southbound-key-for-local-use-only` | southbound, both controllers, `just bench node-token` |
 | `WEAVE_ADAPTER_{1,2,3,4}_TOKEN` | `strom-node-{1,2,3,4}`'s epoch-0 token under the default key | adapter-1 to adapter-4; the recipes present node 1's for southbound reads |
 | `WEAVE_BROWSER_TOKEN` | `browser-bench`'s epoch-0 token under the default key | the in-bench browser page, which takes its node id from it |
+| `WEAVE_BROWSER_2_TOKEN` | `browser-bench-2`'s epoch-0 token under the default key | the second in-bench page (`browser-2`) |
 | `WEAVE_SRT_KEY_SECRET` | `bench-srt-key-secret-for-local-use-only` | both controllers, to derive the keys of SRT links between nodes |
 | `WEAVE_SOUTHBOUND_MIN_EPOCHS` | unset | southbound, both controllers: `<id>=<epoch>` pairs that revoke a node's older tokens |
 
 `docker-compose.yml` passes each adapter its token as `WEAVE_SOUTHBOUND_TOKEN`.
 The adapter configs leave `node.southbound_token` unset and inherit it. The node
 tokens are written out in `docker-compose.yml` and the bench `justfile`, so
-exporting `WEAVE_SOUTHBOUND_KEY` means exporting the five token variables too;
+exporting `WEAVE_SOUTHBOUND_KEY` means exporting the six token variables too;
 `just bench node-token <id>` prints each one under the exported key, and
 `just bench node-token <id> <epoch>` a token at a later epoch.
 

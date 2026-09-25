@@ -30,7 +30,9 @@ them from the first.
 
 Statuses below were observed on the live bench (controller `/status`), not
 inferred. Media columns use the bundled `producer`/`consumer`; `—` marks a cell
-not measured.
+not measured. Most rows were observed with Strom 0.6.6, before the bench moved
+to 0.6.10; `basic`, `nat-egress`, `browser-cam`, `browser-return` and
+`browser-b2b` were driven again on 0.6.10.
 
 | Manifest | Scenario | No media | With producer | With producer + consumer |
 |----------|----------|----------|---------------|--------------------------|
@@ -50,9 +52,10 @@ not measured.
 | `nat-transit` | NAT'd node-3 → NAT'd node-4, no `via`; the controller bridges via node-1 | — | — | `flowing` |
 | `format-ok` | declared source format the destination accepts | `awaiting_input` | — | `flowing` |
 | `format-mismatch` | 48 kHz source into a 44.1 kHz-only destination | `degraded` | — | `degraded` |
-| `browser-cam` | page camera → node-1 over WHIP, consumer pulls SRT | `degraded` (see note) | — | `degraded` (see note) |
+| `browser-cam` | page camera → node-1 over WHIP, consumer pulls SRT | — | — | `flowing` |
 | `browser-cam-host` | camera of a page on the docker host → node-1 via the `docker-host` network | `degraded` (see note) | — | — |
 | `browser-return` | producer → node-1 → page screen over WHEP | `awaiting_input` | `flowing` | `flowing` |
+| `browser-b2b` | one page's camera → node-1 → another page's screen, WHIP in and WHEP out | `flowing` (see note) | — | — |
 
 Notes:
 
@@ -136,14 +139,12 @@ Notes:
 - **`browser-*`**: templates, `browser-placeholder` is the page's node id and
   `just bench browser-stream` fills it in; applying one directly leaves it
   `pending` on an unregistered node. The media for `browser-cam` comes from the
-  page itself, so its "No media" column is the page with no consumer attached.
-  It is `degraded` because the page's Chromium sends no H264 and Strom's WHIP
-  input accepts nothing else, so only audio arrives — the page's own hop reads
-  `flowing` on both sockets while node-1's reads `idle → flowing` at a few
-  kb/s. `bench/README.md` has the detail and
-  `backlog/OW-13-browser-cam-no-video.md` the item.
-  `browser-return` is the mirror and flows end to end (VP9 + Opus into the page
-  at ~8 Mb/s).
+  page itself; with the consumer attached it reads `flowing`, and `ffprobe` on
+  the SRT output shows H264 640x480 and AAC. `browser-return` is the mirror and
+  flows end to end (H264 + Opus into the page). `browser-b2b` has a second
+  placeholder, `viewer-placeholder`, for the page that plays it, and
+  `just bench browser-b2b` fills in both. It needs no producer or consumer: both
+  ends are pages, so its "No media" column is the two pages running.
 - **`browser-cam-host`**: `browser-cam` for a page in a browser on the docker
   host, which `just bench host-cam <seat>` fills in. Its destination names node
   1's `docker-host` attachment, so the page is told to signal at `localhost:28080`

@@ -2,9 +2,9 @@
 id: OW-13
 title: "browser-cam carries audio and no video"
 type: bug
-status: todo
+status: done
 depends_on: []
-assignee:
+assignee: claude-webrtc
 ---
 
 ## Evidence
@@ -28,7 +28,7 @@ Strom.
 
 ## Done when
 
-- [ ] `just bench browser-stream` reaches `flowing` on `browser-cam` with video
+- [x] `just bench browser-stream` reaches `flowing` on `browser-cam` with video
       in the SRT output.
 
 ## Easy to break
@@ -40,3 +40,16 @@ Strom.
 ## Log
 
 - 2026-09-25: moved from `BACKLOG.md` into its own file.
+- 2026-09-25: started by claude-webrtc: Debian trixie's `chromium` in the bench
+  browser image, driven by Playwright through `executablePath`.
+- 2026-09-25: on the bench with Strom 0.6.6 (first session, same branch) the page
+  sent H264 and Opus, Strom logged `Pad video_0` but never linked a video
+  decoder, the gateway flow stayed `Paused`, and `ffprobe` on the SRT output saw
+  AAC only. So the fix also needs the Strom 0.6.10 pin from OW-15.
+- 2026-09-25: ticked. Bench run on main at 7b2ce9d with this commit's bench
+  changes, Strom 0.6.10, browser image from `bench/Dockerfile.browser` (Debian
+  `chromium` 153). `just bench browser-stream` ended with `browser-return:
+  flowing` and `browser-cam: flowing`. `ffprobe` from inside `ow-consumer` on
+  the SRT output: `h264` 640x480 and `aac` 48000 Hz 2 ch. `bench/justfile` now
+  waits on `browser-cam`; `bench/README.md` and `bench/manifests/README.md` say
+  what it reaches. Bench only.

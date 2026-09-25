@@ -1,0 +1,11 @@
+# One page's camera to another page's screen: the planner relays through node-1's whip-to-whep.
+# Templated: browser-placeholder is the sending page's id and viewer-placeholder the playing page's, filled in by `just bench browser-b2b`.
+name: browser-b2b
+enabled: true
+source:
+  device:
+    node: browser-placeholder
+destinations:
+  - id: display
+    device:
+      node: viewer-placeholder

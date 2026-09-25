@@ -351,7 +351,7 @@ services:
 
   # --- node 1 (net_node1) ---
   strom-1:
-    image: eyevinntechnology/strom:latest
+    image: eyevinntechnology/strom:0.6.10
     container_name: ow-strom-1
     environment:
       STROM_PORT: "8080"
@@ -395,7 +395,7 @@ services:
 
   # --- node 2 (net_node2) ---
   strom-2:
-    image: eyevinntechnology/strom:latest
+    image: eyevinntechnology/strom:0.6.10
     container_name: ow-strom-2
     environment:
       STROM_PORT: "8080"
@@ -439,7 +439,7 @@ services:
 
   # --- node 3 (net_node3, behind NAT) ---
   strom-3:
-    image: eyevinntechnology/strom:latest
+    image: eyevinntechnology/strom:0.6.10
     container_name: ow-strom-3
     environment:
       STROM_PORT: "8080"
@@ -486,7 +486,7 @@ services:
 
   # --- node 4 (net_node4, behind its own NAT) ---
   strom-4:
-    image: eyevinntechnology/strom:latest
+    image: eyevinntechnology/strom:0.6.10
     container_name: ow-strom-4
     environment:
       STROM_PORT: "8080"
@@ -546,6 +546,8 @@ services:
       WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_BROWSER_TOKEN:-browser-bench.0.ed7971623b06be894b581ccca99662bdb3983d232e8737a2c3e5a46455b00540}
       # check.mjs polls southbound from Node, which reads this.
       NODE_EXTRA_CA_CERTS: /tls/ca.pem
+      # `video` sends the camera without the microphone (`just bench browser-up video`).
+      WEAVE_BROWSER_MEDIA: ${WEAVE_BROWSER_MEDIA:-}
     volumes:
       - ../nodes/browser:/work:ro
       - ./tls/public:/tls:ro
@@ -563,6 +565,39 @@ services:
     # which certutil fills before the page is opened. The page takes its node id
     # from its token, so the browser manifests keep naming the same node across
     # restarts; the `browser-id` recipe reads the id off the same default token.
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        db="sql:$$HOME/.pki/nssdb"
+        mkdir -p "$$HOME/.pki/nssdb"
+        [ -f "$$HOME/.pki/nssdb/cert9.db" ] || certutil -d "$$db" -N --empty-password
+        certutil -d "$$db" -A -t C,, -n open-weave-bench-ca -i /tls/ca.pem
+        exec node /work/check.mjs --serve 8000 --stay
+
+  # A second page, node `browser-bench-2`, for a stream from one page's camera to
+  # another page's screen (`just bench browser-b2b`). Started by `browser-2-up`.
+  browser-2:
+    image: open-weave-bench-browser:local
+    container_name: ow-browser-2
+    profiles: ["browser"]
+    restart: "no"
+    shm_size: "1gb"
+    environment:
+      WEAVE_SOUTHBOUND_URL: https://10.97.25.25:8443
+      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_BROWSER_2_TOKEN:-browser-bench-2.0.01b7733061b2fec1c70751c03fd9c027e962589084f12bbb6cee4c9a9e65ea82}
+      NODE_EXTRA_CA_CERTS: /tls/ca.pem
+    volumes:
+      - ../nodes/browser:/work:ro
+      - ./tls/public:/tls:ro
+      - ../crates/core/src/lib.rs:/crates/core/src/lib.rs:ro
+    networks:
+      net_core:
+        ipv4_address: 10.97.25.41
+    depends_on:
+      tls-certs:
+        condition: service_completed_successfully
     command:
       - sh
       - -c

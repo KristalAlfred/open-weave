@@ -15,7 +15,9 @@ in the root README).
 The page needs a secure context for the camera: serve it over `https`, or over
 `http` from `localhost` / `127.0.0.1`; on any other `http` origin the sender hop
 fails with "no camera access". Add `&media=video` to send the camera without a
-microphone. A capture device the OS never answers for (macOS without microphone
+microphone. The `camera-to-whip` profile declares the tracks the page sends
+(`tracks: [video]`, or `[audio, video]` by default), so the WHIP end builds a
+flow for those tracks only. A capture device the OS never answers for (macOS without microphone
 permission for the browser) leaves `getUserMedia` pending, and a pending request
 blocks every later one in the page, so the choice is made up front rather than
 by falling back.
@@ -60,9 +62,12 @@ machine running the script. Against a southbound behind TLS with a private CA,
 the script needs `NODE_EXTRA_CA_CERTS` for its own polling and Chromium needs the
 CA in its trust store; the bench does both (`bench/README.md`, "TLS"). `--stay` keeps the browser running afterwards, which
 is how the bench hosts a node; `--headed` shows the window; `--video-only`
-passes `media=video`; `--node ID` passes `node=ID`. The script launches
-Playwright's full Chromium (`channel: "chromium"`), because the headless shell
-never answers `getUserMedia` for the fake devices.
+(or `WEAVE_BROWSER_MEDIA=video`) passes `media=video`; `--node ID` passes
+`node=ID`. The script launches Playwright's full Chromium (`channel:
+"chromium"`), because the headless shell never answers `getUserMedia` for the
+fake devices. `--executable PATH` (or `WEAVE_BROWSER_EXECUTABLE`) launches that
+Chromium binary instead; the bench image points it at Debian's `chromium`, which
+encodes H264 on arm64 where Playwright's build does not.
 
 The page carries its own copies of `weave_core::PROTOCOL_VERSION` and
 `weave_core::DEVICE_TRANSPORT`, so

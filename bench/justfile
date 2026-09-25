@@ -34,6 +34,8 @@ sb_auth  := "-H 'Authorization: Bearer " + sb_token + "'"
 # keep naming it across restarts.
 browser_token := env("WEAVE_BROWSER_TOKEN", "browser-bench.0.ed7971623b06be894b581ccca99662bdb3983d232e8737a2c3e5a46455b00540")
 browser_node  := replace_regex(browser_token, '\..*', '')
+browser_2_token := env("WEAVE_BROWSER_2_TOKEN", "browser-bench-2.0.01b7733061b2fec1c70751c03fd9c027e962589084f12bbb6cee4c9a9e65ea82")
+browser_2_node  := replace_regex(browser_2_token, '\..*', '')
 
 # Port `just hook-sink` listens on. docker-compose.yml points the controller's
 # WEAVE_WEBHOOK_URL at this port on host.docker.internal.
@@ -479,26 +481,47 @@ consumer-2-down:
     {{compose}} --profile consumer rm -sf consumer-2
 
 # Build and start the headless browser node inside the bench, then print its id.
+# `just bench browser-up video` sends the camera alone, with no microphone.
 [doc("Start the in-bench browser node (profile `browser`) and print its node id.")]
 [group("browser")]
-browser-up:
-    {{compose}} --profile browser up -d --build browser
+browser-up media="":
+    WEAVE_BROWSER_MEDIA={{media}} {{compose}} --profile browser up -d --build browser
     @just browser-id
 
-# Wait for the browser node to appear in southbound's registry, then echo it.
+# Wait for a browser node (default: the in-bench page) to register, then echo it.
 [group("browser")]
-browser-id:
+browser-id node=browser_node svc="browser":
     #!/usr/bin/env bash
     set -euo pipefail
     for _ in $(seq 1 30); do
         got="$(curl -sf {{tls}} {{sb_auth}} {{sb}}/nodes \
-            | jq -r --arg id '{{browser_node}}' '.[] | select(.id==$id) | .id' 2>/dev/null || true)"
+            | jq -r --arg id '{{node}}' '.[] | select(.id==$id) | .id' 2>/dev/null || true)"
         if [ -n "$got" ]; then echo "$got"; exit 0; fi
         sleep 2
     done
-    echo "{{browser_node}} has not registered with southbound;" \
-         "'just bench logs browser' shows why, 'just bench status' lists the nodes there are" >&2
+    echo "{{node}} has not registered with southbound;" \
+         "'just bench logs {{svc}}' shows why, 'just bench status' lists the nodes there are" >&2
     exit 1
+
+# Start the second in-bench page, node `browser-bench-2`, then print its id.
+[group("browser")]
+browser-2-up:
+    {{compose}} --profile browser up -d browser-2
+    @just browser-id {{browser_2_node}} browser-2
+
+# Apply browser-b2b: the first page's camera to the second page's screen, relayed
+# through node 1's `whip-to-whep`. Needs both pages up.
+[doc("Apply browser-b2b between the two in-bench pages and wait for `flowing`.")]
+[group("browser")]
+browser-b2b:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
+    sed -e "s/browser-placeholder/$(just browser-id)/" \
+        -e "s/viewer-placeholder/$(just browser-id {{browser_2_node}} browser-2)/" \
+        {{manifests}}/browser-b2b.yaml > "$tmp"
+    WEAVE_NORTHBOUND_TOKEN={{nb_token}} {{cli}} apply -f "$tmp"
+    just stream-wait browser-b2b flowing
 
 # Apply browser-cam and browser-return for the page and drive both: the camera
 # stream's SRT output is pulled by the consumer, the return stream's SRT ingress
@@ -518,21 +541,17 @@ browser-stream id="":
     just consumer-up browser-cam
     just producer-up browser-return
     just stream-wait browser-return flowing
-    # browser-cam never reaches `flowing` here and is not waited on: the page's
-    # Chromium sends no H264, Strom's whip_input accepts nothing else, and its
-    # inactivity monitor drops the session every ~20 s, so the stream cycles
-    # `degraded` and `pending` (backlog/OW-13).
-    printf 'browser-cam: '
-    curl -sf {{tls}} {{nb_auth}} {{nb}}/status | jq -r '.streams[] | select(.name=="browser-cam") | .status'
+    just stream-wait browser-cam flowing
 
-# Detach the media endpoints, delete both browser streams, and stop the page.
+# Detach the media endpoints, delete the browser streams, and stop the pages.
 [group("browser")]
 browser-down:
     -@just consumer-down
     -@just producer-down
     -@just stream-rm browser-cam
     -@just stream-rm browser-return
-    -@{{compose}} --profile browser rm -sf browser
+    -@just stream-rm browser-b2b
+    -@{{compose}} --profile browser rm -sf browser browser-2
 
 # Serve the page for a browser on this host. It needs a localhost origin for the
 # camera, and southbound's CORS default of `*` lets it register from there. It

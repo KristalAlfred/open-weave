@@ -1,18 +1,23 @@
 # syntax=docker/dockerfile:1
-# The bench's browser node: Playwright's image (Chromium and its fake-device
-# support) plus the `playwright` package from nodes/browser, which the image
-# does not ship, and certutil, which adds the bench CA to Chromium's NSS
-# database at start.
+# The bench's browser node: Debian's Chromium, driven by the `playwright`
+# package from nodes/browser, and certutil, which adds the bench CA to
+# Chromium's NSS database at start. Playwright's own Chromium and Firefox builds
+# have no H264 encoder on arm64, and Strom's whip_input takes H264 video only;
+# Debian's build encodes it.
 #
 # The package installs at / because docker-compose.yml mounts nodes/browser at
 # /work read-only at run time, hiding anything the image writes there, and
 # /node_modules is the next directory Node's resolver looks in for
-# `import("playwright")` from /work/check.mjs. The browsers it would otherwise
-# download are already in the image, so its install script is skipped.
-FROM mcr.microsoft.com/playwright:v1.62.1-noble
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends libnss3-tools && \
-    rm -rf /var/lib/apt/lists/*
+# `import("playwright")` from /work/check.mjs. Its install script, which
+# downloads Playwright's browsers, is skipped.
+FROM node:24-alpine AS deps
 COPY nodes/browser/package.json nodes/browser/pnpm-lock.yaml /
 RUN corepack enable pnpm && pnpm install --dir / --frozen-lockfile --ignore-scripts
+
+FROM debian:trixie
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends chromium nodejs libnss3-tools \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=deps /node_modules /node_modules
+ENV WEAVE_BROWSER_EXECUTABLE=/usr/bin/chromium
 WORKDIR /work

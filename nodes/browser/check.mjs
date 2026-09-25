@@ -3,10 +3,15 @@
 //
 //   node check.mjs --southbound http://host:8081 --token <token> [--page URL]
 //                  [--serve PORT] [--stay] [--headed] [--video-only] [--node ID]
+//                  [--executable PATH]
 //   node check.mjs --check-only
 //
-// --video-only asks the page for the camera alone, for hosts where the fake
-// microphone never answers (macOS without microphone permission for the browser).
+// --video-only (or WEAVE_BROWSER_MEDIA=video) asks the page for the camera
+// alone, for hosts where the fake microphone never answers (macOS without
+// microphone permission for the browser) and for a sender with no audio.
+//
+// --executable (or WEAVE_BROWSER_EXECUTABLE) launches that Chromium binary
+// instead of Playwright's own build.
 //
 // With --serve the script hosts this directory itself on loopback and opens it
 // from http://127.0.0.1:PORT/ (or --page when given, for a different origin).
@@ -72,8 +77,9 @@ const { chromium } = await import("playwright");
 
 // The full Chromium build, not the headless shell: only the former answers
 // getUserMedia for the fake devices.
+const executablePath = args.executable || process.env.WEAVE_BROWSER_EXECUTABLE;
 const browser = await chromium.launch({
-  channel: "chromium",
+  ...(executablePath ? { executablePath } : { channel: "chromium" }),
   headless: !args.headed,
   args: [
     "--use-fake-device-for-media-stream",
@@ -85,7 +91,8 @@ const context = await browser.newContext({ permissions: ["camera", "microphone"]
 const tab = await context.newPage();
 tab.on("console", message => console.log(`[page] ${message.text()}`));
 tab.on("pageerror", error => console.log(`[page error] ${error.message}`));
-const media = args["video-only"] ? "&media=video" : "";
+const videoOnly = args["video-only"] || process.env.WEAVE_BROWSER_MEDIA === "video";
+const media = videoOnly ? "&media=video" : "";
 const pinned = args.node ? `&node=${encodeURIComponent(args.node)}` : "";
 // GET /nodes still lists a node an earlier run registered, so this run counts
 // only a registration its own page got accepted.
