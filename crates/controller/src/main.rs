@@ -1054,6 +1054,9 @@ fn update_view_generation(view: &mut ControllerView, stored: &StoredStream) {
     }
 }
 
+/// The view helpers below run while the caller holds the `streams` write lock,
+/// so no request or tick sees a stream change before the view shows it. Taking
+/// `streams` before `view` is the order a tick takes them in.
 async fn update_pending_generation(state: &AppState, stored: &StoredStream) {
     let mut view = state.view.write().await;
     update_view_generation(&mut view, stored);
@@ -1722,10 +1725,10 @@ async fn put_stream_set(
             streams.insert(stream.spec.name.clone(), stream.clone());
         }
         stream_sets.insert(owner.clone(), write.stream_set.revision);
+        update_stream_set_view(&state, &write).await;
         write
     };
 
-    update_stream_set_view(&state, &write).await;
     let response = StreamSetAccepted {
         status: AcceptedState::Accepted,
         owner: owner.clone(),
@@ -1881,9 +1884,9 @@ async fn submit_stream(
             }
         };
         streams.insert(name.clone(), stored.clone());
+        update_pending_generation(&state, &stored).await;
         (stored, changed)
     };
-    update_pending_generation(&state, &stored).await;
     tracing::info!(%name, "stream accepted");
     with_etag(
         (
@@ -2017,8 +2020,8 @@ async fn delete_stream(
         }
     }
     streams.remove(&name);
-    drop(streams);
     remove_stream_view(&state, &name).await;
+    drop(streams);
     tracing::info!(%name, "stream deleted");
     StatusCode::NO_CONTENT.into_response()
 }
@@ -5600,6 +5603,63 @@ mod tests {
             ["relay-a"],
             "a relay that stops heartbeating after the restart still loses the bridge"
         );
+    }
+
+    /// While a write waits for the view, no other request may read the streams
+    /// it changed: a second write or a tick could otherwise land in between.
+    #[tokio::test]
+    async fn a_stream_write_holds_the_streams_until_the_view_shows_it() {
+        let (state, mem) = mem_state();
+        let app = open_router(state.clone());
+        let set = json!({ "streams": [serde_json::to_value(stream("owned")).unwrap()] });
+        for (label, method, uri, body, headers, writes) in [
+            (
+                "create",
+                "POST",
+                "/streams",
+                Some(serde_json::to_value(stream("basic")).unwrap()),
+                vec![("if-none-match", "*")],
+                1,
+            ),
+            (
+                "stream set",
+                "PUT",
+                "/stream-sets/production",
+                Some(set),
+                vec![("if-none-match", "*")],
+                1,
+            ),
+            (
+                "delete",
+                "DELETE",
+                "/streams/basic",
+                None,
+                vec![("if-match", "\"revision-1\"")],
+                1,
+            ),
+        ] {
+            let view = state.view.write().await;
+            let before = mem.upsert_stream_calls() + mem.delete_stream_calls();
+            let request = tokio::spawn({
+                let app = app.clone();
+                async move { send_with_headers(&app, method, uri, body, &headers).await }
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if label != "stream set" {
+                assert_eq!(
+                    mem.upsert_stream_calls() + mem.delete_stream_calls(),
+                    before + writes,
+                    "{label}: the store write has happened"
+                );
+            }
+            assert!(
+                state.streams.try_read().is_err(),
+                "{label}: the streams are readable before the view shows the write"
+            );
+            drop(view);
+            let (status, _, body) = request.await.unwrap();
+            assert!(status.is_success(), "{label}: {status} {body}");
+        }
     }
 
     #[tokio::test]
