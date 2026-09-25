@@ -87,9 +87,26 @@ tab.on("console", message => console.log(`[page] ${message.text()}`));
 tab.on("pageerror", error => console.log(`[page error] ${error.message}`));
 const media = args["video-only"] ? "&media=video" : "";
 const pinned = args.node ? `&node=${encodeURIComponent(args.node)}` : "";
+// GET /nodes still lists a node an earlier run registered, so this run counts
+// only a registration its own page got accepted.
+const registeredHere = tab
+  .waitForResponse(
+    response =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname.endsWith("/nodes/register") &&
+      response.ok(),
+    { timeout: 30_000 },
+  )
+  .then(() => true, () => false);
 await tab.goto(`${page}#southbound=${encodeURIComponent(southbound)}&token=${encodeURIComponent(token)}${media}${pinned}`);
 const nodeId = await tab.locator("#node-id").textContent();
 console.log(`page open as ${nodeId}`);
+
+if (!(await registeredHere)) {
+  console.error(`${nodeId}: southbound accepted no registration from this page within 30s`);
+  await browser.close();
+  process.exit(1);
+}
 
 const deadline = Date.now() + 30_000;
 let seen = false;

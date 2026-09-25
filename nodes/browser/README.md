@@ -46,8 +46,9 @@ The page shows manifests naming its node id; copy one, change the Strom node,
 and apply it. Southbound must allow the page's origin
 (`WEAVE_SOUTHBOUND_CORS_ORIGIN`, see the root README).
 
-`check.mjs` drives the page with Playwright and a fake camera and waits for the
-node to appear in `GET /nodes`:
+`check.mjs` drives the page with Playwright and a fake camera. It waits until
+southbound accepts a registration from that page, then for the node to appear in
+`GET /nodes`; an entry an earlier run left there does not count:
 
 ```sh
 pnpm install
