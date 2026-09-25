@@ -3123,6 +3123,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_json_has_a_structured_error() {
+        let (state, mem) = mem_state();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/streams")
+            .header("content-type", "application/json")
+            .body(Body::from("{"))
+            .unwrap();
+
+        let response = open_router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let error: ApiError = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, ApiErrorCode::InvalidJson);
+        assert_eq!(error.details[0].field, "body");
+        assert_eq!(mem.upsert_stream_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_resource_paths_are_rejected() {
+        let (state, mem) = mem_state();
+        let app = open_router(state);
+
+        for (method, uri, body) in [
+            ("GET", "/streams/foo%3Fignored", None),
+            ("DELETE", "/streams/foo%3Fignored", None),
+            ("GET", "/streams/foo%3Fignored/endpoints", None),
+            (
+                "POST",
+                "/nodes/foo%3Fignored/heartbeat",
+                Some(json!({ "node_id": "foo?ignored", "status": "ready" })),
+            ),
+            ("GET", "/nodes/foo%3Fignored/desired", None),
+        ] {
+            let (status, _) = send(&app, method, uri, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}");
+        }
+
+        assert_eq!(mem.delete_stream_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn ui_is_served_at_root_and_ui() {
+        let (state, _mem) = mem_state();
+        let app = open_router(state);
+        for uri in ["/", "/ui"] {
+            let request = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let content_type = response.headers()["content-type"].to_str().unwrap();
+            assert!(content_type.starts_with("text/html"), "{content_type}");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(String::from_utf8_lossy(&bytes).contains("open-weave"));
+        }
+    }
+
+    pub(super) const NORTH_ROUTES: [(&str, &str); 9] = [
+        ("GET", "/streams"),
+        ("POST", "/streams"),
+        ("POST", "/stream-plans"),
+        ("GET", "/streams/basic"),
+        ("DELETE", "/streams/basic"),
+        ("GET", "/streams/basic/endpoints"),
+        ("GET", "/stream-sets"),
+        ("GET", "/stream-sets/studio-a"),
+        ("PUT", "/stream-sets/studio-a"),
+    ];
+
+    pub(super) const SOUTH_ROUTES: [(&str, &str); 5] = [
+        ("POST", "/nodes/register"),
+        ("POST", "/nodes/strom-node-1/heartbeat"),
+        ("GET", "/nodes/strom-node-1/desired"),
+        ("GET", "/endpoints"),
+        ("GET", "/state"),
+    ];
+
+    pub(super) const SHARED_READ_ROUTES: [(&str, &str); 1] = [("GET", "/nodes")];
+
+    /// Version-prefixed paths are not aliases for the current contract.
+    #[tokio::test]
+    async fn versioned_api_paths_are_not_served() {
+        let (state, _mem) = mem_state();
+        let app = open_router(state);
+        for retired_prefix in ["/v1", "/v2", "/v3", "/v4", "/v5", "/v6"] {
+            for (method, uri) in NORTH_ROUTES
+                .iter()
+                .chain(&SOUTH_ROUTES)
+                .chain(&SHARED_READ_ROUTES)
+            {
+                let retired = format!("{retired_prefix}{uri}");
+                let (status, _) = send(&app, method, &retired, None).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{retired} must stay retired");
+            }
+            let (status, _) = send(&app, "GET", &format!("{retired_prefix}/status"), None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
     async fn status_distinguishes_current_and_observed_generations() {
         let (state, _mem) = mem_state();
         let app = open_router(state.clone());

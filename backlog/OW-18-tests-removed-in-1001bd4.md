@@ -187,3 +187,8 @@ Status section and the header of `bench/manifests/nat-relay.yaml` still cite.
   destinations are now `preview` and `studio` rather than a duplicated entry,
   and the sender's egresses are asserted by those branch ids. All pass; unit
   tests only.
+- 2026-09-25: `crates/controller/src/main.rs`, HTTP: 4 of 4 back
+  (`invalid_json_has_a_structured_error`, `invalid_resource_paths_are_rejected`,
+  `ui_is_served_at_root_and_ui`, `versioned_api_paths_are_not_served`), with
+  the route lists the last one walks. No changes to their assertions. All
+  pass; unit tests only.
