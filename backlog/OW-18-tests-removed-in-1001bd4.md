@@ -125,3 +125,30 @@ Status section and the header of `bench/manifests/nat-relay.yaml` still cite.
   is no `relay` flag and every hop, pinned or not, needs a matching hop profile
   in `select_profile`. No ported test failed. Checked with
   `cargo test -p weave-controller path::tests`, unit tests only.
+- 2026-09-25: `crates/controller/src/main.rs` not started by claude-tests: it
+  waits on OW-1 (`in-progress`) and OW-8 (`todo`). At `337cf40`, 28 of its 43
+  removed tests are still missing. Auth: `api_routes_reject_missing_and_wrong_tokens`,
+  `dashboard_and_health_stay_open`, `each_surface_accepts_its_own_token`,
+  `each_surface_rejects_the_other_surfaces_token`,
+  `node_inventory_accepts_either_surface_token`. Streams and stream sets:
+  `post_stream_then_get_returns_it_and_writes_through`,
+  `delete_stream_removes_and_writes_through`,
+  `invalid_stream_is_rejected_before_persistence`,
+  `stream_writes_require_and_enforce_etag_preconditions`,
+  `owned_streams_reject_single_resource_mutations`,
+  `stream_set_apply_retains_noops_and_prunes_atomically`,
+  `stream_set_conflicts_do_not_partially_apply`,
+  `hydration_refuses_invalid_persisted_streams`. Plans:
+  `plan_allocates_ports_alongside_existing_streams`,
+  `plan_distinguishes_unplaced_and_disabled_streams`,
+  `plan_places_without_changing_desired_state`. Registration:
+  `registration_with_an_incompatible_protocol_version_is_rejected`,
+  `registration_with_an_invalid_node_id_is_rejected`,
+  `node_cannot_report_another_nodes_hop_status`,
+  `a_browser_endpoint_is_stored_verbatim_and_never_dialled`. Views:
+  `endpoints_route_pending_then_placed`,
+  `reconcile_reports_why_a_stream_is_pending`,
+  `view_before_first_tick_has_no_report`,
+  `view_joins_desired_hops_with_reported_status`. HTTP:
+  `invalid_json_has_a_structured_error`, `invalid_resource_paths_are_rejected`,
+  `ui_is_served_at_root_and_ui`, `versioned_api_paths_are_not_served`.
