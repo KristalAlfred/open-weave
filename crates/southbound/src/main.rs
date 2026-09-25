@@ -282,15 +282,11 @@ fn invalid_node_id(error: weave_core::ResourceIdError) -> Response {
 
 fn relay(answer: Answer) -> Response {
     let status = StatusCode::from_u16(answer.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let content_type = answer
-        .headers
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
     let mut out = (status, answer.body).into_response();
-    if let Some(value) = content_type.and_then(|ct| ct.parse().ok()) {
-        out.headers_mut()
-            .insert(reqwest::header::CONTENT_TYPE, value);
+    for name in [header::CONTENT_TYPE, header::WWW_AUTHENTICATE] {
+        if let Some(value) = answer.headers.get(&name) {
+            out.headers_mut().insert(name, value.clone());
+        }
     }
     out
 }
@@ -632,6 +628,36 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{addr}")
+    }
+
+    /// A controller refusing every token, as one with a higher minimum epoch
+    /// than southbound's does.
+    async fn refusing_controller() -> String {
+        let app = Router::new().fallback(|| async { auth::unauthorized() });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_controller_refusal_keeps_its_bearer_challenge() {
+        let app = guarded_app(refusing_controller().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/nodes/strom-node-1/desired")
+                    .header("authorization", bearer("strom-node-1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()[header::WWW_AUTHENTICATE], "Bearer");
+        assert_eq!(body_json(response).await["code"], "unauthorized");
     }
 
     #[tokio::test]
