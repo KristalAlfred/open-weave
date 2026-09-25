@@ -163,3 +163,11 @@ Status section and the header of `bench/manifests/nat-relay.yaml` still cite.
   `hydration_refuses_invalid_persisted_streams`). The only change is a
   `network` on the invalid stream's remote. All pass; `cargo test -p
   weave-controller`, unit tests only.
+- 2026-09-25: `crates/controller/src/main.rs`, plans: 3 of 3 back
+  (`plan_places_without_changing_desired_state`,
+  `plan_distinguishes_unplaced_and_disabled_streams`,
+  `plan_allocates_ports_alongside_existing_streams`). The old port test gave
+  each node one port, so the preview was unplaceable with or without the
+  existing stream. The ported test sizes node 2 for one receiver, first checks
+  the preview alone is `placed`, and then that it is `unplaced` with "no free
+  port" once `existing` is applied. All pass; unit tests only.

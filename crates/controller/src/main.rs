@@ -3071,6 +3071,147 @@ mod tests {
         assert!(listed.is_empty());
     }
 
+    fn with_port_range(
+        mut registration: NodeRegistration,
+        start: u16,
+        end: u16,
+    ) -> NodeRegistration {
+        registration.node.topology.attachments[0]
+            .listeners
+            .srt
+            .as_mut()
+            .expect("an SRT listener")
+            .port_range = PortRange { start, end };
+        registration
+    }
+
+    #[tokio::test]
+    async fn plan_places_without_changing_desired_state() {
+        let (state, mem) = mem_state();
+        let app = open_router(state.clone());
+        for registration in [
+            node_registration("strom-node-1", "172.26.0.10"),
+            node_registration("strom-node-2", "172.27.0.10"),
+        ] {
+            let (status, _) = send(
+                &app,
+                "POST",
+                "/nodes/register",
+                Some(serde_json::to_value(registration).unwrap()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+        }
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/stream-plans",
+            Some(serde_json::to_value(stream("preview")).unwrap()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let plan: StreamPlan = serde_json::from_value(body).unwrap();
+        assert_eq!(plan.status, PlanStatus::Placed);
+        assert_eq!(plan.nodes, ["strom-node-1", "strom-node-2"]);
+        assert_eq!(plan.hops.len(), 2);
+        assert!(plan.endpoints.is_some());
+        assert_eq!(mem.upsert_stream_calls(), 0);
+        assert!(state.streams.read().await.is_empty());
+        assert!(state.desired.read().await.is_empty());
+        assert!(state.view.read().await.streams.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_distinguishes_unplaced_and_disabled_streams() {
+        let (state, mem) = mem_state();
+        let app = open_router(state);
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/stream-plans",
+            Some(serde_json::to_value(stream("unplaced")).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let plan: StreamPlan = serde_json::from_value(body).unwrap();
+        assert_eq!(plan.status, PlanStatus::Unplaced);
+        assert!(plan.hops.is_empty());
+        assert!(plan.reason.unwrap().contains("not registered"));
+
+        let mut disabled = stream("disabled");
+        disabled.enabled = false;
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/stream-plans",
+            Some(serde_json::to_value(disabled).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let plan: StreamPlan = serde_json::from_value(body).unwrap();
+        assert_eq!(plan.status, PlanStatus::Disabled);
+        assert!(plan.hops.is_empty());
+        assert!(plan.reason.is_none());
+        assert_eq!(mem.upsert_stream_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn plan_allocates_ports_alongside_existing_streams() {
+        let (state, mem) = mem_state();
+        let app = open_router(state);
+        // Node 1 has room for one sender ingress; node 2 for one receiver's
+        // ingress and consumer port. One stream fits and a second does not.
+        for registration in [
+            with_port_range(node_registration("strom-node-1", "172.26.0.10"), 7000, 7000),
+            with_port_range(node_registration("strom-node-2", "172.27.0.10"), 7000, 7001),
+        ] {
+            send(
+                &app,
+                "POST",
+                "/nodes/register",
+                Some(serde_json::to_value(registration).unwrap()),
+            )
+            .await;
+        }
+        let (_, body) = send(
+            &app,
+            "POST",
+            "/stream-plans",
+            Some(serde_json::to_value(stream("preview")).unwrap()),
+        )
+        .await;
+        let plan: StreamPlan = serde_json::from_value(body).unwrap();
+        assert_eq!(plan.status, PlanStatus::Placed, "alone, the preview fits");
+
+        send(
+            &app,
+            "POST",
+            "/streams",
+            Some(serde_json::to_value(stream("existing")).unwrap()),
+        )
+        .await;
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/stream-plans",
+            Some(serde_json::to_value(stream("preview")).unwrap()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let plan: StreamPlan = serde_json::from_value(body).unwrap();
+        assert_eq!(plan.status, PlanStatus::Unplaced);
+        assert!(plan.reason.unwrap().contains("no free port"));
+        assert_eq!(mem.upsert_stream_calls(), 1, "plan did not write a stream");
+        let (_, body) = send(&app, "GET", "/streams", None).await;
+        let streams: Vec<StreamResource> = serde_json::from_value(body).unwrap();
+        assert_eq!(streams[0].spec, stream("existing"));
+    }
+
     #[tokio::test]
     async fn hydration_refuses_invalid_persisted_streams() {
         let mem = Arc::new(MemStore::new());
