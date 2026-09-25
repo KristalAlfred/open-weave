@@ -4,7 +4,7 @@
 # adapter-2.yaml.
 node:
   id: strom-node-2
-  southbound_url: http://10.97.25.21:8081
+  southbound_url: https://10.97.25.25:8443
   listen: 0.0.0.0:8091
   public_endpoint: http://10.97.27.11:8091
   topology:

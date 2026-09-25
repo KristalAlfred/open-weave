@@ -205,6 +205,42 @@ services:
       retries: 10
       start_period: 5s
 
+  # --- TLS (net_core) ---
+  # nginx terminates TLS for northbound and southbound; the services behind it
+  # serve plain HTTP, and their plaintext ports stay published. The adapters and
+  # the browser page dial southbound through it and trust the bench CA that
+  # tls-certs generates into ./tls.
+  tls-certs:
+    image: nicolaka/netshoot:latest
+    container_name: ow-tls-certs
+    restart: "no"
+    network_mode: none
+    volumes:
+      - ./tls:/tls
+      - ./scripts/tls-certs.sh:/tls-certs.sh:ro
+    entrypoint: ["sh", "/tls-certs.sh", "/tls"]
+
+  tls:
+    image: nginx:alpine
+    container_name: ow-tls
+    restart: unless-stopped
+    volumes:
+      - ./config/tls-proxy.conf:/etc/nginx/nginx.conf:ro
+      - ./tls/server:/tls:ro
+    ports:
+      - "29443:9443"
+      - "29444:8443"
+    networks:
+      net_core:
+        ipv4_address: 10.97.25.25
+    depends_on:
+      tls-certs:
+        condition: service_completed_successfully
+      northbound:
+        condition: service_healthy
+      southbound:
+        condition: service_healthy
+
   # Routes into the node subnets live in each service's netns and are lost when
   # its container restarts or is recreated, so they are asserted continuously
   # from outside rather than by one-shot per-service sidecars. Covers every
@@ -340,8 +376,13 @@ services:
     command: ["weave-adapter-strom", "--config", "/etc/weave/node.yaml"]
     environment:
       WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_ADAPTER_1_TOKEN:-strom-node-1.0.dc18eb10e0f080536c55f9ff6569abb31d2da3ce4f782b294dd0d32fcbd8dbaf}
+      SSL_CERT_FILE: /tls/ca.pem
     volumes:
       - ./config/adapter-1.yaml:/etc/weave/node.yaml:ro
+      - ./tls/public:/tls:ro
+    depends_on:
+      tls-certs:
+        condition: service_completed_successfully
     networks:
       net_node1:
         ipv4_address: 10.97.26.11
@@ -379,8 +420,13 @@ services:
     command: ["weave-adapter-strom", "--config", "/etc/weave/node.yaml"]
     environment:
       WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_ADAPTER_2_TOKEN:-strom-node-2.0.f6a9e27d3f0c5cac5cadb705f27e8659a31a43836822b29d2aac602607ea79f3}
+      SSL_CERT_FILE: /tls/ca.pem
     volumes:
       - ./config/${WEAVE_ADAPTER_2_CONFIG:-adapter-2.yaml}:/etc/weave/node.yaml:ro
+      - ./tls/public:/tls:ro
+    depends_on:
+      tls-certs:
+        condition: service_completed_successfully
     networks:
       net_node2:
         ipv4_address: 10.97.27.11
@@ -421,8 +467,13 @@ services:
     command: ["weave-adapter-strom", "--config", "/etc/weave/node.yaml"]
     environment:
       WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_ADAPTER_3_TOKEN:-strom-node-3.0.63f1a6fc0325ad42d897365d027ebbc08c60b9f4b5a3f82c4ff1cda8cb5ca267}
+      SSL_CERT_FILE: /tls/ca.pem
     volumes:
       - ./config/adapter-3.yaml:/etc/weave/node.yaml:ro
+      - ./tls/public:/tls:ro
+    depends_on:
+      tls-certs:
+        condition: service_completed_successfully
     networks:
       net_node3:
         ipv4_address: 10.97.29.11
@@ -461,8 +512,13 @@ services:
     command: ["weave-adapter-strom", "--config", "/etc/weave/node.yaml"]
     environment:
       WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_ADAPTER_4_TOKEN:-strom-node-4.0.dc5a557a1c746f319ed4f7590f21a9aaa5c19d0d4ffcff9d0ecd81ca1f69c14f}
+      SSL_CERT_FILE: /tls/ca.pem
     volumes:
       - ./config/adapter-4.yaml:/etc/weave/node.yaml:ro
+      - ./tls/public:/tls:ro
+    depends_on:
+      tls-certs:
+        condition: service_completed_successfully
     networks:
       net_node4:
         ipv4_address: 10.97.30.11
@@ -486,10 +542,13 @@ services:
     restart: "no"
     shm_size: "1gb"
     environment:
-      WEAVE_SOUTHBOUND_URL: http://10.97.25.21:8081
+      WEAVE_SOUTHBOUND_URL: https://10.97.25.25:8443
       WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_BROWSER_TOKEN:-browser-bench.0.ed7971623b06be894b581ccca99662bdb3983d232e8737a2c3e5a46455b00540}
+      # check.mjs polls southbound from Node, which reads this.
+      NODE_EXTRA_CA_CERTS: /tls/ca.pem
     volumes:
       - ../nodes/browser:/work:ro
+      - ./tls/public:/tls:ro
       # check.mjs compares the page's PROTOCOL_VERSION with the Rust constant and
       # looks for it two levels above the page, so /work needs this beside it or
       # the comparison is skipped.
@@ -497,10 +556,23 @@ services:
     networks:
       net_core:
         ipv4_address: 10.97.25.40
-    # The page takes its node id from its token, so the browser manifests keep
-    # naming the same node across restarts; the `browser-id` recipe reads the id
-    # off the same default token.
-    command: ["node", "/work/check.mjs", "--serve", "8000", "--stay"]
+    depends_on:
+      tls-certs:
+        condition: service_completed_successfully
+    # Chromium trusts the bench CA through the NSS database it reads on Linux,
+    # which certutil fills before the page is opened. The page takes its node id
+    # from its token, so the browser manifests keep naming the same node across
+    # restarts; the `browser-id` recipe reads the id off the same default token.
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        db="sql:$$HOME/.pki/nssdb"
+        mkdir -p "$$HOME/.pki/nssdb"
+        [ -f "$$HOME/.pki/nssdb/cert9.db" ] || certutil -d "$$db" -N --empty-password
+        certutil -d "$$db" -A -t C,, -n open-weave-bench-ca -i /tls/ca.pem
+        exec node /work/check.mjs --serve 8000 --stay
 
   # --- external verification endpoints (NOT part of the system) ---
   # Off by default (profiles). Started explicitly via the bench producer/consumer

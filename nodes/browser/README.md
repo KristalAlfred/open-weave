@@ -55,7 +55,9 @@ node check.mjs --southbound http://127.0.0.1:8081 --token "$(weave node-token br
 ```
 
 `--serve` hosts this directory on loopback only, so the page is opened from the
-machine running the script. `--stay` keeps the browser running afterwards, which
+machine running the script. Against a southbound behind TLS with a private CA,
+the script needs `NODE_EXTRA_CA_CERTS` for its own polling and Chromium needs the
+CA in its trust store; the bench does both (`bench/README.md`, "TLS"). `--stay` keeps the browser running afterwards, which
 is how the bench hosts a node; `--headed` shows the window; `--video-only`
 passes `media=video`; `--node ID` passes `node=ID`. The script launches
 Playwright's full Chromium (`channel: "chromium"`), because the headless shell

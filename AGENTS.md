@@ -96,8 +96,8 @@ docker-compose stack of real Strom instances behind per-node `netem` routers.
 The items in `backlog/` are the authority on gaps, with the evidence behind each
 one, and `BACKLOG.md` says how to work them. Do not infer from the code that
 something works; if an open item lists it, it does not.
-Not implemented today: TLS, Postgres HA, format conversion, and every adapter
-except Strom.
+Not implemented today: TLS served by the services themselves (the bench puts a
+proxy in front), Postgres HA, format conversion, and every adapter except Strom.
 
 Anything only verified on the `bench/` stack is verified there and nowhere else.
 Say which one a claim rests on.

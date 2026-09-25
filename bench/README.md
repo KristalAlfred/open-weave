@@ -84,6 +84,7 @@ just bench up          # build + start + wait for healthy
 just bench status      # health, registered nodes, controller view, streams
 just bench auth-check  # a node token is refused for another node's id
 just bench leader      # which controller holds the lease
+just bench tls-check   # the TLS endpoints verify against the bench CA, and only it
 just bench ps          # container states
 just bench logs controller   # follow one service's logs
 just bench down        # tear down (containers, networks, volumes)
@@ -160,7 +161,7 @@ drives a stream whose link from node 1 to node 2 the planner puts on RIST.
 
 ```
                      net_core 10.97.25.0/24
-        northbound  southbound  controller  controller-2  postgres
+        northbound  southbound  controller  controller-2  postgres  tls
      +---------------+-----------------+------------------+
      |               |                 |                  |
   router-1        router-2         router-3 (NAT)     router-4 (NAT)
@@ -346,8 +347,10 @@ payload and the delivery guarantees.
 
 | Port | Service |
 |------|---------|
-| 29080 | northbound (`WEAVE_NORTHBOUND_URL=http://localhost:29080 weave ...`) |
-| 29081 | southbound (`/nodes` shows registered capabilities) |
+| 29443 | northbound over TLS, which the recipes use (`SSL_CERT_FILE=bench/tls/public/ca.pem WEAVE_NORTHBOUND_URL=https://localhost:29443 weave ...`) |
+| 29444 | southbound over TLS, which the recipes use |
+| 29080 | northbound, plaintext |
+| 29081 | southbound, plaintext (`/nodes` shows registered capabilities; `just bench page` uses it) |
 | 29082 | controller: dashboard at `/ui`, `/view`; API at `/status`, `/streams/{name}/endpoints` |
 | 29083 | controller-2, the same routes; whichever does not lead answers `503 not_leader` |
 | 28080 | strom-1 API |
@@ -399,6 +402,34 @@ and the `/status` rollup need no token, so anyone who can reach port 29082 or
 29083 can read the full topology and allocated ports. Compose publishes it on all
 interfaces: fine on a laptop, but **do not expose a controller port on a shared
 or public host.**
+
+## TLS
+
+The `tls` service is nginx on net_core at `10.97.25.25`. It terminates TLS for
+northbound (container port 9443, host 29443) and southbound (8443, host 29444)
+and proxies plain HTTP to them. The services themselves serve no TLS, and their
+plaintext ports stay published.
+
+On every `up`, the one-shot `tls-certs` service runs `scripts/tls-certs.sh` in
+the netshoot image, so the host needs no openssl. It generates a private CA and
+a server certificate for `10.97.25.25`, `127.0.0.1` and `localhost` into
+`bench/tls/` (gitignored). It keeps them while the server certificate names
+`10.97.25.25` and is more than a day from expiring. Delete `bench/tls/` for a
+new CA.
+
+Who dials TLS, and how each trusts the bench CA:
+
+| Client | Dials | Trusts the CA through |
+|---|---|---|
+| adapter-1 to adapter-4 | `https://10.97.25.25:8443` (`southbound_url` in `config/`) | `SSL_CERT_FILE=/tls/ca.pem` |
+| the in-bench browser page | `https://10.97.25.25:8443` | certutil adds the CA to Chromium's NSS database before the page opens; `NODE_EXTRA_CA_CERTS` for `check.mjs`'s own polling |
+| `weave` in the recipes | `https://localhost:29443` | `SSL_CERT_FILE=bench/tls/public/ca.pem` |
+| curl in the recipes | both, on localhost | `--cacert bench/tls/public/ca.pem` |
+
+Certificate verification stays on everywhere; nothing is told to skip it.
+`just bench tls-check` shows that curl and `weave` verify against the bench CA
+and refuse the certificate without it. A browser on the host does not trust the
+bench CA, so `just bench page` points the page at southbound's plaintext port.
 
 ## API compatibility
 

@@ -6,7 +6,7 @@
 # direction each link can actually carry.
 node:
   id: strom-node-3
-  southbound_url: http://10.97.25.21:8081
+  southbound_url: https://10.97.25.25:8443
   listen: 0.0.0.0:8091
   # Reachable only from inside net_node3, which is the point of this node. The
   # controller never dials it — adapters poll southbound — so an address nobody

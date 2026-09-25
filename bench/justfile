@@ -1,8 +1,9 @@
 compose   := "docker compose -f " + source_directory() / "docker-compose.yml"
 scripts   := source_directory() / "scripts"
 manifests := source_directory() / "manifests"
-nb      := "http://localhost:29080"
-sb      := "http://localhost:29081"
+nb      := "https://localhost:29443"
+sb      := "https://localhost:29444"
+sb_plain := "http://localhost:29081"
 ctrl    := "http://localhost:29082"
 ctrl2   := "http://localhost:29083"
 strom1  := "http://localhost:28080"
@@ -10,6 +11,12 @@ strom2  := "http://localhost:28081"
 strom3  := "http://localhost:28082"
 strom4  := "http://localhost:28083"
 page_dir := source_directory() / ".." / "nodes" / "browser"
+
+# northbound and southbound are reached through the `tls` proxy. The CLI trusts
+# the bench CA through SSL_CERT_FILE, curl through --cacert.
+ca  := source_directory() / "tls" / "public" / "ca.pem"
+tls := "--cacert " + ca
+cli := "SSL_CERT_FILE=" + ca + " WEAVE_NORTHBOUND_URL=" + nb + " cargo run --quiet -p weave-cli --"
 
 # Northbound's bearer token, and the key southbound derives node tokens from.
 # Defaults match docker-compose.yml so the bench needs no exports. `/health` and
@@ -48,8 +55,8 @@ up:
 wait:
     @echo "waiting for stack..."
     @for i in $(seq 1 90); do \
-        curl -sf {{nb}}/health   >/dev/null 2>&1 && \
-        curl -sf {{sb}}/health   >/dev/null 2>&1 && \
+        curl -sf {{tls}} {{nb}}/health >/dev/null 2>&1 && \
+        curl -sf {{tls}} {{sb}}/health >/dev/null 2>&1 && \
         curl -sf {{ctrl}}/health >/dev/null 2>&1 && \
         curl -sf {{ctrl2}}/health >/dev/null 2>&1 && \
         curl -sf {{strom1}}/api/version >/dev/null 2>&1 && \
@@ -93,8 +100,8 @@ logs svc="controller":
 [group("stack")]
 status:
     @echo "== health =="
-    @printf "northbound:  "; curl -sf {{nb}}/health   >/dev/null && echo ok || echo DOWN
-    @printf "southbound:  "; curl -sf {{sb}}/health   >/dev/null && echo ok || echo DOWN
+    @printf "northbound:  "; curl -sf {{tls}} {{nb}}/health >/dev/null && echo ok || echo DOWN
+    @printf "southbound:  "; curl -sf {{tls}} {{sb}}/health >/dev/null && echo ok || echo DOWN
     @printf "controller:  "; curl -sf {{ctrl}}/health >/dev/null && echo ok || echo DOWN
     @printf "controller-2:"; curl -sf {{ctrl2}}/health >/dev/null && echo " ok" || echo " DOWN"
     @printf "leading:     "; just leader 2>&1 || true
@@ -103,11 +110,11 @@ status:
     @printf "strom-3:     "; curl -sf {{strom3}}/api/version >/dev/null && echo ok || echo DOWN
     @printf "strom-4:     "; curl -sf {{strom4}}/api/version >/dev/null && echo ok || echo DOWN
     @echo "== registered nodes (southbound) =="
-    @curl -sf {{sb_auth}} {{sb}}/nodes | (jq . 2>/dev/null || cat)
+    @curl -sf {{tls}} {{sb_auth}} {{sb}}/nodes | (jq . 2>/dev/null || cat)
     @echo "== /status (northbound, from the leading controller) =="
-    @curl -sf {{nb_auth}} {{nb}}/status | (jq . 2>/dev/null || cat)
+    @curl -sf {{tls}} {{nb_auth}} {{nb}}/status | (jq . 2>/dev/null || cat)
     @echo "== streams (northbound) =="
-    @curl -sf {{nb_auth}} {{nb}}/streams | (jq . 2>/dev/null || cat)
+    @curl -sf {{tls}} {{nb_auth}} {{nb}}/streams | (jq . 2>/dev/null || cat)
 
 # Presents node 1's token for node 2, to southbound and to the leading
 # controller directly (it checks again), then two values that are not node
@@ -125,7 +132,7 @@ auth-check:
     failed=0
     expect() {
         local want="$1" what="$2"; shift 2
-        local got; got="$(curl -s -o /dev/null -w '%{http_code}' "$@")"
+        local got; got="$(curl -s {{tls}} -o /dev/null -w '%{http_code}' "$@")"
         printf '%-46s %s\n' "$what" "$got"
         [ "$got" = "$want" ] || { echo "  expected $want" >&2; failed=1; }
     }
@@ -137,6 +144,24 @@ auth-check:
     expect 403 "controller: heartbeat as strom-node-2" -H "$me" -H "$json" -d "$heartbeat" "$ctrl/nodes/strom-node-2/heartbeat"
     expect 401 "southbound: old shared token" -H "Authorization: Bearer bench-southbound-token" {{sb}}/nodes
     expect 401 "southbound: the key as a token" -H "Authorization: Bearer {{sb_key}}" {{sb}}/nodes
+    exit "$failed"
+
+[doc("Check that the TLS endpoints verify against the bench CA, and fail without it.")]
+[group("stack")]
+tls-check:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    failed=0
+    check() {
+        local what="$1"; shift
+        if "$@" >/dev/null 2>&1; then r=yes; else r=NO; failed=1; fi
+        printf '%-56s %s\n' "$what" "$r"
+    }
+    check "curl verifies northbound against the bench CA" curl -sf {{tls}} {{nb}}/health
+    check "curl verifies southbound against the bench CA" curl -sf {{tls}} {{sb}}/health
+    check "curl without the bench CA refuses southbound" sh -c 'curl -s {{sb}}/health; [ $? -eq 60 ]'
+    check "weave trusts the bench CA from SSL_CERT_FILE" env WEAVE_NORTHBOUND_TOKEN={{nb_token}} {{cli}} get status
+    check "weave without SSL_CERT_FILE refuses the certificate" sh -c 'env -u SSL_CERT_FILE WEAVE_NORTHBOUND_TOKEN={{nb_token}} cargo run --quiet -p weave-cli -- --url {{nb}} get status 2>&1 | grep -q UnknownIssuer'
     exit "$failed"
 
 # List the available stream manifests with their one-line description.
@@ -152,8 +177,7 @@ stream-ls:
 [doc("Apply a manifest by name, control plane only (no media).")]
 [group("streams")]
 stream name:
-    @WEAVE_NORTHBOUND_URL={{nb}} WEAVE_NORTHBOUND_TOKEN={{nb_token}} \
-        cargo run --quiet -p weave-cli -- apply -f {{manifests}}/{{name}}.yaml
+    @WEAVE_NORTHBOUND_TOKEN={{nb_token}} {{cli}} apply -f {{manifests}}/{{name}}.yaml
     @[ -n "${WEAVE_BENCH_DRIVING:-}" ] || \
         echo "applied {{name}} (no media yet — 'just bench stream-up {{name}}' drives it end to end)"
 
@@ -172,7 +196,7 @@ stream-up name="basic":
     # Not every manifest is drivable. Wait for placement to resolve, then say why
     # rather than letting endpoint discovery poll a stream that will never place.
     for _ in $(seq 1 10); do
-        placed="$(curl -sf {{nb_auth}} {{nb}}/status \
+        placed="$(curl -sf {{tls}} {{nb_auth}} {{nb}}/status \
             | jq -r --arg n {{name}} '.streams[] | select(.name==$n) | .status' 2>/dev/null || true)"
         [ -n "$placed" ] && [ "$placed" != "pending" ] && break
         sleep 2
@@ -192,7 +216,7 @@ stream-up name="basic":
     second="$(printf '%s\n' "$ids" | awk '{print $2}')"
     echo "{{name}} placed with $outputs receiver output(s); attaching endpoints"
     # The endpoints dial with the passphrases the manifest gives their sockets.
-    spec="$(curl -sf {{nb_auth}} {{nb}}/streams/{{name}})"
+    spec="$(curl -sf {{tls}} {{nb_auth}} {{nb}}/streams/{{name}})"
     passphrase() { printf '%s' "$spec" | jq -r "$1 // empty"; }
     destination_passphrase() {
         passphrase ".spec.destinations[] | select(.id==\"$1\") | .srt.passphrase"
@@ -224,7 +248,7 @@ stream-wait name status="flowing" attempts="45":
     #!/usr/bin/env bash
     set -euo pipefail
     for _ in $(seq 1 {{attempts}}); do
-        got="$(curl -sf {{nb_auth}} {{nb}}/status \
+        got="$(curl -sf {{tls}} {{nb_auth}} {{nb}}/status \
             | jq -r --arg n {{name}} '.streams[] | select(.name==$n) | .status' 2>/dev/null || true)"
         if [ "$got" = "{{status}}" ]; then echo "{{name}}: {{status}}"; exit 0; fi
         sleep 2
@@ -240,14 +264,14 @@ stream-rm name:
     set -euo pipefail
     headers="$(mktemp)"; body="$(mktemp)"; trap 'rm -f "$headers" "$body"' EXIT
     # DELETE needs the stream's current ETag as If-Match.
-    status="$(curl -s -o "$body" -D "$headers" -w '%{http_code}' {{nb_auth}} {{nb}}/streams/{{name}} || true)"
+    status="$(curl -s -o "$body" -D "$headers" -w '%{http_code}' {{tls}} {{nb_auth}} {{nb}}/streams/{{name}} || true)"
     case "$status" in
         200) ;;
         404) echo "not found: {{name}}"; exit 0 ;;
         *) echo "cannot read {{name}}: northbound returned $status $(cat "$body")" >&2; exit 1 ;;
     esac
     etag="$(awk 'tolower($1) == "etag:" { print $2 }' "$headers" | tr -d '\r')"
-    status="$(curl -s -o "$body" -w '%{http_code}' {{nb_auth}} -H "If-Match: $etag" \
+    status="$(curl -s -o "$body" -w '%{http_code}' {{tls}} {{nb_auth}} -H "If-Match: $etag" \
         -X DELETE {{nb}}/streams/{{name}} || true)"
     case "$status" in
         204) echo "deleted {{name}}" ;;
@@ -303,9 +327,9 @@ controller-restart stream="basic" how="restart":
         done | sort
     }
     identity() {
-        etag="$(curl -sf -D - -o /dev/null {{nb_auth}} {{nb}}/streams/{{stream}} \
+        etag="$(curl -sf {{tls}} -D - -o /dev/null {{nb_auth}} {{nb}}/streams/{{stream}} \
             | tr -d '\r' | awk 'tolower($1) == "etag:" { print $2 }')"
-        generation="$(curl -sf {{nb_auth}} {{nb}}/streams/{{stream}} | jq .generation)"
+        generation="$(curl -sf {{tls}} {{nb_auth}} {{nb}}/streams/{{stream}} | jq .generation)"
         echo "etag $etag generation $generation"
     }
     leader="$(just leader)"
@@ -364,7 +388,7 @@ controller-restart stream="basic" how="restart":
             failed=1
         fi
     done
-    offline="$(curl -sf {{nb_auth}} {{nb}}/nodes \
+    offline="$(curl -sf {{tls}} {{nb_auth}} {{nb}}/nodes \
         | jq -r '.[] | select((.id | startswith("strom-node-")) and .status == "offline") | .id')"
     if [ -n "$offline" ]; then
         echo "FAIL: offline after the switch: $offline" >&2
@@ -467,7 +491,7 @@ browser-id:
     #!/usr/bin/env bash
     set -euo pipefail
     for _ in $(seq 1 30); do
-        got="$(curl -sf {{sb_auth}} {{sb}}/nodes \
+        got="$(curl -sf {{tls}} {{sb_auth}} {{sb}}/nodes \
             | jq -r --arg id '{{browser_node}}' '.[] | select(.id==$id) | .id' 2>/dev/null || true)"
         if [ -n "$got" ]; then echo "$got"; exit 0; fi
         sleep 2
@@ -489,8 +513,7 @@ browser-stream id="":
     tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
     for m in browser-cam browser-return; do
         sed "s/browser-placeholder/$id/" {{manifests}}/$m.yaml > "$tmp"
-        WEAVE_NORTHBOUND_URL={{nb}} WEAVE_NORTHBOUND_TOKEN={{nb_token}} \
-            cargo run --quiet -p weave-cli -- apply -f "$tmp"
+        WEAVE_NORTHBOUND_TOKEN={{nb_token}} {{cli}} apply -f "$tmp"
     done
     just consumer-up browser-cam
     just producer-up browser-return
@@ -500,7 +523,7 @@ browser-stream id="":
     # inactivity monitor drops the session every ~20 s, so the stream cycles
     # `degraded` and `pending` (backlog/OW-13).
     printf 'browser-cam: '
-    curl -sf {{nb_auth}} {{nb}}/status | jq -r '.streams[] | select(.name=="browser-cam") | .status'
+    curl -sf {{tls}} {{nb_auth}} {{nb}}/status | jq -r '.streams[] | select(.name=="browser-cam") | .status'
 
 # Detach the media endpoints, delete both browser streams, and stop the page.
 [group("browser")]
@@ -512,7 +535,9 @@ browser-down:
     -@{{compose}} --profile browser rm -sf browser
 
 # Serve the page for a browser on this host. It needs a localhost origin for the
-# camera, and southbound's CORS default of `*` lets it register from there.
+# camera, and southbound's CORS default of `*` lets it register from there. It
+# calls southbound's plaintext port: a browser on the host does not trust the
+# bench CA.
 # `seat` is the page's node id: the URL carries that seat's token and pins the
 # id with `#node=`. A guest who rejoins with the same seat keeps the id, so the
 # applied stream keeps pointing at a live node — and open-live, which keys its
@@ -521,7 +546,7 @@ browser-down:
 [doc("Serve nodes/browser on localhost:<port> pinned to <seat>, for a browser on this host; prints the URL to open.")]
 [group("browser")]
 page port="8000" seat="guest-1":
-    @echo "open  http://localhost:{{port}}/#southbound={{sb}}&token=$(just node-token {{seat}})&node={{seat}}&network=docker-host"
+    @echo "open  http://localhost:{{port}}/#southbound={{sb_plain}}&token=$(just node-token {{seat}})&node={{seat}}&network=docker-host"
     python3 -m http.server {{port}} -d {{page_dir}} --bind 127.0.0.1
 
 # Print the southbound token for node <id> at <epoch> under the bench key.
@@ -538,12 +563,11 @@ host-cam seat="guest-1":
     set -euo pipefail
     tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
     sed "s/browser-placeholder/{{seat}}/" {{manifests}}/browser-cam-host.yaml > "$tmp"
-    WEAVE_NORTHBOUND_URL={{nb}} WEAVE_NORTHBOUND_TOKEN={{nb_token}} \
-        cargo run --quiet -p weave-cli -- apply -f "$tmp"
+    WEAVE_NORTHBOUND_TOKEN={{nb_token}} {{cli}} apply -f "$tmp"
     seat_auth="Authorization: Bearer $(just node-token {{seat}})"
     url=""
     for _ in $(seq 1 15); do
-        url="$(curl -sf -H "$seat_auth" {{sb}}/nodes/{{seat}}/desired \
+        url="$(curl -sf {{tls}} -H "$seat_auth" {{sb}}/nodes/{{seat}}/desired \
             | jq -r '.[] | select(.id=="weave-browser-cam-host-sender") | .egresses[0].url' 2>/dev/null || true)"
         [ -n "$url" ] && break
         sleep 2

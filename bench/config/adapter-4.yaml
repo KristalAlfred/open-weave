@@ -5,7 +5,7 @@
 # can dial each other, which router-3 and router-4 do not allow.
 node:
   id: strom-node-4
-  southbound_url: http://10.97.25.21:8081
+  southbound_url: https://10.97.25.25:8443
   listen: 0.0.0.0:8091
   public_endpoint: http://10.97.30.11:8091
   topology:

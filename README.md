@@ -40,8 +40,8 @@ implemented: [Strom](https://github.com/Eyevinn/strom), via
 - File-based or VOD work. Every contract here describes live links between nodes.
 - Deciding what to route. Scheduling, bookings and who gets which feed belong to
   an application that drives open-weave through northbound.
-- Production, yet. No TLS, and one Postgres under every controller — see
-  [Status](#status).
+- Production, yet. The services do not serve TLS, and one Postgres sits under
+  every controller — see [Status](#status).
 
 ## Status
 
@@ -58,11 +58,13 @@ the docker-compose bench in `bench/`, which runs real Strom instances behind
 per-node `netem` routers, and nowhere else. Two things are exceptions, covered
 only by planner and status tests: redundant paths, since no shipped node merges
 two paths, and WHIP senders and WHEP players outside open-weave, since the bench
-has no such peer.
+has no such peer. TLS is exercised on the bench at a reverse proxy in front of
+northbound and southbound, with the adapter, the CLI and a browser page trusting
+a private CA.
 
-Not built: TLS, Postgres HA, format conversion, and any adapter other than
-Strom. The items in `backlog/` list the known gaps with the
-evidence behind each one.
+Not built: TLS served by the services themselves, Postgres HA, format
+conversion, and any adapter other than Strom. The items in `backlog/` list the
+known gaps with the evidence behind each one.
 
 ## Crates and binaries
 
@@ -566,7 +568,13 @@ Left unauthenticated on purpose:
   authenticated, so an exposed port leaks read-only dashboard data rather than
   write access.
 
-There is no TLS: terminate it at a reverse proxy. There is no mTLS.
+The services do not serve TLS: terminate it at a reverse proxy in front of
+northbound and southbound. The bench does this with nginx (`bench/README.md`,
+"TLS"). The `weave` CLI and `weave-adapter-strom` trust the Mozilla roots built
+into them plus the platform's certificate store. Setting `SSL_CERT_FILE` to a
+PEM file replaces the platform store with that file, which is how they trust a
+private CA. A browser node trusts what its browser trusts.
+There is no mTLS.
 
 ## SRT encryption
 

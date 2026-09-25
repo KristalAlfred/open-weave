@@ -1,7 +1,7 @@
 # Node 1 Strom adapter config. Mounted read-only and passed via --config.
 node:
   id: strom-node-1
-  southbound_url: http://10.97.25.21:8081
+  southbound_url: https://10.97.25.25:8443
   # This node's own southbound token. Left unset here: it falls back to
   # WEAVE_SOUTHBOUND_TOKEN, which docker-compose.yml sets to strom-node-1's
   # token. Set it inline to pin it here instead:
