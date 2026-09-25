@@ -480,7 +480,8 @@ printf '%s.%s\n' "$id" "$(printf %s "$id" | openssl dgst -sha256 -hmac "$WEAVE_S
 
 A node token acts only for its own node. `POST /nodes/register` whose
 `node.id`, and `POST /nodes/{id}/heartbeat` or `GET /nodes/{id}/desired` whose
-path id, is another node's gets `403`:
+path id, is another node's gets `403`. So does a registration or heartbeat
+carrying an endpoint whose `node_id` is another node's:
 
 ```json
 { "code": "forbidden", "message": "token does not belong to node strom-node-2" }

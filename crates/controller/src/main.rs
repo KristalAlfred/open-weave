@@ -2072,6 +2072,9 @@ async fn register_node(
     if let Err(issue) = validate_endpoint_node_ids(&registration.endpoints) {
         return invalid_request("endpoint node id is invalid", vec![issue]);
     }
+    if let Some(response) = refuse_other_nodes_endpoints(&caller, &registration.endpoints) {
+        return response;
+    }
     if registration
         .hop_status
         .iter()
@@ -2153,6 +2156,9 @@ async fn node_heartbeat(
     }
     if let Err(issue) = validate_endpoint_node_ids(&heartbeat.endpoints) {
         return invalid_request("endpoint node id is invalid", vec![issue]);
+    }
+    if let Some(response) = refuse_other_nodes_endpoints(&caller, &heartbeat.endpoints) {
+        return response;
     }
     if heartbeat
         .hop_status
@@ -2266,6 +2272,18 @@ fn validate_endpoint_node_ids(endpoints: &[EndpointDescriptor]) -> Result<(), Va
         }
     }
     Ok(())
+}
+
+/// The `403` for an endpoint whose `node_id` names a node `caller` may not act
+/// as, `None` when every endpoint is the caller's or names no node.
+fn refuse_other_nodes_endpoints(
+    caller: &NodeCaller,
+    endpoints: &[EndpointDescriptor],
+) -> Option<Response> {
+    endpoints
+        .iter()
+        .filter_map(|endpoint| endpoint.node_id.as_deref())
+        .find_map(|node_id| refuse_other_node(caller, node_id))
 }
 
 /// The constraint the placed sender's profile puts on the media entering it.
@@ -6052,6 +6070,106 @@ mod node_auth_tests {
             node_ids(&app).await,
             ["strom-node-1"],
             "a forged registration is not recorded"
+        );
+    }
+
+    fn with_endpoints(mut body: Value, owners: &[Option<&str>]) -> Value {
+        body["endpoints"] = owners
+            .iter()
+            .enumerate()
+            .map(|(index, owner)| {
+                json!({ "id": format!("cam-{index}"), "label": "cam", "node_id": owner, "kind": "source" })
+            })
+            .collect();
+        body
+    }
+
+    async fn endpoint_owners(app: &Router) -> Vec<Option<String>> {
+        let (status, endpoints) =
+            send(app, "GET", "/endpoints", &node_bearer("strom-node-1"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        endpoints
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|endpoint| endpoint["node_id"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_node_publishes_endpoints_only_under_its_own_id() {
+        let (app, _) = app().await;
+        let me = node_bearer("strom-node-1");
+        let foreign = [Some("strom-node-1"), Some("strom-node-2")];
+
+        let (status, error) = send(
+            &app,
+            "POST",
+            "/nodes/register",
+            &me,
+            Some(with_endpoints(registration("strom-node-1"), &foreign)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(error["code"], "forbidden");
+        assert!(node_ids(&app).await.is_empty(), "nothing is recorded");
+
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/nodes/register",
+            &me,
+            Some(with_endpoints(
+                registration("strom-node-1"),
+                &[Some("strom-node-1"), None],
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let (status, error) = send(
+            &app,
+            "POST",
+            "/nodes/strom-node-1/heartbeat",
+            &me,
+            Some(with_endpoints(heartbeat("strom-node-1"), &foreign)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(error["code"], "forbidden");
+        assert_eq!(
+            endpoint_owners(&app).await,
+            [Some("strom-node-1".to_string()), None],
+            "the refused heartbeat changed nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_auth_a_node_may_publish_endpoints_under_any_id() {
+        let (_, state) = app().await;
+        let app = router(state, Guard::Disabled, NodeGuard::Disabled);
+        let foreign = [Some("strom-node-2")];
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/nodes/register",
+            "",
+            Some(with_endpoints(registration("strom-node-1"), &foreign)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/nodes/strom-node-1/heartbeat",
+            "",
+            Some(with_endpoints(heartbeat("strom-node-1"), &foreign)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            endpoint_owners(&app).await,
+            [Some("strom-node-2".to_string())]
         );
     }
 
