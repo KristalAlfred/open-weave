@@ -22,8 +22,7 @@ It does **not** define a new media data plane, and no media passes through
 open-weave itself. The northbound side speaks operator intent; the southbound
 side normalizes media runtimes into one observed/control model. One runtime is
 implemented: [Strom](https://github.com/Eyevinn/strom), via
-`weave-adapter-strom`. NMOS, MXL and MCM are targets the adapter contract is
-shaped for, not ones it ships with.
+`weave-adapter-strom`.
 
 ## Use it for
 
@@ -39,6 +38,8 @@ shaped for, not ones it ships with.
 - Moving or converting media. Nothing transcodes, resamples or remuxes; a format
   mismatch is reported, not fixed.
 - File-based or VOD work. Every contract here describes live links between nodes.
+- Deciding what to route. Scheduling, bookings and who gets which feed belong to
+  an application that drives open-weave through northbound.
 - Production, yet. No TLS, no controller HA, no per-node tokens — see
   [Status](#status).
 
@@ -52,7 +53,8 @@ Built: the three control-plane services, the `weave` CLI, one southbound adapter
 (`weave-adapter-strom`), and a browser node. Links carry SRT, WHIP or WHEP, and
 the controller plans NAT traversal through relay nodes. All of it is verified on
 the docker-compose bench in `bench/`, which runs real Strom instances behind
-per-node `netem` routers, and nowhere else.
+per-node `netem` routers, and nowhere else. Automatic relay insertion is the
+exception: the bench has one NAT'd site, so only planner tests cover it.
 
 Not built: TLS, controller HA, per-node tokens, format conversion, and any
 adapter other than Strom. `BACKLOG.md` lists the known gaps with the evidence
@@ -72,13 +74,9 @@ behind each one.
   dashboard at `/ui` (backed by the `/view` JSON document) showing nodes,
   streams, and per-hop link conditions.
 - **`weave-southbound`** — adapter-facing API for registration, telemetry,
-  endpoint discovery, and future command streams.
+  and endpoint discovery.
 - **`weave-adapter-strom`** — southbound adapter for existing
   [Strom](https://github.com/Eyevinn/strom) media runtimes.
-
-Further adapters get their own crates as they arrive. None exist yet;
-`weave-adapter-nmos`, `weave-adapter-mxl-domain` and `weave-adapter-mcm` are
-names for unstarted work, listed to show where the seam falls.
 
 ## Runtime shape
 
@@ -417,10 +415,10 @@ origin from southbound, southbound sends CORS headers on its API routes when
 `WEAVE_SOUTHBOUND_CORS_ORIGIN` is set — an exact origin such as
 `https://studio.example`, or `*` for development. Unset, no CORS headers are
 sent and only non-browser adapters can register. The preflight is answered
-before the bearer check and allows `Authorization` and `Content-Type`. Per-node
-tokens issued at registration remain a follow-up; today a page holds the shared
-southbound secret. A browser node registers with a `browser://<id>` endpoint,
-which is a placeholder: the controller never dials any node's endpoint.
+before the bearer check and allows `Authorization` and `Content-Type`. A page
+holds the shared southbound secret. A browser node registers with a
+`browser://<id>` endpoint, which is a placeholder: the controller never dials any
+node's endpoint.
 
 The Strom adapter also presents a token that open-weave never accepts, so it
 is not in the table. When Strom requires a bearer token, the adapter presents
@@ -448,8 +446,8 @@ Left unauthenticated on purpose:
   authenticated, so an exposed port leaks read-only dashboard data rather than
   write access.
 
-There is no TLS: terminate it at a reverse proxy. Per-node tokens issued at
-registration and mTLS are follow-ups, not implemented here.
+There is no TLS: terminate it at a reverse proxy. There are no per-node tokens
+and no mTLS.
 
 ## Node lifecycle webhooks
 
@@ -638,9 +636,8 @@ constraint sets that a concrete format is checked against.
 Formats are **declared, not discovered**. An SRT flow that only moves bytes never
 parses its payload, so nothing in the path knows what is inside it — a Strom
 endpoint reporting negotiated pad caps would faithfully report "some bytes".
-Learning the real format means putting a parsing element in the pipeline, which
-is a separate piece of work. Until then an absent `format` means unknown, not
-wrong, and nothing is inferred from it.
+Learning the real format would mean putting a parsing element in the pipeline.
+An absent `format` means unknown, not wrong, and nothing is inferred from it.
 
 When a declared source format does not satisfy a destination's `accepts`, the
 stream places and the media flows — it just arrives somewhere it cannot be
@@ -654,11 +651,8 @@ degraded — destination studio cannot accept the source format:
 The mismatch is known at plan time, so it is reported before any media exists.
 A lost node outranks it: both read `Degraded`, and the reason distinguishes them.
 
-**Nothing converts anything yet.** Placing a resampler needs nodes to advertise
-which transforms they can perform, and a cost model so the planner does not
-silently insert a transcode farm to rescue a mistyped manifest. Naming the
-problem precisely is what comes first, and it is what a conversion planner will
-read when it arrives.
+**Nothing converts anything.** A mismatch is reported and no node is placed to
+fix it.
 
 ## Strom adapter and drift policy
 

@@ -62,6 +62,11 @@ docker-compose stack of real Strom instances behind per-node `netem` routers.
 
 ## What to get right
 
+- **open-weave routes; it does not orchestrate or carry media.** It decides which
+  node dials which, over which standard protocol and through which relays.
+  Scheduling and feed choice belong to an application driving northbound; media
+  nodes and the data plane belong to the runtimes behind the adapters.
+  `BACKLOG.md` opens with the full scope.
 - **The controller owns all state.** Northbound and southbound are stateless
   proxies that call into it. The controller answers no request by calling out;
   its one outbound call is the node lifecycle webhook, which is fire-and-forget
