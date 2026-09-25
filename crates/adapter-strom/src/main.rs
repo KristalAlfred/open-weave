@@ -191,7 +191,7 @@ async fn sync_loop(
 
 async fn sync_once(
     southbound: &Southbound,
-    strom: &StromClient,
+    strom: &dyn FlowApi,
     config: &AdapterConfig,
     public_endpoint: &str,
     registered: bool,
@@ -215,6 +215,28 @@ async fn sync_once(
         .find_map(|attachment| attachment.listeners.srt.as_ref())
         .map(|listener| listener.host.as_str());
 
+    // The first registration is the version handshake, so nothing is created
+    // or deleted before southbound has accepted it.
+    if !registered {
+        let hop_status = match flows.as_deref() {
+            Some(flows) => {
+                hop_statuses(
+                    strom,
+                    last_desired,
+                    flows,
+                    listener_host,
+                    &std::collections::HashSet::new(),
+                    tracker,
+                )
+                .await
+            }
+            None => pending_statuses(last_desired),
+        };
+        let registration = registration(config, public_endpoint, status, endpoints, hop_status);
+        register_node(southbound, &registration).await?;
+        return Ok(true);
+    }
+
     let hop_status = hop_status(
         southbound,
         strom,
@@ -233,11 +255,6 @@ async fn sync_once(
         endpoints.clone(),
         hop_status.clone(),
     );
-
-    if !registered {
-        register_node(southbound, &registration).await?;
-        return Ok(true);
-    }
 
     let heartbeat = NodeHeartbeat {
         node_id: node_id.clone(),
@@ -1074,6 +1091,49 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         Southbound::new(format!("http://{addr}"), None)
+    }
+
+    #[tokio::test]
+    async fn a_refused_first_registration_leaves_every_flow_alone() {
+        let app = Router::new()
+            .route(
+                "/nodes/register",
+                axum::routing::post(|| async {
+                    (
+                        StatusCode::CONFLICT,
+                        Json(json!({ "code": "incompatible_protocol_version" })),
+                    )
+                }),
+            )
+            .route(
+                "/nodes/{node_id}/desired",
+                get(|| async { Json(json!([])) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let southbound = Southbound::new(format!("http://{addr}"), None);
+        let config: AdapterConfig = serde_norway::from_str(&format!(
+            "node:\n  id: strom-node-1\n  southbound_url: http://{addr}\n  listen: 127.0.0.1:0\n  topology: {{ attachments: [] }}\nstrom:\n  url: http://127.0.0.1:1\n"
+        ))
+        .unwrap();
+        let strom = RecordingFlowApi::listing(&[("weave-old-sender", "id-old")]);
+
+        let result = sync_once(
+            &southbound,
+            &strom,
+            &config,
+            "http://strom-node-1",
+            false,
+            &mut StallTracker::default(),
+            &mut Vec::new(),
+        )
+        .await;
+
+        assert!(result.is_err_and(|error| error.is::<RegistrationRejected>()));
+        assert!(strom.ops().is_empty(), "{:?}", strom.ops());
     }
 
     async fn provision_against(southbound: &Southbound, flows: &[StromFlow]) -> (bool, Vec<Op>) {

@@ -242,7 +242,8 @@ naming the node id:
 Nothing about a rejected node is recorded: a registration the controller cannot
 serve correctly is worse than none. `weave-adapter-strom` treats the `409` as
 fatal and exits — retrying never converges — so a version mismatch surfaces as a
-stopped container with a clear reason instead of a node that looks alive.
+stopped container with a clear reason instead of a node that looks alive. It
+creates and deletes no Strom flow until its first registration is accepted.
 `PROTOCOL_VERSION` is a southbound handshake. It moves when adapter behavior or
 payload semantics become incompatible, so the controller can reject a stale
 process at registration rather than wait for a later request to fail. It is `5`:
