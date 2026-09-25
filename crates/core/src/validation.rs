@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    FormatConstraint, NodeDescriptor, Passphrase, SrtEndpoint, StreamDefinition, StreamDestination,
-    StreamTransport,
+    FormatConstraint, MediaFormat, NodeDescriptor, Passphrase, SignallingEndpoint, SrtEndpoint,
+    StreamDefinition, StreamDestination, StreamTransport,
 };
 
 pub const RESOURCE_ID_MAX_LEN: usize = 63;
@@ -232,7 +232,48 @@ fn validate_transport(
                 );
             }
         }
+        StreamTransport::Whip(endpoint) => {
+            let path = format!("{path}.whip");
+            if !is_source {
+                issues.push(ValidationIssue::new(
+                    &path,
+                    "source_only",
+                    "whip belongs on the source, not a destination",
+                ));
+            }
+            validate_signalling(endpoint, &path, is_source, issues);
+        }
+        StreamTransport::Whep(endpoint) => {
+            let path = format!("{path}.whep");
+            if is_source {
+                issues.push(ValidationIssue::new(
+                    &path,
+                    "destination_only",
+                    "whep belongs on a destination, not the source",
+                ));
+            }
+            validate_signalling(endpoint, &path, is_source, issues);
+        }
     }
+}
+
+fn validate_signalling(
+    endpoint: &SignallingEndpoint,
+    path: &str,
+    is_source: bool,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    validate_id(&endpoint.node, &format!("{path}.node"), "node id", issues);
+    if let Some(network) = &endpoint.network {
+        validate_id(network, &format!("{path}.network"), "network id", issues);
+    }
+    validate_format(
+        endpoint.format.as_ref(),
+        endpoint.accepts.as_ref(),
+        path,
+        is_source,
+        issues,
+    );
 }
 
 fn validate_srt(
@@ -242,7 +283,13 @@ fn validate_srt(
     issues: &mut Vec<ValidationIssue>,
 ) {
     validate_via(endpoint, path, is_source, issues);
-    validate_format(endpoint, path, is_source, issues);
+    validate_format(
+        endpoint.format.as_ref(),
+        endpoint.accepts.as_ref(),
+        path,
+        is_source,
+        issues,
+    );
     if let Some(passphrase) = &endpoint.passphrase {
         validate_passphrase(passphrase, &format!("{path}.passphrase"), issues);
     }
@@ -357,26 +404,27 @@ fn validate_id(value: &str, field: &str, label: &str, issues: &mut Vec<Validatio
 }
 
 fn validate_format(
-    endpoint: &SrtEndpoint,
+    format: Option<&MediaFormat>,
+    accepts: Option<&FormatConstraint>,
     path: &str,
     is_source: bool,
     issues: &mut Vec<ValidationIssue>,
 ) {
-    if is_source && endpoint.accepts.is_some() {
+    if is_source && accepts.is_some() {
         issues.push(ValidationIssue::new(
             format!("{path}.accepts"),
             "destination_only",
             "accepts belongs on a destination, not the source",
         ));
     }
-    if !is_source && endpoint.format.is_some() {
+    if !is_source && format.is_some() {
         issues.push(ValidationIssue::new(
             format!("{path}.format"),
             "source_only",
             "format belongs on the source, not a destination",
         ));
     }
-    if let Some(accepts) = &endpoint.accepts {
+    if let Some(accepts) = accepts {
         validate_constraint(accepts, &format!("{path}.accepts"), issues);
     }
 }
@@ -837,6 +885,103 @@ mod tests {
                 "not_allowed",
                 "a destination with two paths must not pin via"
             )]
+        );
+    }
+    fn signalling(node: &str) -> crate::SignallingEndpoint {
+        crate::SignallingEndpoint {
+            node: node.to_string(),
+            network: None,
+            format: None,
+            accepts: None,
+        }
+    }
+
+    #[test]
+    fn whip_is_a_source_and_whep_a_destination() {
+        let mut outside = stream();
+        outside.source = StreamTransport::Whip(signalling("gateway"));
+        outside.destinations = vec![destination(
+            "monitor",
+            StreamTransport::Whep(signalling("player-edge")),
+        )];
+        assert_eq!(validate_stream(&outside), []);
+
+        let mut reversed = stream();
+        reversed.source = StreamTransport::Whep(signalling("gateway"));
+        reversed.destinations = vec![destination(
+            "monitor",
+            StreamTransport::Whip(signalling("player-edge")),
+        )];
+        assert_eq!(
+            validate_stream(&reversed),
+            [
+                issue(
+                    "source.whep",
+                    "destination_only",
+                    "whep belongs on a destination, not the source",
+                ),
+                issue(
+                    "destinations[0].whip",
+                    "source_only",
+                    "whip belongs on the source, not a destination",
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn whip_and_whep_fields_are_validated() {
+        let mut invalid = stream();
+        invalid.source = StreamTransport::Whip(crate::SignallingEndpoint {
+            network: Some("Internet".to_string()),
+            accepts: Some(FormatConstraint::default()),
+            ..signalling("gateway")
+        });
+        invalid.destinations = vec![destination(
+            "monitor",
+            StreamTransport::Whep(crate::SignallingEndpoint {
+                format: Some(MediaFormat {
+                    container: Container::MpegTs,
+                    video: None,
+                    audio: None,
+                }),
+                ..signalling("player_edge")
+            }),
+        )];
+        assert_eq!(
+            validate_stream(&invalid)
+                .iter()
+                .map(|issue| (issue.field.as_str(), issue.code.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("source.whip.network", "invalid_characters"),
+                ("source.whip.accepts", "destination_only"),
+                ("destinations[0].whep.node", "invalid_characters"),
+                ("destinations[0].whep.format", "source_only"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_whip_source_parses_from_its_manifest_tag() {
+        let parsed: StreamDefinition = serde_json::from_value(serde_json::json!({
+            "name": "encoder",
+            "source": { "whip": { "node": "strom-node-1", "network": "internet" } },
+            "destinations": [{ "id": "monitor", "whep": { "node": "strom-node-2" } }]
+        }))
+        .unwrap();
+        assert_eq!(parsed.source.kind(), "whip");
+        assert_eq!(parsed.source.node(), Some("strom-node-1"));
+        assert_eq!(parsed.source.network(), Some("internet"));
+        assert_eq!(parsed.destinations[0].endpoint.kind(), "whep");
+        assert!(
+            serde_json::from_value::<StreamDefinition>(serde_json::json!({
+                "name": "encoder",
+                "source": { "whip": { "node": "strom-node-1", "url": "http://x" } },
+                "destinations": [{ "id": "monitor", "whep": { "node": "strom-node-2" } }]
+            }))
+            .is_err(),
+            "a manifest never carries an address"
         );
     }
 }

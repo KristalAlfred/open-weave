@@ -10,7 +10,11 @@
             "additionalProperties": false,
             "properties": {
               "host": {
-                "type": "string"
+                "description": "The SRT listener's host. Absent for a WHIP or WHEP endpoint, whose `url`\n carries it.",
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "node": {
                 "type": "string"
@@ -19,16 +23,18 @@
                 "format": "uint16",
                 "maximum": 65535,
                 "minimum": 0,
-                "type": "integer"
+                "type": [
+                  "integer",
+                  "null"
+                ]
               },
               "url": {
+                "description": "What a peer dials: `srt://host:port`, or the WHIP or WHEP URL.",
                 "type": "string"
               }
             },
             "required": [
               "node",
-              "host",
-              "port",
               "url"
             ],
             "type": [
@@ -54,7 +60,11 @@
       "additionalProperties": false,
       "properties": {
         "host": {
-          "type": "string"
+          "description": "The SRT listener's host. Absent for a WHIP or WHEP endpoint, whose `url`\n carries it.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "node": {
           "type": "string"
@@ -63,16 +73,18 @@
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "url": {
+          "description": "What a peer dials: `srt://host:port`, or the WHIP or WHEP URL.",
           "type": "string"
         }
       },
       "required": [
         "node",
-        "host",
-        "port",
         "url"
       ],
       "type": [

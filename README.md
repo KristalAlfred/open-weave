@@ -53,8 +53,10 @@ Built: the three control-plane services, the `weave` CLI, one southbound adapter
 the controller plans NAT traversal through relay nodes. SRT links between nodes
 are encrypted with keys the controller derives. All of it is verified on
 the docker-compose bench in `bench/`, which runs real Strom instances behind
-per-node `netem` routers, and nowhere else. Redundant paths are the exception:
-no shipped node merges two paths, so only planner and status tests cover them.
+per-node `netem` routers, and nowhere else. Two things are exceptions, covered
+only by planner and status tests: redundant paths, since no shipped node merges
+two paths, and WHIP senders and WHEP players outside open-weave, since the bench
+has no such peer.
 
 Not built: TLS, controller HA, format conversion, and any adapter other than
 Strom. The items in `backlog/` list the known gaps with the
@@ -785,8 +787,40 @@ destinations:
       passphrase: far-end-shared-passphrase
 ```
 
+A source can be an outside WHIP sender, such as an encoder, and a destination
+an outside WHEP player. Neither is a registered node. Each names the node whose
+signalling listener the peer calls, as an SRT producer or consumer names the
+node it dials:
+
+```yaml
+source:
+  whip: { node: strom-node-1, network: internet }
+destinations:
+  - id: monitor
+    whep: { node: strom-node-2 }
+```
+
+`whip` is for the source only and `whep` for destinations only. Either may pin
+`network`. The planner takes the node's listener for the transport in the same
+order as SRT producers and consumers: lowest network, then lowest attachment
+id. A `whip` source may declare `format` and a `whep`
+destination `accepts`, as SRT endpoints do. The sender is placed on the named
+node with its ingress at that attachment's `whip` base, and the receiver on the
+named node with its last egress at the `whep` base. Both URLs end in the hop id:
+`{base}/weave-{stream}-sender` and `{base}/weave-{stream}-receiver-{destination}`.
+A node that declares no base for the transport cannot take the peer, and the
+stream stays unplaced. On Strom the sender uses `whip-to-srt` and the receiver
+`srt-to-whep`, so a WHIP source and a WHEP destination on one node are two hops
+joined over SRT.
+
+Strom serves `/whip` and `/whep` without authentication; its source puts those
+routes outside its auth middleware. Anyone who can reach the node and knows an
+endpoint id can publish to or play from it, and hop ids are predictable.
+
 `GET /streams/{name}/endpoints` returns `ingress` plus a `destinations` list of
-`{id, endpoint}` objects. A device end has a null endpoint. See
+`{id, endpoint}` objects. An endpoint carries the `node` and the `url` a peer
+dials. An SRT endpoint also carries `host` and `port`; a WHIP or WHEP endpoint's
+`url` is the signalling URL above. A device end has a null endpoint. See
 `nodes/browser/README.md` and `bench/README.md` for the shipped nodes.
 
 ### Redundant paths

@@ -239,8 +239,8 @@ mod tests {
     fn endpoint() -> crate::EndpointAddr {
         crate::EndpointAddr {
             node: "strom-node-2".to_string(),
-            host: "172.27.0.10".to_string(),
-            port: 20001,
+            host: Some("172.27.0.10".to_string()),
+            port: Some(20001),
             url: "srt://172.27.0.10:20001".to_string(),
         }
     }

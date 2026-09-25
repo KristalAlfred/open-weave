@@ -5,8 +5,9 @@ use std::collections::{HashMap, HashSet};
 use weave_core::{
     DesiredEgress, DesiredHop, DestinationEndpoint, DeviceKind, EndpointAddr, HOP_ID_PREFIX,
     HopConditions, HopRole, HopStatus, NetworkAttachment, NodeDescriptor, NodeStatus, Passphrase,
-    Path, PathStatus, PortRange, RemoteAddr, SocketRole, SocketSpec, SrtParams, SrtSocket,
-    StreamDefinition, StreamEndpoints, StreamTransport, Transport, roll_up_path,
+    Path, PathStatus, PortRange, RemoteAddr, SignallingEndpoint, SignallingTransport, SocketRole,
+    SocketSpec, SrtParams, SrtSocket, StreamDefinition, StreamEndpoints, StreamTransport,
+    Transport, roll_up_path,
 };
 
 use crate::keys::LinkKeys;
@@ -43,6 +44,11 @@ pub enum PlacementError {
         socket_end_description(.socket)
     )]
     NotAnSrtListener { hop: String, socket: SocketSpec },
+    #[error(
+        "hop {hop} carries a {} socket where a WHIP or WHEP listener is needed",
+        socket_end_description(.socket)
+    )]
+    NotASignallingListener { hop: String, socket: SocketSpec },
     #[error("stream source must be a node, not a remote endpoint")]
     RemoteSource,
     #[error("endpoint must set exactly one of node or remote")]
@@ -78,6 +84,11 @@ pub enum PlacementError {
     NoMergeProfile { node: String },
     #[error("a remote destination has no receiver to merge a second path")]
     NoMergeReceiver,
+    #[error("a {kind} endpoint cannot be {end}")]
+    WrongEnd {
+        kind: &'static str,
+        end: &'static str,
+    },
     #[error("hop id {hop} is already planned for stream {stream}")]
     HopIdTaken { hop: String, stream: String },
 }
@@ -124,6 +135,8 @@ enum Terminal {
     Srt,
     /// The node's own capture or display device; nothing external attaches.
     Device,
+    /// A WHIP ingest or WHEP playback listener an outside peer calls.
+    Signalling(SignallingTransport),
 }
 
 /// A manifest endpoint as the planner reads it, whichever variant wrote it.
@@ -158,6 +171,19 @@ fn read_endpoint(endpoint: &StreamTransport) -> Result<Endpoint<'_>, PlacementEr
             passphrase: None,
             terminal: Terminal::Device,
         }),
+        StreamTransport::Whip(endpoint) => Ok(signalled(endpoint, SignallingTransport::Whip)),
+        StreamTransport::Whep(endpoint) => Ok(signalled(endpoint, SignallingTransport::Whep)),
+    }
+}
+
+fn signalled(endpoint: &SignallingEndpoint, transport: SignallingTransport) -> Endpoint<'_> {
+    Endpoint {
+        placement: Placement::Node(&endpoint.node),
+        network: endpoint.network.as_deref(),
+        via: &[],
+        latency: None,
+        passphrase: None,
+        terminal: Terminal::Signalling(transport),
     }
 }
 
@@ -379,6 +405,19 @@ pub fn derive_stream(
                         })
                     }
                     Terminal::Device => device_socket(&hop.node_id, DeviceKind::Display, nodes)?,
+                    Terminal::Signalling(SignallingTransport::Whep) => signalling_listener(
+                        &hop.node_id,
+                        dest.network,
+                        SignallingTransport::Whep,
+                        &receiver.id,
+                        nodes,
+                    )?,
+                    Terminal::Signalling(SignallingTransport::Whip) => {
+                        return Err(PlacementError::WrongEnd {
+                            kind: "whip",
+                            end: "a destination",
+                        });
+                    }
                 };
                 hop.egresses.push(DesiredEgress {
                     branch_id: branch_id.clone(),
@@ -1329,8 +1368,9 @@ fn source_node<'a>(source: &Endpoint<'a>) -> Result<&'a str, PlacementError> {
     }
 }
 
-/// The sender's ingress: an SRT listener a producer dials, or the node's own
-/// camera when the source is a `device`.
+/// The sender's ingress: an SRT listener a producer dials, the node's own
+/// camera when the source is a `device`, or the WHIP ingest an outside sender
+/// calls.
 fn source_socket(
     source: &Endpoint,
     node_id: &str,
@@ -1348,7 +1388,72 @@ fn source_socket(
             }))
         }
         Terminal::Device => device_socket(node_id, DeviceKind::Capture, nodes),
+        Terminal::Signalling(SignallingTransport::Whip) => signalling_listener(
+            node_id,
+            source.network,
+            SignallingTransport::Whip,
+            hop_id,
+            nodes,
+        ),
+        Terminal::Signalling(SignallingTransport::Whep) => Err(PlacementError::WrongEnd {
+            kind: "whep",
+            end: "the source",
+        }),
     }
+}
+
+/// A `transport` listener on `node_id` for an outside peer, addressed by
+/// `endpoint_id` at the signalling base of the first attachment, in network
+/// then id order, that declares one on `network`.
+fn signalling_listener(
+    node_id: &str,
+    network: Option<&str>,
+    transport: SignallingTransport,
+    endpoint_id: &str,
+    nodes: &[NodeDescriptor],
+) -> Result<SocketSpec, PlacementError> {
+    let node = find_node(nodes, node_id).ok_or_else(|| PlacementError::NodeNotRegistered {
+        node: node_id.to_string(),
+    })?;
+    if let Some(network) = network
+        && !node
+            .topology
+            .attachments
+            .iter()
+            .any(|attachment| attachment.network == network)
+    {
+        return Err(PlacementError::UnknownNetwork {
+            node: node.id.clone(),
+            network: network.to_string(),
+        });
+    }
+    let mut candidates: Vec<_> = node
+        .topology
+        .attachments
+        .iter()
+        .filter(|attachment| network.is_none_or(|network| attachment.network == network))
+        .filter_map(|attachment| {
+            attachment
+                .listeners
+                .signalling(transport)
+                .map(|base| (attachment, base))
+        })
+        .collect();
+    candidates.sort_by(|(left, _), (right, _)| {
+        (&left.network, &left.id).cmp(&(&right.network, &right.id))
+    });
+    let (_, base) = candidates
+        .first()
+        .ok_or_else(|| PlacementError::NoSignalling {
+            node: node.id.clone(),
+            transport: transport.transport(),
+        })?;
+    Ok(SocketSpec::signalling(
+        transport,
+        SocketRole::Listen,
+        base,
+        endpoint_id,
+    ))
 }
 
 /// A socket on the node's own `kind` device, which the node must advertise.
@@ -1470,34 +1575,25 @@ pub fn stream_endpoints(
             let port = listener_port(&sender.ingress, &sender.id)?;
             Some(endpoint_addr(source_node, source.network, port, nodes)?)
         }
+        Terminal::Signalling(_) => Some(signalling_addr(source_node, &sender.ingress, &sender.id)?),
     };
 
     let mut destinations = Vec::with_capacity(stream.destinations.len());
     for destination in &stream.destinations {
         let dest = read_endpoint(&destination.endpoint)?;
-        let endpoint =
-            match (&dest.placement, dest.terminal) {
-                (Placement::Remote(remote), _) => Some(remote_endpoint_addr(remote)),
-                (Placement::Node(_), Terminal::Device) => None,
-                (Placement::Node(node_id), Terminal::Srt) => {
-                    let receiver_id = receiver_hop_id(&stream.name, &destination.id);
-                    let receiver = path
-                        .hops
-                        .iter()
-                        .find(|hop| hop.id == receiver_id)
-                        .ok_or_else(|| PlacementError::MissingHop {
-                            stream: path.stream.clone(),
-                            hop: receiver_id.clone(),
-                        })?;
-                    let consumer = receiver.egresses.first().ok_or_else(|| {
-                        PlacementError::NoConsumerSocket {
-                            hop: receiver.id.clone(),
-                        }
-                    })?;
-                    let consumer_port = listener_port(consumer, &receiver.id)?;
-                    Some(endpoint_addr(node_id, dest.network, consumer_port, nodes)?)
-                }
-            };
+        let endpoint = match (&dest.placement, dest.terminal) {
+            (Placement::Remote(remote), _) => Some(remote_endpoint_addr(remote)),
+            (Placement::Node(_), Terminal::Device) => None,
+            (Placement::Node(node_id), Terminal::Srt) => {
+                let (receiver, consumer) = consumer_socket(path, &destination.id)?;
+                let consumer_port = listener_port(consumer, &receiver.id)?;
+                Some(endpoint_addr(node_id, dest.network, consumer_port, nodes)?)
+            }
+            (Placement::Node(node_id), Terminal::Signalling(_)) => {
+                let (receiver, consumer) = consumer_socket(path, &destination.id)?;
+                Some(signalling_addr(node_id, consumer, &receiver.id)?)
+            }
+        };
         destinations.push(DestinationEndpoint {
             id: destination.id.clone(),
             endpoint,
@@ -1509,6 +1605,53 @@ pub fn stream_endpoints(
         ingress,
         destinations,
     })
+}
+
+/// The receiver hop carrying `destination`, and the socket its consumer uses.
+fn consumer_socket<'a>(
+    path: &'a Path,
+    destination: &str,
+) -> Result<(&'a DesiredHop, &'a SocketSpec), PlacementError> {
+    let receiver_id = receiver_hop_id(&path.stream, destination);
+    let receiver = path
+        .hops
+        .iter()
+        .find(|hop| hop.id == receiver_id)
+        .ok_or_else(|| PlacementError::MissingHop {
+            stream: path.stream.clone(),
+            hop: receiver_id.clone(),
+        })?;
+    let consumer = receiver
+        .egresses
+        .first()
+        .ok_or_else(|| PlacementError::NoConsumerSocket {
+            hop: receiver.id.clone(),
+        })?;
+    Ok((receiver, &consumer.socket))
+}
+
+/// The URL an outside WHIP sender or WHEP player calls to reach `socket`.
+fn signalling_addr(
+    node_id: &str,
+    socket: &SocketSpec,
+    hop_id: &str,
+) -> Result<EndpointAddr, PlacementError> {
+    match socket {
+        SocketSpec::Whip(listener) | SocketSpec::Whep(listener)
+            if listener.role == SocketRole::Listen =>
+        {
+            Ok(EndpointAddr {
+                node: node_id.to_string(),
+                host: None,
+                port: None,
+                url: listener.url.clone(),
+            })
+        }
+        other => Err(PlacementError::NotASignallingListener {
+            hop: hop_id.to_string(),
+            socket: other.clone(),
+        }),
+    }
 }
 
 fn endpoint_addr(
@@ -1530,8 +1673,8 @@ fn endpoint_addr(
     let url = format!("srt://{host}:{port}");
     Ok(EndpointAddr {
         node: node_id.to_string(),
-        host,
-        port,
+        host: Some(host),
+        port: Some(port),
         url,
     })
 }
@@ -1539,8 +1682,8 @@ fn endpoint_addr(
 fn remote_endpoint_addr(remote: &RemoteAddr) -> EndpointAddr {
     EndpointAddr {
         node: String::new(),
-        host: remote.host.clone(),
-        port: remote.port,
+        host: Some(remote.host.clone()),
+        port: Some(remote.port),
         url: format!("srt://{}:{}", remote.host, remote.port),
     }
 }
@@ -2303,14 +2446,14 @@ mod tests {
     fn srt_dest(stream: &mut StreamDefinition, index: usize) -> &mut SrtEndpoint {
         match &mut stream.destinations[index].endpoint {
             StreamTransport::Srt(endpoint) => endpoint,
-            StreamTransport::Device(_) => unreachable!("fixture endpoint is srt"),
+            _ => unreachable!("fixture endpoint is srt"),
         }
     }
 
     fn srt_source(stream: &mut StreamDefinition) -> &mut SrtEndpoint {
         match &mut stream.source {
             StreamTransport::Srt(endpoint) => endpoint,
-            StreamTransport::Device(_) => unreachable!("fixture endpoint is srt"),
+            _ => unreachable!("fixture endpoint is srt"),
         }
     }
 
@@ -3319,7 +3462,7 @@ mod tests {
         assert_eq!(addr(&endpoints.ingress).node, "strom-node-1");
         assert_eq!(
             addr(&endpoints.ingress).port,
-            srt(&path.hops[0].ingress).port()
+            Some(srt(&path.hops[0].ingress).port())
         );
         assert_eq!(endpoints.destinations.len(), 1);
         assert_eq!(
@@ -3330,7 +3473,7 @@ mod tests {
         let consumer_port = srt(&path.hops[2].egresses[0]).port();
         assert_eq!(
             addr(&endpoints.destinations[0].endpoint).port,
-            consumer_port
+            Some(consumer_port)
         );
     }
 
@@ -3344,8 +3487,8 @@ mod tests {
         let ingress_port = srt(&path.hops[0].ingress).port();
         let ingress = addr(&endpoints.ingress);
         assert_eq!(ingress.node, "strom-node-1");
-        assert_eq!(ingress.host, "172.26.0.10");
-        assert_eq!(ingress.port, ingress_port);
+        assert_eq!(ingress.host.as_deref(), Some("172.26.0.10"));
+        assert_eq!(ingress.port, Some(ingress_port));
         assert_eq!(ingress.url, format!("srt://172.26.0.10:{ingress_port}"));
 
         assert_eq!(endpoints.destinations.len(), 1);
@@ -3353,8 +3496,8 @@ mod tests {
         let output = addr(&endpoints.destinations[0].endpoint);
         let consumer_port = srt(&path.hops[1].egresses[0]).port();
         assert_eq!(output.node, "strom-node-2");
-        assert_eq!(output.host, "172.27.0.10");
-        assert_eq!(output.port, consumer_port);
+        assert_eq!(output.host.as_deref(), Some("172.27.0.10"));
+        assert_eq!(output.port, Some(consumer_port));
         assert_eq!(output.url, format!("srt://172.27.0.10:{consumer_port}"));
     }
 
@@ -3367,8 +3510,8 @@ mod tests {
         let path = derive(&stream, &nodes).expect("derive");
         let endpoints = stream_endpoints(&stream, &path, &nodes).expect("endpoints");
         assert_eq!(
-            addr(&endpoints.destinations[0].endpoint).host,
-            "203.0.113.7"
+            addr(&endpoints.destinations[0].endpoint).host.as_deref(),
+            Some("203.0.113.7")
         );
     }
 
@@ -3416,12 +3559,16 @@ mod tests {
         );
 
         let consumer = addr(&endpoints.destinations[0].endpoint);
-        assert_eq!(srt(&path.hops[1].egresses[0]).port(), consumer.port);
-        assert!(listens_at(studio, &consumer.host, consumer.port));
+        let (consumer_host, consumer_port) =
+            (consumer.host.as_deref().unwrap(), consumer.port.unwrap());
+        assert_eq!(srt(&path.hops[1].egresses[0]).port(), consumer_port);
+        assert!(listens_at(studio, consumer_host, consumer_port));
 
         let producer = addr(&endpoints.ingress);
-        assert_eq!(srt(&path.hops[0].ingress).port(), producer.port);
-        assert!(listens_at(source, &producer.host, producer.port));
+        let (producer_host, producer_port) =
+            (producer.host.as_deref().unwrap(), producer.port.unwrap());
+        assert_eq!(srt(&path.hops[0].ingress).port(), producer_port);
+        assert!(listens_at(source, producer_host, producer_port));
     }
 
     #[test]
@@ -3435,10 +3582,15 @@ mod tests {
         assert_eq!(link_host, "10.1.0.2", "the link takes the lowest network");
         let consumer = addr(&endpoints.destinations[0].endpoint);
         assert_eq!(
-            consumer.host, link_host,
+            consumer.host.as_deref(),
+            Some(link_host),
             "the consumer endpoint sits on the attachment the link chose"
         );
-        assert!((8000..=8099).contains(&consumer.port));
+        assert!(
+            consumer
+                .port
+                .is_some_and(|port| (8000..=8099).contains(&port))
+        );
     }
 
     #[test]

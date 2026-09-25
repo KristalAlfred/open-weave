@@ -7,6 +7,8 @@ mod desired;
 #[cfg(test)]
 mod hop_id_tests;
 mod keys;
+#[cfg(test)]
+mod outside_peer_tests;
 mod path;
 #[cfg(test)]
 mod redundant_paths_tests;
@@ -1887,16 +1889,11 @@ fn stream_condition(
 }
 
 fn format_condition(stream: &StreamDefinition) -> StreamCondition {
-    let source_declared = matches!(
-        &stream.source,
-        weave_core::StreamTransport::Srt(endpoint) if endpoint.format.is_some()
-    );
-    let constrained = stream.destinations.iter().any(|destination| {
-        matches!(
-            &destination.endpoint,
-            weave_core::StreamTransport::Srt(endpoint) if endpoint.accepts.is_some()
-        )
-    });
+    let source_declared = stream.source.format().is_some();
+    let constrained = stream
+        .destinations
+        .iter()
+        .any(|destination| destination.endpoint.accepts().is_some());
     if !source_declared || !constrained {
         return stream_condition(
             StreamConditionType::FormatCompatible,

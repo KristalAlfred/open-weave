@@ -413,6 +413,644 @@
               "device"
             ],
             "type": "object"
+          },
+          {
+            "description": "A WHIP sender open-weave does not manage pushes the media to an ingest\n on `node`. Sources only.",
+            "properties": {
+              "whip": {
+                "additionalProperties": false,
+                "description": "A WHIP or WHEP peer open-weave does not manage, reaching the signalling\n listener `node` declares. Like an SRT producer or consumer, the peer dials\n the node; the manifest names the node, never an address.",
+                "properties": {
+                  "accepts": {
+                    "additionalProperties": false,
+                    "description": "What the WHEP player accepts. Destinations only.",
+                    "properties": {
+                      "audio": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "channels": {
+                            "items": {
+                              "format": "uint8",
+                              "maximum": 255,
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "minItems": 1,
+                            "type": [
+                              "array",
+                              "null"
+                            ]
+                          },
+                          "codec": {
+                            "items": {
+                              "enum": [
+                                "aac",
+                                "opus",
+                                "mp2",
+                                "pcm_s16",
+                                "pcm_s24"
+                              ],
+                              "type": "string"
+                            },
+                            "minItems": 1,
+                            "type": [
+                              "array",
+                              "null"
+                            ]
+                          },
+                          "sample_rate": {
+                            "items": {
+                              "format": "uint32",
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "minItems": 1,
+                            "type": [
+                              "array",
+                              "null"
+                            ]
+                          }
+                        },
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      },
+                      "container": {
+                        "items": {
+                          "enum": [
+                            "mpeg_ts",
+                            "rtp"
+                          ],
+                          "type": "string"
+                        },
+                        "minItems": 1,
+                        "type": [
+                          "array",
+                          "null"
+                        ]
+                      },
+                      "video": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "chroma_subsampling": {
+                            "items": {
+                              "enum": [
+                                "yuv420",
+                                "yuv422",
+                                "yuv444"
+                              ],
+                              "type": "string"
+                            },
+                            "minItems": 1,
+                            "type": [
+                              "array",
+                              "null"
+                            ]
+                          },
+                          "codec": {
+                            "items": {
+                              "enum": [
+                                "h264",
+                                "h265",
+                                "av1",
+                                "vp9"
+                              ],
+                              "type": "string"
+                            },
+                            "minItems": 1,
+                            "type": [
+                              "array",
+                              "null"
+                            ]
+                          },
+                          "framerate": {
+                            "items": {
+                              "additionalProperties": false,
+                              "description": "Frames per second as a rational, because broadcast rates are not integers:\n 29.97 is exactly 30000/1001 and rounding it loses the distinction from 30.",
+                              "properties": {
+                                "denominator": {
+                                  "format": "uint32",
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "numerator": {
+                                  "format": "uint32",
+                                  "minimum": 0,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "numerator",
+                                "denominator"
+                              ],
+                              "type": "object"
+                            },
+                            "minItems": 1,
+                            "type": [
+                              "array",
+                              "null"
+                            ]
+                          },
+                          "height": {
+                            "items": {
+                              "format": "uint32",
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "minItems": 1,
+                            "type": [
+                              "array",
+                              "null"
+                            ]
+                          },
+                          "width": {
+                            "items": {
+                              "format": "uint32",
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "minItems": 1,
+                            "type": [
+                              "array",
+                              "null"
+                            ]
+                          }
+                        },
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      }
+                    },
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "format": {
+                    "additionalProperties": false,
+                    "description": "What the WHIP sender sends. Sources only; see [`SrtEndpoint::format`].",
+                    "properties": {
+                      "audio": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "channels": {
+                            "format": "uint8",
+                            "maximum": 255,
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "codec": {
+                            "enum": [
+                              "aac",
+                              "opus",
+                              "mp2",
+                              "pcm_s16",
+                              "pcm_s24"
+                            ],
+                            "type": "string"
+                          },
+                          "sample_rate": {
+                            "description": "Samples per second. The field a sample-rate conversion changes.",
+                            "format": "uint32",
+                            "minimum": 0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "codec",
+                          "sample_rate",
+                          "channels"
+                        ],
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      },
+                      "container": {
+                        "enum": [
+                          "mpeg_ts",
+                          "rtp"
+                        ],
+                        "type": "string"
+                      },
+                      "video": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "chroma_subsampling": {
+                            "enum": [
+                              "yuv420",
+                              "yuv422",
+                              "yuv444"
+                            ],
+                            "type": "string"
+                          },
+                          "codec": {
+                            "enum": [
+                              "h264",
+                              "h265",
+                              "av1",
+                              "vp9"
+                            ],
+                            "type": "string"
+                          },
+                          "framerate": {
+                            "additionalProperties": false,
+                            "description": "Frames per second as a rational, because broadcast rates are not integers:\n 29.97 is exactly 30000/1001 and rounding it loses the distinction from 30.",
+                            "properties": {
+                              "denominator": {
+                                "format": "uint32",
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "numerator": {
+                                "format": "uint32",
+                                "minimum": 0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "numerator",
+                              "denominator"
+                            ],
+                            "type": "object"
+                          },
+                          "height": {
+                            "format": "uint32",
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "width": {
+                            "format": "uint32",
+                            "minimum": 0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "codec",
+                          "width",
+                          "height",
+                          "framerate",
+                          "chroma_subsampling"
+                        ],
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "container"
+                    ],
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "network": {
+                    "description": "Shared network the peer reaches the node on. Absent lets the planner\n choose an attachment.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "node": {
+                    "maxLength": 63,
+                    "minLength": 1,
+                    "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "node"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "whip"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A WHEP player open-weave does not manage pulls the media from `node`.\n Destinations only.",
+            "properties": {
+              "whep": {
+                "additionalProperties": false,
+                "description": "A WHIP or WHEP peer open-weave does not manage, reaching the signalling\n listener `node` declares. Like an SRT producer or consumer, the peer dials\n the node; the manifest names the node, never an address.",
+                "properties": {
+                  "accepts": {
+                    "additionalProperties": false,
+                    "description": "What the WHEP player accepts. Destinations only.",
+                    "properties": {
+                      "audio": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "channels": {
+                            "items": {
+                              "format": "uint8",
+                              "maximum": 255,
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "minItems": 1,
+                            "type": [
+                              "array",
+                              "null"
+                            ]
+                          },
+                          "codec": {
+                            "items": {
+                              "enum": [
+                                "aac",
+                                "opus",
+                                "mp2",
+                                "pcm_s16",
+                                "pcm_s24"
+                              ],
+                              "type": "string"
+                            },
+                            "minItems": 1,
+                            "type": [
+                              "array",
+                              "null"
+                            ]
+                          },
+                          "sample_rate": {
+                            "items": {
+                              "format": "uint32",
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "minItems": 1,
+                            "type": [
+                              "array",
+                              "null"
+                            ]
+                          }
+                        },
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      },
+                      "container": {
+                        "items": {
+                          "enum": [
+                            "mpeg_ts",
+                            "rtp"
+                          ],
+                          "type": "string"
+                        },
+                        "minItems": 1,
+                        "type": [
+                          "array",
+                          "null"
+                        ]
+                      },
+                      "video": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "chroma_subsampling": {
+                            "items": {
+                              "enum": [
+                                "yuv420",
+                                "yuv422",
+                                "yuv444"
+                              ],
+                              "type": "string"
+                            },
+                            "minItems": 1,
+                            "type": [
+                              "array",
+                              "null"
+                            ]
+                          },
+                          "codec": {
+                            "items": {
+                              "enum": [
+                                "h264",
+                                "h265",
+                                "av1",
+                                "vp9"
+                              ],
+                              "type": "string"
+                            },
+                            "minItems": 1,
+                            "type": [
+                              "array",
+                              "null"
+                            ]
+                          },
+                          "framerate": {
+                            "items": {
+                              "additionalProperties": false,
+                              "description": "Frames per second as a rational, because broadcast rates are not integers:\n 29.97 is exactly 30000/1001 and rounding it loses the distinction from 30.",
+                              "properties": {
+                                "denominator": {
+                                  "format": "uint32",
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "numerator": {
+                                  "format": "uint32",
+                                  "minimum": 0,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "numerator",
+                                "denominator"
+                              ],
+                              "type": "object"
+                            },
+                            "minItems": 1,
+                            "type": [
+                              "array",
+                              "null"
+                            ]
+                          },
+                          "height": {
+                            "items": {
+                              "format": "uint32",
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "minItems": 1,
+                            "type": [
+                              "array",
+                              "null"
+                            ]
+                          },
+                          "width": {
+                            "items": {
+                              "format": "uint32",
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "minItems": 1,
+                            "type": [
+                              "array",
+                              "null"
+                            ]
+                          }
+                        },
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      }
+                    },
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "format": {
+                    "additionalProperties": false,
+                    "description": "What the WHIP sender sends. Sources only; see [`SrtEndpoint::format`].",
+                    "properties": {
+                      "audio": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "channels": {
+                            "format": "uint8",
+                            "maximum": 255,
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "codec": {
+                            "enum": [
+                              "aac",
+                              "opus",
+                              "mp2",
+                              "pcm_s16",
+                              "pcm_s24"
+                            ],
+                            "type": "string"
+                          },
+                          "sample_rate": {
+                            "description": "Samples per second. The field a sample-rate conversion changes.",
+                            "format": "uint32",
+                            "minimum": 0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "codec",
+                          "sample_rate",
+                          "channels"
+                        ],
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      },
+                      "container": {
+                        "enum": [
+                          "mpeg_ts",
+                          "rtp"
+                        ],
+                        "type": "string"
+                      },
+                      "video": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "chroma_subsampling": {
+                            "enum": [
+                              "yuv420",
+                              "yuv422",
+                              "yuv444"
+                            ],
+                            "type": "string"
+                          },
+                          "codec": {
+                            "enum": [
+                              "h264",
+                              "h265",
+                              "av1",
+                              "vp9"
+                            ],
+                            "type": "string"
+                          },
+                          "framerate": {
+                            "additionalProperties": false,
+                            "description": "Frames per second as a rational, because broadcast rates are not integers:\n 29.97 is exactly 30000/1001 and rounding it loses the distinction from 30.",
+                            "properties": {
+                              "denominator": {
+                                "format": "uint32",
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "numerator": {
+                                "format": "uint32",
+                                "minimum": 0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "numerator",
+                              "denominator"
+                            ],
+                            "type": "object"
+                          },
+                          "height": {
+                            "format": "uint32",
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "width": {
+                            "format": "uint32",
+                            "minimum": 0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "codec",
+                          "width",
+                          "height",
+                          "framerate",
+                          "chroma_subsampling"
+                        ],
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "container"
+                    ],
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "network": {
+                    "description": "Shared network the peer reaches the node on. Absent lets the planner\n choose an attachment.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "node": {
+                    "maxLength": 63,
+                    "minLength": 1,
+                    "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "node"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "whep"
+            ],
+            "type": "object"
           }
         ],
         "properties": {
@@ -858,6 +1496,646 @@
           },
           "required": [
             "device"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A WHIP sender open-weave does not manage pushes the media to an ingest\n on `node`. Sources only.",
+          "properties": {
+            "whip": {
+              "additionalProperties": false,
+              "description": "A WHIP or WHEP peer open-weave does not manage, reaching the signalling\n listener `node` declares. Like an SRT producer or consumer, the peer dials\n the node; the manifest names the node, never an address.",
+              "properties": {
+                "accepts": {
+                  "additionalProperties": false,
+                  "description": "What the WHEP player accepts. Destinations only.",
+                  "properties": {
+                    "audio": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "channels": {
+                          "items": {
+                            "format": "uint8",
+                            "maximum": 255,
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "minItems": 1,
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "codec": {
+                          "items": {
+                            "enum": [
+                              "aac",
+                              "opus",
+                              "mp2",
+                              "pcm_s16",
+                              "pcm_s24"
+                            ],
+                            "type": "string"
+                          },
+                          "minItems": 1,
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "sample_rate": {
+                          "items": {
+                            "format": "uint32",
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "minItems": 1,
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        }
+                      },
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "container": {
+                      "items": {
+                        "enum": [
+                          "mpeg_ts",
+                          "rtp"
+                        ],
+                        "type": "string"
+                      },
+                      "minItems": 1,
+                      "type": [
+                        "array",
+                        "null"
+                      ]
+                    },
+                    "video": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "chroma_subsampling": {
+                          "items": {
+                            "enum": [
+                              "yuv420",
+                              "yuv422",
+                              "yuv444"
+                            ],
+                            "type": "string"
+                          },
+                          "minItems": 1,
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "codec": {
+                          "items": {
+                            "enum": [
+                              "h264",
+                              "h265",
+                              "av1",
+                              "vp9"
+                            ],
+                            "type": "string"
+                          },
+                          "minItems": 1,
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "framerate": {
+                          "items": {
+                            "additionalProperties": false,
+                            "description": "Frames per second as a rational, because broadcast rates are not integers:\n 29.97 is exactly 30000/1001 and rounding it loses the distinction from 30.",
+                            "properties": {
+                              "denominator": {
+                                "format": "uint32",
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "numerator": {
+                                "format": "uint32",
+                                "minimum": 0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "numerator",
+                              "denominator"
+                            ],
+                            "type": "object"
+                          },
+                          "minItems": 1,
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "height": {
+                          "items": {
+                            "format": "uint32",
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "minItems": 1,
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "width": {
+                          "items": {
+                            "format": "uint32",
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "minItems": 1,
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        }
+                      },
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
+                  },
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "format": {
+                  "additionalProperties": false,
+                  "description": "What the WHIP sender sends. Sources only; see [`SrtEndpoint::format`].",
+                  "properties": {
+                    "audio": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "channels": {
+                          "format": "uint8",
+                          "maximum": 255,
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "codec": {
+                          "enum": [
+                            "aac",
+                            "opus",
+                            "mp2",
+                            "pcm_s16",
+                            "pcm_s24"
+                          ],
+                          "type": "string"
+                        },
+                        "sample_rate": {
+                          "description": "Samples per second. The field a sample-rate conversion changes.",
+                          "format": "uint32",
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "codec",
+                        "sample_rate",
+                        "channels"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "container": {
+                      "enum": [
+                        "mpeg_ts",
+                        "rtp"
+                      ],
+                      "type": "string"
+                    },
+                    "video": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "chroma_subsampling": {
+                          "enum": [
+                            "yuv420",
+                            "yuv422",
+                            "yuv444"
+                          ],
+                          "type": "string"
+                        },
+                        "codec": {
+                          "enum": [
+                            "h264",
+                            "h265",
+                            "av1",
+                            "vp9"
+                          ],
+                          "type": "string"
+                        },
+                        "framerate": {
+                          "additionalProperties": false,
+                          "description": "Frames per second as a rational, because broadcast rates are not integers:\n 29.97 is exactly 30000/1001 and rounding it loses the distinction from 30.",
+                          "properties": {
+                            "denominator": {
+                              "format": "uint32",
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "numerator": {
+                              "format": "uint32",
+                              "minimum": 0,
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "numerator",
+                            "denominator"
+                          ],
+                          "type": "object"
+                        },
+                        "height": {
+                          "format": "uint32",
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "width": {
+                          "format": "uint32",
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "codec",
+                        "width",
+                        "height",
+                        "framerate",
+                        "chroma_subsampling"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "container"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "network": {
+                  "description": "Shared network the peer reaches the node on. Absent lets the planner\n choose an attachment.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "node": {
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "node"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "whip"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A WHEP player open-weave does not manage pulls the media from `node`.\n Destinations only.",
+          "properties": {
+            "whep": {
+              "additionalProperties": false,
+              "description": "A WHIP or WHEP peer open-weave does not manage, reaching the signalling\n listener `node` declares. Like an SRT producer or consumer, the peer dials\n the node; the manifest names the node, never an address.",
+              "properties": {
+                "accepts": {
+                  "additionalProperties": false,
+                  "description": "What the WHEP player accepts. Destinations only.",
+                  "properties": {
+                    "audio": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "channels": {
+                          "items": {
+                            "format": "uint8",
+                            "maximum": 255,
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "minItems": 1,
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "codec": {
+                          "items": {
+                            "enum": [
+                              "aac",
+                              "opus",
+                              "mp2",
+                              "pcm_s16",
+                              "pcm_s24"
+                            ],
+                            "type": "string"
+                          },
+                          "minItems": 1,
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "sample_rate": {
+                          "items": {
+                            "format": "uint32",
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "minItems": 1,
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        }
+                      },
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "container": {
+                      "items": {
+                        "enum": [
+                          "mpeg_ts",
+                          "rtp"
+                        ],
+                        "type": "string"
+                      },
+                      "minItems": 1,
+                      "type": [
+                        "array",
+                        "null"
+                      ]
+                    },
+                    "video": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "chroma_subsampling": {
+                          "items": {
+                            "enum": [
+                              "yuv420",
+                              "yuv422",
+                              "yuv444"
+                            ],
+                            "type": "string"
+                          },
+                          "minItems": 1,
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "codec": {
+                          "items": {
+                            "enum": [
+                              "h264",
+                              "h265",
+                              "av1",
+                              "vp9"
+                            ],
+                            "type": "string"
+                          },
+                          "minItems": 1,
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "framerate": {
+                          "items": {
+                            "additionalProperties": false,
+                            "description": "Frames per second as a rational, because broadcast rates are not integers:\n 29.97 is exactly 30000/1001 and rounding it loses the distinction from 30.",
+                            "properties": {
+                              "denominator": {
+                                "format": "uint32",
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "numerator": {
+                                "format": "uint32",
+                                "minimum": 0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "numerator",
+                              "denominator"
+                            ],
+                            "type": "object"
+                          },
+                          "minItems": 1,
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "height": {
+                          "items": {
+                            "format": "uint32",
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "minItems": 1,
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "width": {
+                          "items": {
+                            "format": "uint32",
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "minItems": 1,
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        }
+                      },
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
+                  },
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "format": {
+                  "additionalProperties": false,
+                  "description": "What the WHIP sender sends. Sources only; see [`SrtEndpoint::format`].",
+                  "properties": {
+                    "audio": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "channels": {
+                          "format": "uint8",
+                          "maximum": 255,
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "codec": {
+                          "enum": [
+                            "aac",
+                            "opus",
+                            "mp2",
+                            "pcm_s16",
+                            "pcm_s24"
+                          ],
+                          "type": "string"
+                        },
+                        "sample_rate": {
+                          "description": "Samples per second. The field a sample-rate conversion changes.",
+                          "format": "uint32",
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "codec",
+                        "sample_rate",
+                        "channels"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "container": {
+                      "enum": [
+                        "mpeg_ts",
+                        "rtp"
+                      ],
+                      "type": "string"
+                    },
+                    "video": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "chroma_subsampling": {
+                          "enum": [
+                            "yuv420",
+                            "yuv422",
+                            "yuv444"
+                          ],
+                          "type": "string"
+                        },
+                        "codec": {
+                          "enum": [
+                            "h264",
+                            "h265",
+                            "av1",
+                            "vp9"
+                          ],
+                          "type": "string"
+                        },
+                        "framerate": {
+                          "additionalProperties": false,
+                          "description": "Frames per second as a rational, because broadcast rates are not integers:\n 29.97 is exactly 30000/1001 and rounding it loses the distinction from 30.",
+                          "properties": {
+                            "denominator": {
+                              "format": "uint32",
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "numerator": {
+                              "format": "uint32",
+                              "minimum": 0,
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "numerator",
+                            "denominator"
+                          ],
+                          "type": "object"
+                        },
+                        "height": {
+                          "format": "uint32",
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "width": {
+                          "format": "uint32",
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "codec",
+                        "width",
+                        "height",
+                        "framerate",
+                        "chroma_subsampling"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "container"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "network": {
+                  "description": "Shared network the peer reaches the node on. Absent lets the planner\n choose an attachment.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "node": {
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "node"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "whep"
           ],
           "type": "object"
         }

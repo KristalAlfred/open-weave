@@ -276,6 +276,12 @@ pub enum StreamTransport {
     /// camera when this is the source, a screen when it is a destination. The
     /// controller chooses the transport that carries it to or from the node.
     Device(NodeEndpoint),
+    /// A WHIP sender open-weave does not manage pushes the media to an ingest
+    /// on `node`. Sources only.
+    Whip(SignallingEndpoint),
+    /// A WHEP player open-weave does not manage pulls the media from `node`.
+    /// Destinations only.
+    Whep(SignallingEndpoint),
 }
 
 impl StreamTransport {
@@ -285,6 +291,7 @@ impl StreamTransport {
         match self {
             Self::Srt(endpoint) => endpoint.node.as_deref(),
             Self::Device(endpoint) => Some(&endpoint.node),
+            Self::Whip(endpoint) | Self::Whep(endpoint) => Some(&endpoint.node),
         }
     }
 
@@ -294,6 +301,7 @@ impl StreamTransport {
         match self {
             Self::Srt(endpoint) => endpoint.network.as_deref(),
             Self::Device(endpoint) => endpoint.network.as_deref(),
+            Self::Whip(endpoint) | Self::Whep(endpoint) => endpoint.network.as_deref(),
         }
     }
 
@@ -301,10 +309,55 @@ impl StreamTransport {
     #[must_use]
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::Srt(_) => "srt",
+            Self::Srt(_) => Transport::Srt.name(),
             Self::Device(_) => DEVICE_TRANSPORT,
+            Self::Whip(_) => Transport::Whip.name(),
+            Self::Whep(_) => Transport::Whep.name(),
         }
     }
+
+    /// The format this endpoint declares it sends, when it declares one.
+    #[must_use]
+    pub fn format(&self) -> Option<&MediaFormat> {
+        match self {
+            Self::Srt(endpoint) => endpoint.format.as_ref(),
+            Self::Whip(endpoint) | Self::Whep(endpoint) => endpoint.format.as_ref(),
+            Self::Device(_) => None,
+        }
+    }
+
+    /// What this endpoint declares it accepts, when it declares a constraint.
+    #[must_use]
+    pub fn accepts(&self) -> Option<&FormatConstraint> {
+        match self {
+            Self::Srt(endpoint) => endpoint.accepts.as_ref(),
+            Self::Whip(endpoint) | Self::Whep(endpoint) => endpoint.accepts.as_ref(),
+            Self::Device(_) => None,
+        }
+    }
+}
+
+/// A WHIP or WHEP peer open-weave does not manage, reaching the signalling
+/// listener `node` declares. Like an SRT producer or consumer, the peer dials
+/// the node; the manifest names the node, never an address.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SignallingEndpoint {
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    )]
+    pub node: String,
+    /// Shared network the peer reaches the node on. Absent lets the planner
+    /// choose an attachment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// What the WHIP sender sends. Sources only; see [`SrtEndpoint::format`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<MediaFormat>,
+    /// What the WHEP player accepts. Destinations only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepts: Option<FormatConstraint>,
 }
 
 /// An endpoint that is nothing but a node: the node itself produces or consumes
@@ -398,10 +451,7 @@ pub struct RemoteAddr {
 /// about the manifest, and saying so is useful well before anything can fix it.
 #[must_use]
 pub fn stream_format_conflicts(stream: &StreamDefinition) -> Vec<media::FormatConflict> {
-    let StreamTransport::Srt(source) = &stream.source else {
-        return Vec::new();
-    };
-    let Some(format) = &source.format else {
+    let Some(format) = stream.source.format() else {
         return Vec::new();
     };
 
@@ -409,10 +459,7 @@ pub fn stream_format_conflicts(stream: &StreamDefinition) -> Vec<media::FormatCo
         .destinations
         .iter()
         .filter_map(|destination| {
-            let StreamTransport::Srt(endpoint) = &destination.endpoint else {
-                return None;
-            };
-            let mismatches = endpoint.accepts.as_ref()?.mismatches(format);
+            let mismatches = destination.endpoint.accepts()?.mismatches(format);
             (!mismatches.is_empty()).then_some(media::FormatConflict {
                 destination: destination.id.clone(),
                 mismatches,
@@ -1741,8 +1788,13 @@ pub struct DestinationEndpoint {
 #[serde(deny_unknown_fields)]
 pub struct EndpointAddr {
     pub node: String,
-    pub host: String,
-    pub port: u16,
+    /// The SRT listener's host. Absent for a WHIP or WHEP endpoint, whose `url`
+    /// carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// What a peer dials: `srt://host:port`, or the WHIP or WHEP URL.
     pub url: String,
 }
 
@@ -2418,6 +2470,26 @@ mod tests {
             .map(|c| c.destination)
             .collect();
         assert_eq!(offenders, vec!["fussy-a", "fussy-b"], "in manifest order");
+    }
+
+    #[test]
+    fn a_whep_player_that_cannot_accept_a_whip_senders_format_is_reported() {
+        let mut stream = stream_with_formats(None, None);
+        stream.source = StreamTransport::Whip(SignallingEndpoint {
+            node: "strom-node-1".to_string(),
+            network: None,
+            format: Some(aac_48k()),
+            accepts: None,
+        });
+        stream.destinations[0].endpoint = StreamTransport::Whep(SignallingEndpoint {
+            node: "strom-node-2".to_string(),
+            network: None,
+            format: None,
+            accepts: Some(wants_44k()),
+        });
+        let conflicts = stream_format_conflicts(&stream);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].destination, "studio");
     }
 
     #[test]
