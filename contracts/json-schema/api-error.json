@@ -23,7 +23,8 @@
         "persistence_failed",
         "controller_unreachable",
         "encoding_failed",
-        "not_leader"
+        "not_leader",
+        "controller_timeout"
       ],
       "type": "string"
     },

@@ -825,11 +825,15 @@ controller.
 
 Northbound and southbound take every controller in `WEAVE_CONTROLLER_URL`,
 comma-separated; unset means `http://127.0.0.1:8082`. A request goes first to
-the controller that answered last. The proxy moves to the next one only when it
-cannot connect within two seconds or gets `503 not_leader`: neither controller
-has acted on the request, so a write is never sent twice. Any other answer, a
-timeout after connecting included, is passed back as it is. When no controller
-leads, the proxy passes back `503 not_leader`; when none can be reached,
+the controller that answered last. The proxy moves to the next one
+when it cannot connect within two seconds or gets `503 not_leader`: neither
+controller has acted on the request, so a write is never sent twice. A request
+waits at most ten seconds for its answer. A `GET` that gets none, or fails after
+connecting, moves on to the next controller. Any other request is not sent
+again, since the controller may have applied it, and gets
+`504 controller_timeout`; the next request goes to another controller first.
+Every other answer is passed back as it is. When no controller leads, the proxy
+passes back `503 not_leader`; when none can be reached,
 `502 controller_unreachable`.
 
 While no controller leads, the Strom adapter and the browser node get `503` or

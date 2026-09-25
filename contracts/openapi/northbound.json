@@ -26,7 +26,8 @@
               "persistence_failed",
               "controller_unreachable",
               "encoding_failed",
-              "not_leader"
+              "not_leader",
+              "controller_timeout"
             ],
             "type": "string"
           },
@@ -14985,6 +14986,16 @@
               }
             },
             "description": "No controller holds the lease"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Controller did not answer in time; it may have applied the request"
           }
         }
       }
@@ -15032,6 +15043,16 @@
               }
             },
             "description": "No controller holds the lease"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Controller did not answer in time; it may have applied the request"
           }
         }
       }
@@ -15109,6 +15130,16 @@
               }
             },
             "description": "No controller holds the lease"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Controller did not answer in time; it may have applied the request"
           }
         }
       }
@@ -15156,6 +15187,16 @@
               }
             },
             "description": "No controller holds the lease"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Controller did not answer in time; it may have applied the request"
           }
         }
       }
@@ -15244,6 +15285,16 @@
               }
             },
             "description": "No controller holds the lease"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Controller did not answer in time; it may have applied the request"
           }
         }
       },
@@ -15389,6 +15440,16 @@
               }
             },
             "description": "No controller holds the lease"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Controller did not answer in time; it may have applied the request"
           }
         }
       }
@@ -15436,6 +15497,16 @@
               }
             },
             "description": "No controller holds the lease"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Controller did not answer in time; it may have applied the request"
           }
         }
       },
@@ -15570,6 +15641,16 @@
               }
             },
             "description": "No controller holds the lease"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Controller did not answer in time; it may have applied the request"
           }
         }
       }
@@ -15682,6 +15763,16 @@
               }
             },
             "description": "No controller holds the lease"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Controller did not answer in time; it may have applied the request"
           }
         }
       },
@@ -15768,6 +15859,16 @@
               }
             },
             "description": "No controller holds the lease"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Controller did not answer in time; it may have applied the request"
           }
         }
       }
@@ -15848,6 +15949,16 @@
               }
             },
             "description": "Stream not placed, or no controller holds the lease"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Controller did not answer in time; it may have applied the request"
           }
         }
       }

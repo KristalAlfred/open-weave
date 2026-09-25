@@ -260,14 +260,7 @@ async fn proxy(
         .await;
     match sent {
         Ok(answer) => relay(answer),
-        Err(unanswered) => {
-            tracing::warn!(err = %unanswered.source, url = %unanswered.url, "proxying to controller failed");
-            ApiError::new(
-                ApiErrorCode::ControllerUnreachable,
-                "controller unreachable",
-            )
-            .response(StatusCode::BAD_GATEWAY)
-        }
+        Err(unanswered) => unanswered.response(),
     }
 }
 

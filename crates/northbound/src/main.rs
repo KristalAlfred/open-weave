@@ -371,14 +371,7 @@ async fn proxy_with_headers(
         .await;
     match sent {
         Ok(answer) => relay(answer),
-        Err(unanswered) => {
-            tracing::warn!(err = %unanswered.source, url = %unanswered.url, "proxying to controller failed");
-            error(
-                StatusCode::BAD_GATEWAY,
-                ApiErrorCode::ControllerUnreachable,
-                "controller unreachable",
-            )
-        }
+        Err(unanswered) => unanswered.response(),
     }
 }
 

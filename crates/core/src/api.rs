@@ -284,6 +284,7 @@ pub enum ApiErrorCode {
     ControllerUnreachable,
     EncodingFailed,
     NotLeader,
+    ControllerTimeout,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
