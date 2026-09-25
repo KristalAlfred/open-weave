@@ -152,3 +152,14 @@ Status section and the header of `bench/manifests/nat-relay.yaml` still cite.
   `view_joins_desired_hops_with_reported_status`. HTTP:
   `invalid_json_has_a_structured_error`, `invalid_resource_paths_are_rejected`,
   `ui_is_served_at_root_and_ui`, `versioned_api_paths_are_not_served`.
+- 2026-09-25: `crates/controller/src/main.rs`, streams and stream sets: 8 of 8
+  back (`post_stream_then_get_returns_it_and_writes_through`,
+  `delete_stream_removes_and_writes_through`,
+  `invalid_stream_is_rejected_before_persistence`,
+  `stream_writes_require_and_enforce_etag_preconditions`,
+  `owned_streams_reject_single_resource_mutations`,
+  `stream_set_apply_retains_noops_and_prunes_atomically`,
+  `stream_set_conflicts_do_not_partially_apply`,
+  `hydration_refuses_invalid_persisted_streams`). The only change is a
+  `network` on the invalid stream's remote. All pass; `cargo test -p
+  weave-controller`, unit tests only.

@@ -2572,6 +2572,364 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_stream_then_get_returns_it_and_writes_through() {
+        let (state, mem) = mem_state();
+        let app = open_router(state);
+
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/streams",
+            Some(serde_json::to_value(stream("basic")).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let (status, body) = send(&app, "GET", "/streams", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let listed: Vec<StreamResource> = serde_json::from_value(body).unwrap();
+        assert_eq!(listed[0].generation, 1);
+        assert_eq!(listed[0].spec, stream("basic"));
+
+        let (status, body) = send(&app, "GET", "/streams/basic", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_value::<StreamResource>(body).unwrap(),
+            StreamResource {
+                generation: 1,
+                owner: None,
+                spec: stream("basic")
+            }
+        );
+
+        let (status, body) = send(&app, "GET", "/streams/missing", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "stream_not_found");
+
+        assert_eq!(
+            mem.upsert_stream_calls(),
+            1,
+            "stream was written through the store"
+        );
+        assert_eq!(mem.load_streams().await.unwrap()[0].spec, stream("basic"));
+    }
+
+    #[tokio::test]
+    async fn stream_writes_require_and_enforce_etag_preconditions() {
+        let (state, _mem) = mem_state();
+        let app = open_router(state);
+        let original = stream("basic");
+
+        let (status, _, body) = send_with_headers(
+            &app,
+            "POST",
+            "/streams",
+            Some(serde_json::to_value(&original).unwrap()),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(body["code"], "precondition_required");
+
+        let (status, headers, body) = send_with_headers(
+            &app,
+            "POST",
+            "/streams",
+            Some(serde_json::to_value(&original).unwrap()),
+            &[("if-none-match", "*")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let first_etag = response_etag(&headers);
+        let accepted: StreamAccepted = serde_json::from_value(body).unwrap();
+        assert_eq!(accepted.generation, 1);
+        assert!(accepted.changed);
+
+        let (status, headers, body) = send_with_headers(
+            &app,
+            "POST",
+            "/streams",
+            Some(serde_json::to_value(&original).unwrap()),
+            &[("if-match", &first_etag)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(response_etag(&headers), first_etag);
+        let accepted: StreamAccepted = serde_json::from_value(body).unwrap();
+        assert_eq!(accepted.generation, 1);
+        assert!(!accepted.changed);
+
+        let mut changed = original.clone();
+        changed.enabled = false;
+        let (status, headers, body) = send_with_headers(
+            &app,
+            "POST",
+            "/streams",
+            Some(serde_json::to_value(&changed).unwrap()),
+            &[("if-match", &first_etag)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let second_etag = response_etag(&headers);
+        assert_ne!(second_etag, first_etag);
+        let accepted: StreamAccepted = serde_json::from_value(body).unwrap();
+        assert_eq!(accepted.generation, 2);
+        assert!(accepted.changed);
+
+        let (status, _, body) = send_with_headers(
+            &app,
+            "POST",
+            "/streams",
+            Some(serde_json::to_value(&original).unwrap()),
+            &[("if-match", &first_etag)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(body["code"], "precondition_failed");
+
+        let (status, headers, body) =
+            send_with_headers(&app, "GET", "/streams/basic", None, &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response_etag(&headers), second_etag);
+        let resource: StreamResource = serde_json::from_value(body).unwrap();
+        assert_eq!(resource.generation, 2);
+        assert_eq!(resource.spec, changed);
+    }
+
+    #[tokio::test]
+    async fn stream_set_apply_retains_noops_and_prunes_atomically() {
+        let (state, _mem) = mem_state();
+        let app = open_router(state);
+        let alpha = stream("alpha");
+        let beta = stream("beta");
+        let create = StreamSetApply {
+            streams: vec![alpha.clone(), beta.clone()],
+            prune: false,
+        };
+        let (status, headers, body) = send_with_headers(
+            &app,
+            "PUT",
+            "/stream-sets/studio-a",
+            Some(serde_json::to_value(create).unwrap()),
+            &[("if-none-match", "*")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let first_etag = response_etag(&headers);
+        let accepted: StreamSetAccepted = serde_json::from_value(body).unwrap();
+        assert!(accepted.changed);
+        assert_eq!(accepted.streams.len(), 2);
+        assert!(
+            accepted
+                .streams
+                .iter()
+                .all(|stream| stream.action == StreamSetAction::Created)
+        );
+
+        let mut changed_alpha = alpha;
+        changed_alpha.enabled = false;
+        let gamma = stream("gamma");
+        let update = StreamSetApply {
+            streams: vec![changed_alpha.clone(), gamma.clone()],
+            prune: false,
+        };
+        let (status, headers, body) = send_with_headers(
+            &app,
+            "PUT",
+            "/stream-sets/studio-a",
+            Some(serde_json::to_value(&update).unwrap()),
+            &[("if-match", &first_etag)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let second_etag = response_etag(&headers);
+        assert_ne!(second_etag, first_etag);
+        let accepted: StreamSetAccepted = serde_json::from_value(body).unwrap();
+        assert_eq!(
+            accepted
+                .streams
+                .iter()
+                .map(|stream| (stream.name.as_str(), stream.generation, stream.action))
+                .collect::<Vec<_>>(),
+            [
+                ("alpha", 2, StreamSetAction::Updated),
+                ("beta", 1, StreamSetAction::Unchanged),
+                ("gamma", 1, StreamSetAction::Created),
+            ]
+        );
+
+        let (status, headers, body) = send_with_headers(
+            &app,
+            "PUT",
+            "/stream-sets/studio-a",
+            Some(serde_json::to_value(&update).unwrap()),
+            &[("if-match", &second_etag)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(response_etag(&headers), second_etag);
+        let accepted: StreamSetAccepted = serde_json::from_value(body).unwrap();
+        assert!(!accepted.changed);
+        assert!(
+            accepted
+                .streams
+                .iter()
+                .all(|stream| stream.action == StreamSetAction::Unchanged)
+        );
+
+        let prune = StreamSetApply {
+            streams: vec![changed_alpha.clone()],
+            prune: true,
+        };
+        let (status, headers, body) = send_with_headers(
+            &app,
+            "PUT",
+            "/stream-sets/studio-a",
+            Some(serde_json::to_value(prune).unwrap()),
+            &[("if-match", &second_etag)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let third_etag = response_etag(&headers);
+        let accepted: StreamSetAccepted = serde_json::from_value(body).unwrap();
+        assert_eq!(accepted.pruned, ["beta", "gamma"]);
+
+        let mut stale = changed_alpha;
+        stale.enabled = true;
+        let (status, _, body) = send_with_headers(
+            &app,
+            "PUT",
+            "/stream-sets/studio-a",
+            Some(
+                serde_json::to_value(StreamSetApply {
+                    streams: vec![stale],
+                    prune: true,
+                })
+                .unwrap(),
+            ),
+            &[("if-match", &second_etag)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(body["code"], "precondition_failed");
+
+        let (status, headers, body) =
+            send_with_headers(&app, "GET", "/stream-sets/studio-a", None, &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response_etag(&headers), third_etag);
+        let resource: StreamSetResource = serde_json::from_value(body).unwrap();
+        assert_eq!(resource.streams.len(), 1);
+        assert_eq!(resource.streams[0].owner.as_deref(), Some("studio-a"));
+        assert_eq!(resource.streams[0].spec.name, "alpha");
+    }
+
+    #[tokio::test]
+    async fn stream_set_conflicts_do_not_partially_apply() {
+        let (state, _mem) = mem_state();
+        let app = open_router(state);
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/streams",
+            Some(serde_json::to_value(stream("taken")).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let (status, _, body) = send_with_headers(
+            &app,
+            "PUT",
+            "/stream-sets/studio-a",
+            Some(
+                serde_json::to_value(StreamSetApply {
+                    streams: vec![stream("new"), stream("taken")],
+                    prune: false,
+                })
+                .unwrap(),
+            ),
+            &[("if-none-match", "*")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "ownership_conflict");
+        let (status, _) = send(&app, "GET", "/streams/new", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = send(&app, "GET", "/stream-sets/studio-a", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn owned_streams_reject_single_resource_mutations() {
+        let (state, _mem) = mem_state();
+        let app = open_router(state);
+        let (status, _, _) = send_with_headers(
+            &app,
+            "PUT",
+            "/stream-sets/studio-a",
+            Some(
+                serde_json::to_value(StreamSetApply {
+                    streams: vec![stream("alpha")],
+                    prune: false,
+                })
+                .unwrap(),
+            ),
+            &[("if-none-match", "*")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let (_, headers, _) = send_with_headers(&app, "GET", "/streams/alpha", None, &[]).await;
+        let stream_etag = response_etag(&headers);
+
+        for (method, body) in [
+            ("POST", Some(serde_json::to_value(stream("alpha")).unwrap())),
+            ("DELETE", None),
+        ] {
+            let (status, _, body) = send_with_headers(
+                &app,
+                method,
+                if method == "POST" {
+                    "/streams"
+                } else {
+                    "/streams/alpha"
+                },
+                body,
+                &[("if-match", &stream_etag)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["code"], "stream_owned");
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_stream_removes_and_writes_through() {
+        let (state, mem) = mem_state();
+        let app = open_router(state);
+
+        send(
+            &app,
+            "POST",
+            "/streams",
+            Some(serde_json::to_value(stream("basic")).unwrap()),
+        )
+        .await;
+        let (status, _) = send(&app, "DELETE", "/streams/basic", None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(mem.delete_stream_calls(), 1);
+
+        let (_, body) = send(&app, "GET", "/streams", None).await;
+        let listed: Vec<StreamResource> = serde_json::from_value(body).unwrap();
+        assert!(listed.is_empty());
+
+        let (status, _) = send(&app, "DELETE", "/streams/basic", None).await;
+        assert_eq!(
+            status,
+            StatusCode::PRECONDITION_FAILED,
+            "second delete fails its revision precondition"
+        );
+    }
+
+    #[tokio::test]
     async fn status_distinguishes_current_and_observed_generations() {
         let (state, _mem) = mem_state();
         let app = open_router(state.clone());
@@ -2666,6 +3024,74 @@ mod tests {
         assert_eq!(
             current.conditions[0].last_transition_time,
             "2026-09-18T10:02:00Z"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_stream_is_rejected_before_persistence() {
+        let (state, mem) = mem_state();
+        let app = open_router(state);
+        let mut invalid = stream("invalid");
+        let StreamTransport::Srt(destination) = &mut invalid.destinations[0].endpoint else {
+            unreachable!()
+        };
+        destination.remote = Some(weave_core::RemoteAddr {
+            host: "example.test".to_string(),
+            port: 9000,
+            network: "internet".to_string(),
+        });
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/streams",
+            Some(serde_json::to_value(&invalid).unwrap()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "invalid_request");
+        assert_eq!(body["details"][0]["field"], "destinations[0].srt");
+        assert_eq!(body["details"][0]["code"], "mutually_exclusive");
+        assert_eq!(mem.upsert_stream_calls(), 0);
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/stream-plans",
+            Some(serde_json::to_value(invalid).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "invalid_request");
+        assert_eq!(mem.upsert_stream_calls(), 0);
+
+        let (_, body) = send(&app, "GET", "/streams", None).await;
+        let listed: Vec<StreamResource> = serde_json::from_value(body).unwrap();
+        assert!(listed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hydration_refuses_invalid_persisted_streams() {
+        let mem = Arc::new(MemStore::new());
+        let mut invalid = stream("broken");
+        invalid.destinations.clear();
+        mem.create_stream(&invalid).await.unwrap();
+
+        let error = AppState::hydrate(
+            mem,
+            Duration::from_secs(15),
+            Duration::from_secs(300),
+            None,
+            LinkKeys::for_tests(),
+        )
+        .await
+        .err()
+        .expect("invalid stored stream must prevent startup");
+
+        assert_eq!(
+            error.to_string(),
+            "stored stream \"broken\" is invalid at destinations: stream must have at least one destination"
         );
     }
 
