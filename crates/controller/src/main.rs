@@ -23,6 +23,8 @@ mod relay_choice_tests;
 mod rist_tests;
 #[cfg(test)]
 mod scale_tests;
+#[cfg(test)]
+mod second_path_tests;
 mod store;
 mod webhook;
 

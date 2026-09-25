@@ -328,6 +328,17 @@ impl HeldPorts {
             .get(node)
             .is_some_and(|ports| ports.contains(&port))
     }
+
+    /// The ports held by sockets `holds` picks, per node.
+    fn held_by(&self, holds: impl Fn(&SocketAt) -> bool) -> HashMap<String, HashSet<u16>> {
+        let mut ports: HashMap<String, HashSet<u16>> = HashMap::new();
+        for ((node, at), port) in &self.by_socket {
+            if holds(at) {
+                ports.entry(node.clone()).or_default().insert(*port);
+            }
+        }
+        ports
+    }
 }
 
 /// Per-tick, per-node port occupancy. Assigns every port a path needs from the
@@ -341,6 +352,9 @@ impl HeldPorts {
 pub struct PortAllocator {
     used: HashMap<String, HashSet<u16>>,
     held: Arc<HeldPorts>,
+    /// Held ports a claim may still take once no other port is free: while a
+    /// stream plans its first paths, those its own running second paths hold.
+    yielding: Arc<HashMap<String, HashSet<u16>>>,
 }
 
 impl PortAllocator {
@@ -356,6 +370,7 @@ impl PortAllocator {
         Self {
             used: HashMap::new(),
             held: Arc::new(held),
+            yielding: Arc::default(),
         }
     }
 
@@ -407,11 +422,17 @@ impl PortAllocator {
             let offset = ((preferred + step) % count) as u16;
             range.start.saturating_add(offset)
         });
+        let yielding = self.yielding.get(&node.id);
         let free = |port: u16| !occupied.contains(&port) && !held.is_held(&node.id, port);
         let port = probe
             .clone()
             .find(|&port| free(port) && !splits_rist_pair(port, &rist, occupied))
             .or_else(|| probe.clone().find(|&port| free(port)))
+            .or_else(|| {
+                probe.clone().find(|port| {
+                    !occupied.contains(port) && yielding.is_some_and(|ports| ports.contains(port))
+                })
+            })
             .ok_or_else(|| PlacementError::PortRangeExhausted {
                 node: node.id.clone(),
             })?;
@@ -419,8 +440,9 @@ impl PortAllocator {
         Ok(port)
     }
 
-    /// Whether `node` has a free port for each of `listeners`, taken in turn.
-    fn can_claim(&self, node: &NodeDescriptor, listeners: &[PortListener]) -> bool {
+    /// Whether `node` has a free port for each of `listeners`, taken in turn,
+    /// counting [`Self::yielding`] ports only when `yielding` is set.
+    fn can_claim(&self, node: &NodeDescriptor, listeners: &[PortListener], yielding: bool) -> bool {
         let mut trial = Self {
             used: self
                 .used
@@ -428,6 +450,11 @@ impl PortAllocator {
                 .map(|ports| HashMap::from([(node.id.clone(), ports.clone())]))
                 .unwrap_or_default(),
             held: Arc::clone(&self.held),
+            yielding: if yielding {
+                Arc::clone(&self.yielding)
+            } else {
+                Arc::default()
+            },
         };
         listeners.iter().all(|listener| match listener {
             PortListener::Srt(attachment, at) => {
@@ -477,12 +504,21 @@ impl PortAllocator {
             occupied.extend([port, port + 1]);
             return Ok(port);
         }
-        for step in 0..count {
-            let port = pairs[(preferred + step) % count];
-            if free(port) && !held.is_held(&node.id, port) && !held.is_held(&node.id, port + 1) {
-                occupied.extend([port, port + 1]);
-                return Ok(port);
-            }
+        let yielding = self.yielding.get(&node.id);
+        let unheld = |port: u16| !held.is_held(&node.id, port) && !held.is_held(&node.id, port + 1);
+        let yielded = |port: u16| {
+            [port, port + 1].iter().all(|port| {
+                !held.is_held(&node.id, *port) || yielding.is_some_and(|ports| ports.contains(port))
+            })
+        };
+        let probe = (0..count).map(|step| pairs[(preferred + step) % count]);
+        let pair = probe
+            .clone()
+            .find(|&port| free(port) && unheld(port))
+            .or_else(|| probe.clone().find(|&port| free(port) && yielded(port)));
+        if let Some(port) = pair {
+            occupied.extend([port, port + 1]);
+            return Ok(port);
         }
         Err(PlacementError::PortRangeExhausted {
             node: node.id.clone(),
@@ -724,6 +760,7 @@ fn derive_on(
     let mut first_paths = Vec::new();
     let mut single_path = Vec::new();
     let mut relays = RelayCache::new(observed);
+    ports.yielding = Arc::new(ports.held.held_by(|at| is_second_path_socket(stream, at)));
 
     let mut destinations: Vec<_> = stream.destinations.iter().collect();
     destinations.sort_by(|left, right| left.id.cmp(&right.id));
@@ -732,6 +769,11 @@ fn derive_on(
         let dest = read_endpoint(&destination.endpoint)?;
         let latency = dest.latency.unwrap_or(DEFAULT_SINK_LATENCY);
 
+        let second_path_relays = if destination.paths > 1 {
+            relays.second_path_relays(&stream.name, &destination.id)
+        } else {
+            Vec::new()
+        };
         let chain = chain_hops(
             &stream.name,
             &destination.id,
@@ -740,6 +782,7 @@ fn derive_on(
             nodes,
             &ports,
             &mut relays,
+            &second_path_relays,
         )?;
 
         // Each link attaches its upstream socket to the hop before it, which is
@@ -883,6 +926,7 @@ fn derive_on(
         hop.profile_id = select_profile(hop, nodes)?;
     }
 
+    ports.yielding = Arc::default();
     for first in &first_paths {
         if let Err(reason) = place_second_path(
             &stream.name,
@@ -950,6 +994,28 @@ const SECOND_PATH_SUFFIX: &str = ".2";
 /// bridges.
 fn second_path_branch_id(destination: &str) -> String {
     format!("{destination}{SECOND_PATH_SUFFIX}")
+}
+
+/// Whether `at` is a socket of the second path of one of `stream`'s
+/// destinations that ask for two: its sender egress, one of its bridges, or the
+/// receiver's merge ingress.
+fn is_second_path_socket(stream: &StreamDefinition, at: &SocketAt) -> bool {
+    stream
+        .destinations
+        .iter()
+        .filter(|destination| destination.paths > 1)
+        .any(|destination| {
+            let branch = second_path_branch_id(&destination.id);
+            let bridge = at
+                .hop
+                .strip_prefix(&bridge_hop_id_prefix(&stream.name, &branch))
+                .is_some_and(is_bridge_position);
+            let merge = at.slot == Slot::MergeIngress
+                && at.hop == receiver_hop_id(&stream.name, &destination.id);
+            let egress = at.hop == sender_hop_id(&stream.name)
+                && matches!(&at.slot, Slot::Egress(egress) if *egress == branch);
+            bridge || merge || egress
+        })
 }
 
 /// Whether an egress with `branch_id` carries media to `destination`, over its
@@ -1022,7 +1088,7 @@ fn place_second_path<'n>(
         &sender,
         &receiver,
         nodes,
-        &first.relays,
+        (&first.relays, &[]),
         &ports,
         relays,
     )?;
@@ -1157,7 +1223,7 @@ fn pick_remote_relay<'n>(
                     (*node, listeners)
                 })
         });
-    match relay_with_ports(candidates, ports, &keep) {
+    match relay_with_ports(candidates, ports, &keep, &[]) {
         Some(relay) => relay.map(|node| node.id.clone()),
         None => Err(PlacementError::CannotDialNetwork {
             node: upstream.node_id.clone(),
@@ -1331,6 +1397,7 @@ struct LinkEnd<'a> {
 
 /// Build one destination's chain: a bridge per relayed node, a relay wherever no
 /// transport carries a link directly, and the terminal the last link runs into.
+#[allow(clippy::too_many_arguments)]
 fn chain_hops<'a, 'n>(
     stream: &str,
     destination_id: &str,
@@ -1339,6 +1406,7 @@ fn chain_hops<'a, 'n>(
     nodes: &'n [NodeDescriptor],
     ports: &PortAllocator,
     relays: &mut RelayCache<'n>,
+    shun: &[String],
 ) -> Result<Chain<'a>, PlacementError> {
     let mut stations: Vec<Station> = Vec::with_capacity(dest.via.len());
     for station in dest.via.iter().map(|id| Station::relay(id)) {
@@ -1348,7 +1416,7 @@ fn chain_hops<'a, 'n>(
             source,
             &station,
             nodes,
-            &[],
+            (&[], shun),
             ports,
             relays,
         )?;
@@ -1369,7 +1437,7 @@ fn chain_hops<'a, 'n>(
                 source,
                 &station,
                 nodes,
-                &[],
+                (&[], shun),
                 ports,
                 relays,
             )?;
@@ -1425,6 +1493,17 @@ impl<'n> RelayCache<'n> {
         self.running.get(hop_id).map_or(&[], Vec::as_slice)
     }
 
+    /// The nodes that report running the bridges of `destination`'s second path.
+    fn second_path_relays(&self, stream: &str, destination: &str) -> Vec<String> {
+        let branch = second_path_branch_id(destination);
+        (0..)
+            .map(|position| self.running(&bridge_hop_id(stream, &branch, position)))
+            .take_while(|nodes| !nodes.is_empty())
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
     fn reachable_from(
         &mut self,
         upstream: &Station,
@@ -1448,7 +1527,7 @@ impl<'n> RelayCache<'n> {
 /// from the station before it — the source's own station when the chain is
 /// still empty. The relay is none of `avoid_relays`, and is the node that
 /// reports running the bridge `(stream, branch)` would place there when that
-/// node still qualifies.
+/// node still qualifies. It is one of `shun` only when no other relay has room.
 ///
 /// A spliced relay is compatible with both halves by construction, so each
 /// resolves under the ordinary rule — the upstream reaches the relay, and the
@@ -1461,7 +1540,7 @@ fn relay_before<'n>(
     source: &Station,
     next: &Station,
     nodes: &'n [NodeDescriptor],
-    avoid_relays: &[String],
+    (avoid_relays, shun): (&[String], &[String]),
     ports: &PortAllocator,
     relays: &mut RelayCache<'n>,
 ) -> Result<(), PlacementError> {
@@ -1473,7 +1552,7 @@ fn relay_before<'n>(
             upstream,
             next,
             failure,
-            avoid_relays,
+            (avoid_relays, shun),
             ports,
             relays,
             (&bridge, branch),
@@ -1499,7 +1578,7 @@ fn pick_relay<'n>(
     upstream: &Station,
     downstream: &Station,
     failure: LinkFailure,
-    avoid: &[String],
+    (avoid, shun): (&[String], &[String]),
     ports: &PortAllocator,
     relays: &mut RelayCache<'n>,
     (bridge, branch): (&str, &str),
@@ -1539,7 +1618,7 @@ fn pick_relay<'n>(
                     (*node, listeners)
                 })
         });
-    match relay_with_ports(candidates, ports, &keep) {
+    match relay_with_ports(candidates, ports, &keep, shun) {
         Some(relay) => relay.map(|node| Station::relay(&node.id)),
         None => Err(failure.into_error(&upstream.node_id, &downstream.node_id)),
     }
@@ -1569,23 +1648,37 @@ enum PortListener {
     Rist(RistListener, SocketAt),
 }
 
-/// The candidate with free ports for each SRT or RIST listener it would host,
-/// one of `keep` before the lowest-id one; `PortRangeExhausted` for the lowest-id
-/// one when none has, or `None` when there are no candidates.
+/// The candidate with free ports for each SRT or RIST listener it would host:
+/// one of `keep`, else the lowest-id one not in `shun`, else the lowest-id one,
+/// and only then one whose room is ports this stream's running second paths
+/// hold (see [`PortAllocator::yielding`]). `PortRangeExhausted` for the
+/// lowest-id one when none has room, or `None` when there are no candidates.
 fn relay_with_ports<'a>(
     candidates: impl Iterator<Item = (&'a NodeDescriptor, Vec<PortListener>)>,
     ports: &PortAllocator,
     keep: &[String],
+    shun: &[String],
 ) -> Option<Result<&'a NodeDescriptor, PlacementError>> {
     let mut candidates: Vec<_> = candidates.collect();
     candidates.sort_by(|(left, _), (right, _)| left.id.cmp(&right.id));
     let (lowest, _) = candidates.first()?;
+    let with_room = |yielding| {
+        move |(node, listeners): &&(&'a NodeDescriptor, Vec<PortListener>)| {
+            ports.can_claim(node, listeners, yielding)
+        }
+    };
     Some(
         candidates
             .iter()
             .filter(|(node, _)| keep.contains(&node.id))
-            .chain(&candidates)
-            .find(|(node, listeners)| ports.can_claim(node, listeners))
+            .chain(
+                candidates
+                    .iter()
+                    .filter(|(node, _)| !shun.contains(&node.id)),
+            )
+            .find(with_room(false))
+            .or_else(|| candidates.iter().find(with_room(false)))
+            .or_else(|| candidates.iter().find(with_room(true)))
             .map(|(node, _)| *node)
             .ok_or_else(|| PlacementError::PortRangeExhausted {
                 node: lowest.id.clone(),
@@ -3046,9 +3139,9 @@ mod contract_tests {
             SocketAt::ingress("hop"),
         )];
         let mut ports = PortAllocator::new();
-        assert!(ports.can_claim(&relay, &listeners));
+        assert!(ports.can_claim(&relay, &listeners, false));
         assert_eq!(ports.claim_rist(&relay, &listener, "hop"), Ok(21_000));
-        assert!(!ports.can_claim(&relay, &listeners));
+        assert!(!ports.can_claim(&relay, &listeners, false));
     }
 
     #[test]

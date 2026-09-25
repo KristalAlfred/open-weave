@@ -1043,6 +1043,14 @@ may carry its link on. A dialing socket names no local address, so at an end
 that dials, every dialing attachment on that network counts as used: two paths
 that both dial out of one node leave it over different networks.
 
+A running second path is left alone where it can be. A first path that needs
+a relay passes over the relays its own running second path uses while another
+relay has room, and a stream's first paths take the ports its running second
+paths hold only when no relay has other room. Then the second path moves or
+the destination is left with one path, rather than the stream going
+unplaced. Another stream never takes them, see
+[Capabilities and topology](#capabilities-and-topology).
+
 Merging the two copies is the receiver's job. A second path is placed only when
 the receiver has a hop profile with `merge: true`. The receiver hop then gets a
 `merge_ingress`, a second socket of that profile's ingress class:
