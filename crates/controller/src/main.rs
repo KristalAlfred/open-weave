@@ -54,7 +54,7 @@ use weave_core::auth::{
 };
 use weave_core::webhook::{EventType, NodeSummary, StreamSummary, Subject};
 use weave_core::{
-    AcceptedState, ApiError, ApiErrorCode, DesiredHop, EndpointDescriptor, HopStatus, NodeAccepted,
+    AcceptedState, ApiError, ApiErrorCode, DesiredHop, EndpointDescriptor, NodeAccepted,
     NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus, ObservedState, PROTOCOL_VERSION,
     PathStatus, PlanStatus, ROUTE_ENDPOINTS, ROUTE_NODE_DESIRED, ROUTE_NODE_HEARTBEAT,
     ROUTE_NODE_REGISTER, ROUTE_NODES, ROUTE_STATE, ROUTE_STATUS, ROUTE_STREAM,
@@ -1329,7 +1329,7 @@ async fn get_view(State(state): State<AppState>) -> Json<SystemView> {
     let view = state.view.read().await;
     let now = Instant::now();
 
-    let observed: Vec<&HopStatus> = nodes.values().flat_map(|r| &r.hop_status).collect();
+    let observed = reports_by_hop(nodes.values().flat_map(|r| &r.hop_status));
 
     let node_views = nodes
         .values()
@@ -1364,8 +1364,8 @@ async fn get_view(State(state): State<AppState>) -> Json<SystemView> {
                 .flatten()
                 .map(|hop| {
                     let status = observed
-                        .iter()
-                        .find(|s| s.id == hop.id && s.node_id == hop.node_id);
+                        .get(&(hop.id.as_str(), hop.node_id.as_str()))
+                        .copied();
                     HopView {
                         id: hop.id.clone(),
                         node: hop.node_id.clone(),
@@ -3019,9 +3019,9 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
     use weave_core::{
-        HopEndpointClass, HopProfile, NetworkAttachment, NetworkListeners, NodeCapabilities,
-        NodeTopology, PortRange, RoleSet, SrtEndpoint, SrtListener, StreamDestination,
-        StreamTransport, Transport, TransportClass,
+        HopEndpointClass, HopProfile, HopStatus, NetworkAttachment, NetworkListeners,
+        NodeCapabilities, NodeTopology, PortRange, RoleSet, SrtEndpoint, SrtListener,
+        StreamDestination, StreamTransport, Transport, TransportClass,
     };
 
     use crate::webhook::tests::{Sink, sink};

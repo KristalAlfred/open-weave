@@ -2093,7 +2093,9 @@ fn resolve_station<'a>(
 
 /// Each hop's first report, by hop id and node.
 #[must_use]
-pub fn reports_by_hop(reports: &[HopStatus]) -> HashMap<(&str, &str), &HopStatus> {
+pub fn reports_by_hop<'a>(
+    reports: impl IntoIterator<Item = &'a HopStatus>,
+) -> HashMap<(&'a str, &'a str), &'a HopStatus> {
     let mut by_hop = HashMap::new();
     for report in reports {
         by_hop
