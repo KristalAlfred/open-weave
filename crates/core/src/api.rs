@@ -273,6 +273,7 @@ pub enum ApiErrorCode {
     StreamSetNotFound,
     StreamOwned,
     OwnershipConflict,
+    HopIdConflict,
     NodeNotFound,
     StreamNotReady,
     PreconditionRequired,

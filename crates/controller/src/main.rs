@@ -62,7 +62,7 @@ use weave_core::{
 use keys::{LinkKeys, SecretSource};
 use path::{
     HopIds, PlacementError, PortAllocator, SinglePath, derive_stream, destination_nodes,
-    destination_path_status, path_status, stream_endpoints,
+    destination_path_status, path_status, shared_hop_id, stream_endpoints,
 };
 use store::{
     LeaseTerm, MemStore, PgStore, StateStore, StoreError, StoredStream, StreamSetMemberAction,
@@ -1606,6 +1606,9 @@ async fn put_stream_set(
 
     let write = {
         let mut streams = state.streams.write().await;
+        if let Some(conflict) = stream_set_hop_id_conflict(&owner, &apply, &streams) {
+            return conflict;
+        }
         let mut stream_sets = state.stream_sets.write().await;
         let result = match precondition {
             StreamWritePrecondition::Absent => {
@@ -1682,6 +1685,70 @@ async fn put_stream_set(
     )
 }
 
+/// The first of `others` that can plan a hop id `stream` can, and that id.
+fn first_shared_hop_id<'a>(
+    stream: &StreamDefinition,
+    others: impl IntoIterator<Item = &'a StreamDefinition>,
+) -> Option<(&'a str, String)> {
+    others
+        .into_iter()
+        .find_map(|other| shared_hop_id(stream, other).map(|hop| (other.name.as_str(), hop)))
+}
+
+/// A stream-set write refused because a stream it changes can plan a hop id
+/// another stream can: one kept from the store, or another stream in the write.
+/// Streams the write replaces or prunes are not kept, and an unchanged stream
+/// is not checked, so reapplying a set is never refused for a collision it
+/// already held.
+fn stream_set_hop_id_conflict(
+    owner: &str,
+    apply: &StreamSetApply,
+    stored: &BTreeMap<String, StoredStream>,
+) -> Option<Response> {
+    let written: BTreeSet<&str> = apply
+        .streams
+        .iter()
+        .map(|stream| stream.name.as_str())
+        .collect();
+    let kept: Vec<&StreamDefinition> = stored
+        .values()
+        .filter(|stream| !written.contains(stream.spec.name.as_str()))
+        .filter(|stream| !(apply.prune && stream.owner.as_deref() == Some(owner)))
+        .map(|stream| &stream.spec)
+        .collect();
+    apply
+        .streams
+        .iter()
+        .enumerate()
+        .filter(|(_, stream)| {
+            stored
+                .get(&stream.name)
+                .is_none_or(|current| current.spec != **stream)
+        })
+        .find_map(|(index, stream)| {
+            let others = kept.iter().copied().chain(
+                apply
+                    .streams
+                    .iter()
+                    .filter(|other| other.name != stream.name),
+            );
+            first_shared_hop_id(stream, others).map(|(other, hop)| {
+                hop_id_conflict(&format!("streams[{index}].name"), &stream.name, other, &hop)
+            })
+        })
+}
+
+fn hop_id_conflict(field: &str, stream: &str, other: &str, hop: &str) -> Response {
+    let message =
+        format!("stream {stream} can plan hop id {hop}, which stream {other} can also plan");
+    ApiError::with_details(
+        ApiErrorCode::HopIdConflict,
+        format!("stream {stream} and stream {other} can plan the same hop id"),
+        vec![ValidationIssue::new(field, "hop_id_conflict", message)],
+    )
+    .response(StatusCode::CONFLICT)
+}
+
 async fn submit_stream(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1702,9 +1769,21 @@ async fn submit_stream(
     let name = stream.name.clone();
     let (stored, changed) = {
         let mut streams = state.streams.write().await;
-        let changed = streams
-            .get(&name)
-            .is_none_or(|current| current.spec != stream);
+        let current = streams.get(&name);
+        let changed = current.is_none_or(|current| current.spec != stream);
+        let owned = current.is_some_and(|current| current.owner.is_some());
+        if changed
+            && !owned
+            && let Some((other, hop)) = first_shared_hop_id(
+                &stream,
+                streams
+                    .values()
+                    .map(|stored| &stored.spec)
+                    .filter(|stored| stored.name != name),
+            )
+        {
+            return hop_id_conflict("name", &name, other, &hop);
+        }
         let result = match precondition {
             StreamWritePrecondition::Absent => state.store.create_stream(&stream).await,
             StreamWritePrecondition::Revision(revision) => {
@@ -3302,6 +3381,259 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = send(&app, "GET", "/stream-sets/studio-a", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Its receiver for `a-sender` is `weave-x-receiver-a-sender`, which is also
+    /// the sender of `x-receiver-a`.
+    fn stream_x_to_a_sender() -> StreamDefinition {
+        let mut stream = stream("x");
+        stream.destinations[0].id = "a-sender".to_string();
+        stream
+    }
+
+    const X_CONFLICT: &str = "stream x can plan hop id weave-x-receiver-a-sender, \
+                              which stream x-receiver-a can also plan";
+
+    fn assert_hop_id_conflict(body: &Value, field: &str) {
+        assert_eq!(body["code"], "hop_id_conflict");
+        assert_eq!(
+            body["message"],
+            "stream x and stream x-receiver-a can plan the same hop id"
+        );
+        assert_eq!(body["details"][0]["field"], field);
+        assert_eq!(body["details"][0]["code"], "hop_id_conflict");
+        assert_eq!(body["details"][0]["message"], X_CONFLICT);
+    }
+
+    async fn register_both_nodes(state: &AppState) {
+        let mut nodes = state.nodes.write().await;
+        for (id, host) in [
+            ("strom-node-1", "172.26.0.10"),
+            ("strom-node-2", "172.27.0.10"),
+        ] {
+            nodes.insert(id.to_string(), node_registration(id, host));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_can_plan_a_stored_streams_hop_id_is_refused() {
+        let (state, mem) = mem_state();
+        register_both_nodes(&state).await;
+        let app = open_router(state.clone());
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/streams",
+            Some(serde_json::to_value(stream("x-receiver-a")).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        reconcile_tick(&state).await;
+        assert!(state.view.read().await.hops.contains_key("x-receiver-a"));
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/streams",
+            Some(serde_json::to_value(stream_x_to_a_sender()).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_hop_id_conflict(&body, "name");
+        assert_eq!(
+            mem.upsert_stream_calls(),
+            1,
+            "the refused stream is not stored"
+        );
+
+        reconcile_tick(&state).await;
+        let view = state.view.read().await;
+        assert!(
+            view.hops.contains_key("x-receiver-a"),
+            "the stored stream stays placed"
+        );
+        assert!(!view.streams.iter().any(|status| status.name == "x"));
+    }
+
+    #[tokio::test]
+    async fn a_stream_set_write_that_can_plan_a_kept_streams_hop_id_writes_nothing() {
+        let (state, _mem) = mem_state();
+        let app = open_router(state);
+        send(
+            &app,
+            "POST",
+            "/streams",
+            Some(serde_json::to_value(stream("x-receiver-a")).unwrap()),
+        )
+        .await;
+
+        let (status, _, body) = send_with_headers(
+            &app,
+            "PUT",
+            "/stream-sets/studio-a",
+            Some(
+                serde_json::to_value(StreamSetApply {
+                    streams: vec![stream("alpha"), stream_x_to_a_sender()],
+                    prune: false,
+                })
+                .unwrap(),
+            ),
+            &[("if-none-match", "*")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_hop_id_conflict(&body, "streams[1].name");
+        let (status, _) = send(&app, "GET", "/stream-sets/studio-a", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = send(&app, "GET", "/streams/alpha", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn two_streams_in_one_set_write_that_can_plan_the_same_hop_id_are_refused() {
+        let (state, _mem) = mem_state();
+        let app = open_router(state);
+        let (status, _, body) = send_with_headers(
+            &app,
+            "PUT",
+            "/stream-sets/studio-a",
+            Some(
+                serde_json::to_value(StreamSetApply {
+                    streams: vec![stream_x_to_a_sender(), stream("x-receiver-a")],
+                    prune: false,
+                })
+                .unwrap(),
+            ),
+            &[("if-none-match", "*")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_hop_id_conflict(&body, "streams[0].name");
+    }
+
+    #[tokio::test]
+    async fn a_set_write_may_prune_the_stream_it_would_share_a_hop_id_with() {
+        let (state, _mem) = mem_state();
+        let app = open_router(state);
+        let apply =
+            |streams, prune| Some(serde_json::to_value(StreamSetApply { streams, prune }).unwrap());
+        let (status, headers, _) = send_with_headers(
+            &app,
+            "PUT",
+            "/stream-sets/studio-a",
+            apply(vec![stream("x-receiver-a")], false),
+            &[("if-none-match", "*")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let etag = response_etag(&headers);
+
+        let (status, _, body) = send_with_headers(
+            &app,
+            "PUT",
+            "/stream-sets/studio-a",
+            apply(vec![stream_x_to_a_sender()], false),
+            &[("if-match", &etag)],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "without prune the member stays"
+        );
+        assert_hop_id_conflict(&body, "streams[0].name");
+
+        let (status, _, body) = send_with_headers(
+            &app,
+            "PUT",
+            "/stream-sets/studio-a",
+            apply(vec![stream_x_to_a_sender()], true),
+            &[("if-match", &etag)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let accepted: StreamSetAccepted = serde_json::from_value(body).unwrap();
+        assert_eq!(accepted.pruned, ["x-receiver-a"]);
+    }
+
+    /// Streams stored before the apply check could already collide. Reapplying
+    /// them unchanged is a no-op, and planning keeps the earlier name.
+    #[tokio::test]
+    async fn streams_that_already_collide_reapply_unchanged_and_plan_in_name_order() {
+        let (state, mem) = mem_state();
+        register_both_nodes(&state).await;
+        let loose = mem.create_stream(&stream("x-receiver-a")).await.unwrap();
+        state
+            .streams
+            .write()
+            .await
+            .insert(loose.spec.name.clone(), loose);
+        let set = mem
+            .create_stream_set("studio-a", &[stream_x_to_a_sender()], false)
+            .await
+            .unwrap();
+        for stored in &set.stream_set.streams {
+            state
+                .streams
+                .write()
+                .await
+                .insert(stored.spec.name.clone(), stored.clone());
+        }
+        state
+            .stream_sets
+            .write()
+            .await
+            .insert("studio-a".to_string(), set.stream_set.revision);
+        let app = open_router(state.clone());
+
+        let (_, headers, _) =
+            send_with_headers(&app, "GET", "/streams/x-receiver-a", None, &[]).await;
+        let etag = response_etag(&headers);
+        let (status, headers, body) = send_with_headers(
+            &app,
+            "POST",
+            "/streams",
+            Some(serde_json::to_value(stream("x-receiver-a")).unwrap()),
+            &[("if-match", &etag)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(response_etag(&headers), etag);
+        assert_eq!(body["changed"], false);
+
+        let (_, headers, _) =
+            send_with_headers(&app, "GET", "/stream-sets/studio-a", None, &[]).await;
+        let etag = response_etag(&headers);
+        let (status, headers, body) = send_with_headers(
+            &app,
+            "PUT",
+            "/stream-sets/studio-a",
+            Some(
+                serde_json::to_value(StreamSetApply {
+                    streams: vec![stream_x_to_a_sender()],
+                    prune: false,
+                })
+                .unwrap(),
+            ),
+            &[("if-match", &etag)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(response_etag(&headers), etag);
+        assert_eq!(body["changed"], false);
+        assert_eq!(body["streams"][0]["generation"], 1);
+
+        reconcile_tick(&state).await;
+        let view = state.view.read().await;
+        assert!(view.hops.contains_key("x"));
+        let later = view
+            .streams
+            .iter()
+            .find(|status| status.name == "x-receiver-a")
+            .unwrap();
+        assert_eq!(later.status, PathStatus::Pending);
+        assert!(later.conditions.iter().any(|condition| condition.detail
+            == "hop id weave-x-receiver-a-sender is already planned for stream x"));
     }
 
     #[tokio::test]

@@ -262,9 +262,15 @@ Hop ids join names with `-`, so two valid streams can spell the same id: the
 sender of stream `x-receiver-a` and the receiver of stream `x` for destination
 `a-sender` are both `weave-x-receiver-a-sender`. A hop id names one hop, since it
 is the flow name on its node and the input to the key of the link feeding it.
-Streams are planned in name order, and a stream that would plan an id an earlier
-stream holds stays unplaced, with reason `placement_failed` and a detail naming
-the id and the stream holding it.
+`POST /streams` and `PUT /stream-sets/{owner}` refuse a stream that can plan an
+id another stream can, on whatever nodes each lands, with
+`409 hop_id_conflict`. The message names both streams and the detail names the
+id. The stream being replaced, and streams the same stream-set write replaces
+or prunes, do not count; another stream in the same write does. An unchanged
+stream is not checked, so streams stored before this check that already collide
+still reapply as no-ops. Streams are planned in name order, and a stream that
+would plan an id an earlier stream holds stays unplaced, with reason
+`placement_failed` and a detail naming the id and the stream holding it.
 
 ```json
 {
@@ -365,7 +371,9 @@ stored. If persisted desired state no longer passes the current contract, the
 controller refuses to start and names the stream, field, and validation error.
 
 Validation returns every issue as a field-addressed detail. Top-level and
-endpoint payloads reject unknown fields.
+endpoint payloads reject unknown fields. A valid stream can still be refused
+with `409 hop_id_conflict` when it can plan a hop id another stream can (see
+[Hop status and fan-out](#hop-status-and-fan-out)).
 
 ### Error responses
 

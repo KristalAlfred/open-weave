@@ -8,6 +8,7 @@ use weave_core::{
 };
 
 use crate::keys::LinkKeys;
+use crate::path::shared_hop_id;
 use crate::{ReconcileOutcome, reconcile};
 
 fn node(id: &str, network: &str) -> NodeDescriptor {
@@ -214,4 +215,52 @@ fn a_refused_stream_claims_no_port() {
         outcome.hops_by_stream.contains_key(&later.name),
         "four ports on edge hold two receivers"
     );
+}
+
+#[test]
+fn the_apply_check_names_the_id_each_colliding_pair_plans_twice() {
+    for [first, second] in colliding_pairs() {
+        let outcome = run(vec![first.clone()]);
+        let planned = &outcome.hops_by_stream[&first.name];
+        let other = run(vec![second.clone()]);
+        let shared = other.hops_by_stream[&second.name]
+            .iter()
+            .find(|hop| planned.iter().any(|held| held.id == hop.id))
+            .map(|hop| hop.id.clone());
+        assert!(
+            shared.is_some(),
+            "{} and {} collide",
+            first.name,
+            second.name
+        );
+        assert_eq!(shared_hop_id(&first, &second), shared);
+        assert_eq!(shared_hop_id(&second, &first), shared);
+    }
+}
+
+#[test]
+fn streams_whose_hop_ids_cannot_meet_are_not_flagged() {
+    let pairs = [
+        [
+            stream("x", "core", &[("a", "edge")]),
+            stream("x-receiver-a", "edge", &[("b", "core")]),
+        ],
+        [
+            stream("a", "site", &[("b", "core")]),
+            stream("a-bridge", "site", &[("b", "core")]),
+        ],
+        [
+            stream("x", "core", &[("a", "edge")]),
+            stream("y", "core", &[("a", "edge")]),
+        ],
+    ];
+    for [first, second] in pairs {
+        assert_eq!(
+            shared_hop_id(&first, &second),
+            None,
+            "{} and {}",
+            first.name,
+            second.name
+        );
+    }
 }

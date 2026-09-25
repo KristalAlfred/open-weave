@@ -17,6 +17,7 @@
               "stream_set_not_found",
               "stream_owned",
               "ownership_conflict",
+              "hop_id_conflict",
               "node_not_found",
               "stream_not_ready",
               "precondition_required",
@@ -15199,7 +15200,7 @@
                 }
               }
             },
-            "description": "Stream ownership conflict"
+            "description": "Stream ownership conflict, or a stream can plan a hop id another can"
           },
           "412": {
             "content": {
@@ -15380,7 +15381,7 @@
                 }
               }
             },
-            "description": "Stream is owned by a stream set"
+            "description": "Stream is owned by a stream set, or can plan a hop id a stored stream can"
           },
           "412": {
             "content": {

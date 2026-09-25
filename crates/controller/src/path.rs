@@ -118,7 +118,11 @@ pub fn receiver_hop_id(stream: &str, destination: &str) -> String {
 /// pinned one are named the same way.
 #[must_use]
 pub fn bridge_hop_id(stream: &str, destination: &str, position: usize) -> String {
-    format!("{HOP_ID_PREFIX}{stream}-bridge-{destination}-{position}")
+    format!("{}{position}", bridge_hop_id_prefix(stream, destination))
+}
+
+fn bridge_hop_id_prefix(stream: &str, destination: &str) -> String {
+    format!("{HOP_ID_PREFIX}{stream}-bridge-{destination}-")
 }
 
 /// Where a stream endpoint is placed: on a registered node, or dialed out to an
@@ -263,6 +267,67 @@ impl HopIds {
         );
         Ok(())
     }
+}
+
+/// A hop id a stream can plan on any nodes: one exact id, or a bridge id with
+/// any position after the prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HopIdForm {
+    Exact(String),
+    Bridge(String),
+}
+
+impl HopIdForm {
+    fn shared_id(&self, other: &Self) -> Option<String> {
+        match (self, other) {
+            (Self::Exact(left), Self::Exact(right)) => (left == right).then(|| left.clone()),
+            (Self::Exact(id), Self::Bridge(prefix)) | (Self::Bridge(prefix), Self::Exact(id)) => id
+                .strip_prefix(prefix.as_str())
+                .is_some_and(is_bridge_position)
+                .then(|| id.clone()),
+            (Self::Bridge(left), Self::Bridge(right)) => {
+                (left == right).then(|| format!("{left}0"))
+            }
+        }
+    }
+}
+
+/// Whether `text` is a position as [`bridge_hop_id`] writes one.
+fn is_bridge_position(text: &str) -> bool {
+    text.parse::<usize>()
+        .is_ok_and(|position| position.to_string() == text)
+}
+
+fn hop_id_forms(stream: &StreamDefinition) -> Vec<HopIdForm> {
+    let mut forms = vec![HopIdForm::Exact(sender_hop_id(&stream.name))];
+    for destination in &stream.destinations {
+        if destination.node().is_some() {
+            forms.push(HopIdForm::Exact(receiver_hop_id(
+                &stream.name,
+                &destination.id,
+            )));
+        }
+        forms.push(HopIdForm::Bridge(bridge_hop_id_prefix(
+            &stream.name,
+            &destination.id,
+        )));
+        if destination.paths > 1 {
+            forms.push(HopIdForm::Bridge(bridge_hop_id_prefix(
+                &stream.name,
+                &second_path_branch_id(&destination.id),
+            )));
+        }
+    }
+    forms
+}
+
+/// A hop id both streams can plan, whatever nodes each lands on.
+#[must_use]
+pub fn shared_hop_id(left: &StreamDefinition, right: &StreamDefinition) -> Option<String> {
+    let right_forms = hop_id_forms(right);
+    hop_id_forms(left)
+        .iter()
+        .find_map(|form| right_forms.iter().find_map(|other| form.shared_id(other)))
 }
 
 /// Derive the ordered (source→destination) hop chain realising one stream.
@@ -3518,6 +3583,136 @@ mod tests {
         assert_eq!(
             addr(&endpoints.destinations[0].endpoint).host.as_deref(),
             Some("203.0.113.7")
+        );
+    }
+
+    fn plan(stream: &StreamDefinition, nodes: &[NodeDescriptor]) -> Path {
+        derive_stream(
+            stream,
+            nodes,
+            &[],
+            &mut PortAllocator::new(),
+            &LinkKeys::for_tests(),
+        )
+        .expect("derive")
+        .path
+    }
+
+    #[test]
+    fn every_planned_hop_id_has_a_form_its_stream_declares() {
+        let nat_pair = vec![
+            nat_node("strom-node-1", "172.26.0.10"),
+            nat_node("strom-node-2", "172.27.0.10"),
+            node("edge-relay", "198.51.100.9"),
+        ];
+
+        let mut pinned = contribution();
+        srt_dest(&mut pinned, 0).via = vec!["relay-first".to_string(), "relay-second".to_string()];
+        let mut pinned_nodes = nodes();
+        pinned_nodes.push(node("relay-first", "198.51.100.10"));
+        pinned_nodes.push(node("relay-second", "198.51.100.20"));
+
+        let mut uplink = contribution();
+        let mut remote = remote_dest();
+        remote.via = vec!["edge-relay".to_string()];
+        uplink.destinations = vec![dest("uplink", remote)];
+        let mut uplink_nodes = nodes();
+        uplink_nodes.push(node("edge-relay", "198.51.100.9"));
+
+        let mut redundant = contribution();
+        redundant.destinations[0].paths = 2;
+        let two_uplinks = |id: &str, host: &str| {
+            node_with(
+                id,
+                vec![
+                    attachment("out-a", "internet-a", true, NetworkListeners::default()),
+                    attachment("out-b", "internet-b", true, NetworkListeners::default()),
+                    attachment(
+                        "site",
+                        &format!("{id}-site"),
+                        true,
+                        srt_listener(host, 7000, 7999),
+                    ),
+                ],
+            )
+        };
+        let mut merging = two_uplinks("strom-node-2", "172.27.0.10");
+        let mut merge = srt_forward();
+        merge.id = "srt-merge".to_string();
+        merge.merge = true;
+        merging.capabilities.hop_profiles.push(merge);
+        let redundant_nodes = vec![
+            two_uplinks("strom-node-1", "172.26.0.10"),
+            merging,
+            node_with(
+                "relay-a",
+                vec![attachment(
+                    "wan",
+                    "internet-a",
+                    true,
+                    srt_listener("10.0.0.2", 7000, 7999),
+                )],
+            ),
+            node_with(
+                "relay-b",
+                vec![attachment(
+                    "wan",
+                    "internet-b",
+                    true,
+                    srt_listener("10.1.0.2", 7000, 7999),
+                )],
+            ),
+        ];
+
+        let mut planned = Vec::new();
+        for (stream, nodes) in [
+            (contribution(), nodes()),
+            (contribution(), nat_pair),
+            (pinned, pinned_nodes),
+            (uplink, uplink_nodes),
+            (redundant, redundant_nodes),
+        ] {
+            let path = plan(&stream, &nodes);
+            planned.extend(path.hops.iter().map(|hop| (stream.clone(), hop.id.clone())));
+        }
+        assert!(
+            planned.iter().any(|(_, id)| id.contains(".2-")),
+            "a second path's bridge is among the planned ids"
+        );
+
+        for (stream, id) in planned {
+            assert!(
+                hop_id_forms(&stream)
+                    .iter()
+                    .any(|form| form.shared_id(&HopIdForm::Exact(id.clone())).is_some()),
+                "{} planned {id}, which none of its forms spells",
+                stream.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_bridge_form_matches_only_positions_as_bridge_hop_id_writes_them() {
+        let form = HopIdForm::Bridge(bridge_hop_id_prefix("x", "a"));
+        for position in [0, 1, 10] {
+            let id = bridge_hop_id("x", "a", position);
+            assert_eq!(form.shared_id(&HopIdForm::Exact(id.clone())), Some(id));
+        }
+        for id in [
+            "weave-x-bridge-a-",
+            "weave-x-bridge-a-01",
+            "weave-x-bridge-a-+1",
+            "weave-x-bridge-a-1-0",
+        ] {
+            assert_eq!(
+                form.shared_id(&HopIdForm::Exact(id.to_string())),
+                None,
+                "{id}"
+            );
+        }
+        assert_eq!(
+            form.shared_id(&HopIdForm::Bridge(bridge_hop_id_prefix("x", "a-1"))),
+            None
         );
     }
 
