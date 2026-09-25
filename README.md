@@ -249,12 +249,19 @@ process at registration rather than wait for a later request to fail. It is `5`:
 SRT socket `params` carry a `passphrase` and `pbkeylen` (see
 [SRT encryption](#srt-encryption)). An adapter at `4` would ignore both and
 build its end of every keyed link in the clear, which the other end refuses.
-The same version adds a hop profile's `merge`, a desired hop's
-`merge_ingress`, and the hop status that reports it (see
-[Redundant paths](#redundant-paths)), the `rist` transport and socket (see
-[Capabilities and topology](#capabilities-and-topology)), which an adapter at
-`4` cannot read, and a capture device's `tracks` with the desired hop's copy of
-them (see [Capabilities and topology](#capabilities-and-topology)).
+The same version adds:
+
+- a hop profile's `merge`, a desired hop's `merge_ingress`, and the hop status
+  that reports it (see [Redundant paths](#redundant-paths));
+- a hop profile's `accepts`, and the `vp8` video codec it and a stream's
+  formats can name (see [Capabilities and topology](#capabilities-and-topology)
+  and [Media formats](#media-formats));
+- the `rist` transport and socket (see
+  [Capabilities and topology](#capabilities-and-topology)), which an adapter at
+  `4` cannot read;
+- a capture device's `tracks`, and the desired hop's `tracks`, the source's
+  tracks copied onto every hop (see
+  [Capabilities and topology](#capabilities-and-topology)).
 
 ### Hop status and fan-out
 
