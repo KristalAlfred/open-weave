@@ -56,3 +56,10 @@ declared reachability.
   the bridge on strom-node-1, and on strom-node-2 with node 1 offline.
 - 2026-09-25: re-run on `bench/` after rebasing on `main` at f768383: `nat-transit`
   and `basic` reach `flowing`, with the bridge on strom-node-1.
+- 2026-09-25: re-run on `bench/` at `main` 1f4eed7, after SRT links between nodes
+  became keyed: `nat-transit` reached `flowing`; the bridge on strom-node-1 and
+  both NAT'd hops carried `passphrase` and `pbkeylen=32` in their link URIs.
+  Stopping `ow-adapter-1` moved the bridge to strom-node-2 and the stream read
+  `flowing` about 30 s later; starting it moved the bridge back in about 20 s.
+  TCP connects between the two NAT'd sites, and into each from nodes 1 and 2,
+  still fail.
