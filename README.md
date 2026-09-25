@@ -269,8 +269,9 @@ id another stream can, on whatever nodes each lands, with
 id. The stream being replaced, and streams the same stream-set write replaces
 or prunes, do not count; another stream in the same write does. An unchanged
 stream is not checked, so streams stored before this check that already collide
-still reapply as no-ops. Streams are planned in name order, and a stream that
-would plan an id an earlier stream holds stays unplaced, with reason
+still reapply as no-ops. Streams whose sender a node reports running are
+planned first, then the rest, each group in name order. A stream that would
+plan an id an earlier stream holds stays unplaced, with reason
 `placement_failed` and a detail naming the id and the stream holding it.
 
 ```json
@@ -883,11 +884,12 @@ is no `relay` flag.
 A bridge stays on the relay that reports running it, as long as that relay is
 online, still qualifies, has the ports, and its report of the bridge is not
 `failed`. So an earlier relay coming back does not move a working stream, and
-a relay that goes offline or fails the bridge loses it. A stream plans the
-destinations some node already carries before new ones, so a new destination
-takes the next relay instead of the ports of an existing bridge. Hops are still
-listed in destination id order. An explicit `via` chain remains an exact node
-constraint:
+a relay that goes offline or fails the bridge loses it. Streams a node already
+runs are planned before new ones, and a stream plans the destinations some node
+already carries before new ones, so a new stream or destination takes the next
+relay instead of the ports of an existing bridge. Streams are still listed, and
+each node's desired hops ordered, by stream name, and a stream's hops by
+destination id. An explicit `via` chain remains an exact node constraint:
 
 ```yaml
 destinations:

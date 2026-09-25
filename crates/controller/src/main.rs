@@ -64,7 +64,7 @@ use weave_core::{
 use keys::{LinkKeys, SecretSource};
 use path::{
     HopIds, PlacementError, PortAllocator, SinglePath, derive_stream, destination_nodes,
-    destination_path_status, path_status, shared_hop_id, stream_endpoints,
+    destination_path_status, path_status, sender_hop_id, shared_hop_id, stream_endpoints,
 };
 use store::{
     LeaseTerm, MemStore, PgStore, StateStore, StoreError, StoredStream, StreamSetMemberAction,
@@ -2614,8 +2614,20 @@ fn reconcile(
     keys: &LinkKeys,
 ) -> ReconcileOutcome {
     // Stable order so the per-tick port allocator assigns deterministically for a
-    // given stream set.
-    streams.sort_by(|a, b| a.name.cmp(&b.name));
+    // given stream set. Streams a node already runs claim ports and hop ids
+    // before new ones, so a new stream cannot take an existing stream's relay.
+    let running: BTreeSet<&str> = observed
+        .hops
+        .iter()
+        .filter(|hop| hop.state != weave_core::HopState::Failed)
+        .map(|hop| hop.id.as_str())
+        .collect();
+    streams.sort_by_cached_key(|stream| {
+        (
+            !running.contains(sender_hop_id(&stream.name).as_str()),
+            stream.name.clone(),
+        )
+    });
 
     // Seed every registered node with an empty desired list so deleted or disabled
     // streams' hops are cleared.
@@ -2639,6 +2651,7 @@ fn reconcile(
     let mut flowing = 0usize;
     let mut ports = PortAllocator::new();
     let mut hop_ids = HopIds::default();
+    let mut placed_hops = Vec::new();
 
     for stream in &streams {
         if !stream.enabled {
@@ -2684,15 +2697,12 @@ fn reconcile(
                 ports = stream_ports;
                 let path = planned.path;
                 hops_by_stream.insert(stream.name.clone(), path.hops.clone());
+                placed_hops.push((stream.name.clone(), path.hops.clone()));
                 let mut nodes = Vec::new();
                 for hop in &path.hops {
                     if !nodes.contains(&hop.node_id) {
                         nodes.push(hop.node_id.clone());
                     }
-                    desired_by_node
-                        .entry(hop.node_id.clone())
-                        .or_default()
-                        .push(hop.clone());
                 }
                 let path_status = path_status(&path, &observed.hops);
                 let offline_node = nodes
@@ -2816,6 +2826,14 @@ fn reconcile(
         }
     }
 
+    placed_hops.sort_by(|left, right| left.0.cmp(&right.0));
+    for hop in placed_hops.into_iter().flat_map(|(_, hops)| hops) {
+        desired_by_node
+            .entry(hop.node_id.clone())
+            .or_default()
+            .push(hop);
+    }
+    stream_statuses.sort_by(|left, right| left.name.cmp(&right.name));
     for stream in &mut stream_statuses {
         stream
             .destinations

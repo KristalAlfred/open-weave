@@ -1,12 +1,13 @@
 use weave_core::{
     DesiredHop, EgressStatus, HopEndpointClass, HopProfile, HopState, HopStatus, LinkCondition,
     NetworkAttachment, NetworkListeners, NodeCapabilities, NodeDescriptor, NodeStatus,
-    NodeTopology, Path, PortRange, RoleSet, SocketStatus, SrtEndpoint, SrtListener,
+    NodeTopology, ObservedState, Path, PortRange, RoleSet, SocketStatus, SrtEndpoint, SrtListener,
     StreamDefinition, StreamDestination, StreamTransport, Transport, TransportClass,
 };
 
 use crate::keys::LinkKeys;
 use crate::path::{PortAllocator, derive_path};
+use crate::{ReconcileOutcome, reconcile};
 
 fn srt_forward() -> HopProfile {
     let srt = || {
@@ -81,6 +82,18 @@ fn relay(id: &str, host: &str, ports: u16) -> NodeDescriptor {
     )
 }
 
+/// `nodes`, with room on each relay for the two listeners of one NAT-to-NAT
+/// bridge.
+fn two_port_relays() -> Vec<NodeDescriptor> {
+    let mut nodes = nodes();
+    for (index, id) in ["relay-a", "relay-b"].into_iter().enumerate() {
+        let host = format!("198.51.100.{}", 10 * (index + 1));
+        let slot = nodes.iter_mut().find(|node| node.id == id).unwrap();
+        *slot = relay(id, &host, 2);
+    }
+    nodes
+}
+
 fn nodes() -> Vec<NodeDescriptor> {
     vec![
         nat_node("source"),
@@ -109,8 +122,12 @@ fn endpoint(node: &str, via: &[&str]) -> StreamTransport {
 }
 
 fn stream(destinations: &[(&str, &str)]) -> StreamDefinition {
+    named("feed", destinations)
+}
+
+fn named(name: &str, destinations: &[(&str, &str)]) -> StreamDefinition {
     StreamDefinition {
-        name: "feed".to_string(),
+        name: name.to_string(),
         enabled: true,
         source: endpoint("source", &[]),
         destinations: destinations
@@ -243,15 +260,9 @@ fn a_via_pin_wins_over_the_relay_running_the_bridge() {
     assert_eq!(hop(&path, STUDIO_BRIDGE).node_id, "relay-a");
 }
 
-/// Each relay has two ports, the two listeners of one NAT-to-NAT bridge.
 #[test]
 fn a_new_destination_takes_the_next_relay_and_leaves_an_existing_bridge_alone() {
-    let mut nodes = nodes();
-    for (index, id) in ["relay-a", "relay-b"].into_iter().enumerate() {
-        let host = format!("198.51.100.{}", 10 * (index + 1));
-        let slot = nodes.iter_mut().find(|node| node.id == id).unwrap();
-        *slot = relay(id, &host, 2);
-    }
+    let nodes = two_port_relays();
     let before = plan(&stream(&[("studio", "studio-node")]), &nodes, &[]);
     assert_eq!(hop(&before, STUDIO_BRIDGE).node_id, "relay-a");
 
@@ -286,4 +297,77 @@ fn a_new_destination_takes_the_next_relay_and_leaves_an_existing_bridge_alone() 
         "relay-b",
         "with nothing reported, the earlier id takes the first relay"
     );
+}
+
+fn run(
+    streams: Vec<StreamDefinition>,
+    nodes: &[NodeDescriptor],
+    hops: Vec<HopStatus>,
+) -> ReconcileOutcome {
+    reconcile(
+        streams,
+        &ObservedState {
+            nodes: nodes.to_vec(),
+            endpoints: Vec::new(),
+            hops,
+        },
+        &LinkKeys::for_tests(),
+    )
+}
+
+#[test]
+fn a_new_stream_that_sorts_first_takes_the_next_relay_and_leaves_an_existing_one_alone() {
+    let nodes = two_port_relays();
+    let existing = named("feed", &[("studio", "studio-node")]);
+    let newcomer = named("alpha", &[("truck", "truck-node")]);
+
+    let before = run(vec![existing.clone()], &nodes, Vec::new());
+    let running = &before.hops_by_stream["feed"];
+    assert_eq!(hop_in(running, STUDIO_BRIDGE).node_id, "relay-a");
+    let reports = reported(
+        &Path {
+            stream: "feed".to_string(),
+            enabled: true,
+            hops: running.clone(),
+        },
+        HopState::Provisioned,
+    );
+
+    let after = run(vec![newcomer.clone(), existing.clone()], &nodes, reports);
+    assert_eq!(
+        &after.hops_by_stream["feed"], running,
+        "the existing stream's hops, ports and keys are unchanged"
+    );
+    assert_eq!(
+        hop_in(&after.hops_by_stream["alpha"], "weave-alpha-bridge-truck-0").node_id,
+        "relay-b"
+    );
+    let names: Vec<_> = after
+        .streams
+        .iter()
+        .map(|status| status.name.as_str())
+        .collect();
+    assert_eq!(names, ["alpha", "feed"], "statuses stay in name order");
+    let senders: Vec<_> = after.desired_by_node["source"]
+        .iter()
+        .map(|hop| hop.id.as_str())
+        .collect();
+    assert_eq!(
+        senders,
+        ["weave-alpha-sender", "weave-feed-sender"],
+        "a node's desired hops stay in stream name order"
+    );
+
+    let unreported = run(vec![newcomer, existing], &nodes, Vec::new());
+    assert_eq!(
+        hop_in(&unreported.hops_by_stream["feed"], STUDIO_BRIDGE).node_id,
+        "relay-b",
+        "with nothing reported, the earlier name takes the first relay"
+    );
+}
+
+fn hop_in<'a>(hops: &'a [DesiredHop], id: &str) -> &'a DesiredHop {
+    hops.iter()
+        .find(|hop| hop.id == id)
+        .unwrap_or_else(|| panic!("no hop {id}"))
 }
