@@ -1602,3 +1602,1002 @@ pub enum NodeStatus {
     Degraded,
     Offline,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_json_uses_snake_case_transport_tag_and_defaults_enabled() {
+        let json = serde_json::json!({
+            "name": "cam1-to-studio",
+            "source": { "srt": { "node": "strom-node-1", "latency": 200 } },
+            "destinations": [
+                { "id": "studio", "srt": { "node": "strom-node-2", "network": "wan" } }
+            ]
+        });
+
+        let stream: StreamDefinition = serde_json::from_value(json).expect("parse stream");
+
+        assert!(stream.enabled, "enabled defaults to true when omitted");
+        assert_eq!(
+            stream.source,
+            StreamTransport::Srt(SrtEndpoint {
+                node: Some("strom-node-1".to_string()),
+                remote: None,
+                via: Vec::new(),
+                format: None,
+                accepts: None,
+                network: None,
+                latency: Some(200),
+            })
+        );
+        assert_eq!(stream.destinations[0].id, "studio");
+        assert_eq!(
+            stream.destinations[0].endpoint,
+            StreamTransport::Srt(SrtEndpoint {
+                node: Some("strom-node-2".to_string()),
+                remote: None,
+                via: Vec::new(),
+                format: None,
+                accepts: None,
+                network: Some("wan".to_string()),
+                latency: None,
+            })
+        );
+
+        let round_trip: StreamDefinition =
+            serde_json::from_str(&serde_json::to_string(&stream).unwrap()).unwrap();
+        assert_eq!(stream, round_trip);
+        assert_eq!(
+            serde_json::to_value(&stream).unwrap()["source"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .next()
+                .unwrap(),
+            "srt"
+        );
+    }
+
+    fn sample_hop() -> DesiredHop {
+        DesiredHop {
+            id: "weave-contribution-sender".to_string(),
+            node_id: "strom-node-1".to_string(),
+            profile_id: "srt-forward".to_string(),
+            role: HopRole::Sender,
+            ingress: SocketSpec::srt_listen(7001, 200),
+            egresses: vec![DesiredEgress {
+                branch_id: "studio".to_string(),
+                socket: SocketSpec::srt_connect("172.31.0.10", 7002, 1000),
+            }],
+        }
+    }
+
+    #[test]
+    fn path_round_trips_and_defaults_enabled_and_hops() {
+        let path = Path {
+            stream: "contribution".to_string(),
+            enabled: true,
+            hops: vec![sample_hop()],
+        };
+        let round_trip: Path =
+            serde_json::from_str(&serde_json::to_string(&path).unwrap()).unwrap();
+        assert_eq!(path, round_trip);
+
+        let minimal: Path = serde_json::from_value(serde_json::json!({
+            "stream": "contribution"
+        }))
+        .expect("parse minimal path");
+        assert!(minimal.enabled, "enabled defaults to true");
+        assert!(minimal.hops.is_empty(), "hops defaults to empty");
+    }
+
+    #[test]
+    fn hop_with_multiple_egresses_round_trips() {
+        let mut hop = sample_hop();
+        hop.egresses.push(DesiredEgress {
+            branch_id: "preview".to_string(),
+            socket: SocketSpec::srt_connect("172.31.0.10", 7003, 1000),
+        });
+        assert_eq!(hop.egresses.len(), 2);
+
+        let value = serde_json::to_value(&hop).unwrap();
+        assert_eq!(value["profile_id"], "srt-forward");
+        assert_eq!(value["egresses"][1]["branch_id"], "preview");
+        assert_eq!(value["egresses"][1]["transport"], "srt");
+        let round_trip: DesiredHop = serde_json::from_value(value).unwrap();
+        assert_eq!(hop, round_trip);
+    }
+
+    #[test]
+    fn a_listening_srt_socket_carries_no_host() {
+        let value = serde_json::to_value(SocketSpec::srt_listen(7001, 200)).unwrap();
+        assert!(value.get("host").is_none(), "a listener has no host");
+        assert_eq!(value["role"], "listen");
+        assert_eq!(value["transport"], "srt");
+    }
+
+    #[test]
+    fn hop_status_round_trips_with_optional_fields_absent() {
+        let status = HopStatus {
+            id: "weave-contribution-sender".to_string(),
+            node_id: "strom-node-1".to_string(),
+            state: HopState::Provisioned,
+            ingress: SocketStatus {
+                condition: LinkCondition::Flowing,
+                resolved: Some(ResolvedAddr {
+                    host: "0.0.0.0".to_string(),
+                    port: 7001,
+                }),
+                stats: Some(LinkStats {
+                    connections: 1,
+                    rate_mbps: 4.5,
+                    ..LinkStats::default()
+                }),
+            },
+            egresses: vec![EgressStatus {
+                branch_id: "studio".to_string(),
+                status: SocketStatus {
+                    condition: LinkCondition::Connected,
+                    resolved: None,
+                    stats: None,
+                },
+            }],
+        };
+        let round_trip: HopStatus =
+            serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
+        assert_eq!(status, round_trip);
+    }
+
+    #[test]
+    fn heartbeat_parses_without_hop_status_field() {
+        let heartbeat: NodeHeartbeat = serde_json::from_value(serde_json::json!({
+            "node_id": "strom-node-1",
+            "status": "ready"
+        }))
+        .expect("parse legacy heartbeat");
+        assert!(heartbeat.hop_status.is_empty());
+    }
+
+    #[test]
+    fn registration_without_protocol_version_reads_as_incompatible_zero() {
+        let registration: NodeRegistration = serde_json::from_value(serde_json::json!({
+            "node": {
+                "id": "strom-node-1",
+                "endpoint": "http://strom-node-1:8091",
+                "status": "ready",
+                "topology": {}
+            }
+        }))
+        .expect("parse pre-handshake registration");
+
+        assert_eq!(registration.protocol_version, 0);
+        assert!(
+            !protocol_compatible(registration.protocol_version),
+            "an adapter that declares no version is not compatible"
+        );
+    }
+
+    #[test]
+    fn protocol_compatible_accepts_only_the_supported_version() {
+        assert!(protocol_compatible(PROTOCOL_VERSION));
+        assert!(!protocol_compatible(PROTOCOL_VERSION + 1));
+        assert!(!protocol_compatible(0));
+    }
+
+    #[test]
+    fn is_managed_hop_id_matches_only_prefixed_names() {
+        assert!(is_managed_hop_id("weave-contribution-sender"));
+        assert!(!is_managed_hop_id("contribution"));
+        assert!(!is_managed_hop_id("contribution-recv"));
+    }
+
+    fn hc(state: HopState, ingress: LinkCondition, egress: LinkCondition) -> Option<HopConditions> {
+        Some(HopConditions {
+            state,
+            ingress,
+            egresses: vec![egress],
+        })
+    }
+
+    #[test]
+    fn rollup_disabled_is_idle() {
+        let hops = [hc(
+            HopState::Provisioned,
+            LinkCondition::Flowing,
+            LinkCondition::Flowing,
+        )];
+        assert_eq!(roll_up_path(false, &hops), PathStatus::Idle);
+    }
+
+    #[test]
+    fn rollup_failed_hop_wins_over_flowing() {
+        let hops = [
+            hc(
+                HopState::Provisioned,
+                LinkCondition::Flowing,
+                LinkCondition::Flowing,
+            ),
+            hc(
+                HopState::Failed,
+                LinkCondition::Flowing,
+                LinkCondition::Flowing,
+            ),
+        ];
+        assert_eq!(roll_up_path(true, &hops), PathStatus::Failed);
+    }
+
+    #[test]
+    fn rollup_pending_or_missing_hop_is_pending() {
+        let pending = [hc(
+            HopState::Pending,
+            LinkCondition::Idle,
+            LinkCondition::Idle,
+        )];
+        assert_eq!(roll_up_path(true, &pending), PathStatus::Pending);
+
+        let missing = [
+            hc(
+                HopState::Provisioned,
+                LinkCondition::Flowing,
+                LinkCondition::Flowing,
+            ),
+            None,
+        ];
+        assert_eq!(roll_up_path(true, &missing), PathStatus::Pending);
+    }
+
+    #[test]
+    fn rollup_source_not_receiving_is_awaiting_input() {
+        let idle = [hc(
+            HopState::Provisioned,
+            LinkCondition::Idle,
+            LinkCondition::Idle,
+        )];
+        assert_eq!(roll_up_path(true, &idle), PathStatus::AwaitingInput);
+
+        let silent = [hc(
+            HopState::Provisioned,
+            LinkCondition::Connected,
+            LinkCondition::Connected,
+        )];
+        assert_eq!(roll_up_path(true, &silent), PathStatus::AwaitingInput);
+    }
+
+    #[test]
+    fn rollup_flowing_source_with_stalled_downstream_is_degraded() {
+        let hops = [
+            hc(
+                HopState::Provisioned,
+                LinkCondition::Flowing,
+                LinkCondition::Flowing,
+            ),
+            hc(
+                HopState::Provisioned,
+                LinkCondition::Connected,
+                LinkCondition::Connected,
+            ),
+        ];
+        assert_eq!(roll_up_path(true, &hops), PathStatus::Degraded);
+    }
+
+    #[test]
+    fn rollup_stalled_source_is_degraded_not_awaiting_input() {
+        let stalled_source = [hc(
+            HopState::Provisioned,
+            LinkCondition::Stalled,
+            LinkCondition::Idle,
+        )];
+        assert_eq!(roll_up_path(true, &stalled_source), PathStatus::Degraded);
+    }
+
+    #[test]
+    fn rollup_stalled_downstream_hop_is_degraded() {
+        let hops = [
+            hc(
+                HopState::Provisioned,
+                LinkCondition::Flowing,
+                LinkCondition::Flowing,
+            ),
+            hc(
+                HopState::Provisioned,
+                LinkCondition::Stalled,
+                LinkCondition::Idle,
+            ),
+        ];
+        assert_eq!(roll_up_path(true, &hops), PathStatus::Degraded);
+    }
+
+    #[test]
+    fn rollup_all_flowing_is_flowing() {
+        let hops = [
+            hc(
+                HopState::Provisioned,
+                LinkCondition::Flowing,
+                LinkCondition::Flowing,
+            ),
+            hc(
+                HopState::Provisioned,
+                LinkCondition::Flowing,
+                LinkCondition::Flowing,
+            ),
+        ];
+        assert_eq!(roll_up_path(true, &hops), PathStatus::Flowing);
+    }
+
+    #[test]
+    fn rollup_checks_every_fanout_branch() {
+        let hops = [Some(HopConditions {
+            state: HopState::Provisioned,
+            ingress: LinkCondition::Flowing,
+            egresses: vec![LinkCondition::Flowing, LinkCondition::Connecting],
+        })];
+        assert_eq!(roll_up_path(true, &hops), PathStatus::Degraded);
+    }
+
+    #[test]
+    fn hop_status_conditions_match_desired_branches_by_id() {
+        let mut desired = sample_hop();
+        desired.egresses.push(DesiredEgress {
+            branch_id: "preview".to_string(),
+            socket: SocketSpec::srt_connect("172.31.0.11", 7003, 1000),
+        });
+        let status = HopStatus {
+            id: "weave-a".to_string(),
+            node_id: "n1".to_string(),
+            state: HopState::Provisioned,
+            ingress: SocketStatus {
+                condition: LinkCondition::Flowing,
+                resolved: None,
+                stats: None,
+            },
+            egresses: vec![
+                EgressStatus {
+                    branch_id: "preview".to_string(),
+                    status: SocketStatus {
+                        condition: LinkCondition::Connected,
+                        resolved: None,
+                        stats: None,
+                    },
+                },
+                EgressStatus {
+                    branch_id: "studio".to_string(),
+                    status: SocketStatus {
+                        condition: LinkCondition::Flowing,
+                        resolved: None,
+                        stats: None,
+                    },
+                },
+            ],
+        };
+        assert_eq!(
+            status.conditions(&desired),
+            Some(HopConditions {
+                state: HopState::Provisioned,
+                ingress: LinkCondition::Flowing,
+                egresses: vec![LinkCondition::Flowing, LinkCondition::Connected],
+            })
+        );
+    }
+
+    #[test]
+    fn hop_status_conditions_reject_missing_duplicate_and_extra_branches() {
+        let desired = sample_hop();
+        let socket = SocketStatus {
+            condition: LinkCondition::Flowing,
+            resolved: None,
+            stats: None,
+        };
+        let mut status = HopStatus {
+            id: desired.id.clone(),
+            node_id: desired.node_id.clone(),
+            state: HopState::Provisioned,
+            ingress: socket.clone(),
+            egresses: Vec::new(),
+        };
+        assert_eq!(status.conditions(&desired), None);
+
+        status.egresses = vec![
+            EgressStatus {
+                branch_id: "studio".to_string(),
+                status: socket.clone(),
+            },
+            EgressStatus {
+                branch_id: "studio".to_string(),
+                status: socket.clone(),
+            },
+        ];
+        assert_eq!(status.conditions(&desired), None);
+
+        status.egresses = vec![EgressStatus {
+            branch_id: "preview".to_string(),
+            status: socket,
+        }];
+        assert_eq!(status.conditions(&desired), None);
+    }
+
+    #[test]
+    fn srt_endpoint_serde_allows_node_or_remote_and_denies_unknown_fields() {
+        let bare: SrtEndpoint =
+            serde_json::from_value(serde_json::json!({ "network": "wan" })).expect("parse bare");
+        assert_eq!(bare.node, None);
+        assert_eq!(bare.remote, None);
+
+        let via: SrtEndpoint = serde_json::from_value(serde_json::json!({
+            "node": "strom-node-2",
+            "via": ["edge-relay"]
+        }))
+        .expect("parse via");
+        assert_eq!(via.via, vec!["edge-relay".to_string()]);
+        assert!(
+            serde_json::to_value(&bare).unwrap().get("via").is_none(),
+            "an empty via is not serialized"
+        );
+
+        let remote: SrtEndpoint = serde_json::from_value(serde_json::json!({
+            "remote": { "host": "198.51.100.5", "port": 9000, "network": "internet" }
+        }))
+        .expect("parse remote");
+        assert_eq!(
+            remote.remote,
+            Some(RemoteAddr {
+                host: "198.51.100.5".to_string(),
+                port: 9000,
+                network: "internet".to_string(),
+            })
+        );
+        let round_trip: SrtEndpoint =
+            serde_json::from_str(&serde_json::to_string(&remote).unwrap()).unwrap();
+        assert_eq!(remote, round_trip);
+
+        let bogus: Result<SrtEndpoint, _> =
+            serde_json::from_value(serde_json::json!({ "node": "n", "bogus": true }));
+        assert!(bogus.is_err(), "deny_unknown_fields rejects typos");
+    }
+
+    fn node_config() -> NodeConfig {
+        NodeConfig {
+            id: "strom-node-1".to_string(),
+            southbound_url: "http://127.0.0.1:8081".to_string(),
+            southbound_token: None,
+            listen: "0.0.0.0:8091".to_string(),
+            public_endpoint: None,
+            topology: NodeTopology {
+                attachments: vec![NetworkAttachment {
+                    id: "lan".to_string(),
+                    network: "studio-lan".to_string(),
+                    dial: true,
+                    listeners: NetworkListeners {
+                        srt: Some(SrtListener {
+                            host: "172.26.0.10".to_string(),
+                            port_range: PortRange {
+                                start: 20000,
+                                end: 20999,
+                            },
+                        }),
+                        whip: None,
+                        whep: None,
+                    },
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn node_config_public_endpoint_defaults_to_listen() {
+        let config = node_config();
+        assert_eq!(config.public_endpoint(), "http://0.0.0.0:8091");
+
+        let mut pinned = node_config();
+        pinned.public_endpoint = Some("http://172.25.0.21:8091".to_string());
+        assert_eq!(pinned.public_endpoint(), "http://172.25.0.21:8091");
+    }
+
+    #[test]
+    fn node_config_validate_accepts_valid_config() {
+        assert_eq!(node_config().validate(), Ok(()));
+    }
+
+    #[test]
+    fn node_config_validate_rejects_invariant_violations() {
+        let mut empty_id = node_config();
+        empty_id.id = "  ".to_string();
+        assert_eq!(
+            empty_id.validate(),
+            Err(ConfigError::InvalidId(ResourceIdError::InvalidCharacters))
+        );
+
+        let mut long_id = node_config();
+        long_id.id = "a".repeat(RESOURCE_ID_MAX_LEN + 1);
+        assert_eq!(
+            long_id.validate(),
+            Err(ConfigError::InvalidId(ResourceIdError::InvalidLength))
+        );
+
+        let mut blank_host = node_config();
+        blank_host.topology.attachments[0]
+            .listeners
+            .srt
+            .as_mut()
+            .unwrap()
+            .host = String::new();
+        assert_eq!(blank_host.validate(), Err(ConfigError::BlankListener));
+
+        let mut bad_range = node_config();
+        bad_range.topology.attachments[0]
+            .listeners
+            .srt
+            .as_mut()
+            .unwrap()
+            .port_range = PortRange {
+            start: 21000,
+            end: 20000,
+        };
+        assert_eq!(
+            bad_range.validate(),
+            Err(ConfigError::InvalidPortRange {
+                start: 21000,
+                end: 20000,
+            })
+        );
+    }
+
+    fn stream_with_formats(
+        format: Option<MediaFormat>,
+        accepts: Option<FormatConstraint>,
+    ) -> StreamDefinition {
+        let mut source = SrtEndpoint {
+            node: Some("strom-node-1".to_string()),
+            remote: None,
+            via: Vec::new(),
+            network: None,
+            latency: None,
+            format: None,
+            accepts: None,
+        };
+        let mut destination = source.clone();
+        source.format = format;
+        destination.node = Some("strom-node-2".to_string());
+        destination.accepts = accepts;
+
+        StreamDefinition {
+            name: "formats".to_string(),
+            enabled: true,
+            source: StreamTransport::Srt(source),
+            destinations: vec![StreamDestination {
+                id: "studio".to_string(),
+                endpoint: StreamTransport::Srt(destination),
+            }],
+        }
+    }
+
+    fn aac_48k() -> MediaFormat {
+        MediaFormat {
+            container: Container::MpegTs,
+            video: None,
+            audio: Some(AudioFormat {
+                codec: AudioCodec::Aac,
+                sample_rate: 48_000,
+                channels: 2,
+            }),
+        }
+    }
+
+    fn wants_44k() -> FormatConstraint {
+        FormatConstraint {
+            audio: Some(AudioConstraint {
+                sample_rate: Some(vec![44_100]),
+                ..AudioConstraint::default()
+            }),
+            ..FormatConstraint::default()
+        }
+    }
+
+    #[test]
+    fn a_destination_that_cannot_accept_the_source_format_is_reported() {
+        let stream = stream_with_formats(Some(aac_48k()), Some(wants_44k()));
+        let conflicts = stream_format_conflicts(&stream);
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].destination, "studio");
+        assert_eq!(
+            conflicts[0].to_string(),
+            "destination studio cannot accept the source format: \
+             audio.sample_rate is 48000 but accepts 44100"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_format_or_constraint_conflicts_with_nothing() {
+        assert!(stream_format_conflicts(&stream_with_formats(None, Some(wants_44k()))).is_empty());
+        assert!(stream_format_conflicts(&stream_with_formats(Some(aac_48k()), None)).is_empty());
+        assert!(stream_format_conflicts(&stream_with_formats(None, None)).is_empty());
+    }
+
+    #[test]
+    fn only_the_destinations_that_conflict_are_reported() {
+        let mut stream = stream_with_formats(Some(aac_48k()), None);
+        let StreamTransport::Srt(base) = &stream.destinations[0].endpoint else {
+            unreachable!("fixture destination is srt");
+        };
+
+        let mut fussy = base.clone();
+        fussy.accepts = Some(wants_44k());
+        let mut relaxed = base.clone();
+        relaxed.accepts = Some(FormatConstraint::default());
+
+        let destination = |id: &str, endpoint: &SrtEndpoint| StreamDestination {
+            id: id.to_string(),
+            endpoint: StreamTransport::Srt(endpoint.clone()),
+        };
+        stream.destinations = vec![
+            destination("relaxed", &relaxed),
+            destination("fussy-a", &fussy),
+            destination("fussy-b", &fussy),
+        ];
+
+        let offenders: Vec<String> = stream_format_conflicts(&stream)
+            .into_iter()
+            .map(|c| c.destination)
+            .collect();
+        assert_eq!(offenders, vec!["fussy-a", "fussy-b"], "in manifest order");
+    }
+
+    #[test]
+    fn network_attachment_rejects_a_misspelled_field() {
+        let attachment: NetworkAttachment = serde_json::from_value(serde_json::json!({
+            "id": "client",
+            "network": "internet",
+            "dial": true
+        }))
+        .expect("parse attachment");
+        assert!(attachment.dial);
+        assert!(attachment.listeners.is_empty());
+
+        let result: Result<NetworkAttachment, _> = serde_json::from_value(serde_json::json!({
+            "id": "client",
+            "network": "internet",
+            "dail": true
+        }));
+        assert!(result.is_err(), "a typo must not read as dial-less");
+    }
+
+    #[test]
+    fn node_config_rejects_unknown_fields() {
+        let mut value = serde_json::json!({
+            "id": "n1",
+            "southbound_url": "http://127.0.0.1:8081",
+            "listen": "0.0.0.0:8091",
+            "topology": { "attachments": [] }
+        });
+        assert!(serde_json::from_value::<NodeConfig>(value.clone()).is_ok());
+
+        value["bogus"] = serde_json::json!(true);
+        let result: Result<NodeConfig, _> = serde_json::from_value(value);
+        assert!(result.is_err(), "deny_unknown_fields rejects typos");
+    }
+
+    #[test]
+    fn device_endpoint_round_trips_and_denies_unknown_fields() {
+        let json = serde_json::json!({
+            "name": "alice-cam",
+            "source": { "device": { "node": "browser-a1b2" } },
+            "destinations": [ { "id": "studio", "srt": { "node": "strom-node-2" } } ]
+        });
+        let stream: StreamDefinition = serde_json::from_value(json).expect("parse stream");
+        assert_eq!(
+            stream.source,
+            StreamTransport::Device(NodeEndpoint {
+                node: "browser-a1b2".to_string(),
+                network: None,
+            })
+        );
+        assert_eq!(stream.source.node(), Some("browser-a1b2"));
+        assert_eq!(stream.source.kind(), "device");
+
+        let round_trip: StreamDefinition =
+            serde_json::from_str(&serde_json::to_string(&stream).unwrap()).unwrap();
+        assert_eq!(stream, round_trip);
+        let value = serde_json::to_value(&stream).unwrap();
+        assert_eq!(
+            value["source"]["device"],
+            serde_json::json!({ "node": "browser-a1b2" })
+        );
+
+        let with_latency: Result<StreamTransport, _> = serde_json::from_value(serde_json::json!({
+            "device": { "node": "browser-a1b2", "latency": 200 }
+        }));
+        assert!(with_latency.is_err(), "a device endpoint has no SRT fields");
+    }
+
+    #[test]
+    fn device_source_declares_no_format_so_nothing_conflicts() {
+        let stream = StreamDefinition {
+            name: "alice-cam".to_string(),
+            enabled: true,
+            source: StreamTransport::Device(NodeEndpoint {
+                node: "browser-a1b2".to_string(),
+                network: None,
+            }),
+            destinations: vec![StreamDestination {
+                id: "studio".to_string(),
+                endpoint: StreamTransport::Srt(SrtEndpoint {
+                    node: Some("strom-node-2".to_string()),
+                    remote: None,
+                    via: Vec::new(),
+                    network: None,
+                    latency: None,
+                    format: None,
+                    accepts: Some(wants_44k()),
+                }),
+            }],
+        };
+        assert!(stream_format_conflicts(&stream).is_empty());
+    }
+
+    #[test]
+    fn every_socket_variant_round_trips_through_its_flat_wire_form() {
+        let cases = [
+            (
+                SocketSpec::srt_listen(7001, 200),
+                serde_json::json!({
+                    "transport": "srt", "role": "listen", "port": 7001,
+                    "params": { "latency": 200 }
+                }),
+            ),
+            (
+                SocketSpec::srt_connect("10.0.0.2", 7002, 1000),
+                serde_json::json!({
+                    "transport": "srt", "role": "connect", "host": "10.0.0.2", "port": 7002,
+                    "params": { "latency": 1000 }
+                }),
+            ),
+            (
+                SocketSpec::signalling(
+                    SignallingTransport::Whip,
+                    SocketRole::Listen,
+                    "http://172.26.0.10:8080/whip",
+                    "weave-x",
+                ),
+                serde_json::json!({
+                    "transport": "whip", "role": "listen",
+                    "url": "http://172.26.0.10:8080/whip/weave-x", "endpoint_id": "weave-x"
+                }),
+            ),
+            (
+                SocketSpec::signalling(
+                    SignallingTransport::Whep,
+                    SocketRole::Connect,
+                    "http://172.26.0.10:8080/whep",
+                    "weave-x",
+                ),
+                serde_json::json!({
+                    "transport": "whep", "role": "connect",
+                    "url": "http://172.26.0.10:8080/whep/weave-x", "endpoint_id": "weave-x"
+                }),
+            ),
+            (
+                SocketSpec::Device(DeviceKind::Capture),
+                serde_json::json!({ "transport": "device", "role": "capture" }),
+            ),
+            (
+                SocketSpec::Device(DeviceKind::Display),
+                serde_json::json!({ "transport": "device", "role": "display" }),
+            ),
+        ];
+
+        for (socket, wire) in cases {
+            assert_eq!(serde_json::to_value(&socket).unwrap(), wire);
+            let parsed: SocketSpec = serde_json::from_value(wire).unwrap();
+            assert_eq!(parsed, socket);
+        }
+    }
+
+    #[test]
+    fn an_srt_socket_parses_with_empty_params() {
+        let stored: SocketSpec = serde_json::from_value(serde_json::json!({
+            "transport": "srt", "role": "listen", "port": 7001, "params": {}
+        }))
+        .expect("hydrate");
+        assert_eq!(
+            stored,
+            SocketSpec::Srt(SrtSocket::Listen {
+                port: 7001,
+                params: SrtParams::default(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_socket_that_mixes_up_its_transport_is_rejected() {
+        let rejected = [
+            serde_json::json!({ "transport": "srt", "role": "listen", "params": {} }),
+            serde_json::json!({ "transport": "srt", "role": "connect", "port": 7002 }),
+            serde_json::json!({
+                "transport": "srt", "role": "listen", "port": 7001, "host": "10.0.0.2"
+            }),
+            serde_json::json!({
+                "transport": "srt", "role": "listen", "port": 7001, "url": "http://x/whip/y"
+            }),
+            serde_json::json!({ "transport": "whip", "role": "listen" }),
+            serde_json::json!({
+                "transport": "whip", "role": "listen", "url": "http://x/whip/y"
+            }),
+            serde_json::json!({
+                "transport": "whip", "role": "listen", "url": "http://x/whip/y", "port": 7001,
+                "endpoint_id": "y"
+            }),
+            serde_json::json!({
+                "transport": "whep", "role": "connect", "url": "http://x/whep/y",
+                "endpoint_id": "y", "params": {}
+            }),
+            serde_json::json!({ "transport": "device", "role": "connect" }),
+            serde_json::json!({ "transport": "srt", "role": "capture", "port": 7001 }),
+            serde_json::json!({ "transport": "device", "role": "capture", "port": 7001 }),
+            serde_json::json!({ "transport": "srt", "role": "listen", "port": 7001, "bogus": 1 }),
+            serde_json::json!({
+                "transport": "srt", "role": "listen", "port": 7001, "endpoint_id": "y"
+            }),
+            serde_json::json!({ "transport": "device", "role": "capture", "endpoint_id": "y" }),
+        ];
+
+        for wire in rejected {
+            let result: Result<SocketSpec, _> = serde_json::from_value(wire.clone());
+            assert!(result.is_err(), "{wire} must not parse");
+        }
+    }
+
+    #[test]
+    fn socket_display_names_the_transport_or_the_device() {
+        assert_eq!(SocketSpec::srt_listen(7001, 200).to_string(), "srt");
+        assert_eq!(
+            SocketSpec::signalling(
+                SignallingTransport::Whip,
+                SocketRole::Listen,
+                "http://x/whip",
+                "y"
+            )
+            .to_string(),
+            "whip"
+        );
+        assert_eq!(
+            SocketSpec::signalling(
+                SignallingTransport::Whep,
+                SocketRole::Connect,
+                "http://x/whep",
+                "y"
+            )
+            .to_string(),
+            "whep"
+        );
+        assert_eq!(
+            SocketSpec::Device(DeviceKind::Capture).to_string(),
+            "capture device"
+        );
+        assert_eq!(
+            SocketSpec::Device(DeviceKind::Display).to_string(),
+            "display device"
+        );
+    }
+
+    #[test]
+    fn a_transport_offered_in_no_role_or_under_no_known_name_is_rejected() {
+        let no_role: Result<TransportClass, _> =
+            serde_json::from_value(serde_json::json!({ "transport": "whip", "roles": [] }));
+        assert!(no_role.is_err(), "a transport offered in no role");
+
+        let unknown: Result<TransportClass, _> =
+            serde_json::from_value(serde_json::json!({ "transport": "rist", "roles": ["listen"] }));
+        assert!(unknown.is_err(), "an unknown transport name is an error");
+    }
+
+    #[test]
+    fn hop_profiles_decide_which_transports_roles_and_devices_a_node_offers() {
+        let capabilities: NodeCapabilities = serde_json::from_value(serde_json::json!({
+            "hop_profiles": [{
+                "id": "camera-to-whip",
+                "ingress": { "device": "capture" },
+                "egress": { "transport": "whip", "roles": ["connect"] },
+                "max_egresses": 1
+            }]
+        }))
+        .expect("parse capabilities");
+
+        assert!(capabilities.offers_ingress_device(DeviceKind::Capture));
+        assert!(!capabilities.offers_ingress_device(DeviceKind::Display));
+        assert!(!capabilities.offers_egress_device(DeviceKind::Capture));
+        assert!(capabilities.offers_egress(Transport::Whip, SocketRole::Connect));
+        assert!(!capabilities.offers_egress(Transport::Whip, SocketRole::Listen));
+        assert!(!capabilities.offers_ingress(Transport::Whip, SocketRole::Connect));
+        assert!(!capabilities.offers_ingress(Transport::Srt, SocketRole::Listen));
+
+        let round_trip: NodeCapabilities =
+            serde_json::from_str(&serde_json::to_string(&capabilities).unwrap()).unwrap();
+        assert_eq!(capabilities, round_trip);
+
+        let bare = NodeCapabilities::default();
+        assert!(!bare.offers_ingress(Transport::Srt, SocketRole::Listen));
+        assert!(!bare.offers_egress(Transport::Srt, SocketRole::Connect));
+        assert!(!bare.offers_ingress_device(DeviceKind::Capture));
+    }
+
+    #[test]
+    fn network_listeners_carry_signalling_bases_per_webrtc_transport() {
+        let listeners: NetworkListeners = serde_json::from_value(serde_json::json!({
+            "whip": { "base_url": "http://172.26.0.10:8080/whip" },
+            "whep": { "base_url": "http://172.26.0.10:8080/whep" }
+        }))
+        .expect("parse");
+        assert!(!listeners.is_empty());
+        assert_eq!(
+            listeners.signalling(SignallingTransport::Whip),
+            Some("http://172.26.0.10:8080/whip")
+        );
+        assert_eq!(
+            listeners.signalling(SignallingTransport::Whep),
+            Some("http://172.26.0.10:8080/whep")
+        );
+        let round_trip: NetworkListeners =
+            serde_json::from_str(&serde_json::to_string(&listeners).unwrap()).unwrap();
+        assert_eq!(listeners, round_trip);
+
+        let srt_only: NetworkListeners = serde_json::from_value(serde_json::json!({
+            "srt": { "host": "172.26.0.10", "port_range": { "start": 20000, "end": 20999 } }
+        }))
+        .expect("parse srt listener");
+        assert_eq!(srt_only.signalling(SignallingTransport::Whip), None);
+        assert_eq!(
+            serde_json::to_value(&srt_only).unwrap(),
+            serde_json::json!({
+                "srt": { "host": "172.26.0.10", "port_range": { "start": 20000, "end": 20999 } }
+            }),
+            "a listener set hosting no signalling serializes none"
+        );
+    }
+
+    #[test]
+    fn signalling_socket_joins_base_and_endpoint_id() {
+        let trimmed = SignallingSocket::new(SocketRole::Listen, "http://x:8080/whip/", "weave-a");
+        let bare = SignallingSocket::new(SocketRole::Listen, "http://x:8080/whip", "weave-a");
+        assert_eq!(trimmed.url, "http://x:8080/whip/weave-a");
+        assert_eq!(trimmed.endpoint_id, "weave-a");
+        assert_eq!(
+            trimmed, bare,
+            "a trailing slash on the base changes nothing"
+        );
+    }
+
+    #[test]
+    fn signalling_transport_maps_both_ways_with_transport() {
+        assert_eq!(Transport::Srt.signalling(), None);
+        assert_eq!(
+            Transport::Whip.signalling(),
+            Some(SignallingTransport::Whip)
+        );
+        assert_eq!(
+            Transport::Whep.signalling(),
+            Some(SignallingTransport::Whep)
+        );
+        assert_eq!(SignallingTransport::Whip.transport(), Transport::Whip);
+        assert_eq!(SignallingTransport::Whep.transport(), Transport::Whep);
+    }
+
+    #[test]
+    fn transport_and_device_names_match_their_wire_form() {
+        for transport in [Transport::Srt, Transport::Whip, Transport::Whep] {
+            assert_eq!(
+                serde_json::to_value(transport).unwrap(),
+                serde_json::json!(transport.name())
+            );
+            assert_eq!(transport.to_string(), transport.name());
+        }
+        for kind in [DeviceKind::Capture, DeviceKind::Display] {
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::json!(kind.name())
+            );
+            assert_eq!(kind.to_string(), kind.name());
+        }
+    }
+}

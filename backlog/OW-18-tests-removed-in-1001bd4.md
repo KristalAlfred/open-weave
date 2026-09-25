@@ -44,3 +44,21 @@ Status section and the header of `bench/manifests/nat-relay.yaml` still cite.
 
 - 2026-09-25: filed from research on OW-1, OW-7, OW-8 and OW-6.
 - 2026-09-25: started by claude-tests.
+- 2026-09-25: `crates/core/src/lib.rs`: 41 tests back for the old 47. 40 are
+  one-to-one ports to the v4 types (destination ids, `profile_id`, topology
+  attachments); `data_plane_addr_rejects_a_misspelled_field` and
+  `data_plane_addr_carries_signalling_bases_per_webrtc_transport` now test
+  `NetworkAttachment` and `NetworkListeners`. The node config invariant test
+  lost its missing-`default`-alias case, since there is no default alias.
+  `capabilities_without_transports_read_as_srt_in_both_roles` and
+  `devices_parse_from_a_list_and_are_omitted_when_empty` became one hop-profile
+  test. Removed behaviour, not ported: the `data_plane` shorthand, reachability
+  and `relay` flag (replaced by attachments); a pre-reachability registration
+  hydrating (a stored row that no longer parses is dropped at boot by
+  `decode_registrations` in `store.rs`); the bare-name `transports` offer and a
+  role-less stored offer (replaced by `hop_profiles` with explicit roles); the
+  SRT fallback for capabilities that declare no transports (a bare
+  `NodeCapabilities` now offers nothing); `Signalling::set` (replaced by
+  `NetworkListeners`, which has no setter). `crates/core/src/validation.rs`: 9
+  of 9 back; the id-grammar test also covers destination and network ids. No
+  ported test failed. Checked with `cargo test -p weave-core`, unit tests only.
