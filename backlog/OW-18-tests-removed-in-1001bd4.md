@@ -171,3 +171,11 @@ Status section and the header of `bench/manifests/nat-relay.yaml` still cite.
   existing stream. The ported test sizes node 2 for one receiver, first checks
   the preview alone is `placed`, and then that it is `unplaced` with "no free
   port" once `existing` is applied. All pass; unit tests only.
+- 2026-09-25: `crates/controller/src/main.rs`, registration: 4 of 4 back
+  (`registration_with_an_incompatible_protocol_version_is_rejected`,
+  `registration_with_an_invalid_node_id_is_rejected`,
+  `node_cannot_report_another_nodes_hop_status`,
+  `a_browser_endpoint_is_stored_verbatim_and_never_dialled`). The browser test
+  now registers the page with a `camera-to-whip` profile and a dial-only
+  attachment, and the Strom with a `whip-to-srt` profile and a WHIP listener.
+  All pass; unit tests only.

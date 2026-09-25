@@ -3294,6 +3294,234 @@ mod tests {
         assert_eq!(observed.nodes[0].status, NodeStatus::Degraded);
     }
 
+    /// A stale adapter is turned away at the handshake, and nothing about it is
+    /// recorded.
+    #[tokio::test]
+    async fn registration_with_an_incompatible_protocol_version_is_rejected() {
+        let (state, mem) = mem_state();
+        let app = open_router(state);
+
+        for reported in [0, PROTOCOL_VERSION + 1] {
+            let mut registration = node_registration("strom-node-1", "172.26.0.10");
+            registration.protocol_version = reported;
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/nodes/register",
+                Some(serde_json::to_value(&registration).unwrap()),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::CONFLICT, "reported version {reported}");
+            assert_eq!(body["code"], "incompatible_protocol_version");
+            assert_eq!(body["details"][0]["field"], "protocol_version");
+            assert_eq!(
+                body["details"][0]["message"],
+                format!("reported {reported}; supported {PROTOCOL_VERSION}")
+            );
+        }
+
+        assert_eq!(
+            mem.upsert_node_calls(),
+            0,
+            "a rejected node is never persisted"
+        );
+        let (_, body) = send(&app, "GET", "/nodes", None).await;
+        assert_eq!(body, json!([]), "a rejected node is never registered");
+    }
+
+    #[tokio::test]
+    async fn registration_with_an_invalid_node_id_is_rejected() {
+        let (state, mem) = mem_state();
+        let app = open_router(state);
+        let registration = node_registration("node/one", "172.26.0.10");
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/nodes/register",
+            Some(serde_json::to_value(&registration).unwrap()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "invalid_request");
+        assert_eq!(body["details"][0]["field"], "node.id");
+        assert_eq!(body["details"][0]["code"], "invalid_characters");
+        assert_eq!(mem.upsert_node_calls(), 0);
+        let (_, body) = send(&app, "GET", "/nodes", None).await;
+        assert_eq!(body, json!([]));
+
+        let mut registration = node_registration("node-one", "172.26.0.10");
+        registration.endpoints.push(EndpointDescriptor {
+            id: "capture-1".to_string(),
+            label: "Capture".to_string(),
+            node_id: Some("node/one".to_string()),
+            kind: weave_core::EndpointKind::Source,
+            transports: Vec::new(),
+            metadata: Value::Null,
+        });
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/nodes/register",
+            Some(serde_json::to_value(&registration).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "invalid_request");
+        assert_eq!(body["details"][0]["field"], "endpoints[0].node_id");
+        assert_eq!(mem.upsert_node_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn node_cannot_report_another_nodes_hop_status() {
+        let (state, mem) = mem_state();
+        let app = open_router(state);
+        let status_for = |node_id: &str| weave_core::HopStatus {
+            id: "weave-basic-sender".to_string(),
+            node_id: node_id.to_string(),
+            state: weave_core::HopState::Provisioned,
+            ingress: weave_core::SocketStatus {
+                condition: weave_core::LinkCondition::Flowing,
+                resolved: None,
+                stats: None,
+            },
+            egresses: Vec::new(),
+        };
+
+        let mut registration = node_registration("strom-node-1", "172.26.0.10");
+        registration.hop_status = vec![status_for("strom-node-2")];
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/nodes/register",
+            Some(serde_json::to_value(&registration).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(mem.upsert_node_calls(), 0);
+
+        registration.hop_status.clear();
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/nodes/register",
+            Some(serde_json::to_value(&registration).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let heartbeat = NodeHeartbeat {
+            node_id: "strom-node-1".to_string(),
+            status: NodeStatus::Ready,
+            endpoints: Vec::new(),
+            hop_status: vec![status_for("strom-node-2")],
+        };
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/nodes/strom-node-1/heartbeat",
+            Some(serde_json::to_value(&heartbeat).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A browser node registers with a `browser://<id>` endpoint. The field is
+    /// opaque here: the controller stores it, makes no outbound call to any node
+    /// (it has no HTTP client at all), and serves the node's desired hops for the
+    /// page to pull like any adapter.
+    #[tokio::test]
+    async fn a_browser_endpoint_is_stored_verbatim_and_never_dialled() {
+        let (state, _mem) = mem_state();
+        let app = open_router(state.clone());
+
+        let mut browser = node_registration("browser-a1b2", "browser");
+        browser.node.endpoint = "browser://browser-a1b2".to_string();
+        browser.node.capabilities.hop_profiles = vec![HopProfile {
+            id: "camera-to-whip".to_string(),
+            ingress: HopEndpointClass::Device(weave_core::DeviceClass {
+                device: weave_core::DeviceKind::Capture,
+            }),
+            egress: HopEndpointClass::Transport(TransportClass {
+                transport: Transport::Whip,
+                roles: RoleSet::only(weave_core::SocketRole::Connect),
+            }),
+            max_egresses: Some(1),
+        }];
+        browser.node.topology.attachments[0].listeners = NetworkListeners::default();
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/nodes/register",
+            Some(serde_json::to_value(&browser).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let mut strom = node_registration("strom-node-2", "172.27.0.10");
+        strom.node.capabilities.hop_profiles.push(HopProfile {
+            id: "whip-to-srt".to_string(),
+            ingress: HopEndpointClass::Transport(TransportClass {
+                transport: Transport::Whip,
+                roles: RoleSet::only(weave_core::SocketRole::Listen),
+            }),
+            egress: HopEndpointClass::Transport(TransportClass {
+                transport: Transport::Srt,
+                roles: RoleSet::both(),
+            }),
+            max_egresses: None,
+        });
+        strom.node.topology.attachments[0].listeners.whip = Some(weave_core::SignallingListener {
+            base_url: "http://172.27.0.10:8080/whip".to_string(),
+        });
+        send(
+            &app,
+            "POST",
+            "/nodes/register",
+            Some(serde_json::to_value(&strom).unwrap()),
+        )
+        .await;
+
+        let mut cam = stream("alice-cam");
+        cam.source = StreamTransport::Device(weave_core::NodeEndpoint {
+            node: "browser-a1b2".to_string(),
+            network: None,
+        });
+        state
+            .streams
+            .write()
+            .await
+            .insert(cam.name.clone(), stored_stream(cam));
+
+        reconcile_tick(&state).await;
+
+        let (_, body) = send(&app, "GET", "/nodes", None).await;
+        let nodes: Vec<NodeDescriptor> = serde_json::from_value(body).unwrap();
+        let page = nodes.iter().find(|n| n.id == "browser-a1b2").unwrap();
+        assert_eq!(page.endpoint, "browser://browser-a1b2");
+
+        let (status, body) = send(&app, "GET", "/nodes/browser-a1b2/desired", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let hops: Vec<DesiredHop> = serde_json::from_value(body).unwrap();
+        assert_eq!(hops.len(), 1);
+        assert!(
+            matches!(
+                hops[0].ingress,
+                weave_core::SocketSpec::Device(weave_core::DeviceKind::Capture)
+            ),
+            "the page's own camera feeds the hop: {:?}",
+            hops[0].ingress
+        );
+        assert!(
+            matches!(hops[0].egresses[0].socket, weave_core::SocketSpec::Whip(_)),
+            "the page pushes to the Strom's ingest: {:?}",
+            hops[0].egresses[0]
+        );
+    }
+
     #[test]
     fn mark_offline_marks_stale_preserves_fresh_and_spares_exact_ttl() {
         let mut nodes = BTreeMap::from([
