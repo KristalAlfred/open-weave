@@ -2567,11 +2567,16 @@ fn placement_failed_conditions(
             StreamConditionReason::NotReady,
         )
     };
+    let placement_reason = if matches!(error, PlacementError::CleartextLink { .. }) {
+        StreamConditionReason::CleartextNotAllowed
+    } else {
+        StreamConditionReason::PlacementFailed
+    };
     vec![
         stream_condition(
             StreamConditionType::PlacementReady,
             StreamConditionStatus::False,
-            StreamConditionReason::PlacementFailed,
+            placement_reason,
             detail.clone(),
         ),
         stream_condition(
@@ -2684,6 +2689,7 @@ fn destination_stream(stream: &StreamDefinition, id: &str) -> StreamDefinition {
     StreamDefinition {
         name: stream.name.clone(),
         enabled: stream.enabled,
+        allow_cleartext_links: false,
         source: stream.source.clone(),
         destinations: vec![destination],
     }
@@ -3077,6 +3083,7 @@ mod tests {
         StreamDefinition {
             name: name.to_string(),
             enabled: true,
+            allow_cleartext_links: false,
             source: srt_endpoint(source, 200),
             destinations: vec![StreamDestination {
                 id: "studio".to_string(),
@@ -6946,6 +6953,7 @@ mod key_exposure_tests {
         StreamDefinition {
             name: "feed".to_string(),
             enabled: true,
+            allow_cleartext_links: false,
             source: endpoint("node-a", PRODUCER_KEY),
             destinations: vec![StreamDestination {
                 id: "studio".to_string(),

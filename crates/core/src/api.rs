@@ -111,6 +111,7 @@ pub enum StreamConditionReason {
     SinglePath,
     Disabled,
     PlacementFailed,
+    CleartextNotAllowed,
     NodesAvailable,
     NodeMissing,
     NodeOffline,

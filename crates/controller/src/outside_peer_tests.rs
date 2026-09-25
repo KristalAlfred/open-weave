@@ -142,6 +142,7 @@ fn stream(source: StreamTransport, destinations: Vec<(&str, StreamTransport)>) -
     let stream = StreamDefinition {
         name: "feed".to_string(),
         enabled: true,
+        allow_cleartext_links: false,
         source,
         destinations: destinations
             .into_iter()

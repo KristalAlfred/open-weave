@@ -44,7 +44,7 @@ to 0.6.10; `basic`, `nat-egress`, `browser-cam`, `browser-return` and
 | `disabled` | `enabled: false` | `idle` | `idle` | `idle` |
 | `srt-latency` | non-default SRT latency (120ms / 2000ms) | `awaiting_input` | `degraded` | `flowing` |
 | `encrypted` | `basic` with a passphrase on the ingress and the output | — | — | `flowing` |
-| `rist` | `basic` under `just bench topology rist`: the link goes over RIST | — | — | `flowing` |
+| `rist` | `basic` with `allow_cleartext_links: true`, under `just bench topology rist`: the link goes over RIST | — | — | `flowing` |
 | `via` | pinned transit: node-1 → bridge on node-2 → node-1 | `awaiting_input` | — | `flowing` |
 | `nat-egress` | NAT'd node-3 contributes out to node-1 | `awaiting_input` | — | `flowing` |
 | `nat-ingress` | node-1 delivers into NAT'd node-3 (link reverses) | `awaiting_input` | — | `flowing` |
@@ -126,8 +126,9 @@ Notes:
   `just bench topology rist`, node 2 offers the internet only a RIST listener,
   so the sender on node-1 pushes RIST to it (`srt-to-rist`, `rist-to-srt`).
   Observed `flowing` with RTP on the even port and RTCP both ways on the next.
-  Every stream through node 2 replans under that topology, so `basic` moves to
-  RIST too; `just bench topology default` puts it back.
+  Every stream through node 2 replans under that topology. One that does not
+  set `allow_cleartext_links`, such as `basic`, reads `pending` with reason
+  `cleartext_not_allowed`; `just bench topology default` puts it back.
 - **`via`**: three hops — `weave-via-sender` on node-1,
   `weave-via-bridge-output-0` on node-2, `weave-via-receiver-output` back on
   node-1 — so the media crosses both

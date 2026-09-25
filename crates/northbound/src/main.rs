@@ -517,6 +517,7 @@ mod tests {
         StreamDefinition {
             name: "cam1-to-studio".to_string(),
             enabled: true,
+            allow_cleartext_links: false,
             source: StreamTransport::Srt(node_ref("strom-node-1")),
             destinations: vec![StreamDestination {
                 id: "studio".to_string(),

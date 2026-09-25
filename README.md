@@ -632,7 +632,9 @@ Where keys appear:
 - A node token reads only its own node's desired hops, so each node learns the
   keys of its own sockets and no others. Whoever holds `WEAVE_SOUTHBOUND_KEY` can
   make any node's token, and so read every key.
-- A link between nodes that runs over RIST carries no key (`backlog/OW-41`).
+- A link between nodes that runs over RIST carries no key. The planner uses RIST
+  only for a stream that sets `allow_cleartext_links` (see
+  [Capabilities and topology](#capabilities-and-topology)).
 - Strom returns the keys in its own `GET /api/flows`, and its SRT blocks log them
   at INFO. `WEAVE_STROM_TOKEN` guards that API when Strom requires a token;
   nothing in open-weave changes what Strom logs.
@@ -904,11 +906,31 @@ among those on the endpoint's `network` when it names one.
 A `rist` listener takes a `host` and a `port_range`, as an SRT one does. RIST
 here is the simple profile: the receiver binds an even port for RTP and the port
 after it for RTCP, and the sender pushes to both. Only the downstream end of a
-link can host it, so a receiver behind NAT cannot take RIST. The planner tries
-RIST after SRT, WHIP and WHEP, so it carries a link only where none of those
-can, and a link that planned before RIST existed keeps its transport. SRT and
-RIST can share a port range: an SRT port takes half of a free RIST pair only when
-no other port in its range is free. A RIST link carries no key (`backlog/OW-41`).
+link can host it, so a receiver behind NAT cannot take RIST. SRT and RIST can
+share a port range: an SRT port takes half of a free RIST pair only when no other
+port in its range is free.
+
+A RIST link carries no encryption: the simple profile has no key, and GStreamer's
+`ristsrc` and `ristsink` take none. The planner puts a link on RIST only for a
+stream that allows it in the clear:
+
+```yaml
+name: rist
+allow_cleartext_links: true
+source:
+  srt: { node: strom-node-1 }
+destinations:
+  - id: output
+    srt: { node: strom-node-2 }
+```
+
+`allow_cleartext_links` defaults to `false` and is omitted when false. Without
+it the stream is planned as if no node offered RIST. A stream only a RIST link
+can carry then stays unplaced: its `placement_ready` condition is `false` with
+reason `cleartext_not_allowed`, and the detail names the node the link runs
+into. With it, the planner tries RIST after SRT, WHIP and WHEP, so it carries a
+link only where none of those can, and a link that planned before RIST existed
+keeps its transport. SRT links are keyed whether or not the stream sets it.
 
 Planning first tries a direct link. If none works, it tries one online transit
 node whose profile supports the required ingress-to-egress shape and whose

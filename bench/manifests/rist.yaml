@@ -1,8 +1,11 @@
 # basic, for node 2's RIST-only topology (`just bench topology rist`): the
 # planner puts the link between the nodes on RIST, since node 2 offers nothing
-# else to the internet. Under the default topology it plans SRT like basic.
+# else to the internet. RIST carries no encryption, so the stream has to allow
+# cleartext links. Under the default topology it plans a keyed SRT link like
+# basic.
 name: rist
 enabled: true
+allow_cleartext_links: true
 source:
   srt:
     node: strom-node-1

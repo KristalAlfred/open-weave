@@ -109,6 +109,7 @@ fn stream(name: &str, destinations: Vec<StreamDestination>) -> StreamDefinition 
     StreamDefinition {
         name: name.to_string(),
         enabled: true,
+        allow_cleartext_links: false,
         source: endpoint("source"),
         destinations,
     }

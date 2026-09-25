@@ -113,6 +113,7 @@ fn fan_out_stream(receivers: usize) -> StreamDefinition {
     StreamDefinition {
         name: "feed".to_string(),
         enabled: true,
+        allow_cleartext_links: false,
         source: endpoint("source"),
         destinations: (0..receivers)
             .map(|index| StreamDestination {

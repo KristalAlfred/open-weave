@@ -1208,6 +1208,7 @@ destinations:
         StreamDefinition {
             name: "cam1-to-studio".to_string(),
             enabled: true,
+            allow_cleartext_links: false,
             source: StreamTransport::Srt(SrtEndpoint {
                 node: Some("strom-node-1".to_string()),
                 remote: None,
@@ -1644,6 +1645,7 @@ destinations:
         let stream = StreamDefinition {
             name: "preview".to_string(),
             enabled: true,
+            allow_cleartext_links: false,
             source: StreamTransport::Srt(SrtEndpoint {
                 node: Some("missing".to_string()),
                 remote: None,

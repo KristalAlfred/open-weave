@@ -154,7 +154,8 @@ and either may get it.
 `just bench topology rist` restarts adapter-2 with `config/adapter-2-rist.yaml`,
 where node 2 dials nothing and offers only a RIST listener to the internet, its
 SRT listener serving consumers on its own LAN. `just bench stream-up rist` then
-drives a stream whose link from node 1 to node 2 the planner puts on RIST.
+drives a stream whose link from node 1 to node 2 the planner puts on RIST, which
+it does because the manifest sets `allow_cleartext_links`.
 `just bench topology default` puts adapter-2 back, and so does the next
 `just bench up`.
 

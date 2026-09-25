@@ -91,6 +91,7 @@ mod contract_tests {
         let left = StreamDefinition {
             name: "feed".to_string(),
             enabled: true,
+            allow_cleartext_links: false,
             source: endpoint("source"),
             destinations: vec![destination("studio", "a"), destination("preview", "b")],
         };
@@ -104,6 +105,7 @@ mod contract_tests {
         let stream = StreamDefinition {
             name: "feed".to_string(),
             enabled: true,
+            allow_cleartext_links: false,
             source: endpoint("source"),
             destinations: vec![destination("studio", "a"), destination("studio", "b")],
         };
@@ -285,6 +287,12 @@ pub struct StreamDefinition {
     pub name: String,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Lets the planner put a link between two nodes on a transport that
+    /// carries no encryption, which today is RIST. Without it no such link is
+    /// planned, and a stream only such a link can carry stays unplaced. SRT links
+    /// are keyed either way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_cleartext_links: bool,
     pub source: StreamTransport,
     #[schemars(length(min = 1))]
     pub destinations: Vec<StreamDestination>,
@@ -292,7 +300,11 @@ pub struct StreamDefinition {
 
 impl PartialEq for StreamDefinition {
     fn eq(&self, other: &Self) -> bool {
-        if self.name != other.name || self.enabled != other.enabled || self.source != other.source {
+        if self.name != other.name
+            || self.enabled != other.enabled
+            || self.allow_cleartext_links != other.allow_cleartext_links
+            || self.source != other.source
+        {
             return false;
         }
         let mut left: Vec<_> = self.destinations.iter().collect();
@@ -2644,6 +2656,7 @@ mod tests {
         StreamDefinition {
             name: "formats".to_string(),
             enabled: true,
+            allow_cleartext_links: false,
             source: StreamTransport::Srt(source),
             destinations: vec![StreamDestination {
                 id: "studio".to_string(),
@@ -2815,10 +2828,35 @@ mod tests {
     }
 
     #[test]
+    fn cleartext_links_are_off_unless_a_stream_allows_them() {
+        let mut json = serde_json::json!({
+            "name": "feed",
+            "source": { "srt": { "node": "strom-node-1" } },
+            "destinations": [ { "id": "studio", "srt": { "node": "strom-node-2" } } ]
+        });
+        let stream: StreamDefinition = serde_json::from_value(json.clone()).unwrap();
+        assert!(!stream.allow_cleartext_links);
+        assert!(
+            serde_json::to_value(&stream).unwrap()["allow_cleartext_links"].is_null(),
+            "omitted when false"
+        );
+
+        json["allow_cleartext_links"] = serde_json::json!(true);
+        let allowing: StreamDefinition = serde_json::from_value(json).unwrap();
+        assert!(allowing.allow_cleartext_links);
+        assert_eq!(
+            serde_json::to_value(&allowing).unwrap()["allow_cleartext_links"],
+            true
+        );
+        assert_ne!(stream, allowing, "the field is part of the spec");
+    }
+
+    #[test]
     fn device_source_declares_no_format_so_nothing_conflicts() {
         let stream = StreamDefinition {
             name: "alice-cam".to_string(),
             enabled: true,
+            allow_cleartext_links: false,
             source: StreamTransport::Device(NodeEndpoint {
                 node: "browser-a1b2".to_string(),
                 network: None,

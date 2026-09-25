@@ -1304,6 +1304,7 @@ pub(crate) mod tests {
         StreamDefinition {
             name: name.to_string(),
             enabled: true,
+            allow_cleartext_links: false,
             source: StreamTransport::Srt(SrtEndpoint {
                 node: Some("strom-node-1".to_string()),
                 remote: None,

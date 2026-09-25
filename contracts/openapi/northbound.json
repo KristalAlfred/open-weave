@@ -706,6 +706,7 @@
                               "single_path",
                               "disabled",
                               "placement_failed",
+                              "cleartext_not_allowed",
                               "nodes_available",
                               "node_missing",
                               "node_offline",
@@ -775,6 +776,7 @@
                                     "single_path",
                                     "disabled",
                                     "placement_failed",
+                                    "cleartext_not_allowed",
                                     "nodes_available",
                                     "node_missing",
                                     "node_offline",
@@ -1085,6 +1087,10 @@
         "additionalProperties": false,
         "description": "Operator intent: one source streamed to one or more destinations over a transport.",
         "properties": {
+          "allow_cleartext_links": {
+            "description": "Lets the planner put a link between two nodes on a transport that\n carries no encryption, which today is RIST. Without it no such link is\n planned, and a stream only such a link can carry stays unplaced. SRT links\n are keyed either way.",
+            "type": "boolean"
+          },
           "destinations": {
             "items": {
               "description": "One stable, named output branch of a stream.",
@@ -3370,6 +3376,10 @@
               "additionalProperties": false,
               "description": "Operator intent: one source streamed to one or more destinations over a transport.",
               "properties": {
+                "allow_cleartext_links": {
+                  "description": "Lets the planner put a link between two nodes on a transport that\n carries no encryption, which today is RIST. Without it no such link is\n planned, and a stream only such a link can carry stays unplaced. SRT links\n are keyed either way.",
+                  "type": "boolean"
+                },
                 "destinations": {
                   "items": {
                     "description": "One stable, named output branch of a stream.",
@@ -6059,6 +6069,10 @@
             "additionalProperties": false,
             "description": "Operator intent: one source streamed to one or more destinations over a transport.",
             "properties": {
+              "allow_cleartext_links": {
+                "description": "Lets the planner put a link between two nodes on a transport that\n carries no encryption, which today is RIST. Without it no such link is\n planned, and a stream only such a link can carry stays unplaced. SRT links\n are keyed either way.",
+                "type": "boolean"
+              },
               "destinations": {
                 "items": {
                   "description": "One stable, named output branch of a stream.",
@@ -8312,6 +8326,10 @@
               "additionalProperties": false,
               "description": "Operator intent: one source streamed to one or more destinations over a transport.",
               "properties": {
+                "allow_cleartext_links": {
+                  "description": "Lets the planner put a link between two nodes on a transport that\n carries no encryption, which today is RIST. Without it no such link is\n planned, and a stream only such a link can carry stays unplaced. SRT links\n are keyed either way.",
+                  "type": "boolean"
+                },
                 "destinations": {
                   "items": {
                     "description": "One stable, named output branch of a stream.",
@@ -10514,6 +10532,10 @@
                     "additionalProperties": false,
                     "description": "Operator intent: one source streamed to one or more destinations over a transport.",
                     "properties": {
+                      "allow_cleartext_links": {
+                        "description": "Lets the planner put a link between two nodes on a transport that\n carries no encryption, which today is RIST. Without it no such link is\n planned, and a stream only such a link can carry stays unplaced. SRT links\n are keyed either way.",
+                        "type": "boolean"
+                      },
                       "destinations": {
                         "items": {
                           "description": "One stable, named output branch of a stream.",
@@ -12725,6 +12747,10 @@
                   "additionalProperties": false,
                   "description": "Operator intent: one source streamed to one or more destinations over a transport.",
                   "properties": {
+                    "allow_cleartext_links": {
+                      "description": "Lets the planner put a link between two nodes on a transport that\n carries no encryption, which today is RIST. Without it no such link is\n planned, and a stream only such a link can carry stays unplaced. SRT links\n are keyed either way.",
+                      "type": "boolean"
+                    },
                     "destinations": {
                       "items": {
                         "description": "One stable, named output branch of a stream.",

@@ -73,6 +73,7 @@ fn stream(name: &str, source: &str, destinations: &[(&str, &str)]) -> StreamDefi
     StreamDefinition {
         name: name.to_string(),
         enabled: true,
+        allow_cleartext_links: false,
         source: endpoint(source),
         destinations: destinations
             .iter()

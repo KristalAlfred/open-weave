@@ -1,5 +1,6 @@
 //! Pure derivation of a per-stream [`Path`] from operator intent and observed state.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use weave_core::{
@@ -98,6 +99,10 @@ pub enum PlacementError {
     },
     #[error("hop id {hop} is already planned for stream {stream}")]
     HopIdTaken { hop: String, stream: String },
+    #[error(
+        "the link into node {node} can only go over RIST, which carries no encryption; set allow_cleartext_links to plan it"
+    )]
+    CleartextLink { node: String },
 }
 
 /// Names `socket` for [`PlacementError::NotAnSrtListener`]. A device's `Display`
@@ -439,7 +444,74 @@ pub fn shared_hop_id(left: &StreamDefinition, right: &StreamDefinition) -> Optio
 /// A destination asking for two paths gets its second once every first path is
 /// placed, see [`place_second_path`]. A second path that cannot be placed leaves
 /// the stream placed with one and is reported in [`PlannedStream::single_path`].
+///
+/// Unless the stream sets `allow_cleartext_links`, the stream is planned as if
+/// no node offered RIST. When it cannot be placed that way but could with RIST,
+/// the error is [`PlacementError::CleartextLink`].
 pub fn derive_stream(
+    stream: &StreamDefinition,
+    nodes: &[NodeDescriptor],
+    observed: &[HopStatus],
+    committed_ports: &mut PortAllocator,
+    keys: &LinkKeys,
+) -> Result<PlannedStream, PlacementError> {
+    let keyed = if stream.allow_cleartext_links || !nodes.iter().any(offers_rist) {
+        Cow::Borrowed(nodes)
+    } else {
+        Cow::Owned(nodes.iter().map(without_rist).collect::<Vec<_>>())
+    };
+    derive_on(stream, &keyed, observed, committed_ports, keys).map_err(|error| {
+        if matches!(keyed, Cow::Borrowed(_)) {
+            return error;
+        }
+        derive_on(stream, nodes, observed, &mut committed_ports.clone(), keys)
+            .ok()
+            .and_then(|planned| rist_listener_node(&planned.path))
+            .map_or(error, |node| PlacementError::CleartextLink { node })
+    })
+}
+
+fn is_rist(class: &HopEndpointClass) -> bool {
+    matches!(class, HopEndpointClass::Transport(class) if class.transport == Transport::Rist)
+}
+
+fn offers_rist(node: &NodeDescriptor) -> bool {
+    node.topology
+        .attachments
+        .iter()
+        .any(|attachment| attachment.listeners.rist.is_some())
+        || node
+            .capabilities
+            .hop_profiles
+            .iter()
+            .any(|profile| is_rist(&profile.ingress) || is_rist(&profile.egress))
+}
+
+/// `node` with its RIST listeners and every hop profile that takes or sends RIST
+/// removed.
+fn without_rist(node: &NodeDescriptor) -> NodeDescriptor {
+    let mut node = node.clone();
+    for attachment in &mut node.topology.attachments {
+        attachment.listeners.rist = None;
+    }
+    node.capabilities
+        .hop_profiles
+        .retain(|profile| !is_rist(&profile.ingress) && !is_rist(&profile.egress));
+    node
+}
+
+/// The node of the first hop in `path` that listens for RIST.
+fn rist_listener_node(path: &Path) -> Option<String> {
+    path.hops
+        .iter()
+        .find(|hop| {
+            hop.sockets()
+                .any(|socket| matches!(socket, SocketSpec::Rist(RistSocket::Listen { .. })))
+        })
+        .map(|hop| hop.node_id.clone())
+}
+
+fn derive_on(
     stream: &StreamDefinition,
     nodes: &[NodeDescriptor],
     observed: &[HopStatus],
@@ -2222,6 +2294,7 @@ mod contract_tests {
         StreamDefinition {
             name: "feed".to_string(),
             enabled: true,
+            allow_cleartext_links: false,
             source: srt_endpoint("source"),
             destinations,
         }
@@ -2352,6 +2425,7 @@ mod contract_tests {
         let stream = StreamDefinition {
             name: "camera".to_string(),
             enabled: true,
+            allow_cleartext_links: false,
             source: StreamTransport::Device(NodeEndpoint {
                 node: "browser".to_string(),
                 network: Some("internet".to_string()),
@@ -2407,6 +2481,7 @@ mod contract_tests {
         let definition = StreamDefinition {
             name: "fanout".to_string(),
             enabled: true,
+            allow_cleartext_links: false,
             source: StreamTransport::Device(NodeEndpoint {
                 node: "browser".to_string(),
                 network: None,
@@ -3031,6 +3106,7 @@ mod tests {
         StreamDefinition {
             name: "contribution".to_string(),
             enabled: true,
+            allow_cleartext_links: false,
             source: StreamTransport::Srt(node_ref("strom-node-1", 200)),
             destinations: vec![dest("studio", node_ref("strom-node-2", 1000))],
         }
@@ -3924,6 +4000,7 @@ mod tests {
         let stream = StreamDefinition {
             name: "nat-transit".to_string(),
             enabled: true,
+            allow_cleartext_links: false,
             source: StreamTransport::Srt(node_ref("strom-node-3", 200)),
             destinations: vec![dest("output", node_ref("strom-node-4", 1000))],
         };
@@ -4475,6 +4552,7 @@ mod tests {
         StreamDefinition {
             name: "alice-cam".to_string(),
             enabled: true,
+            allow_cleartext_links: false,
             source: device_ref("browser-a1b2"),
             destinations: vec![dest("studio", node_ref("strom-node-2", 1000))],
         }
@@ -4484,6 +4562,7 @@ mod tests {
         StreamDefinition {
             name: "alice-return".to_string(),
             enabled: true,
+            allow_cleartext_links: false,
             source: StreamTransport::Srt(node_ref("strom-node-2", 200)),
             destinations: vec![device_dest("guest", "browser-a1b2")],
         }
@@ -4597,6 +4676,7 @@ mod tests {
         let b2b = StreamDefinition {
             name: "b2b".to_string(),
             enabled: true,
+            allow_cleartext_links: false,
             source: device_ref("browser-a1b2"),
             destinations: vec![device_dest("display", "browser-c3d4")],
         };
