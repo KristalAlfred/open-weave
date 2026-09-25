@@ -179,3 +179,11 @@ Status section and the header of `bench/manifests/nat-relay.yaml` still cite.
   now registers the page with a `camera-to-whip` profile and a dial-only
   attachment, and the Strom with a `whip-to-srt` profile and a WHIP listener.
   All pass; unit tests only.
+- 2026-09-25: `crates/controller/src/main.rs`, views: 4 of 4 back
+  (`endpoints_route_pending_then_placed`,
+  `reconcile_reports_why_a_stream_is_pending`,
+  `view_before_first_tick_has_no_report`,
+  `view_joins_desired_hops_with_reported_status`). The joined-view test's two
+  destinations are now `preview` and `studio` rather than a duplicated entry,
+  and the sender's egresses are asserted by those branch ids. All pass; unit
+  tests only.

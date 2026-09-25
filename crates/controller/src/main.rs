@@ -2932,6 +2932,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn endpoints_route_pending_then_placed() {
+        let (state, _mem) = mem_state();
+        {
+            let mut view = state.view.write().await;
+            view.streams = vec![StreamStatus {
+                name: "basic".to_string(),
+                generation: 1,
+                observed_generation: None,
+                status: PathStatus::Pending,
+                nodes: Vec::new(),
+                conditions: Vec::new(),
+                ingress: None,
+                destinations: Vec::new(),
+            }];
+        }
+        let app = open_router(state);
+        let (status, _) = send(&app, "GET", "/streams/basic/endpoints", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let (status, _) = send(&app, "GET", "/streams/nope/endpoints", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn view_joins_desired_hops_with_reported_status() {
+        let (state, _mem) = mem_state();
+        {
+            let mut nodes = state.nodes.write().await;
+            nodes.insert(
+                "strom-node-1".to_string(),
+                node_registration("strom-node-1", "172.26.0.10"),
+            );
+            nodes.insert(
+                "strom-node-2".to_string(),
+                node_registration("strom-node-2", "172.27.0.10"),
+            );
+            let mut definition = stream("basic");
+            let mut preview = definition.destinations[0].clone();
+            preview.id = "preview".to_string();
+            definition.destinations.push(preview);
+            state
+                .streams
+                .write()
+                .await
+                .insert("basic".to_string(), stored_stream(definition));
+            let now = Instant::now();
+            let mut seen = state.last_seen.write().await;
+            seen.insert("strom-node-1".to_string(), now);
+            seen.insert("strom-node-2".to_string(), now);
+        }
+
+        reconcile_tick(&state).await;
+
+        // Node 1 reports its sender hop; node 2 has not picked its hop up yet.
+        state
+            .nodes
+            .write()
+            .await
+            .get_mut("strom-node-1")
+            .unwrap()
+            .hop_status = vec![weave_core::HopStatus {
+            id: "weave-basic-sender".to_string(),
+            node_id: "strom-node-1".to_string(),
+            state: weave_core::HopState::Provisioned,
+            ingress: weave_core::SocketStatus {
+                condition: weave_core::LinkCondition::Flowing,
+                resolved: None,
+                stats: Some(weave_core::LinkStats {
+                    rate_mbps: 3.2,
+                    ..weave_core::LinkStats::default()
+                }),
+            },
+            egresses: vec![
+                weave_core::EgressStatus {
+                    branch_id: "preview".to_string(),
+                    status: weave_core::SocketStatus {
+                        condition: weave_core::LinkCondition::Flowing,
+                        resolved: None,
+                        stats: Some(weave_core::LinkStats {
+                            rate_mbps: 3.1,
+                            ..weave_core::LinkStats::default()
+                        }),
+                    },
+                },
+                weave_core::EgressStatus {
+                    branch_id: "studio".to_string(),
+                    status: weave_core::SocketStatus {
+                        condition: weave_core::LinkCondition::Connecting,
+                        resolved: Some(weave_core::ResolvedAddr {
+                            host: "172.27.0.10".to_string(),
+                            port: 7555,
+                        }),
+                        stats: Some(weave_core::LinkStats {
+                            rate_mbps: 0.0,
+                            ..weave_core::LinkStats::default()
+                        }),
+                    },
+                },
+            ],
+        }];
+
+        let app = open_router(state);
+        let (status, body) = send(&app, "GET", "/view", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert_eq!(body["report"]["status"], "converging");
+        assert_eq!(body["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(body["nodes"][0]["last_seen_secs"], 0);
+
+        let basic = &body["streams"][0];
+        assert_eq!(basic["name"], "basic");
+        let hops = basic["hops"].as_array().unwrap();
+        assert_eq!(hops.len(), 3, "sender + two receivers");
+
+        let sender = &hops[0];
+        assert_eq!(sender["id"], "weave-basic-sender");
+        assert_eq!(sender["node"], "strom-node-1");
+        assert_eq!(sender["state"], "provisioned");
+        assert_eq!(sender["ingress_condition"], "flowing");
+        assert_eq!(sender["ingress_stats"]["rate_mbps"], 3.2);
+        assert_eq!(sender["ingress"]["mode"], "listen");
+        assert_eq!(sender["egresses"][0]["branch_id"], "preview");
+        assert_eq!(sender["egresses"][0]["condition"], "flowing");
+        assert_eq!(sender["egresses"][0]["stats"]["rate_mbps"], 3.1);
+        assert_eq!(sender["egresses"][0]["mode"], "connect");
+        assert_eq!(sender["egresses"][0]["host"], "172.27.0.10");
+        assert_eq!(sender["egresses"][1]["branch_id"], "studio");
+        assert_eq!(sender["egresses"][1]["condition"], "connecting");
+        assert_eq!(sender["egresses"][1]["resolved"]["port"], 7555);
+
+        let receiver = &hops[1];
+        assert_eq!(receiver["node"], "strom-node-2");
+        assert!(
+            receiver.get("state").is_none(),
+            "unreported hop carries no observed fields"
+        );
+    }
+
+    #[tokio::test]
+    async fn view_before_first_tick_has_no_report() {
+        let (state, _mem) = mem_state();
+        let app = open_router(state);
+        let (status, body) = send(&app, "GET", "/view", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("report").is_none());
+        assert_eq!(body["streams"], json!([]));
+    }
+
+    #[tokio::test]
     async fn status_distinguishes_current_and_observed_generations() {
         let (state, _mem) = mem_state();
         let app = open_router(state.clone());
@@ -3783,6 +3932,27 @@ mod tests {
             !outcome.desired_by_node["strom-node-1"].is_empty(),
             "desired hops for the offline node are still computed"
         );
+    }
+
+    #[test]
+    fn reconcile_reports_why_a_stream_is_pending() {
+        let nodes = BTreeMap::from([(
+            "strom-node-1".to_string(),
+            node_registration("strom-node-1", "172.26.0.10"),
+        )]);
+        let observed = observed_state(&nodes);
+
+        let outcome = reconcile(vec![stream("basic")], &observed, &LinkKeys::for_tests());
+
+        let basic = outcome.streams.iter().find(|s| s.name == "basic").unwrap();
+        assert_eq!(basic.status, PathStatus::Pending);
+        let placement = basic
+            .conditions
+            .iter()
+            .find(|condition| condition.condition_type == StreamConditionType::PlacementReady)
+            .unwrap();
+        assert_eq!(placement.reason, StreamConditionReason::PlacementFailed);
+        assert_eq!(placement.detail, "node strom-node-2 is not registered");
     }
 
     #[test]
