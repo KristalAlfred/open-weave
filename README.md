@@ -57,8 +57,8 @@ per-node `netem` routers, and nowhere else. Automatic relay insertion is the
 exception: the bench has one NAT'd site, so only planner tests cover it.
 
 Not built: TLS, controller HA, per-node tokens, format conversion, and any
-adapter other than Strom. `BACKLOG.md` lists the known gaps with the evidence
-behind each one.
+adapter other than Strom. The items in `backlog/` list the known gaps with the
+evidence behind each one.
 
 ## Crates and binaries
 

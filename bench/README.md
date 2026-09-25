@@ -225,8 +225,8 @@ pointing at the page across restarts.
 `browser-return` reaches `flowing`. **`browser-cam` does not** — Strom's
 `whip_input` accepts only H264 and the Playwright image's Chromium has no H264
 encoder on arm64, so only Opus audio negotiates and the gateway flow stalls.
-`browser-stream` prints its status rather than waiting on it. `BACKLOG.md` has
-the item and what would fix it.
+`browser-stream` prints its status rather than waiting on it.
+`backlog/OW-13-browser-cam-no-video.md` has the item and what would fix it.
 
 Node 1 advertises `whip-to-srt` and `srt-to-whep` profiles and declares the
 signalling listener bases in `config/adapter-1.yaml`. Southbound allows

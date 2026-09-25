@@ -270,7 +270,7 @@ browser-stream id="":
     # browser-cam never reaches `flowing` here and is not waited on: the page's
     # Chromium sends no H264, Strom's whip_input accepts nothing else, and its
     # inactivity monitor drops the session every ~20 s, so the stream cycles
-    # `degraded` and `pending` (BACKLOG.md).
+    # `degraded` and `pending` (backlog/OW-13).
     printf 'browser-cam: '
     curl -sf {{ctrl}}/status | jq -r '.streams[] | select(.name=="browser-cam") | .status'
 

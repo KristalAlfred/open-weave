@@ -13,6 +13,7 @@ just build            # cargo build
 just test             # cargo test --workspace, then node nodes/browser/check.mjs
 just lint             # clippy --workspace --all-targets --all-features -D warnings
 just fmt-check        # cargo fmt --all --check
+just board            # backlog items by status and priority
 ```
 
 CI runs `fmt-check`, `lint` and `test` on the workspace, plus the browser-node
@@ -87,8 +88,9 @@ docker-compose stack of real Strom instances behind per-node `netem` routers.
 
 ## What is not built
 
-`BACKLOG.md` is the authority on gaps, with the evidence behind each one. Do not
-infer from the code that something works; if it is listed there, it does not.
+The items in `backlog/` are the authority on gaps, with the evidence behind each
+one, and `BACKLOG.md` says how to work them. Do not infer from the code that
+something works; if an open item lists it, it does not.
 Not implemented today: TLS, controller HA, per-node tokens, format conversion,
 and every adapter except Strom.
 
@@ -97,7 +99,7 @@ Say which one a claim rests on.
 
 ## Docs
 
-`README.md` and `BACKLOG.md` are written plainly: short sentences, no hype, no
-restated conclusions. Match that. State what the code does rather than why
-someone chose it, and keep new comments to the ones a reader could not get from
-the code itself.
+`README.md`, `BACKLOG.md` and `backlog/` are written plainly: short sentences, no
+hype, no restated conclusions. Match that. State what the code does rather than
+why someone chose it, and keep new comments to the ones a reader could not get
+from the code itself.

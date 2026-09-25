@@ -70,3 +70,33 @@ get-endpoints NAME:
 
 delete-stream NAME:
     cargo run -p weave-cli -- delete stream {{NAME}}
+
+# Backlog items by status, then priority. See BACKLOG.md.
+board:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    awk '
+      FNR == 1 { fm = 0; files[++n] = FILENAME }
+      /^---$/ { fm++; next }
+      fm == 1 && /^[a-z_]+:/ {
+        key = $0; sub(/:.*/, "", key)
+        val = $0; sub(/^[^:]*:[ \t]*/, "", val); gsub(/^"|"$/, "", val)
+        f[FILENAME, key] = val
+      }
+      END {
+        split("in-progress review blocked todo done dropped", order, " ")
+        for (i in order) rank[order[i]] = i
+        for (i = 1; i <= n; i++) status[f[files[i], "id"]] = f[files[i], "status"]
+        for (i = 1; i <= n; i++) {
+          file = files[i]; id = f[file, "id"]; st = f[file, "status"]
+          deps = f[file, "depends_on"]; gsub(/[][ ]/, "", deps)
+          waits = ""
+          m = split(deps, d, ",")
+          for (j = 1; j <= m; j++) if (status[d[j]] != "done") waits = waits " " d[j]
+          note = (st == "todo" && waits != "") ? "  (waits on" waits ")" : ""
+          assignee = f[file, "assignee"] == "" ? "-" : f[file, "assignee"]
+          num = id; sub(/^[A-Z]+-/, "", num)
+          printf "%d\t%d\t%d\t%-6s %-11s P%s  %-12s %-10s %s%s\n", rank[st] ? rank[st] : 9, f[file, "priority"], num, id, st, f[file, "priority"], f[file, "type"], assignee, f[file, "title"], note
+        }
+      }
+    ' backlog/*.md | sort -t $'\t' -k1,1n -k2,2n -k3,3n | cut -f4-

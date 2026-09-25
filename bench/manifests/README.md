@@ -119,7 +119,8 @@ Notes:
   It is `degraded` because the page's Chromium sends no H264 and Strom's WHIP
   input accepts nothing else, so only audio arrives — the page's own hop reads
   `flowing` on both sockets while node-1's reads `idle → flowing` at a few
-  kb/s. `bench/README.md` has the detail and `BACKLOG.md` the item.
+  kb/s. `bench/README.md` has the detail and
+  `backlog/OW-13-browser-cam-no-video.md` the item.
   `browser-return` is the mirror and flows end to end (VP9 + Opus into the page
   at ~8 Mb/s).
 - **`browser-cam-host`**: `browser-cam` for a page in a browser on the docker
