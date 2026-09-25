@@ -206,3 +206,9 @@ Status section and the header of `bench/manifests/nat-relay.yaml` still cite.
   checks the same route with the same tokens, plus the wrong ones. All pass;
   unit tests only. Every one of the 43 removed `main.rs` tests is now back,
   covered by a later test, or listed here as removed behaviour.
+- 2026-09-25: the lead asked whether link planning and port/endpoint selection
+  order a node's attachments the same way. They do not. The new planner test
+  `link_and_consumer_endpoint_pick_the_same_attachment` shows the link taking
+  the lowest network while the consumer socket and its endpoint take the lowest
+  attachment id. Filed as OW-33; the test is `#[ignore]`d against it. Not
+  fixed here.

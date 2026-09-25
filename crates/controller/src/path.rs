@@ -3295,6 +3295,33 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "OW-33: link planning and consumer endpoints order attachments differently"]
+    fn link_and_consumer_endpoint_pick_the_same_attachment() {
+        let mut nodes = nodes();
+        nodes[0].topology.attachments = vec![
+            attachment("lan", "alpha", true, NetworkListeners::default()),
+            attachment("wan", "zeta", true, srt_listener("172.26.0.10", 7000, 7999)),
+        ];
+        nodes[1].topology.attachments = vec![
+            attachment("a-site", "zeta", true, srt_listener("10.9.0.2", 7000, 7099)),
+            attachment("z-lan", "alpha", true, srt_listener("10.1.0.2", 8000, 8099)),
+        ];
+
+        let stream = contribution();
+        let path = derive(&stream, &nodes).expect("derive");
+        let endpoints = stream_endpoints(&stream, &path, &nodes).expect("endpoints");
+
+        let link_host = host(&path.hops[0].egresses[0]).expect("sender dials the receiver");
+        assert_eq!(link_host, "10.1.0.2", "the link takes the lowest network");
+        let consumer = addr(&endpoints.destinations[0].endpoint);
+        assert_eq!(
+            consumer.host, link_host,
+            "the consumer endpoint sits on the attachment the link chose"
+        );
+        assert!((8000..=8099).contains(&consumer.port));
+    }
+
+    #[test]
     fn stream_endpoints_on_unregistered_node_error() {
         let stream = contribution();
         let path = derive(&stream, &nodes()).expect("derive");
