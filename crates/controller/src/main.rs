@@ -4,6 +4,7 @@
 //! hops on a fixed interval, entirely from in-memory state.
 
 mod desired;
+mod keys;
 mod path;
 #[cfg(test)]
 mod scale_tests;
@@ -47,6 +48,7 @@ use weave_core::{
     validate_node, validate_resource_id, validate_stream,
 };
 
+use keys::{LinkKeys, SecretSource};
 use path::{
     PlacementError, PortAllocator, derive_path, destination_nodes, destination_path_status,
     path_status, stream_endpoints,
@@ -111,6 +113,7 @@ struct AppState {
     view: Arc<RwLock<ControllerView>>,
     /// `None` when no receiver is configured; every emit site is then a no-op.
     webhooks: Option<Arc<webhook::Emitter>>,
+    keys: LinkKeys,
 }
 
 #[derive(Clone)]
@@ -125,6 +128,7 @@ impl AppState {
         node_ttl: Duration,
         node_forget: Duration,
         webhooks: Option<Arc<webhook::Emitter>>,
+        keys: LinkKeys,
     ) -> Result<Self> {
         let loaded_streams = store.load_streams().await.context("hydrating streams")?;
         for stream in &loaded_streams {
@@ -197,6 +201,7 @@ impl AppState {
             desired: Arc::new(RwLock::new(BTreeMap::new())),
             view: Arc::new(RwLock::new(ControllerView::default())),
             webhooks,
+            keys,
         })
     }
 
@@ -369,6 +374,13 @@ async fn main() -> Result<()> {
             auth::AUTH_DISABLED_VAR
         );
     }
+    let (keys, secret_source) = LinkKeys::from_env()?;
+    if secret_source == SecretSource::Generated {
+        tracing::warn!(
+            "{} unset: generated a random one, so every SRT link key changes when the controller restarts",
+            keys::SECRET_VAR
+        );
+    }
 
     let webhooks = webhook::Emitter::new(webhook::Config {
         url: args.webhook_url.clone(),
@@ -378,7 +390,7 @@ async fn main() -> Result<()> {
     })
     .map(Arc::new);
 
-    let state = AppState::hydrate(store, node_ttl, node_forget, webhooks).await?;
+    let state = AppState::hydrate(store, node_ttl, node_forget, webhooks, keys).await?;
     let app = router_after_first_tick(&state, north, south).await;
     let api = spawn_api_server(args.listen.clone(), app);
 
@@ -441,7 +453,7 @@ async fn reconcile_tick(state: &AppState) {
     for node in forgotten {
         state.emit(EventType::NodeForgotten, node);
     }
-    let mut outcome = reconcile(definitions, &observed);
+    let mut outcome = reconcile(definitions, &observed, &state.keys);
     for status in &mut outcome.streams {
         let stored = streams
             .get(&status.name)
@@ -1427,17 +1439,18 @@ async fn plan_stream(
     let mut observed = observed_state(&nodes);
     drop(nodes);
     observed.hops.clear();
-    let mut outcome = reconcile(streams.into_values().collect(), &observed);
+    let mut outcome = reconcile(streams.into_values().collect(), &observed, &state.keys);
     let endpoints = outcome.endpoints.remove(&stream.name);
     let planned = outcome
         .streams
         .into_iter()
         .find(|status| status.name == stream.name)
         .expect("candidate stream is included in plan");
-    let hops = outcome
+    let mut hops = outcome
         .hops_by_stream
         .remove(&stream.name)
         .unwrap_or_default();
+    withhold_passphrases(&mut hops);
     let status = if !stream.enabled {
         PlanStatus::Disabled
     } else if hops.is_empty() {
@@ -1465,6 +1478,21 @@ async fn plan_stream(
             .flatten(),
     })
     .into_response()
+}
+
+/// Drop every SRT passphrase from `hops`, leaving `pbkeylen` to show which
+/// sockets are keyed. Keys reach adapters through their desired hops and
+/// nowhere else.
+fn withhold_passphrases(hops: &mut [DesiredHop]) {
+    for hop in hops {
+        let sockets = std::iter::once(&mut hop.ingress)
+            .chain(hop.egresses.iter_mut().map(|egress| &mut egress.socket));
+        for socket in sockets {
+            if let weave_core::SocketSpec::Srt(socket) = socket {
+                socket.params_mut().passphrase = None;
+            }
+        }
+    }
 }
 
 async fn delete_stream(
@@ -2069,7 +2097,11 @@ fn destination_stream(stream: &StreamDefinition, id: &str) -> StreamDefinition {
 
 /// Compute per-node desired hops, endpoints, and an aggregate report from the
 /// current stream and node state. Pure: no IO, deterministic for a given input.
-fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> ReconcileOutcome {
+fn reconcile(
+    mut streams: Vec<StreamDefinition>,
+    observed: &ObservedState,
+    keys: &LinkKeys,
+) -> ReconcileOutcome {
     // Stable order so the per-tick port allocator assigns deterministically for a
     // given stream set.
     streams.sort_by(|a, b| a.name.cmp(&b.name));
@@ -2126,7 +2158,7 @@ fn reconcile(mut streams: Vec<StreamDefinition>, observed: &ObservedState) -> Re
         }
         enabled += 1;
 
-        let status = match derive_path(stream, &observed.nodes, &observed.hops, &mut ports) {
+        let status = match derive_path(stream, &observed.nodes, &observed.hops, &mut ports, keys) {
             Ok(path) => {
                 hops_by_stream.insert(stream.name.clone(), path.hops.clone());
                 let mut nodes = Vec::new();
@@ -2315,6 +2347,7 @@ mod tests {
             desired: Arc::new(RwLock::new(BTreeMap::new())),
             view: Arc::new(RwLock::new(ControllerView::default())),
             webhooks: None,
+            keys: LinkKeys::for_tests(),
         };
         (state, mem)
     }
@@ -2391,6 +2424,7 @@ mod tests {
             accepts: None,
             network: None,
             latency: Some(latency),
+            passphrase: None,
         })
     }
 
@@ -2641,9 +2675,15 @@ mod tests {
         let registration = node_registration("node/one", "172.26.0.10");
         mem.upsert_node(&registration).await.unwrap();
 
-        let state = AppState::hydrate(mem, Duration::from_secs(15), Duration::from_secs(300), None)
-            .await
-            .expect("invalid cached nodes must not prevent startup");
+        let state = AppState::hydrate(
+            mem,
+            Duration::from_secs(15),
+            Duration::from_secs(300),
+            None,
+            LinkKeys::for_tests(),
+        )
+        .await
+        .expect("invalid cached nodes must not prevent startup");
 
         assert!(state.nodes.read().await.is_empty());
     }
@@ -2924,7 +2964,7 @@ mod tests {
             container: Some(vec![weave_core::Container::Rtp]),
             ..Default::default()
         });
-        let outcome = reconcile(vec![definition], &observed);
+        let outcome = reconcile(vec![definition], &observed, &LinkKeys::for_tests());
 
         let basic = outcome.streams.iter().find(|s| s.name == "basic").unwrap();
         assert_eq!(basic.status, PathStatus::Degraded);
@@ -2969,7 +3009,7 @@ mod tests {
             ),
         ]);
         let observed = observed_state(&nodes);
-        let outcome = reconcile(vec![stream("basic")], &observed);
+        let outcome = reconcile(vec![stream("basic")], &observed, &LinkKeys::for_tests());
         let basic = outcome.streams.iter().find(|s| s.name == "basic").unwrap();
         assert!(
             basic.nodes.contains(&"relay-a".to_string()),
@@ -2979,7 +3019,7 @@ mod tests {
 
         nodes.get_mut("relay-a").unwrap().node.status = NodeStatus::Offline;
         let observed = observed_state(&nodes);
-        let outcome = reconcile(vec![stream("basic")], &observed);
+        let outcome = reconcile(vec![stream("basic")], &observed, &LinkKeys::for_tests());
 
         let basic = outcome.streams.iter().find(|s| s.name == "basic").unwrap();
         assert!(basic.nodes.contains(&"relay-b".to_string()));
@@ -3062,6 +3102,7 @@ mod tests {
             Duration::from_secs(15),
             Duration::from_secs(300),
             None,
+            LinkKeys::for_tests(),
         )
         .await
         .unwrap();
@@ -3071,6 +3112,7 @@ mod tests {
             Duration::from_secs(15),
             Duration::from_secs(300),
             None,
+            LinkKeys::for_tests(),
         )
         .await
         .unwrap();
@@ -3329,6 +3371,7 @@ mod tests {
             Duration::from_secs(15),
             Duration::from_secs(300),
             webhooks,
+            LinkKeys::for_tests(),
         )
         .await
         .unwrap();
@@ -3486,6 +3529,7 @@ mod tests {
                 accepts: None,
                 network: None,
                 latency: None,
+                passphrase: None,
             }),
         });
         let mut disabled = stream_between("spare", "spare-node", "studio-node");
@@ -3641,6 +3685,7 @@ mod node_auth_tests {
             Duration::from_secs(15),
             Duration::from_secs(300),
             None,
+            LinkKeys::for_tests(),
         )
         .await
         .unwrap();
@@ -3816,6 +3861,179 @@ mod node_auth_tests {
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
             let (status, _) = send(&app, "GET", uri, &node_bearer("strom-node-1"), None).await;
             assert_eq!(status, past_auth, "{uri}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod key_exposure_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    use weave_core::{
+        HopEndpointClass, HopProfile, NetworkAttachment, NetworkListeners, NodeCapabilities,
+        NodeTopology, Passphrase, PortRange, RoleSet, SrtEndpoint, SrtListener, StreamDestination,
+        StreamTransport, Transport, TransportClass,
+    };
+
+    const PRODUCER_KEY: &str = "producer-passphrase-1";
+    const CONSUMER_KEY: &str = "consumer-passphrase-1";
+
+    fn registration(id: &str, host: &str) -> NodeRegistration {
+        let srt = || {
+            HopEndpointClass::Transport(TransportClass {
+                transport: Transport::Srt,
+                roles: RoleSet::both(),
+            })
+        };
+        NodeRegistration {
+            protocol_version: PROTOCOL_VERSION,
+            node: NodeDescriptor {
+                id: id.to_string(),
+                endpoint: format!("http://{id}"),
+                status: NodeStatus::Ready,
+                capabilities: NodeCapabilities {
+                    adapters: Vec::new(),
+                    hop_profiles: vec![HopProfile {
+                        id: "srt-forward".to_string(),
+                        ingress: srt(),
+                        egress: srt(),
+                        max_egresses: None,
+                    }],
+                },
+                topology: NodeTopology {
+                    attachments: vec![NetworkAttachment {
+                        id: "wan".to_string(),
+                        network: "internet".to_string(),
+                        dial: true,
+                        listeners: NetworkListeners {
+                            srt: Some(SrtListener {
+                                host: host.to_string(),
+                                port_range: PortRange {
+                                    start: 20_000,
+                                    end: 20_100,
+                                },
+                            }),
+                            whip: None,
+                            whep: None,
+                        },
+                    }],
+                },
+            },
+            endpoints: Vec::new(),
+            hop_status: Vec::new(),
+        }
+    }
+
+    fn endpoint(node: &str, passphrase: &str) -> StreamTransport {
+        StreamTransport::Srt(SrtEndpoint {
+            node: Some(node.to_string()),
+            remote: None,
+            via: Vec::new(),
+            network: None,
+            latency: None,
+            passphrase: Some(Passphrase::new(passphrase)),
+            format: None,
+            accepts: None,
+        })
+    }
+
+    fn keyed_stream() -> StreamDefinition {
+        StreamDefinition {
+            name: "feed".to_string(),
+            enabled: true,
+            source: endpoint("node-a", PRODUCER_KEY),
+            destinations: vec![StreamDestination {
+                id: "studio".to_string(),
+                endpoint: endpoint("node-b", CONSUMER_KEY),
+            }],
+        }
+    }
+
+    async fn send(app: &Router, request: Request<Body>) -> (StatusCode, String) {
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    fn json_request(method: &str, uri: &str, value: &impl Serialize) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::IF_NONE_MATCH, "*")
+            .body(Body::from(serde_json::to_vec(value).unwrap()))
+            .unwrap()
+    }
+
+    fn get(uri: &str) -> Request<Body> {
+        Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn keys_reach_desired_hops_and_no_other_route() {
+        let keys = LinkKeys::new("0123456789abcdef0123456789abcdef");
+        let link_key = keys.link("weave-feed-receiver-studio");
+        let state = AppState::hydrate(
+            Arc::new(MemStore::new()),
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+            None,
+            keys,
+        )
+        .await
+        .unwrap();
+        let app = router(state.clone(), Guard::Disabled, NodeGuard::Disabled);
+        for node in [
+            registration("node-a", "192.0.2.1"),
+            registration("node-b", "192.0.2.2"),
+        ] {
+            let (status, _) = send(&app, json_request("POST", ROUTE_NODE_REGISTER, &node)).await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+        }
+        let (status, _) = send(&app, json_request("POST", ROUTE_STREAMS, &keyed_stream())).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        reconcile_tick(&state).await;
+
+        let (_, sender) = send(&app, get("/nodes/node-a/desired")).await;
+        let (_, receiver) = send(&app, get("/nodes/node-b/desired")).await;
+        assert!(sender.contains(link_key.expose()) && receiver.contains(link_key.expose()));
+        assert!(sender.contains(PRODUCER_KEY) && receiver.contains(CONSUMER_KEY));
+
+        let (_, resource) = send(&app, get("/streams/feed")).await;
+        assert!(
+            resource.contains(PRODUCER_KEY),
+            "the manifest reads back as written"
+        );
+        assert!(!resource.contains(link_key.expose()));
+
+        let (status, plan) = send(
+            &app,
+            json_request("POST", ROUTE_STREAM_PLANS, &keyed_stream()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(plan.contains("\"pbkeylen\":32"));
+
+        for (route, body) in [
+            ("/view", send(&app, get("/view")).await.1),
+            (ROUTE_STATUS, send(&app, get(ROUTE_STATUS)).await.1),
+            (
+                "/streams/feed/endpoints",
+                send(&app, get("/streams/feed/endpoints")).await.1,
+            ),
+            (ROUTE_STREAM_PLANS, plan),
+        ] {
+            assert!(
+                body.contains("node-a"),
+                "{route} describes the stream: {body}"
+            );
+            for secret in [link_key.expose(), PRODUCER_KEY, CONSUMER_KEY] {
+                assert!(!body.contains(secret), "{route} leaks a key: {body}");
+            }
         }
     }
 }

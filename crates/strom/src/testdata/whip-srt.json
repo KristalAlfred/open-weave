@@ -27,8 +27,8 @@
       "block_definition_id": "builtin.mpegtssrt_output",
       "name": "SRT output",
       "properties": {
-        "srt_uri": "srt://:7003?mode=listener",
         "latency": 200,
+        "srt_uri": "srt://:7003?mode=listener&latency=200",
         "wait_for_connection": false
       },
       "position": [800.0, 200.0]

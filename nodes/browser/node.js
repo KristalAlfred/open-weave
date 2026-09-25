@@ -2,7 +2,7 @@
 
 // Must equal weave_core::PROTOCOL_VERSION; check.mjs reads this line and
 // compares it with the constant in crates/core.
-const PROTOCOL_VERSION = 4;
+const PROTOCOL_VERSION = 5;
 const HEARTBEAT_MS = 5000;
 const POLL_MS = 2000;
 const STALL_POLLS = 3;

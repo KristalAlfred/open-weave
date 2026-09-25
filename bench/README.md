@@ -320,6 +320,7 @@ defaults to development values so `just bench up` stays a single command:
 | `WEAVE_SOUTHBOUND_KEY` | `bench-southbound-key` | southbound, controller, `just bench node-token` |
 | `WEAVE_ADAPTER_{1,2,3}_TOKEN` | `strom-node-{1,2,3}`'s token under the default key | adapter-1, 2 and 3; the recipes present node 1's for southbound reads |
 | `WEAVE_BROWSER_TOKEN` | `browser-bench`'s token under the default key | the in-bench browser page, which takes its node id from it |
+| `WEAVE_SRT_KEY_SECRET` | `bench-srt-key-secret-for-local-use-only` | controller, to derive the keys of SRT links between nodes |
 
 `docker-compose.yml` passes each adapter its token as `WEAVE_SOUTHBOUND_TOKEN`.
 The adapter configs leave `node.southbound_token` unset and inherit it. The node

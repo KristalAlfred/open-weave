@@ -341,6 +341,15 @@
                           "null"
                         ]
                       },
+                      "passphrase": {
+                        "description": "Encrypts this endpoint's own socket: the ingress a producer dials, the\n output a consumer dials, or the remote listener the stream dials. Absent\n leaves that socket in the clear. Links between nodes are keyed by the\n controller whether or not this is set.",
+                        "maxLength": 80,
+                        "minLength": 10,
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
                       "remote": {
                         "additionalProperties": false,
                         "description": "External SRT listener this endpoint dials out to. Destinations only;\n mutually exclusive with [`SrtEndpoint::node`].",
@@ -766,6 +775,15 @@
                       "maxLength": 63,
                       "minLength": 1,
                       "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "passphrase": {
+                      "description": "Encrypts this endpoint's own socket: the ingress a producer dials, the\n output a consumer dials, or the remote listener the stream dials. Absent\n leaves that socket in the clear. Links between nodes are keyed by the\n controller whether or not this is set.",
+                      "maxLength": 80,
+                      "minLength": 10,
                       "type": [
                         "string",
                         "null"

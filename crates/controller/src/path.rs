@@ -4,14 +4,18 @@ use std::collections::{HashMap, HashSet};
 
 use weave_core::{
     DesiredEgress, DesiredHop, DestinationEndpoint, DeviceKind, EndpointAddr, HOP_ID_PREFIX,
-    HopConditions, HopRole, HopStatus, NetworkAttachment, NodeDescriptor, NodeStatus, Path,
-    PathStatus, PortRange, RemoteAddr, SocketRole, SocketSpec, SrtSocket, StreamDefinition,
-    StreamEndpoints, StreamTransport, Transport, roll_up_path,
+    HopConditions, HopRole, HopStatus, NetworkAttachment, NodeDescriptor, NodeStatus, Passphrase,
+    Path, PathStatus, PortRange, RemoteAddr, SocketRole, SocketSpec, SrtParams, SrtSocket,
+    StreamDefinition, StreamEndpoints, StreamTransport, Transport, roll_up_path,
 };
+
+use crate::keys::LinkKeys;
 
 const DEFAULT_SRC_LATENCY: u32 = 200;
 const DEFAULT_SINK_LATENCY: u32 = 1000;
 const RECV_CONSUMER_LATENCY: u32 = 200;
+/// AES key length, in bytes, set on every keyed SRT socket.
+const SRT_PBKEYLEN: u8 = 32;
 
 /// Link transports in the order the planner prefers them.
 const TRANSPORT_PREFERENCE: [Transport; 3] = [Transport::Srt, Transport::Whip, Transport::Whep];
@@ -122,6 +126,7 @@ struct Endpoint<'a> {
     network: Option<&'a str>,
     via: &'a [String],
     latency: Option<u32>,
+    passphrase: Option<&'a Passphrase>,
     terminal: Terminal,
 }
 
@@ -136,6 +141,7 @@ fn read_endpoint(endpoint: &StreamTransport) -> Result<Endpoint<'_>, PlacementEr
             network: endpoint.network.as_deref(),
             via: &endpoint.via,
             latency: endpoint.latency,
+            passphrase: endpoint.passphrase.as_ref(),
             terminal: Terminal::Srt,
         }),
         StreamTransport::Device(endpoint) => Ok(Endpoint {
@@ -143,6 +149,7 @@ fn read_endpoint(endpoint: &StreamTransport) -> Result<Endpoint<'_>, PlacementEr
             network: endpoint.network.as_deref(),
             via: &[],
             latency: None,
+            passphrase: None,
             terminal: Terminal::Device,
         }),
     }
@@ -219,6 +226,10 @@ impl PortAllocator {
 /// a [`SocketSpec::Device`] with no address. The source must be a node; a remote
 /// source is rejected.
 ///
+/// Every SRT link between two hops carries the key `keys` derives for the hop
+/// it feeds, on both of its sockets. A terminal SRT socket carries the
+/// passphrase its manifest endpoint declares, or none.
+///
 /// Fan-out is one sender hop teeing to one egress per destination, each with its
 /// own chain. Placement is all-or-nothing: if any destination is unplaceable the
 /// whole derivation fails and the stream stays pending.
@@ -227,6 +238,7 @@ pub fn derive_path(
     nodes: &[NodeDescriptor],
     _observed: &[HopStatus],
     committed_ports: &mut PortAllocator,
+    keys: &LinkKeys,
 ) -> Result<Path, PlacementError> {
     let mut ports = committed_ports.clone();
     let source = read_endpoint(&stream.source)?;
@@ -265,7 +277,7 @@ pub fn derive_path(
         };
 
         for bridge in &chain.bridges {
-            let (up_socket, hop) = plan_hop(&upstream, bridge, latency, nodes, &mut ports)?;
+            let (up_socket, hop) = plan_hop(&upstream, bridge, latency, nodes, &mut ports, keys)?;
             push_egress(&mut sender_egresses, &mut hops, &branch_id, up_socket);
             hops.push(hop);
             upstream = LinkEnd {
@@ -286,24 +298,31 @@ pub fn derive_path(
                         role: HopRole::Bridge,
                     };
                     let (up_socket, hop) =
-                        plan_hop(&upstream, &bridge, latency, nodes, &mut ports)?;
+                        plan_hop(&upstream, &bridge, latency, nodes, &mut ports, keys)?;
                     push_egress(&mut sender_egresses, &mut hops, &branch_id, up_socket);
                     hops.push(hop);
                 }
-                let socket = SocketSpec::srt_connect(remote.host.clone(), remote.port, latency);
+                let socket = SocketSpec::Srt(SrtSocket::Connect {
+                    host: remote.host.clone(),
+                    port: remote.port,
+                    params: srt_params(latency, dest.passphrase.cloned()),
+                });
                 push_egress(&mut sender_egresses, &mut hops, &branch_id, socket);
             }
             // The chain ends on a receiver hop, whose remaining egress is the
             // socket the consumer dials or the device the media ends on.
             ChainTerminal::Receiver(receiver) => {
                 let (up_socket, mut hop) =
-                    plan_hop(&upstream, receiver, latency, nodes, &mut ports)?;
+                    plan_hop(&upstream, receiver, latency, nodes, &mut ports, keys)?;
                 push_egress(&mut sender_egresses, &mut hops, &branch_id, up_socket);
                 let socket = match dest.terminal {
                     Terminal::Srt => {
                         let key = consumer_key(&receiver.id);
                         let port = claim_port(&hop.node_id, dest.network, &key, nodes, &mut ports)?;
-                        SocketSpec::srt_listen(port, RECV_CONSUMER_LATENCY)
+                        SocketSpec::Srt(SrtSocket::Listen {
+                            port,
+                            params: srt_params(RECV_CONSUMER_LATENCY, dest.passphrase.cloned()),
+                        })
                     }
                     Terminal::Device => device_socket(&hop.node_id, DeviceKind::Display, nodes)?,
                 };
@@ -433,12 +452,13 @@ fn plan_hop(
     latency: u32,
     nodes: &[NodeDescriptor],
     ports: &mut PortAllocator,
+    keys: &LinkKeys,
 ) -> Result<(SocketSpec, DesiredHop), PlacementError> {
     let downstream = LinkEnd {
         station: &hop.station,
         hop_id: &hop.id,
     };
-    let (up_socket, down_socket) = plan_link(upstream, &downstream, latency, nodes, ports)?;
+    let (up_socket, down_socket) = plan_link(upstream, &downstream, latency, nodes, ports, keys)?;
     Ok((
         up_socket,
         DesiredHop {
@@ -800,15 +820,18 @@ fn has_listener(attachment: &NetworkAttachment, transport: Transport) -> bool {
 /// The transport and which end listens come from [`link_transport`]. An SRT
 /// listener claims its port on the listening node, always keyed by the
 /// downstream hop id so an assignment stays stable when a link's direction is
-/// the same across ticks. A WebRTC listener claims no port: its socket is
-/// signalled at the base its node declares, addressed by the downstream hop id
-/// so every link is a distinct endpoint.
+/// the same across ticks. Both SRT sockets carry the key derived from that same
+/// id, so the key survives a replan and a change of direction. A WebRTC
+/// listener claims no port: its socket is signalled at the base its node
+/// declares, addressed by the downstream hop id so every link is a distinct
+/// endpoint.
 fn plan_link(
     upstream: &LinkEnd,
     downstream: &LinkEnd,
     latency: u32,
     nodes: &[NodeDescriptor],
     ports: &mut PortAllocator,
+    keys: &LinkKeys,
 ) -> Result<(SocketSpec, SocketSpec), PlacementError> {
     let up = resolve_station(upstream.station, nodes)?;
     let down = resolve_station(downstream.station, nodes)?;
@@ -829,9 +852,17 @@ fn plan_link(
                 .as_ref()
                 .expect("SRT link choice has an SRT listener");
             let port = ports.claim(host.node, &choice.attachment, downstream.hop_id)?;
+            let params = srt_params(latency, Some(keys.link(downstream.hop_id)));
             (
-                SocketSpec::srt_listen(port, latency),
-                SocketSpec::srt_connect(listener.host.clone(), port, latency),
+                SocketSpec::Srt(SrtSocket::Listen {
+                    port,
+                    params: params.clone(),
+                }),
+                SocketSpec::Srt(SrtSocket::Connect {
+                    host: listener.host.clone(),
+                    port,
+                    params,
+                }),
             )
         }
         Some(signalling) => {
@@ -853,6 +884,14 @@ fn plan_link(
         Listener::Downstream => (connect, listen),
         Listener::Upstream => (listen, connect),
     })
+}
+
+fn srt_params(latency: u32, passphrase: Option<Passphrase>) -> SrtParams {
+    SrtParams {
+        latency: Some(latency),
+        pbkeylen: passphrase.is_some().then_some(SRT_PBKEYLEN),
+        passphrase,
+    }
 }
 
 /// Resolve a station's node and optional network constraint.
@@ -969,7 +1008,10 @@ fn source_socket(
         Terminal::Srt => {
             let latency = source.latency.unwrap_or(DEFAULT_SRC_LATENCY);
             let port = claim_port(node_id, source.network, hop_id, nodes, ports)?;
-            Ok(SocketSpec::srt_listen(port, latency))
+            Ok(SocketSpec::Srt(SrtSocket::Listen {
+                port,
+                params: srt_params(latency, source.passphrase.cloned()),
+            }))
         }
         Terminal::Device => device_socket(node_id, DeviceKind::Capture, nodes),
     }
@@ -1190,6 +1232,10 @@ mod contract_tests {
         SocketStatus, SrtEndpoint, SrtListener, StreamDestination, TransportClass,
     };
 
+    fn keys() -> LinkKeys {
+        LinkKeys::for_tests()
+    }
+
     fn class(transport: Transport, roles: weave_core::RoleSet) -> HopEndpointClass {
         HopEndpointClass::Transport(TransportClass { transport, roles })
     }
@@ -1242,6 +1288,7 @@ mod contract_tests {
             via: Vec::new(),
             network: None,
             latency: None,
+            passphrase: None,
             format: None,
             accepts: None,
         })
@@ -1291,8 +1338,8 @@ mod contract_tests {
             destination("preview", "preview-node"),
             destination("studio", "studio-node"),
         ]);
-        let left = derive_path(&first, &nodes, &[], &mut PortAllocator::new()).unwrap();
-        let right = derive_path(&second, &nodes, &[], &mut PortAllocator::new()).unwrap();
+        let left = derive_path(&first, &nodes, &[], &mut PortAllocator::new(), &keys()).unwrap();
+        let right = derive_path(&second, &nodes, &[], &mut PortAllocator::new(), &keys()).unwrap();
         assert_eq!(left, right);
         assert!(
             left.hops
@@ -1318,6 +1365,7 @@ mod contract_tests {
             &nodes,
             &[],
             &mut PortAllocator::new(),
+            &keys(),
         )
         .unwrap();
         let SocketSpec::Srt(SrtSocket::Connect { host, .. }) = &path.hops[0].egresses[0].socket
@@ -1334,6 +1382,7 @@ mod contract_tests {
                 &nodes,
                 &[],
                 &mut PortAllocator::new(),
+                &keys(),
             )
             .is_err()
         );
@@ -1388,7 +1437,14 @@ mod contract_tests {
             }),
             destinations: vec![destination("studio", "studio-node")],
         };
-        let path = derive_path(&stream, &[browser, strom], &[], &mut PortAllocator::new()).unwrap();
+        let path = derive_path(
+            &stream,
+            &[browser, strom],
+            &[],
+            &mut PortAllocator::new(),
+            &keys(),
+        )
+        .unwrap();
         assert_eq!(path.hops[0].profile_id, "camera-to-whip");
     }
 
@@ -1419,7 +1475,7 @@ mod contract_tests {
         };
         nodes.push(browser);
         assert!(matches!(
-            derive_path(&definition, &nodes, &[], &mut PortAllocator::new()),
+            derive_path(&definition, &nodes, &[], &mut PortAllocator::new(), &keys()),
             Err(PlacementError::NoHopProfile { egresses: 2, .. })
         ));
     }
@@ -1441,6 +1497,7 @@ mod contract_tests {
             &nodes,
             &[],
             &mut PortAllocator::new(),
+            &keys(),
         )
         .unwrap_err();
         let reason = error.to_string();
@@ -1473,6 +1530,7 @@ mod contract_tests {
             &[source.clone(), destination_node.clone(), relay.clone()],
             &[],
             &mut PortAllocator::new(),
+            &keys(),
         )
         .unwrap();
         assert!(path.hops.iter().any(|hop| hop.node_id == "relay"));
@@ -1485,6 +1543,7 @@ mod contract_tests {
                 &[source, destination_node, ineligible],
                 &[],
                 &mut PortAllocator::new(),
+                &keys(),
             )
             .is_err()
         );
@@ -1496,8 +1555,14 @@ mod contract_tests {
             destination("preview", "preview-node"),
             destination("studio", "studio-node"),
         ]);
-        let path =
-            derive_path(&definition, &shared_nodes(), &[], &mut PortAllocator::new()).unwrap();
+        let path = derive_path(
+            &definition,
+            &shared_nodes(),
+            &[],
+            &mut PortAllocator::new(),
+            &keys(),
+        )
+        .unwrap();
         let observed: Vec<_> = path
             .hops
             .iter()
@@ -1535,6 +1600,168 @@ mod contract_tests {
         assert_eq!(
             destination_path_status(&path, "preview", &observed),
             PathStatus::Degraded
+        );
+    }
+
+    fn srt_params(socket: &SocketSpec) -> &SrtParams {
+        match socket {
+            SocketSpec::Srt(socket) => socket.params(),
+            other => panic!("expected an SRT socket, got {other}"),
+        }
+    }
+
+    fn link_key(socket: &SocketSpec) -> Option<&str> {
+        srt_params(socket)
+            .passphrase
+            .as_ref()
+            .map(Passphrase::expose)
+    }
+
+    fn hop<'a>(path: &'a Path, id: &str) -> &'a DesiredHop {
+        path.hops
+            .iter()
+            .find(|hop| hop.id == id)
+            .unwrap_or_else(|| panic!("no hop {id}"))
+    }
+
+    fn egress<'a>(hop: &'a DesiredHop, branch_id: &str) -> &'a SocketSpec {
+        &hop.egresses
+            .iter()
+            .find(|egress| egress.branch_id == branch_id)
+            .unwrap_or_else(|| panic!("no egress {branch_id} on {}", hop.id))
+            .socket
+    }
+
+    fn plan(definition: &StreamDefinition, nodes: &[NodeDescriptor]) -> Path {
+        derive_path(definition, nodes, &[], &mut PortAllocator::new(), &keys()).unwrap()
+    }
+
+    #[test]
+    fn both_ends_of_a_link_share_a_key_no_other_link_has() {
+        let definition = stream(vec![
+            destination("preview", "preview-node"),
+            destination("studio", "studio-node"),
+        ]);
+        let path = plan(&definition, &shared_nodes());
+        let sender = hop(&path, "weave-feed-sender");
+        let mut link_keys = Vec::new();
+        for branch in ["preview", "studio"] {
+            let receiver = hop(&path, &format!("weave-feed-receiver-{branch}"));
+            let key = link_key(egress(sender, branch)).expect("link is keyed");
+            assert_eq!(link_key(&receiver.ingress), Some(key));
+            assert_eq!(key, keys().link(&receiver.id).expose());
+            assert_eq!(srt_params(&receiver.ingress).pbkeylen, Some(32));
+            assert_eq!(srt_params(egress(sender, branch)).pbkeylen, Some(32));
+            link_keys.push(key.to_string());
+        }
+        assert_ne!(link_keys[0], link_keys[1]);
+        assert_eq!(
+            path,
+            plan(&definition, &shared_nodes()),
+            "a replan is identical"
+        );
+    }
+
+    #[test]
+    fn adding_a_destination_leaves_existing_link_keys_alone() {
+        let one = plan(
+            &stream(vec![destination("studio", "studio-node")]),
+            &shared_nodes(),
+        );
+        let two = plan(
+            &stream(vec![
+                destination("preview", "preview-node"),
+                destination("studio", "studio-node"),
+            ]),
+            &shared_nodes(),
+        );
+        let receiver = "weave-feed-receiver-studio";
+        assert_eq!(
+            link_key(&hop(&one, receiver).ingress),
+            link_key(&hop(&two, receiver).ingress)
+        );
+    }
+
+    #[test]
+    fn a_reversed_link_keeps_its_key() {
+        let definition = stream(vec![destination("studio", "studio-node")]);
+        let forward = plan(&definition, &shared_nodes());
+        let mut nodes = shared_nodes();
+        nodes[1].topology.attachments = vec![
+            attachment("wan", "internet", true, None),
+            attachment("lan", "studio-lan", false, Some("10.0.0.5")),
+        ];
+        let reversed = plan(&definition, &nodes);
+
+        let receiver = "weave-feed-receiver-studio";
+        assert!(matches!(
+            hop(&reversed, receiver).ingress,
+            SocketSpec::Srt(SrtSocket::Connect { .. })
+        ));
+        assert_eq!(
+            link_key(&hop(&reversed, receiver).ingress),
+            link_key(&hop(&forward, receiver).ingress)
+        );
+        assert_eq!(
+            link_key(egress(hop(&reversed, "weave-feed-sender"), "studio")),
+            link_key(&hop(&forward, receiver).ingress)
+        );
+    }
+
+    #[test]
+    fn terminal_sockets_carry_the_manifest_passphrase_or_none() {
+        let keyed = |endpoint: &mut StreamTransport, passphrase: &str| {
+            let StreamTransport::Srt(endpoint) = endpoint else {
+                unreachable!()
+            };
+            endpoint.passphrase = Some(Passphrase::new(passphrase));
+        };
+        let mut definition = stream(vec![destination("studio", "studio-node")]);
+        let path = plan(&definition, &shared_nodes());
+        assert_eq!(link_key(&path.hops[0].ingress), None);
+        assert_eq!(srt_params(&path.hops[0].ingress).pbkeylen, None);
+        let receiver = hop(&path, "weave-feed-receiver-studio");
+        assert_eq!(link_key(egress(receiver, "studio")), None);
+
+        keyed(&mut definition.source, "producer-passphrase");
+        keyed(
+            &mut definition.destinations[0].endpoint,
+            "consumer-passphrase",
+        );
+        definition.destinations.push(StreamDestination {
+            id: "uplink".to_string(),
+            endpoint: StreamTransport::Srt(SrtEndpoint {
+                node: None,
+                remote: Some(RemoteAddr {
+                    host: "198.51.100.5".to_string(),
+                    port: 9000,
+                    network: "internet".to_string(),
+                }),
+                via: Vec::new(),
+                network: None,
+                latency: None,
+                passphrase: Some(Passphrase::new("remote-passphrase")),
+                format: None,
+                accepts: None,
+            }),
+        });
+        let path = plan(&definition, &shared_nodes());
+        let sender = hop(&path, "weave-feed-sender");
+        assert_eq!(link_key(&sender.ingress), Some("producer-passphrase"));
+        assert_eq!(srt_params(&sender.ingress).pbkeylen, Some(32));
+        assert_eq!(
+            link_key(egress(sender, "uplink")),
+            Some("remote-passphrase")
+        );
+        let receiver = hop(&path, "weave-feed-receiver-studio");
+        assert_eq!(
+            link_key(egress(receiver, "studio")),
+            Some("consumer-passphrase")
+        );
+        assert_eq!(
+            link_key(&receiver.ingress),
+            Some(keys().link(&receiver.id).expose()),
+            "the manifest passphrase does not replace the link key"
         );
     }
 }
@@ -1692,6 +1919,7 @@ mod tests {
             accepts: None,
             network: None,
             latency: Some(latency),
+            passphrase: None,
         }
     }
 
@@ -1708,6 +1936,7 @@ mod tests {
             accepts: None,
             network: None,
             latency: Some(800),
+            passphrase: None,
         }
     }
 
@@ -1767,7 +1996,13 @@ mod tests {
     }
 
     fn derive(stream: &StreamDefinition, nodes: &[NodeDescriptor]) -> Result<Path, PlacementError> {
-        derive_path(stream, nodes, &[], &mut PortAllocator::new())
+        derive_path(
+            stream,
+            nodes,
+            &[],
+            &mut PortAllocator::new(),
+            &LinkKeys::for_tests(),
+        )
     }
 
     #[test]
@@ -2046,8 +2281,14 @@ mod tests {
             }],
         }];
 
-        let path =
-            derive_path(&stream, &nodes, &observed, &mut PortAllocator::new()).expect("derive");
+        let path = derive_path(
+            &stream,
+            &nodes,
+            &observed,
+            &mut PortAllocator::new(),
+            &LinkKeys::for_tests(),
+        )
+        .expect("derive");
         assert_eq!(
             host(&path.hops[0].egresses[0]),
             Some("203.0.113.7"),
@@ -2153,6 +2394,7 @@ mod tests {
                 accepts: None,
                 network: None,
                 latency: None,
+                passphrase: None,
             },
         )];
         assert_eq!(

@@ -2446,6 +2446,8 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "getrandom 0.3.4",
+ "hmac",
  "http-body-util",
  "reqwest",
  "serde",
@@ -2515,6 +2517,7 @@ name = "weave-strom"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "percent-encoding",
  "reqwest",
  "serde",
  "serde_json",

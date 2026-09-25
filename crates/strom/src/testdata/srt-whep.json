@@ -8,8 +8,8 @@
       "block_definition_id": "builtin.mpegtssrt_input",
       "name": "SRT input",
       "properties": {
-        "srt_uri": "srt://:7001?mode=listener",
         "latency": 200,
+        "srt_uri": "srt://:7001?mode=listener&latency=200",
         "decode": true,
         "keep_listening": true
       },

@@ -29,6 +29,8 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 sqlx = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
+getrandom = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }

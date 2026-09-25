@@ -17,6 +17,7 @@ use weave_core::{
     StreamDefinition, StreamDestination, StreamTransport, Transport, TransportClass,
 };
 
+use crate::keys::LinkKeys;
 use crate::path::{PortAllocator, derive_path};
 use crate::store::MemStore;
 use crate::{AppState, observed_state, reconcile_tick, router};
@@ -103,6 +104,7 @@ fn fan_out_stream() -> StreamDefinition {
             via: Vec::new(),
             network: None,
             latency: None,
+            passphrase: None,
             format: None,
             accepts: None,
         })
@@ -137,6 +139,7 @@ async fn fan_out(label: &str, nodes: Vec<NodeRegistration>) -> AppState {
         Duration::from_secs(15),
         Duration::from_secs(300),
         None,
+        LinkKeys::for_tests(),
     )
     .await
     .unwrap();
@@ -155,7 +158,14 @@ async fn fan_out(label: &str, nodes: Vec<NodeRegistration>) -> AppState {
 
     let observed = observed_state(&*state.nodes.read().await);
     let started = Instant::now();
-    let path = derive_path(&stream, &observed.nodes, &[], &mut PortAllocator::new()).unwrap();
+    let path = derive_path(
+        &stream,
+        &observed.nodes,
+        &[],
+        &mut PortAllocator::new(),
+        &LinkKeys::for_tests(),
+    )
+    .unwrap();
     let plan = started.elapsed();
 
     let started = Instant::now();

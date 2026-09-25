@@ -7,7 +7,7 @@ use weave_core::{
     DesiredHop, HopState, LinkCondition, ResolvedAddr, SocketRole, SocketSpec, SrtSocket,
     is_managed_hop_id,
 };
-use weave_strom::{StromFlow, parse_srt_endpoint};
+use weave_strom::{SrtUri, StromFlow, hop_srt_uris};
 
 /// Consecutive polls without byte progress on one side before a running,
 /// ever-flowed hop is judged stalled there. At the default 5s poll this is ~15s
@@ -112,9 +112,9 @@ impl HopPlan {
 /// Reconcile desired hops against observed Strom flows.
 ///
 /// Flows are adopted by name. A flow whose sockets no longer match the desired
-/// hop (an SRT host or port changed, or a WHIP/WHEP endpoint id) is treated as
-/// drifted: it is deleted and recreated rather than adopted, so a re-addressed
-/// stream actually reaches the node. Only flows carrying the managed hop-id
+/// hop (an SRT address, latency or key changed, or a WHIP/WHEP endpoint id) is
+/// treated as drifted: it is deleted and recreated rather than adopted, so a
+/// changed stream actually reaches the node. Only flows carrying the managed hop-id
 /// prefix are ever deleted, so flows created outside open-weave are left
 /// untouched.
 #[must_use]
@@ -153,16 +153,16 @@ pub fn diff_hops(desired: &[DesiredHop], flows: &[StromFlow]) -> HopPlan {
 }
 
 /// Whether an adopted flow's sockets diverge from the desired hop: its SRT
-/// addresses (element `uri`s and block `srt_uri`s) or its WHIP/WHEP endpoint ids
-/// (block `endpoint_id`s). A flow exposing neither cannot be compared, so it is
-/// adopted rather than recreated.
+/// sockets (element `uri`s and block `srt_uri`s, with every parameter in them)
+/// or its WHIP/WHEP endpoint ids (block `endpoint_id`s). A flow exposing neither
+/// cannot be compared, so it is adopted rather than recreated.
 fn flow_drifted(flow: &StromFlow, hop: &DesiredHop) -> bool {
-    let actual_srt = sorted(flow_srt_endpoints(flow));
+    let actual_srt = sorted(flow_srt_uris(flow));
     let actual_ids = sorted(flow_endpoint_ids(flow));
     if actual_srt.is_empty() && actual_ids.is_empty() {
         return false;
     }
-    actual_srt != sorted(hop_srt_endpoints(hop)) || actual_ids != sorted(hop_endpoint_ids(hop))
+    actual_srt != sorted(hop_srt_uris(hop)) || actual_ids != sorted(hop_endpoint_ids(hop))
 }
 
 fn sorted<T: Ord>(mut values: Vec<T>) -> Vec<T> {
@@ -170,7 +170,7 @@ fn sorted<T: Ord>(mut values: Vec<T>) -> Vec<T> {
     values
 }
 
-fn flow_srt_endpoints(flow: &StromFlow) -> Vec<(String, u16)> {
+fn flow_srt_uris(flow: &StromFlow) -> Vec<SrtUri> {
     let element_uris = flow
         .elements
         .iter()
@@ -182,7 +182,7 @@ fn flow_srt_endpoints(flow: &StromFlow) -> Vec<(String, u16)> {
     element_uris
         .chain(block_uris)
         .filter_map(Value::as_str)
-        .filter_map(parse_srt_endpoint)
+        .filter_map(SrtUri::parse)
         .collect()
 }
 
@@ -199,10 +199,6 @@ fn hop_sockets(hop: &DesiredHop) -> impl Iterator<Item = &SocketSpec> {
     std::iter::once(&hop.ingress).chain(hop.egresses.iter().map(|egress| &egress.socket))
 }
 
-fn hop_srt_endpoints(hop: &DesiredHop) -> Vec<(String, u16)> {
-    hop_sockets(hop).filter_map(socket_endpoint).collect()
-}
-
 fn hop_endpoint_ids(hop: &DesiredHop) -> Vec<String> {
     hop_sockets(hop)
         .filter_map(|spec| match spec {
@@ -210,14 +206,6 @@ fn hop_endpoint_ids(hop: &DesiredHop) -> Vec<String> {
             SocketSpec::Srt(_) | SocketSpec::Device(_) => None,
         })
         .collect()
-}
-
-fn socket_endpoint(spec: &SocketSpec) -> Option<(String, u16)> {
-    match spec {
-        SocketSpec::Srt(SrtSocket::Listen { port, .. }) => Some((String::new(), *port)),
-        SocketSpec::Srt(SrtSocket::Connect { host, port, .. }) => Some((host.clone(), *port)),
-        SocketSpec::Whip(_) | SocketSpec::Whep(_) | SocketSpec::Device(_) => None,
-    }
 }
 
 /// Derive a hop's control-plane lifecycle state from its flow presence.
@@ -417,13 +405,53 @@ mod tests {
         let flows = vec![flow_with_uris(
             "weave-a",
             "id-a",
-            "srt://:7001?mode=listener",
-            "srt://10.0.0.2:7002?mode=caller",
+            "srt://:7001?mode=listener&latency=200",
+            "srt://10.0.0.2:7002?mode=caller&latency=1000",
         )];
 
         let plan = diff_hops(&desired, &flows);
 
         assert!(plan.is_empty(), "unchanged flow is adopted as-is: {plan:?}");
+    }
+
+    fn keyed(socket: SocketSpec, passphrase: &str) -> SocketSpec {
+        let SocketSpec::Srt(mut socket) = socket else {
+            panic!("expected an SRT socket");
+        };
+        let params = socket.params_mut();
+        params.passphrase = Some(weave_core::Passphrase::new(passphrase));
+        params.pbkeylen = Some(32);
+        SocketSpec::Srt(socket)
+    }
+
+    #[test]
+    fn a_flow_whose_key_differs_is_recreated() {
+        let mut keyed_hop = hop("weave-a");
+        keyed_hop.egresses[0].socket = keyed(keyed_hop.egresses[0].socket.clone(), "new-link-key");
+        let desired = vec![keyed_hop];
+        for egress in [
+            "srt://10.0.0.2:7002?mode=caller&latency=1000",
+            "srt://10.0.0.2:7002?mode=caller&latency=1000&passphrase=old%2Dlink%2Dkey&pbkeylen=32",
+            "srt://10.0.0.2:7002?mode=caller&latency=1000&passphrase=new%2Dlink%2Dkey&pbkeylen=16",
+        ] {
+            let flows = vec![flow_with_uris(
+                "weave-a",
+                "id-a",
+                "srt://:7001?mode=listener&latency=200",
+                egress,
+            )];
+            let plan = diff_hops(&desired, &flows);
+            assert_eq!(plan.delete, vec!["id-a".to_string()], "{egress}");
+            assert_eq!(plan.create.len(), 1, "{egress}");
+        }
+
+        let flows = vec![flow_with_uris(
+            "weave-a",
+            "id-a",
+            "srt://:7001?mode=listener&latency=200",
+            "srt://10.0.0.2:7002?mode=caller&latency=1000&passphrase=new%2Dlink%2Dkey&pbkeylen=32",
+        )];
+        assert!(diff_hops(&desired, &flows).is_empty());
     }
 
     #[test]
@@ -742,7 +770,7 @@ mod tests {
         let flows = vec![block_flow(
             "weave-alice-cam-receiver-studio",
             "weave-alice-cam-receiver-studio",
-            "srt://:7003?mode=listener",
+            "srt://:7003?mode=listener&latency=200",
         )];
         assert!(diff_hops(&desired, &flows).is_empty());
     }
@@ -753,11 +781,11 @@ mod tests {
         for (endpoint_id, srt_uri) in [
             (
                 "weave-alice-cam-receiver-preview",
-                "srt://:7003?mode=listener",
+                "srt://:7003?mode=listener&latency=200",
             ),
             (
                 "weave-alice-cam-receiver-studio",
-                "srt://:7004?mode=listener",
+                "srt://:7004?mode=listener&latency=200",
             ),
         ] {
             let flows = vec![block_flow(

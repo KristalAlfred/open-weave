@@ -75,8 +75,9 @@ services:
   # --- control plane (net_core) ---
   # Northbound takes one shared bearer token. Southbound and the controller hold
   # WEAVE_SOUTHBOUND_KEY and take from each node a token derived from it for that
-  # node's id (`weave node-token <id>`). Every service refuses to start without
-  # its secret. The bench defaults below keep `just up` a single command, and the
+  # node's id (`weave node-token <id>`). The controller also derives SRT link keys
+  # from WEAVE_SRT_KEY_SECRET. Every service refuses to start without its secret.
+  # The bench defaults below keep `just up` a single command, and the
   # node tokens are the ones the default key gives: exporting WEAVE_SOUTHBOUND_KEY
   # means exporting WEAVE_ADAPTER_{1,2,3}_TOKEN and WEAVE_BROWSER_TOKEN too. They
   # are development values, not secrets — the bench sits on a private subnet.
@@ -139,6 +140,7 @@ services:
       DATABASE_URL: postgres://weave:weave@10.97.25.23:5432/weave
       WEAVE_NORTHBOUND_TOKEN: ${WEAVE_NORTHBOUND_TOKEN:-bench-northbound-token}
       WEAVE_SOUTHBOUND_KEY: ${WEAVE_SOUTHBOUND_KEY:-bench-southbound-key}
+      WEAVE_SRT_KEY_SECRET: ${WEAVE_SRT_KEY_SECRET:-bench-srt-key-secret-for-local-use-only}
       # Webhooks, delivered to `just bench hook-sink` on this
       # host. Unset WEAVE_WEBHOOK_URL to switch them off.
       WEAVE_WEBHOOK_URL: ${WEAVE_WEBHOOK_URL-http://host.docker.internal:29099}

@@ -31,6 +31,30 @@
                     "integer",
                     "null"
                   ]
+                },
+                "passphrase": {
+                  "description": "Encrypts the socket. Both ends of a link carry the same passphrase.",
+                  "maxLength": 80,
+                  "minLength": 10,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "pbkeylen": {
+                  "description": "AES key length in bytes, 16, 24 or 32, used with `passphrase`.",
+                  "enum": [
+                    16,
+                    24,
+                    32
+                  ],
+                  "format": "uint8",
+                  "maximum": 255,
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 }
               },
               "type": [
@@ -104,6 +128,30 @@
             "properties": {
               "latency": {
                 "format": "uint32",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "passphrase": {
+                "description": "Encrypts the socket. Both ends of a link carry the same passphrase.",
+                "maxLength": 80,
+                "minLength": 10,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "pbkeylen": {
+                "description": "AES key length in bytes, 16, 24 or 32, used with `passphrase`.",
+                "enum": [
+                  16,
+                  24,
+                  32
+                ],
+                "format": "uint8",
+                "maximum": 255,
                 "minimum": 0,
                 "type": [
                   "integer",

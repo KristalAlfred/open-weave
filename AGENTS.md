@@ -24,12 +24,14 @@ Tests are `#[cfg(test)]` modules beside the code they cover; there is no
 
 ## Running it
 
-Every service refuses to start without its secret, and the adapter without its
-node token, so either export them or opt out explicitly:
+Every service refuses to start without its secret, the controller also without
+its SRT key secret, and the adapter without its node token, so either export
+them or opt out explicitly:
 
 ```sh
 export WEAVE_NORTHBOUND_TOKEN=$(openssl rand -hex 32)
 export WEAVE_SOUTHBOUND_KEY=$(openssl rand -hex 32)       # southbound, controller
+export WEAVE_SRT_KEY_SECRET=$(openssl rand -hex 32)       # controller
 export WEAVE_SOUTHBOUND_TOKEN=$(just cli node-token strom-node-1)  # the adapter
 # or, for local work only:
 export WEAVE_AUTH_DISABLED=1

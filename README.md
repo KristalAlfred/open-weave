@@ -50,7 +50,8 @@ refused rather than smoothed over.
 
 Built: the three control-plane services, the `weave` CLI, one southbound adapter
 (`weave-adapter-strom`), and a browser node. Links carry SRT, WHIP or WHEP, and
-the controller plans NAT traversal through relay nodes. All of it is verified on
+the controller plans NAT traversal through relay nodes. SRT links between nodes
+are encrypted with keys the controller derives. All of it is verified on
 the docker-compose bench in `bench/`, which runs real Strom instances behind
 per-node `netem` routers, and nowhere else. Automatic relay insertion is the
 exception: the bench has one NAT'd site, so only planner tests cover it.
@@ -205,7 +206,7 @@ and return `404`.
 `protocol_version` field, which adapters set from `weave_core::PROTOCOL_VERSION`:
 
 ```json
-{ "protocol_version": 4, "node": { "id": "strom-node-1", "...": "..." } }
+{ "protocol_version": 5, "node": { "id": "strom-node-1", "...": "..." } }
 ```
 
 The controller accepts only the version it speaks. Anything else — including an
@@ -220,7 +221,7 @@ naming the node id:
   "details": [{
     "field": "protocol_version",
     "code": "unsupported",
-    "message": "reported 3; supported 4"
+    "message": "reported 4; supported 5"
   }]
 }
 ```
@@ -231,10 +232,10 @@ fatal and exits — retrying never converges — so a version mismatch surfaces 
 stopped container with a clear reason instead of a node that looks alive.
 `PROTOCOL_VERSION` is a southbound handshake. It moves when adapter behavior or
 payload semantics become incompatible, so the controller can reject a stale
-process at registration rather than wait for a later request to fail. It is `4`:
-stable destination ids, hop profiles, selected profile ids, and network
-attachments replace positional branches and independent capability and
-reachability fields.
+process at registration rather than wait for a later request to fail. It is `5`:
+SRT socket `params` carry a `passphrase` and `pbkeylen` (see
+[SRT encryption](#srt-encryption)). An adapter at `4` would ignore both and
+build its end of every keyed link in the clear, which the other end refuses.
 
 ### Hop status and fan-out
 
@@ -492,10 +493,11 @@ With neither set no `Authorization` header is sent, so an unauthenticated Strom
 keeps working.
 
 **Services fail closed.** A service whose secret (`WEAVE_NORTHBOUND_TOKEN`,
-`WEAVE_SOUTHBOUND_KEY`) is unset or empty refuses to start rather than serve
-unauthenticated traffic, and so does an adapter without a node token. For local development
-set `WEAVE_AUTH_DISABLED=1` to opt out explicitly; only `1` or `true` disable it,
-so `WEAVE_AUTH_DISABLED=0` leaves authentication on.
+`WEAVE_SOUTHBOUND_KEY`, and for the controller `WEAVE_SRT_KEY_SECRET`, see
+[SRT encryption](#srt-encryption)) is unset or empty refuses to start rather than
+serve unauthenticated traffic, and so does an adapter without a node token. For
+local development set `WEAVE_AUTH_DISABLED=1` to opt out explicitly; only `1` or
+`true` disable it, so `WEAVE_AUTH_DISABLED=0` leaves authentication on.
 
 Left unauthenticated on purpose:
 
@@ -513,6 +515,59 @@ Left unauthenticated on purpose:
   write access.
 
 There is no TLS: terminate it at a reverse proxy. There is no mTLS.
+
+## SRT encryption
+
+Every SRT link between two nodes is encrypted. The controller derives its key as
+HMAC-SHA256 of `WEAVE_SRT_KEY_SECRET` over the id of the hop the link feeds,
+written as 64 hex characters, and puts it with `pbkeylen: 32` (AES-256) in both
+ends' desired hops. The same secret and topology give the same key on every
+tick, so no key is stored and a replan, or a link changing direction, does not
+rekey it. Changing the secret rekeys every link once.
+
+`WEAVE_SRT_KEY_SECRET` must be at least 32 characters, for example
+`openssl rand -hex 32`. Without it the controller refuses to start, like a
+service without its token. With `WEAVE_AUTH_DISABLED=1` and no secret it
+generates a random one and logs a warning: every link key then changes when the
+controller restarts, and every adapter rebuilds its flows.
+
+A socket that something outside open-weave dials, or that dials out to it, takes
+its key from the manifest: the source ingress a producer dials, the output a
+consumer dials, and a `remote` listener.
+
+```yaml
+source:
+  srt:
+    node: strom-node-1
+    passphrase: producer-shared-passphrase
+destinations:
+  - id: uplink
+    srt:
+      remote: { host: 198.51.100.5, port: 9000, network: internet }
+      passphrase: far-end-shared-passphrase
+```
+
+A passphrase is 10 to 80 bytes, the range libsrt accepts, with no control
+characters. A socket without one runs in the clear. The peer must use the same
+passphrase; its key length may differ, since SRT settles on one at connect.
+
+Where keys appear:
+
+- Adapters get them in `GET /nodes/{id}/desired`, and nothing else serves them.
+- `/view`, `/status` and `/streams/{name}/endpoints` carry none.
+  `POST /stream-plans` drops every passphrase from the hops it returns and keeps
+  `pbkeylen`, which marks a keyed socket.
+- `GET /streams`, `/streams/{name}` and the stream-set routes return the manifest
+  as written, so a northbound-token holder can read manifest passphrases. Derived
+  keys never reach northbound.
+- The controller stores manifest passphrases in Postgres in the clear, as part of
+  the stream spec.
+- A node token reads only its own node's desired hops, so each node learns the
+  keys of its own sockets and no others. Whoever holds `WEAVE_SOUTHBOUND_KEY` can
+  make any node's token, and so read every key.
+- Strom returns the keys in its own `GET /api/flows`, and its SRT blocks log them
+  at INFO. `WEAVE_STROM_TOKEN` guards that API when Strom requires a token;
+  nothing in open-weave changes what Strom logs.
 
 ## Webhooks
 
@@ -698,13 +753,15 @@ destinations:
 ```
 
 Manifests still name terminal nodes, never inter-node transports. A remote SRT
-listener includes its network because its reachability cannot be inferred:
+listener includes its network because its reachability cannot be inferred, and
+may carry the passphrase it expects:
 
 ```yaml
 destinations:
   - id: uplink
     srt:
       remote: { host: 198.51.100.5, port: 9000, network: internet }
+      passphrase: far-end-shared-passphrase
 ```
 
 `GET /streams/{name}/endpoints` returns `ingress` plus a `destinations` list of
@@ -780,6 +837,11 @@ Strom UI/API edits are **drift**, like direct edits to Kubernetes managed
 objects. The source of truth is open-weave desired state; out-of-band Strom
 changes should be reconciled back or explicitly adopted into desired state.
 
+The adapter writes each SRT socket's latency and key into its `srt://` URI, since
+setting an srt element's `uri` resets both and Strom sets element properties in no
+fixed order. A flow whose SRT address, latency or key differs from its desired hop,
+or whose WHIP/WHEP endpoint id does, is deleted and created again.
+
 ## Quickstart
 
 The fastest way to see open-weave work is the bench: a docker-compose stack with
@@ -791,13 +853,15 @@ To run the services directly instead, note that `run-north`, `run-south`,
 `run-controller` and `run-strom-adapter` are each a long-running server and want
 a terminal of their own.
 
-Every service needs its secret (see [Authentication](#authentication)), so
-export both first, and the adapter its node token — or set
+Every service needs its secret (see [Authentication](#authentication)), and the
+controller its SRT key secret, so export them first, and the adapter its node
+token — or set
 `WEAVE_AUTH_DISABLED=1` to run without any:
 
 ```sh
 export WEAVE_NORTHBOUND_TOKEN=$(openssl rand -hex 32)
 export WEAVE_SOUTHBOUND_KEY=$(openssl rand -hex 32)
+export WEAVE_SRT_KEY_SECRET=$(openssl rand -hex 32)
 export WEAVE_SOUTHBOUND_TOKEN=$(just cli node-token strom-node-1)
 ```
 

@@ -510,6 +510,7 @@ mod tests {
             accepts: None,
             network: None,
             latency: None,
+            passphrase: None,
         }
     }
 

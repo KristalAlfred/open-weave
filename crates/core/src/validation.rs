@@ -3,7 +3,9 @@ use std::collections::HashSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{FormatConstraint, NodeDescriptor, SrtEndpoint, StreamDefinition, StreamTransport};
+use crate::{
+    FormatConstraint, NodeDescriptor, Passphrase, SrtEndpoint, StreamDefinition, StreamTransport,
+};
 
 pub const RESOURCE_ID_MAX_LEN: usize = 63;
 
@@ -208,6 +210,9 @@ fn validate_srt(
 ) {
     validate_via(endpoint, path, is_source, issues);
     validate_format(endpoint, path, is_source, issues);
+    if let Some(passphrase) = &endpoint.passphrase {
+        validate_passphrase(passphrase, &format!("{path}.passphrase"), issues);
+    }
     if let Some(network) = &endpoint.network {
         validate_id(network, &format!("{path}.network"), "network id", issues);
     }
@@ -285,6 +290,30 @@ fn validate_via(
                 "via must not repeat a node",
             ));
         }
+    }
+}
+
+/// Checks a passphrase against libsrt's limits. The messages never quote the
+/// value.
+fn validate_passphrase(passphrase: &Passphrase, field: &str, issues: &mut Vec<ValidationIssue>) {
+    let value = passphrase.expose();
+    if !(Passphrase::MIN_LEN..=Passphrase::MAX_LEN).contains(&value.len()) {
+        issues.push(ValidationIssue::new(
+            field,
+            "invalid_length",
+            format!(
+                "passphrase must be between {} and {} bytes",
+                Passphrase::MIN_LEN,
+                Passphrase::MAX_LEN
+            ),
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        issues.push(ValidationIssue::new(
+            field,
+            "invalid_characters",
+            "passphrase must not contain control characters",
+        ));
     }
 }
 
@@ -372,6 +401,7 @@ mod tests {
             via: Vec::new(),
             network: None,
             latency: None,
+            passphrase: None,
             format: None,
             accepts: None,
         }
@@ -518,6 +548,7 @@ mod tests {
             via: Vec::new(),
             network: None,
             latency: None,
+            passphrase: None,
             format: None,
             accepts: None,
         });
@@ -716,5 +747,62 @@ mod tests {
                 ("destinations[1].device.node", "invalid_characters"),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod passphrase_tests {
+    use super::*;
+    use crate::{StreamDestination, StreamTransport};
+
+    fn keyed(passphrase: &str) -> StreamDefinition {
+        StreamDefinition {
+            name: "feed".to_string(),
+            enabled: true,
+            source: StreamTransport::Srt(SrtEndpoint {
+                node: Some("source".to_string()),
+                remote: None,
+                via: Vec::new(),
+                network: None,
+                latency: None,
+                passphrase: Some(Passphrase::new(passphrase)),
+                format: None,
+                accepts: None,
+            }),
+            destinations: vec![StreamDestination {
+                id: "studio".to_string(),
+                endpoint: StreamTransport::Srt(SrtEndpoint {
+                    node: Some("studio".to_string()),
+                    remote: None,
+                    via: Vec::new(),
+                    network: None,
+                    latency: None,
+                    passphrase: None,
+                    format: None,
+                    accepts: None,
+                }),
+            }],
+        }
+    }
+
+    #[test]
+    fn passphrase_length_follows_libsrt() {
+        for (length, valid) in [(9, false), (10, true), (80, true), (81, false)] {
+            let issues = validate_stream(&keyed(&"k".repeat(length)));
+            assert_eq!(issues.is_empty(), valid, "{length}: {issues:?}");
+        }
+    }
+
+    #[test]
+    fn a_rejected_passphrase_is_named_but_never_quoted() {
+        let secret = "short-key";
+        let issues = validate_stream(&keyed(secret));
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].field, "source.srt.passphrase");
+        assert_eq!(issues[0].code, "invalid_length");
+        assert!(!issues[0].message.contains(secret));
+
+        let issues = validate_stream(&keyed("line\nbreak-in-key"));
+        assert_eq!(issues[0].code, "invalid_characters");
     }
 }

@@ -47,7 +47,7 @@ pub const ROUTE_STREAMS: &str = "/streams";
 /// A stale adapter is rejected at registration instead of being served desired
 /// state it cannot realise. This changes when southbound behavior or payload
 /// semantics become incompatible.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Whether the controller can serve an adapter declaring protocol `version`.
 ///
@@ -70,6 +70,7 @@ mod contract_tests {
             via: Vec::new(),
             network: None,
             latency: None,
+            passphrase: None,
             format: None,
             accepts: None,
         })
@@ -116,6 +117,39 @@ mod contract_tests {
         assert_eq!(value["id"], "studio");
         assert_eq!(value["srt"]["node"], "studio-node");
         assert!(value.get("endpoint").is_none());
+    }
+
+    #[test]
+    fn a_keyed_socket_round_trips_and_debug_never_prints_the_key() {
+        let socket = SocketSpec::Srt(SrtSocket::Listen {
+            port: 7001,
+            params: SrtParams {
+                latency: Some(200),
+                passphrase: Some(Passphrase::new("correct horse battery")),
+                pbkeylen: Some(32),
+            },
+        });
+        let value = serde_json::to_value(&socket).unwrap();
+        assert_eq!(value["params"]["passphrase"], "correct horse battery");
+        assert_eq!(value["params"]["pbkeylen"], 32);
+        assert_eq!(serde_json::from_value::<SocketSpec>(value).unwrap(), socket);
+        assert!(!format!("{socket:?}").contains("correct horse"));
+    }
+
+    #[test]
+    fn a_socket_without_a_key_decodes_unkeyed() {
+        let socket: SocketSpec = serde_json::from_value(serde_json::json!({
+            "transport": "srt",
+            "role": "listen",
+            "port": 7001,
+            "params": { "latency": 200 }
+        }))
+        .unwrap();
+        let SocketSpec::Srt(socket) = socket else {
+            panic!("expected an SRT socket");
+        };
+        assert_eq!(socket.params().passphrase, None);
+        assert_eq!(socket.params().pbkeylen, None);
     }
 
     #[test]
@@ -272,6 +306,13 @@ pub struct SrtEndpoint {
     pub network: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency: Option<u32>,
+    /// Encrypts this endpoint's own socket: the ingress a producer dials, the
+    /// output a consumer dials, or the remote listener the stream dials. Absent
+    /// leaves that socket in the clear. Links between nodes are keyed by the
+    /// controller whether or not this is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = Passphrase::MIN_LEN, max = Passphrase::MAX_LEN))]
+    pub passphrase: Option<Passphrase>,
     /// What the producer feeding this endpoint sends. Sources only.
     ///
     /// Declared, not discovered: an SRT flow that only moves bytes never parses
@@ -424,6 +465,7 @@ impl SocketSpec {
             port,
             params: SrtParams {
                 latency: Some(latency),
+                ..SrtParams::default()
             },
         })
     }
@@ -436,6 +478,7 @@ impl SocketSpec {
             port,
             params: SrtParams {
                 latency: Some(latency),
+                ..SrtParams::default()
             },
         })
     }
@@ -510,9 +553,15 @@ impl SrtSocket {
     }
 
     #[must_use]
-    pub fn params(&self) -> SrtParams {
+    pub fn params(&self) -> &SrtParams {
         match self {
-            Self::Listen { params, .. } | Self::Connect { params, .. } => *params,
+            Self::Listen { params, .. } | Self::Connect { params, .. } => params,
+        }
+    }
+
+    pub fn params_mut(&mut self) -> &mut SrtParams {
+        match self {
+            Self::Listen { params, .. } | Self::Connect { params, .. } => params,
         }
     }
 }
@@ -652,13 +701,13 @@ impl From<&SocketSpec> for SocketRepr {
         match spec {
             SocketSpec::Srt(SrtSocket::Listen { port, params }) => Self {
                 port: Some(*port),
-                params: Some(*params),
+                params: Some(params.clone()),
                 ..bare(SocketTransport::Srt, SocketEnd::Listen)
             },
             SocketSpec::Srt(SrtSocket::Connect { host, port, params }) => Self {
                 host: Some(host.clone()),
                 port: Some(*port),
-                params: Some(*params),
+                params: Some(params.clone()),
                 ..bare(SocketTransport::Srt, SocketEnd::Connect)
             },
             SocketSpec::Whip(socket) => Self {
@@ -880,10 +929,47 @@ impl std::fmt::Display for DeviceKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 pub struct SrtParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency: Option<u32>,
+    /// Encrypts the socket. Both ends of a link carry the same passphrase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = Passphrase::MIN_LEN, max = Passphrase::MAX_LEN))]
+    pub passphrase: Option<Passphrase>,
+    /// AES key length in bytes, 16, 24 or 32, used with `passphrase`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("enum" = [16, 24, 32]))]
+    pub pbkeylen: Option<u8>,
+}
+
+/// An SRT passphrase. [`std::fmt::Debug`] redacts it, no [`std::fmt::Display`]
+/// is implemented, and [`Passphrase::expose`] is the only accessor.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct Passphrase(String);
+
+impl Passphrase {
+    /// Fewest bytes libsrt accepts in a passphrase.
+    pub const MIN_LEN: usize = 10;
+    /// Most bytes libsrt accepts in a passphrase.
+    pub const MAX_LEN: usize = 80;
+
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Passphrase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Passphrase(<redacted>)")
+    }
 }
 
 /// Node-reported realisation status for one desired hop.
@@ -1630,6 +1716,7 @@ mod tests {
                 accepts: None,
                 network: None,
                 latency: Some(200),
+                passphrase: None,
             })
         );
         assert_eq!(stream.destinations[0].id, "studio");
@@ -1643,6 +1730,7 @@ mod tests {
                 accepts: None,
                 network: Some("wan".to_string()),
                 latency: None,
+                passphrase: None,
             })
         );
 
@@ -2155,6 +2243,7 @@ mod tests {
             via: Vec::new(),
             network: None,
             latency: None,
+            passphrase: None,
             format: None,
             accepts: None,
         };
@@ -2331,6 +2420,7 @@ mod tests {
                     via: Vec::new(),
                     network: None,
                     latency: None,
+                    passphrase: None,
                     format: None,
                     accepts: Some(wants_44k()),
                 }),

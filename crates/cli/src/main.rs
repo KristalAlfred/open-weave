@@ -986,6 +986,7 @@ destinations:
                 accepts: None,
                 network: None,
                 latency: Some(200),
+                passphrase: None,
             })
         );
         assert_eq!(stream.destinations.len(), 2);
@@ -999,6 +1000,7 @@ destinations:
                 accepts: None,
                 network: Some("wan".to_string()),
                 latency: None,
+                passphrase: None,
             })
         );
     }
@@ -1197,6 +1199,7 @@ destinations:
                 via: Vec::new(),
                 network: None,
                 latency: None,
+                passphrase: None,
                 format: None,
                 accepts: None,
             }),
@@ -1208,6 +1211,7 @@ destinations:
                     via: Vec::new(),
                     network: None,
                     latency: None,
+                    passphrase: None,
                     format: None,
                     accepts: None,
                 }),
@@ -1630,6 +1634,7 @@ destinations:
                 via: Vec::new(),
                 network: None,
                 latency: None,
+                passphrase: None,
                 format: None,
                 accepts: None,
             }),
@@ -1641,6 +1646,7 @@ destinations:
                     via: Vec::new(),
                     network: None,
                     latency: None,
+                    passphrase: None,
                     format: None,
                     accepts: None,
                 }),

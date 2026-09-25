@@ -2,9 +2,9 @@
 id: OW-23
 title: "Flow drift is checked on host and port only"
 type: bug
-status: todo
+status: in-progress
 depends_on: []
-assignee:
+assignee: claude-transport
 ---
 
 ## Evidence
@@ -21,3 +21,4 @@ flow keeps its old settings. Found by reading the code; not run.
 ## Log
 
 - 2026-09-25: filed from research on OW-2.
+- 2026-09-25: started by claude-transport.

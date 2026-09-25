@@ -1078,6 +1078,7 @@ mod tests {
                 accepts: None,
                 network: None,
                 latency: None,
+                passphrase: None,
             }),
             destinations: vec![StreamDestination {
                 id: "studio".to_string(),
@@ -1089,6 +1090,7 @@ mod tests {
                     accepts: None,
                     network: None,
                     latency: None,
+                    passphrase: None,
                 }),
             }],
         }
