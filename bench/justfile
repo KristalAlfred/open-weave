@@ -330,7 +330,7 @@ host-cam-down:
 # The controller only delivers when WEAVE_WEBHOOK_URL is set on its service, so
 # start this before `just bench up` and expect a connection-refused line in the
 # controller log for anything emitted while it is down.
-[doc("Print node lifecycle webhooks the controller delivers, until interrupted.")]
+[doc("Print the webhooks the controller delivers, until interrupted.")]
 [group("webhooks")]
 hook-sink:
     #!/usr/bin/env python3
@@ -342,7 +342,8 @@ hook-sink:
             auth = self.headers.get("authorization", "<none>")
             try:
                 event = json.loads(body)
-                line = f"{event['event_type']:16} {event['node']['id']:16} {event['occurred_at']}"
+                subject = event["node"]["id"] if "node" in event else event["stream"]["name"]
+                line = f"{event['event_type']:16} {subject:16} {event['occurred_at']}"
                 detail = json.dumps(event, indent=2)
             except (ValueError, KeyError):
                 line, detail = "<unparsed>", body.decode("utf-8", "replace")

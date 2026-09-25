@@ -91,7 +91,7 @@ operator/system
 
 Requests flow left to right: the CLI calls northbound, adapters call southbound,
 and both of those call the controller. The controller answers no request by
-calling back out; its one outbound call is the node lifecycle webhook below,
+calling back out; its one outbound call is the webhook below,
 which is fire-and-forget and off unless configured.
 
 The core rule is: **wide southbound ecosystem, narrow adapter contract**. A
@@ -356,7 +356,8 @@ no field context.
 Generated OpenAPI 3.1 documents for the northbound and southbound surfaces are
 in `contracts/openapi/`. JSON Schema 2020-12 documents for their request and
 response payloads are in `contracts/json-schema/`. They are generated from
-the Rust wire types. Resource-id patterns, required destination lists, non-empty
+the Rust wire types, and `contracts/json-schema/webhook-event.json` describes a
+webhook delivery. Resource-id patterns, required destination lists, non-empty
 format constraints, unknown-field rejection, and enum values are present in the
 schemas. Rules that depend on where a shared endpoint type appears, such as
 source-only `format`, remain authoritative in the shared validator and return
@@ -464,12 +465,13 @@ Left unauthenticated on purpose:
 There is no TLS: terminate it at a reverse proxy. There are no per-node tokens
 and no mTLS.
 
-## Node lifecycle webhooks
+## Webhooks
 
 The controller POSTs a JSON event to one configured receiver when a node
-registers, goes offline, or comes back. It exists so a service that hosts guest
-pages can declare a stream for a guest's seat on being told the page registered,
-rather than polling `/nodes`.
+registers, goes offline, or comes back, and when a stream's conditions change.
+It exists so a service that hosts guest pages can declare a stream for a guest's
+seat on being told the page registered, and hear that the stream went `flowing`
+or `degraded`, rather than polling `/nodes` and `/status`.
 
 | Variable | Meaning |
 |---|---|
@@ -482,6 +484,7 @@ rather than polling `/nodes`.
 | `node.registered` | Every accepted registration, including a re-registration of a node already online — a page reload does exactly this. |
 | `node.online` | A node heartbeats after having been marked offline. |
 | `node.offline` | A node crosses `WEAVE_NODE_TTL_SECS` without a heartbeat. |
+| `stream.changed` | A reconcile tick computes a stream's conditions for the first time, or computes conditions that differ from the previous tick's in `type`, `status` or `reason`, on the stream or on any destination. |
 
 ```json
 {
@@ -516,14 +519,60 @@ capture, while its dial-only attachment shows it exposes no media listener.
 contract. `event_id` is stable across retries of one delivery, so a receiver can
 deduplicate.
 
-Emitting never blocks a registration. Events are queued and delivered by one
-background worker, in order, retried with backoff on a connect error or 5xx and
-abandoned after four attempts; a 4xx is the receiver rejecting the event and is
-not retried. A full queue drops rather than waits, and the queue is in memory, so
+```json
+{
+  "event_id": "basic-7",
+  "event_type": "stream.changed",
+  "occurred_at": "2026-09-25T10:15:02.412345678Z",
+  "stream": {
+    "name": "basic",
+    "generation": 2,
+    "observed_generation": 2,
+    "status": "degraded",
+    "conditions": [{
+      "type": "nodes_available",
+      "status": "false",
+      "reason": "node_offline",
+      "detail": "node strom-node-2 is offline",
+      "last_transition_time": "2026-09-25T10:15:02.410123456Z"
+    }],
+    "destinations": [{
+      "id": "studio",
+      "status": "degraded",
+      "conditions": [{
+        "type": "media_flowing",
+        "status": "false",
+        "reason": "media_degraded",
+        "detail": "media is not flowing across every branch",
+        "last_transition_time": "2026-09-25T10:15:02.410123456Z"
+      }]
+    }]
+  }
+}
+```
+
+That is abbreviated too: a stream and each destination carry all five
+conditions. `stream` has the stream's `name`, `generation`,
+`observed_generation` and `status`, and every condition on the stream and on
+each destination with its stable `reason` code. It leaves out the stream's nodes
+and every address, which `/status` and `/streams/{name}/endpoints` carry. A tick
+sends at most one event per stream. The first tick after a controller start
+sends one for every stream, because the controller keeps no conditions across a
+restart. A change of `detail`
+alone sends nothing, and deleting a stream sends nothing. An event follows the
+change it reports by up to one reconcile interval plus an adapter poll.
+
+An empty `WEAVE_WEBHOOK_EVENTS` delivers every type, `stream.changed` included.
+Set it to `node.registered,node.online,node.offline` for node events only.
+
+Emitting never blocks a registration or a reconcile tick. Events are queued and
+delivered by one background worker, in order, retried with backoff on a connect
+error or 5xx and abandoned after four attempts; a 4xx is the receiver rejecting
+the event and is not retried. A full queue drops rather than waits, and the queue is in memory, so
 events do not survive a controller restart.
 
 **Delivery is at-least-once and incomplete by design.** A receiver reconciles
-against southbound `GET /nodes` on boot and treats events as hints, not truth.
+against `GET /nodes` and `/status` on boot and treats events as hints, not truth.
 
 The bearer token authenticates the controller to the receiver; it does not let
 the receiver tell a genuine event from anyone who has learned the token. A

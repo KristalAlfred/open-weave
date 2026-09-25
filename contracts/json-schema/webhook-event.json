@@ -1,0 +1,624 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "One event. The whole JSON body of a delivery.",
+  "oneOf": [
+    {
+      "properties": {
+        "node": {
+          "description": "The node an event is about.\n\n A [`crate::NodeRegistration`] also carries `endpoints` and `hop_status`.\n Those describe hops rather than the node, and are not part of this contract.",
+          "properties": {
+            "capabilities": {
+              "additionalProperties": false,
+              "default": {
+                "adapters": [],
+                "hop_profiles": []
+              },
+              "properties": {
+                "adapters": {
+                  "default": [],
+                  "items": {
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "strom",
+                          "nmos",
+                          "mxl_domain",
+                          "mxl_k8s",
+                          "mcm",
+                          "vendor",
+                          "custom"
+                        ],
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name",
+                      "kind"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "hop_profiles": {
+                  "default": [],
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "egress": {
+                        "anyOf": [
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "roles": {
+                                "items": {
+                                  "description": "Which end of a link a socket is: `Listen` hosts and `Connect` dials.",
+                                  "enum": [
+                                    "listen",
+                                    "connect"
+                                  ],
+                                  "type": "string"
+                                },
+                                "minItems": 1,
+                                "type": "array"
+                              },
+                              "transport": {
+                                "description": "A transport that carries media between two nodes.",
+                                "oneOf": [
+                                  {
+                                    "enum": [
+                                      "srt"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  {
+                                    "const": "whip",
+                                    "description": "WebRTC ingest. The `Connect` end pushes media to the `Listen` end's\n signalling URL.",
+                                    "type": "string"
+                                  },
+                                  {
+                                    "const": "whep",
+                                    "description": "WebRTC playback. The `Connect` end pulls media from the `Listen` end's\n signalling URL.",
+                                    "type": "string"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "transport",
+                              "roles"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "device": {
+                                "description": "The node's own capture or display device, where media starts or ends.",
+                                "enum": [
+                                  "capture",
+                                  "display"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "device"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      },
+                      "id": {
+                        "maxLength": 63,
+                        "minLength": 1,
+                        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                        "type": "string"
+                      },
+                      "ingress": {
+                        "anyOf": [
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "roles": {
+                                "items": {
+                                  "description": "Which end of a link a socket is: `Listen` hosts and `Connect` dials.",
+                                  "enum": [
+                                    "listen",
+                                    "connect"
+                                  ],
+                                  "type": "string"
+                                },
+                                "minItems": 1,
+                                "type": "array"
+                              },
+                              "transport": {
+                                "description": "A transport that carries media between two nodes.",
+                                "oneOf": [
+                                  {
+                                    "enum": [
+                                      "srt"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  {
+                                    "const": "whip",
+                                    "description": "WebRTC ingest. The `Connect` end pushes media to the `Listen` end's\n signalling URL.",
+                                    "type": "string"
+                                  },
+                                  {
+                                    "const": "whep",
+                                    "description": "WebRTC playback. The `Connect` end pulls media from the `Listen` end's\n signalling URL.",
+                                    "type": "string"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "transport",
+                              "roles"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "device": {
+                                "description": "The node's own capture or display device, where media starts or ends.",
+                                "enum": [
+                                  "capture",
+                                  "display"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "device"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      },
+                      "max_egresses": {
+                        "format": "uint",
+                        "minimum": 1,
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "ingress",
+                      "egress"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              },
+              "type": "object"
+            },
+            "endpoint": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "unknown",
+                "ready",
+                "degraded",
+                "offline"
+              ],
+              "type": "string"
+            },
+            "topology": {
+              "additionalProperties": false,
+              "properties": {
+                "attachments": {
+                  "default": [],
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "dial": {
+                        "default": false,
+                        "type": "boolean"
+                      },
+                      "id": {
+                        "maxLength": 63,
+                        "minLength": 1,
+                        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                        "type": "string"
+                      },
+                      "listeners": {
+                        "additionalProperties": false,
+                        "default": {},
+                        "properties": {
+                          "srt": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "host": {
+                                "type": "string"
+                              },
+                              "port_range": {
+                                "description": "Inclusive `[start, end]` range of ports a node offers for controller-side\n assignment.",
+                                "properties": {
+                                  "end": {
+                                    "format": "uint16",
+                                    "maximum": 65535,
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "start": {
+                                    "format": "uint16",
+                                    "maximum": 65535,
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "start",
+                                  "end"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "required": [
+                              "host",
+                              "port_range"
+                            ],
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "whep": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "base_url": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "base_url"
+                            ],
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "whip": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "base_url": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "base_url"
+                            ],
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "network": {
+                        "maxLength": 63,
+                        "minLength": 1,
+                        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "network"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "id",
+            "status",
+            "endpoint",
+            "topology"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "node"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "stream": {
+          "description": "The stream an event is about: its generations, status and conditions.\n\n A [`StreamStatus`] also carries the stream's nodes, ingress and destination\n endpoints. Those are addresses, and are not part of this contract.",
+          "properties": {
+            "conditions": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "detail": {
+                    "type": "string"
+                  },
+                  "last_transition_time": {
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "reason": {
+                    "enum": [
+                      "placed",
+                      "disabled",
+                      "placement_failed",
+                      "nodes_available",
+                      "node_missing",
+                      "node_offline",
+                      "hops_ready",
+                      "hops_pending",
+                      "hop_failed",
+                      "format_compatible",
+                      "format_unknown",
+                      "format_mismatch",
+                      "media_flowing",
+                      "awaiting_input",
+                      "media_degraded",
+                      "media_failed",
+                      "media_idle",
+                      "not_ready"
+                    ],
+                    "type": "string"
+                  },
+                  "status": {
+                    "enum": [
+                      "true",
+                      "false",
+                      "unknown"
+                    ],
+                    "type": "string"
+                  },
+                  "type": {
+                    "enum": [
+                      "placement_ready",
+                      "nodes_available",
+                      "hops_ready",
+                      "format_compatible",
+                      "media_flowing"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "status",
+                  "reason",
+                  "detail",
+                  "last_transition_time"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "destinations": {
+              "items": {
+                "properties": {
+                  "conditions": {
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "detail": {
+                          "type": "string"
+                        },
+                        "last_transition_time": {
+                          "format": "date-time",
+                          "type": "string"
+                        },
+                        "reason": {
+                          "enum": [
+                            "placed",
+                            "disabled",
+                            "placement_failed",
+                            "nodes_available",
+                            "node_missing",
+                            "node_offline",
+                            "hops_ready",
+                            "hops_pending",
+                            "hop_failed",
+                            "format_compatible",
+                            "format_unknown",
+                            "format_mismatch",
+                            "media_flowing",
+                            "awaiting_input",
+                            "media_degraded",
+                            "media_failed",
+                            "media_idle",
+                            "not_ready"
+                          ],
+                          "type": "string"
+                        },
+                        "status": {
+                          "enum": [
+                            "true",
+                            "false",
+                            "unknown"
+                          ],
+                          "type": "string"
+                        },
+                        "type": {
+                          "enum": [
+                            "placement_ready",
+                            "nodes_available",
+                            "hops_ready",
+                            "format_compatible",
+                            "media_flowing"
+                          ],
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "status",
+                        "reason",
+                        "detail",
+                        "last_transition_time"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "description": "End-to-end status of a path, derived from its hops' conditions.",
+                    "oneOf": [
+                      {
+                        "const": "idle",
+                        "description": "The path is disabled.",
+                        "type": "string"
+                      },
+                      {
+                        "const": "failed",
+                        "description": "At least one hop failed to provision.",
+                        "type": "string"
+                      },
+                      {
+                        "const": "pending",
+                        "description": "A hop is still provisioning or has not reported yet.",
+                        "type": "string"
+                      },
+                      {
+                        "const": "awaiting_input",
+                        "description": "Provisioned end to end, but no media is entering at the source.",
+                        "type": "string"
+                      },
+                      {
+                        "const": "degraded",
+                        "description": "Media is entering at the source but not flowing all the way through.",
+                        "type": "string"
+                      },
+                      {
+                        "const": "flowing",
+                        "description": "Media is flowing across every hop.",
+                        "type": "string"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "id",
+                  "status",
+                  "conditions"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "generation": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "type": "string"
+            },
+            "observed_generation": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "status": {
+              "description": "End-to-end status of a path, derived from its hops' conditions.",
+              "oneOf": [
+                {
+                  "const": "idle",
+                  "description": "The path is disabled.",
+                  "type": "string"
+                },
+                {
+                  "const": "failed",
+                  "description": "At least one hop failed to provision.",
+                  "type": "string"
+                },
+                {
+                  "const": "pending",
+                  "description": "A hop is still provisioning or has not reported yet.",
+                  "type": "string"
+                },
+                {
+                  "const": "awaiting_input",
+                  "description": "Provisioned end to end, but no media is entering at the source.",
+                  "type": "string"
+                },
+                {
+                  "const": "degraded",
+                  "description": "Media is entering at the source but not flowing all the way through.",
+                  "type": "string"
+                },
+                {
+                  "const": "flowing",
+                  "description": "Media is flowing across every hop.",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "required": [
+            "name",
+            "generation",
+            "status",
+            "conditions",
+            "destinations"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "stream"
+      ],
+      "type": "object"
+    }
+  ],
+  "properties": {
+    "event_id": {
+      "description": "Stable across retries of one delivery, so a receiver can deduplicate.",
+      "type": "string"
+    },
+    "event_type": {
+      "enum": [
+        "node.registered",
+        "node.online",
+        "node.offline",
+        "stream.changed"
+      ],
+      "type": "string"
+    },
+    "occurred_at": {
+      "description": "RFC 3339, UTC.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "event_id",
+    "event_type",
+    "occurred_at"
+  ],
+  "title": "Event",
+  "type": "object"
+}

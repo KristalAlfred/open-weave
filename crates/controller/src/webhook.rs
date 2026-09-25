@@ -8,7 +8,7 @@
 //!
 //! Delivery is at-least-once: a receiver that answers late still gets a retry,
 //! and events are lost on a controller restart. A consumer reconciles against
-//! southbound `GET /nodes` rather than treating the stream as complete.
+//! `GET /nodes` and `GET /status` rather than treating the events as complete.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -17,7 +17,7 @@ use reqwest::Client;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use weave_core::auth::Token;
-use weave_core::webhook::{Event, EventType, NodeSummary};
+use weave_core::webhook::{Event, EventType, Subject};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -94,7 +94,7 @@ impl Emitter {
             .map(|kind| kind.as_str())
             .collect::<Vec<_>>()
             .join(",");
-        tracing::info!(%url, %events, "node lifecycle webhooks enabled");
+        tracing::info!(%url, %events, "webhooks enabled");
 
         Some(Self {
             tx,
@@ -105,15 +105,20 @@ impl Emitter {
         })
     }
 
-    pub fn emit(&self, event_type: EventType, node: NodeSummary) {
+    pub fn emit(&self, event_type: EventType, subject: impl Into<Subject>) {
         if !self.allowed.contains(&event_type) {
             return;
         }
+        let subject = subject.into();
         let event = Event {
-            event_id: format!("{}-{}", node.id, self.seq.fetch_add(1, Ordering::Relaxed)),
+            event_id: format!(
+                "{}-{}",
+                subject.id(),
+                self.seq.fetch_add(1, Ordering::Relaxed)
+            ),
             event_type,
             occurred_at: now_rfc3339(),
-            node,
+            subject,
         };
 
         match self.tx.try_send(event) {
@@ -257,7 +262,8 @@ pub(crate) mod tests {
     use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
     use axum::routing::post;
     use axum::{Json, Router};
-    use weave_core::{NodeCapabilities, NodeStatus};
+    use weave_core::webhook::{NodeSummary, StreamSummary};
+    use weave_core::{NodeCapabilities, NodeStatus, PathStatus};
 
     pub(crate) struct Delivery {
         auth: Option<String>,
@@ -381,7 +387,7 @@ pub(crate) mod tests {
         let delivery = sink.next().await;
         assert_eq!(delivery.auth.as_deref(), Some("Bearer hook-token"));
         assert_eq!(delivery.event.event_type, EventType::NodeRegistered);
-        assert_eq!(delivery.event.node.id, "guest-1");
+        assert_eq!(delivery.event.subject.id(), "guest-1");
         assert!(delivery.event.event_id.starts_with("guest-1-"));
         assert!(!delivery.event.occurred_at.is_empty());
     }
@@ -460,6 +466,34 @@ pub(crate) mod tests {
         emitter.emit(EventType::NodeOffline, node("guest-1"));
 
         assert_eq!(sink.next().await.event.event_type, EventType::NodeOffline);
+        sink.expect_idle().await;
+    }
+
+    #[tokio::test]
+    async fn an_allowlist_can_name_the_stream_event() {
+        let mut sink = sink(StatusCode::OK).await;
+        let emitter = Emitter::new(Config {
+            events: vec!["stream.changed".to_string()],
+            ..config(&sink.url)
+        })
+        .unwrap();
+
+        emitter.emit(EventType::NodeRegistered, node("guest-1"));
+        emitter.emit(
+            EventType::StreamChanged,
+            StreamSummary {
+                name: "basic".to_string(),
+                generation: 1,
+                observed_generation: Some(1),
+                status: PathStatus::Pending,
+                conditions: Vec::new(),
+                destinations: Vec::new(),
+            },
+        );
+
+        let event = sink.next().await.event;
+        assert_eq!(event.event_type, EventType::StreamChanged);
+        assert_eq!(event.subject.id(), "basic");
         sink.expect_idle().await;
     }
 

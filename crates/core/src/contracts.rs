@@ -7,7 +7,7 @@ use crate::{
     ROUTE_NODE_REGISTER, ROUTE_NODES, ROUTE_STATE, ROUTE_STATUS, ROUTE_STREAM,
     ROUTE_STREAM_ENDPOINTS, ROUTE_STREAM_PLANS, ROUTE_STREAM_SET, ROUTE_STREAM_SETS, ROUTE_STREAMS,
     StatusResponse, StreamAccepted, StreamDefinition, StreamEndpoints, StreamPlan, StreamResource,
-    StreamSetAccepted, StreamSetApply, StreamSetResource,
+    StreamSetAccepted, StreamSetApply, StreamSetResource, webhook,
 };
 
 pub struct ContractArtifact {
@@ -35,6 +35,7 @@ pub fn artifacts() -> Vec<ContractArtifact> {
         schema_artifact::<NodeRegistration>("contracts/json-schema/node-registration.json"),
         schema_artifact::<ObservedState>("contracts/json-schema/observed-state.json"),
         schema_artifact::<Vec<DesiredHop>>("contracts/json-schema/desired-hops.json"),
+        schema_artifact::<webhook::Event>("contracts/json-schema/webhook-event.json"),
     ]
 }
 

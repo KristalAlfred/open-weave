@@ -263,15 +263,15 @@ destination, and the page registers on that network. With nothing dialling the S
 stream reads `degraded`, which is the roll-up for a source that flows and a
 destination that does not.
 
-## Node lifecycle webhooks
+## Webhooks
 
 The `controller` service sets `WEAVE_WEBHOOK_URL` to
 `http://host.docker.internal:29099` and `WEAVE_WEBHOOK_TOKEN` to
-`bench-webhook-token`, so it delivers `node.registered`, `node.online` and
-`node.offline` to a sink on this host. `just bench hook-sink` is that sink: a
-few lines of Python that print each event and the `Authorization` header it
-arrived with. Export `WEAVE_WEBHOOK_URL=` (empty) before `just bench up` to
-switch webhooks off.
+`bench-webhook-token`, so it delivers `node.registered`, `node.online`,
+`node.offline` and `stream.changed` to a sink on this host. `just bench
+hook-sink` is that sink: a few lines of Python that print each event and the
+`Authorization` header it arrived with. Export `WEAVE_WEBHOOK_URL=` (empty)
+before `just bench up` to switch webhooks off.
 
 Run the sink in its own terminal *before* `just bench up` — the controller logs
 a connection-refused line and gives up on anything emitted while it is down.
@@ -285,10 +285,12 @@ just bench page 8000 guest-1    # terminal 3, then open the printed URL
 Opening the page gives one `node.registered` for `guest-1`. Reloading the tab
 gives a second `node.registered` for the same id, because `#node=` pins the seat
 and a re-registration is not reported as `node.online`. Closing the tab and
-waiting `WEAVE_NODE_TTL_SECS` (15) gives `node.offline`.
+waiting `WEAVE_NODE_TTL_SECS` (15) gives `node.offline`. Applying a stream gives
+a `stream.changed` on the next reconcile tick, and another each time its
+conditions change.
 
 `host.docker.internal` resolves through the `extra_hosts: host-gateway` entry on
-the controller service. See the root README's "Node lifecycle webhooks" for the
+the controller service. See the root README's "Webhooks" for the
 payload and the delivery guarantees.
 
 ## Host ports
@@ -301,7 +303,7 @@ payload and the delivery guarantees.
 | 28080 | strom-1 API |
 | 28081 | strom-2 API |
 | 28082 | strom-3 API (host→container; grants no route into net_node3) |
-| 29099 | `just bench hook-sink` on this host, where the controller delivers node lifecycle webhooks |
+| 29099 | `just bench hook-sink` on this host, where the controller delivers webhooks |
 
 ## Authentication
 

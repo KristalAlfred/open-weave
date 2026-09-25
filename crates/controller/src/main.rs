@@ -29,7 +29,7 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 use weave_core::auth::{self, Guard, require_bearer};
-use weave_core::webhook::{EventType, NodeSummary};
+use weave_core::webhook::{EventType, NodeSummary, StreamSummary, Subject};
 use weave_core::{
     AcceptedState, ApiError, ApiErrorCode, DesiredHop, EndpointDescriptor, HopStatus, NodeAccepted,
     NodeDescriptor, NodeHeartbeat, NodeRegistration, NodeStatus, ObservedState, PROTOCOL_VERSION,
@@ -68,7 +68,7 @@ struct Args {
     /// in-memory store and does not persist state across restarts.
     #[arg(long, env = "DATABASE_URL")]
     database_url: Option<String>,
-    /// Absolute URL that receives node lifecycle events. Webhooks are off when unset.
+    /// Absolute URL that receives node and stream events. Webhooks are off when unset.
     #[arg(long, env = "WEAVE_WEBHOOK_URL")]
     webhook_url: Option<String>,
     /// Presented to the receiver as `Authorization: Bearer <token>`.
@@ -189,9 +189,9 @@ impl AppState {
         })
     }
 
-    fn emit(&self, event_type: EventType, node: NodeSummary) {
+    fn emit(&self, event_type: EventType, subject: impl Into<Subject>) {
         if let Some(emitter) = &self.webhooks {
-            emitter.emit(event_type, node);
+            emitter.emit(event_type, subject);
         }
     }
 }
@@ -437,10 +437,63 @@ async fn reconcile_tick(state: &AppState) {
     *state.desired.write().await = desired;
     let mut view = state.view.write().await;
     stamp_condition_transition_times(&mut outcome.streams, &view.streams, &now_rfc3339());
+    let changed = changed_streams(&outcome.streams, &view.streams);
     view.report = Some(outcome.report);
     view.streams = outcome.streams;
     view.endpoints = outcome.endpoints;
     view.hops = outcome.hops_by_stream;
+    drop(view);
+    drop(streams);
+    for stream in changed {
+        state.emit(EventType::StreamChanged, stream);
+    }
+}
+
+/// Every stream whose conditions differ from the previous tick's by type,
+/// status or reason, on the stream or on any destination. A stream no earlier
+/// tick computed has changed; one only accepted since then has a placeholder
+/// status with no `observed_generation`.
+fn changed_streams(current: &[StreamStatus], previous: &[StreamStatus]) -> Vec<StreamSummary> {
+    current
+        .iter()
+        .filter(|stream| {
+            previous
+                .iter()
+                .find(|candidate| {
+                    candidate.name == stream.name && candidate.observed_generation.is_some()
+                })
+                .is_none_or(|previous| condition_keys(previous) != condition_keys(stream))
+        })
+        .map(StreamSummary::from)
+        .collect()
+}
+
+type ConditionKey<'a> = (
+    Option<&'a str>,
+    StreamConditionType,
+    StreamConditionStatus,
+    StreamConditionReason,
+);
+
+fn condition_keys(stream: &StreamStatus) -> Vec<ConditionKey<'_>> {
+    std::iter::once((None, &stream.conditions))
+        .chain(
+            stream
+                .destinations
+                .iter()
+                .map(|destination| (Some(destination.id.as_str()), &destination.conditions)),
+        )
+        .flat_map(|(destination, conditions)| {
+            conditions.iter().map(move |condition| {
+                (
+                    destination,
+                    condition.condition_type,
+                    condition.status,
+                    condition.reason,
+                )
+            })
+        })
+        .collect()
 }
 
 fn now_rfc3339() -> String {
@@ -2648,9 +2701,12 @@ mod tests {
 
         let event = sink.next().await.event;
         assert_eq!(event.event_type, EventType::NodeRegistered);
-        assert_eq!(event.node.id, "guest-1");
-        assert_eq!(event.node.endpoint, "http://guest-1:8080");
-        assert_eq!(event.node.status, NodeStatus::Ready);
+        let Subject::Node(node) = event.subject else {
+            panic!("expected a node event");
+        };
+        assert_eq!(node.id, "guest-1");
+        assert_eq!(node.endpoint, "http://guest-1:8080");
+        assert_eq!(node.status, NodeStatus::Ready);
     }
 
     #[tokio::test]
@@ -2671,8 +2727,11 @@ mod tests {
 
         let event = sink.next().await.event;
         assert_eq!(event.event_type, EventType::NodeOffline);
-        assert_eq!(event.node.id, "guest-1");
-        assert_eq!(event.node.status, NodeStatus::Offline);
+        let Subject::Node(node) = event.subject else {
+            panic!("expected a node event");
+        };
+        assert_eq!(node.id, "guest-1");
+        assert_eq!(node.status, NodeStatus::Offline);
         sink.expect_idle().await;
     }
 
@@ -2700,7 +2759,10 @@ mod tests {
 
         let event = sink.next().await.event;
         assert_eq!(event.event_type, EventType::NodeOnline);
-        assert_eq!(event.node.status, NodeStatus::Ready);
+        let Subject::Node(node) = event.subject else {
+            panic!("expected a node event");
+        };
+        assert_eq!(node.status, NodeStatus::Ready);
     }
 
     #[tokio::test]
@@ -3012,5 +3074,264 @@ mod tests {
             desired_hops(&app, "strom-node-1").await,
             (StatusCode::OK, json!([]))
         );
+    }
+
+    fn observed_status(conditions: Vec<StreamCondition>) -> StreamStatus {
+        StreamStatus {
+            name: "basic".to_string(),
+            generation: 1,
+            observed_generation: Some(1),
+            status: PathStatus::AwaitingInput,
+            nodes: Vec::new(),
+            conditions: conditions.clone(),
+            ingress: None,
+            destinations: vec![StreamDestinationStatus {
+                id: "studio".to_string(),
+                status: PathStatus::AwaitingInput,
+                nodes: Vec::new(),
+                conditions,
+                endpoint: None,
+            }],
+        }
+    }
+
+    fn media(status: StreamConditionStatus, reason: StreamConditionReason) -> StreamCondition {
+        let mut condition = stream_condition(
+            StreamConditionType::MediaFlowing,
+            status,
+            reason,
+            "media detail",
+        );
+        condition.last_transition_time = "2026-09-25T10:00:00Z".to_string();
+        condition
+    }
+
+    fn awaiting_input() -> StreamStatus {
+        observed_status(vec![media(
+            StreamConditionStatus::False,
+            StreamConditionReason::AwaitingInput,
+        )])
+    }
+
+    fn changed_names(current: &[StreamStatus], previous: &[StreamStatus]) -> Vec<String> {
+        changed_streams(current, previous)
+            .into_iter()
+            .map(|stream| stream.name)
+            .collect()
+    }
+
+    #[test]
+    fn a_stream_no_tick_computed_before_has_changed() {
+        let current = [awaiting_input()];
+        assert_eq!(changed_names(&current, &[]), ["basic"]);
+
+        let placeholder = unreconciled_stream_status(&stored_stream(stream("basic")));
+        assert_eq!(
+            changed_names(&current, std::slice::from_ref(&placeholder)),
+            ["basic"],
+            "a stream accepted since the last tick"
+        );
+    }
+
+    #[test]
+    fn unchanged_conditions_are_not_a_change() {
+        let previous = [awaiting_input()];
+        assert!(changed_names(&previous, &previous).is_empty());
+
+        let mut detail = awaiting_input();
+        detail.conditions[0].detail = "other words".to_string();
+        assert!(
+            changed_names(std::slice::from_ref(&detail), &previous).is_empty(),
+            "detail is free text"
+        );
+
+        let mut generation = awaiting_input();
+        generation.generation = 2;
+        generation.observed_generation = Some(2);
+        assert!(changed_names(std::slice::from_ref(&generation), &previous).is_empty());
+    }
+
+    #[test]
+    fn a_status_reason_or_destination_change_is_one_change() {
+        let previous = [awaiting_input()];
+
+        let mut flowing = awaiting_input();
+        flowing.conditions[0] = media(
+            StreamConditionStatus::True,
+            StreamConditionReason::MediaFlowing,
+        );
+        flowing.destinations[0].conditions[0] = flowing.conditions[0].clone();
+        assert_eq!(
+            changed_names(std::slice::from_ref(&flowing), &previous),
+            ["basic"]
+        );
+
+        let mut degraded = awaiting_input();
+        degraded.conditions[0].reason = StreamConditionReason::MediaDegraded;
+        assert_eq!(
+            changed_names(std::slice::from_ref(&degraded), &previous),
+            ["basic"],
+            "awaiting_input and media_degraded share a status"
+        );
+
+        let mut destination = awaiting_input();
+        destination.destinations[0].conditions[0].reason = StreamConditionReason::MediaDegraded;
+        assert_eq!(
+            changed_names(std::slice::from_ref(&destination), &previous),
+            ["basic"]
+        );
+
+        let mut added = awaiting_input();
+        let mut preview = added.destinations[0].clone();
+        preview.id = "preview".to_string();
+        added.destinations.insert(0, preview);
+        assert_eq!(
+            changed_names(std::slice::from_ref(&added), &previous),
+            ["basic"]
+        );
+    }
+
+    #[test]
+    fn a_reason_change_keeps_the_transition_time_it_reports() {
+        let previous = [awaiting_input()];
+        let mut current = awaiting_input();
+        current.conditions[0].reason = StreamConditionReason::MediaDegraded;
+        current.conditions[0].last_transition_time = String::new();
+        stamp_condition_transition_times(
+            std::slice::from_mut(&mut current),
+            &previous,
+            "2026-09-25T10:05:00Z",
+        );
+
+        let changed = changed_streams(std::slice::from_ref(&current), &previous);
+        assert_eq!(
+            changed[0].conditions[0].last_transition_time,
+            "2026-09-25T10:00:00Z"
+        );
+    }
+
+    async fn stream_events(sink: &mut Sink) -> Vec<StreamSummary> {
+        let mut events = Vec::new();
+        while let Ok(delivery) = tokio::time::timeout(Duration::from_millis(300), sink.next()).await
+        {
+            assert_eq!(delivery.event.event_type, EventType::StreamChanged);
+            let Subject::Stream(stream) = delivery.event.subject else {
+                panic!("expected a stream event");
+            };
+            events.push(stream);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn the_first_tick_after_a_start_reports_every_stream() {
+        let mut sink = sink(StatusCode::OK).await;
+        let mem = Arc::new(MemStore::new());
+        mem.create_stream(&stream("basic")).await.unwrap();
+        mem.create_stream(&stream("backup")).await.unwrap();
+        let webhooks = webhook::Emitter::new(webhook::Config {
+            url: Some(sink.url.clone()),
+            ..webhook::Config::default()
+        })
+        .map(Arc::new);
+        let state = AppState::hydrate(mem, Duration::from_secs(15), webhooks)
+            .await
+            .unwrap();
+
+        reconcile_tick(&state).await;
+        reconcile_tick(&state).await;
+
+        let events = stream_events(&mut sink).await;
+        let names: Vec<&str> = events.iter().map(|stream| stream.name.as_str()).collect();
+        assert_eq!(names, ["backup", "basic"], "once each, on the first tick");
+        assert_eq!(events[1].generation, 1);
+        assert_eq!(events[1].observed_generation, Some(1));
+        assert_eq!(events[1].status, PathStatus::Pending);
+        let placement = &events[1].conditions[0];
+        assert_eq!(
+            placement.condition_type,
+            StreamConditionType::PlacementReady
+        );
+        assert_eq!(placement.reason, StreamConditionReason::PlacementFailed);
+        assert_eq!(events[1].destinations[0].id, "studio");
+    }
+
+    #[tokio::test]
+    async fn a_hop_status_change_reports_the_stream_once() {
+        let mut sink = sink(StatusCode::OK).await;
+        let state = webhook_state(&sink);
+        two_nodes_and_basic(&state).await;
+        reconcile_tick(&state).await;
+        let first = stream_events(&mut sink).await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].status, PathStatus::Pending, "no hop has reported");
+
+        let hops = state.view.read().await.hops["basic"].clone();
+        {
+            let mut nodes = state.nodes.write().await;
+            for hop in &hops {
+                nodes
+                    .get_mut(&hop.node_id)
+                    .unwrap()
+                    .hop_status
+                    .push(HopStatus {
+                        id: hop.id.clone(),
+                        node_id: hop.node_id.clone(),
+                        state: weave_core::HopState::Provisioned,
+                        ingress: weave_core::SocketStatus {
+                            condition: weave_core::LinkCondition::Connecting,
+                            resolved: None,
+                            stats: None,
+                        },
+                        egresses: hop
+                            .egresses
+                            .iter()
+                            .map(|egress| weave_core::EgressStatus {
+                                branch_id: egress.branch_id.clone(),
+                                status: weave_core::SocketStatus {
+                                    condition: weave_core::LinkCondition::Connecting,
+                                    resolved: None,
+                                    stats: None,
+                                },
+                            })
+                            .collect(),
+                    });
+            }
+        }
+        reconcile_tick(&state).await;
+        reconcile_tick(&state).await;
+
+        let second = stream_events(&mut sink).await;
+        assert_eq!(second.len(), 1, "{second:?}");
+        assert_ne!(second[0].status, PathStatus::Pending);
+        let hops_ready = second[0]
+            .conditions
+            .iter()
+            .find(|condition| condition.condition_type == StreamConditionType::HopsReady)
+            .unwrap();
+        assert_eq!(hops_ready.status, StreamConditionStatus::True);
+    }
+
+    #[tokio::test]
+    async fn a_tick_does_not_wait_on_an_unreachable_receiver() {
+        let (mut state, _mem) = mem_state();
+        state.webhooks = webhook::Emitter::new(webhook::Config {
+            // Reserved for documentation; nothing listens there.
+            url: Some("http://192.0.2.1:1/hook".to_string()),
+            timeout: Duration::from_secs(5),
+            ..webhook::Config::default()
+        })
+        .map(Arc::new);
+        {
+            let mut streams = state.streams.write().await;
+            for index in 0..300 {
+                let name = format!("stream-{index}");
+                streams.insert(name.clone(), stored_stream(stream(&name)));
+            }
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), reconcile_tick(&state))
+            .await
+            .expect("a tick must not wait on the webhook receiver");
     }
 }
