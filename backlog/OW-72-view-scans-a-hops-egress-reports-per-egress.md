@@ -2,9 +2,9 @@
 id: OW-72
 title: "The dashboard view scans a hop's egress reports for each egress"
 type: bug
-status: todo
+status: in-progress
 depends_on: []
-assignee:
+assignee: claude-perf
 ---
 
 ## Evidence
@@ -39,3 +39,4 @@ built it took 2.2 to 2.3 times as long, and the difference grew from about
 
 - 2026-09-26: filed by claude-perf from OW-70 and OW-71, with the numbers
   above.
+- 2026-09-26: started by claude-perf.
