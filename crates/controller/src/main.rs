@@ -136,6 +136,23 @@ struct AppState {
     /// `None` when no receiver is configured; every emit site is then a no-op.
     webhooks: Option<Arc<webhook::Emitter>>,
     keys: LinkKeys,
+    unsaved: Arc<std::sync::Mutex<Unsaved>>,
+}
+
+/// Nodes and stream statuses whose last store write failed. Each tick writes
+/// them again as they stand then.
+#[derive(Default)]
+struct Unsaved {
+    nodes: BTreeSet<String>,
+    streams: BTreeSet<String>,
+}
+
+impl AppState {
+    fn unsaved(&self) -> std::sync::MutexGuard<'_, Unsaved> {
+        self.unsaved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 #[derive(Clone)]
@@ -234,6 +251,7 @@ impl AppState {
             })),
             webhooks,
             keys,
+            unsaved: Arc::default(),
         })
     }
 
@@ -788,12 +806,18 @@ async fn reconcile_tick(state: &AppState) {
         let mut last_seen = state.last_seen.write().await;
         let now = Instant::now();
         let transitioned = mark_offline(&mut nodes, &last_seen, now, state.node_ttl);
-        let mut went_offline = Vec::new();
-        for registration in transitioned.iter().filter_map(|id| nodes.get(id)) {
+        let went_offline: Vec<NodeSummary> = transitioned
+            .iter()
+            .filter_map(|id| nodes.get(id))
+            .map(|registration| NodeSummary::from(&registration.node))
+            .collect();
+        let mut to_store = std::mem::take(&mut state.unsaved().nodes);
+        to_store.extend(transitioned);
+        for registration in to_store.iter().filter_map(|id| nodes.get(id)) {
             if let Err(err) = state.store.upsert_node(registration).await {
-                tracing::warn!(%err, node_id = %registration.node.id, "storing that a node went offline failed");
+                tracing::warn!(%err, node_id = %registration.node.id, "storing a node failed; retrying next tick");
+                state.unsaved().nodes.insert(registration.node.id.clone());
             }
-            went_offline.push(NodeSummary::from(&registration.node));
         }
         let named = named_nodes(streams.values().map(|stream| &stream.spec));
         let mut forgotten = Vec::new();
@@ -842,16 +866,28 @@ async fn reconcile_tick(state: &AppState) {
     let mut view = state.view.write().await;
     stamp_condition_transition_times(&mut outcome.streams, &view.streams, &now_rfc3339());
     let changed = changed_streams(&outcome.streams, &view.streams);
+    let mut to_store = std::mem::take(&mut state.unsaved().streams);
+    to_store.extend(changed.iter().map(|stream| stream.name.clone()));
+    let statuses: Vec<StreamStatus> = outcome
+        .streams
+        .iter()
+        .filter(|stream| to_store.contains(&stream.name))
+        .cloned()
+        .collect();
     view.report = Some(outcome.report);
     view.streams = outcome.streams;
     view.endpoints = outcome.endpoints;
     view.hops = outcome.hops_by_stream;
     drop(view);
     drop(streams);
-    if !changed.is_empty()
-        && let Err(err) = state.store.save_stream_statuses(&changed).await
+    if !statuses.is_empty()
+        && let Err(err) = state.store.save_stream_statuses(&statuses).await
     {
-        tracing::warn!(%err, "storing changed stream statuses failed");
+        tracing::warn!(%err, "storing stream statuses failed; retrying next tick");
+        state
+            .unsaved()
+            .streams
+            .extend(statuses.into_iter().map(|stream| stream.name));
     }
     for stream in &changed {
         state.emit(EventType::StreamChanged, StreamSummary::from(stream));
@@ -2218,7 +2254,8 @@ async fn node_heartbeat(
             Ok(()) => {}
             Err(StoreError::NotLeader) => return not_leader(),
             Err(err) => {
-                tracing::warn!(%err, %node_id, "storing a changed node report failed");
+                tracing::warn!(%err, %node_id, "storing a changed node report failed; retrying next tick");
+                state.unsaved().nodes.insert(node_id.clone());
             }
         }
     }
@@ -2991,6 +3028,7 @@ mod tests {
             view: Arc::new(RwLock::new(ControllerView::default())),
             webhooks: None,
             keys: LinkKeys::for_tests(),
+            unsaved: Arc::default(),
         };
         (state, mem)
     }
@@ -5577,6 +5615,52 @@ mod tests {
             ["relay-a"],
             "a relay that stops heartbeating after the restart still loses the bridge"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_status_save_is_retried_on_the_next_tick() {
+        let mem = Arc::new(MemStore::new());
+        seed_restart_case(mem.as_ref()).await;
+        let state = hydrated(mem.clone(), None).await;
+        mem.fail_writes(1);
+
+        reconcile_tick(&state).await;
+        assert!(mem.load_stream_statuses().await.unwrap().is_empty());
+        reconcile_tick(&state).await;
+
+        assert_eq!(
+            mem.load_stream_statuses().await.unwrap(),
+            state.view.read().await.streams
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_node_writes_are_retried_on_the_next_tick() {
+        let mem = Arc::new(MemStore::new());
+        seed_restart_case(mem.as_ref()).await;
+        let state = hydrated(mem.clone(), None).await;
+        let app = router_after_first_tick(&state, Guard::Disabled, NodeGuard::Disabled).await;
+
+        mem.fail_writes(1);
+        report_flowing(&app, "restart-node-2").await;
+        state.last_seen.write().await.insert(
+            "restart-node-1".to_string(),
+            Instant::now() - Duration::from_secs(60),
+        );
+        mem.fail_writes(2);
+        reconcile_tick(&state).await;
+        reconcile_tick(&state).await;
+
+        let stored: BTreeMap<String, NodeRegistration> = mem
+            .load_nodes()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|registration| (registration.node.id.clone(), registration))
+            .collect();
+        assert_eq!(stored, *state.nodes.read().await);
+        assert_eq!(stored["restart-node-1"].node.status, NodeStatus::Offline);
+        assert!(!stored["restart-node-2"].hop_status.is_empty());
     }
 
     #[tokio::test]

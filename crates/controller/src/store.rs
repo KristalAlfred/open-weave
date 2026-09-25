@@ -999,6 +999,8 @@ struct MemInner {
     delete_stream_calls: usize,
     #[cfg(test)]
     upsert_node_calls: usize,
+    #[cfg(test)]
+    failing_writes: usize,
 }
 
 impl MemStore {
@@ -1137,6 +1139,21 @@ impl MemStore {
     #[cfg(test)]
     pub fn upsert_node_calls(&self) -> usize {
         self.lock().upsert_node_calls
+    }
+
+    /// Make the next `count` node and stream-status writes fail.
+    #[cfg(test)]
+    pub fn fail_writes(&self, count: usize) {
+        self.lock().failing_writes = count;
+    }
+
+    #[cfg(test)]
+    fn failing_write(inner: &mut MemInner) -> Result<(), StoreError> {
+        if inner.failing_writes == 0 {
+            return Ok(());
+        }
+        inner.failing_writes -= 1;
+        Err(StoreError::Query(sqlx::Error::PoolTimedOut))
     }
 
     #[cfg(test)]
@@ -1288,6 +1305,7 @@ impl StateStore for MemStore {
         #[cfg(test)]
         {
             inner.upsert_node_calls += 1;
+            Self::failing_write(&mut inner)?;
         }
         inner
             .nodes
@@ -1306,6 +1324,8 @@ impl StateStore for MemStore {
 
     async fn save_stream_statuses(&self, statuses: &[StreamStatus]) -> Result<(), StoreError> {
         let mut inner = self.lock();
+        #[cfg(test)]
+        Self::failing_write(&mut inner)?;
         for status in statuses {
             if inner.streams.contains_key(&status.name) {
                 inner

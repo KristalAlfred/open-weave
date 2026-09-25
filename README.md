@@ -807,7 +807,8 @@ controller.
   the last tick concluded. A heartbeat writes the node's registration when its
   status, a hop's state or a socket's condition changes; rates and addresses
   alone write nothing. A tick writes a node it marks `offline`, and each stream
-  whose conditions changed, with their transition times. The new leader's first
+  whose conditions changed, with their transition times. A write that fails is
+  tried again on the next tick. The new leader's first
   tick reads all of it, so a bridge stays on the relay that runs it, a flowing
   stream keeps reading `flowing`, and each condition keeps its transition time.
   Heartbeat times are not stored: the new leader counts every stored node as
