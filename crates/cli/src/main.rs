@@ -82,14 +82,11 @@ enum Command {
         #[command(subcommand)]
         resource: DeleteResource,
     },
-    /// Print a node's southbound token, derived from the southbound key. Calls
-    /// no service.
+    /// Print a node's southbound token, derived from the southbound key in
+    /// `WEAVE_SOUTHBOUND_KEY`. Calls no service.
     NodeToken {
         /// Node id the token authenticates as.
         id: String,
-        /// Key southbound and the controller hold.
-        #[arg(long, env = auth::SOUTHBOUND_KEY_VAR, hide_env_values = true)]
-        key: Option<String>,
         /// Token epoch. Raising the node's minimum in
         /// `WEAVE_SOUTHBOUND_MIN_EPOCHS` past an epoch revokes its tokens.
         #[arg(long, default_value_t = 0)]
@@ -173,7 +170,8 @@ async fn main() -> Result<()> {
                 delete_stream(&url, token.as_ref(), &name, output).await
             }
         },
-        Command::NodeToken { id, key, epoch } => {
+        Command::NodeToken { id, epoch } => {
+            let key = std::env::var(auth::SOUTHBOUND_KEY_VAR).ok();
             println!("{}", node_token(key.as_deref(), &id, epoch)?);
             Ok(())
         }
@@ -186,10 +184,7 @@ fn node_token(key: Option<&str>, id: &str, epoch: u64) -> Result<String> {
     }
     let key = match NodeKey::new(key.unwrap_or_default()) {
         Ok(key) => key,
-        Err(NodeKeyError::Blank) => bail!(
-            "no southbound key: pass --key or set {}",
-            auth::SOUTHBOUND_KEY_VAR
-        ),
+        Err(NodeKeyError::Blank) => bail!("no southbound key: set {}", auth::SOUTHBOUND_KEY_VAR),
         Err(NodeKeyError::TooShort) => bail!(
             "the southbound key must be at least {MIN_NODE_KEY_LEN} characters, as southbound and the controller require"
         ),
@@ -967,6 +962,17 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("32 characters"), "{error}");
+    }
+
+    #[test]
+    fn node_token_takes_no_key_on_its_command_line() {
+        let key = "bench-southbound-key-for-local-use-only";
+        assert!(
+            Cli::try_parse_from(["weave", "node-token", "strom-node-1", "--key", key]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["weave", "node-token", "strom-node-1", "--epoch", "2"]).is_ok()
+        );
     }
 
     #[test]

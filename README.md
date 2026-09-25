@@ -480,8 +480,10 @@ enough to test guesses of a short key offline. Southbound and the controller ref
 start with a shorter key, and `weave node-token` refuses one.
 
 `weave node-token <id>` prints a node's token at epoch 0, and
-`--epoch <n>` at another, from `WEAVE_SOUTHBOUND_KEY` (or `--key`) without
-calling any service. openssl gives the same value:
+`--epoch <n>` at another, from `WEAVE_SOUTHBOUND_KEY` without calling any
+service. It takes the key from no other place, so the key stays out of its
+command line, which `ps` shows to every user on the host. openssl gives the same
+value, though it takes the key on its own command line while it runs:
 
 ```sh
 id=strom-node-1 epoch=0
