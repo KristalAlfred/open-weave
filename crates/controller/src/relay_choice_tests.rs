@@ -7,7 +7,7 @@ use weave_core::{
 };
 
 use crate::keys::LinkKeys;
-use crate::path::{HeldPorts, PortAllocator, derive_path};
+use crate::path::{HopReports, PortAllocator, derive_path};
 use crate::{ReconcileOutcome, reconcile};
 
 fn srt_forward() -> HopProfile {
@@ -149,7 +149,7 @@ fn plan(stream: &StreamDefinition, nodes: &[NodeDescriptor], observed: &[HopStat
         stream,
         nodes,
         observed,
-        &mut PortAllocator::holding(HeldPorts::from_reports(observed, nodes)),
+        &mut PortAllocator::holding(HopReports::from_reports(observed, nodes)),
         &LinkKeys::for_tests(),
     )
     .expect("derive")

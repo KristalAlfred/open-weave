@@ -69,8 +69,8 @@ use weave_core::{
 
 use keys::{LinkKeys, SecretSource};
 use path::{
-    HeldPorts, HopIds, PlacementError, PortAllocator, SinglePath, derive_stream, destination_nodes,
-    destination_path_status, path_status, shared_hop_id, stream_endpoints,
+    HopIds, HopReports, PlacementError, PortAllocator, SinglePath, derive_stream,
+    destination_nodes, destination_path_status, path_status, shared_hop_id, stream_endpoints,
 };
 use store::{
     LeaseTerm, MemStore, PgStore, StateStore, StoreError, StoredStream, StreamSetMemberAction,
@@ -2789,7 +2789,7 @@ fn reconcile(
     let mut enabled = 0usize;
     let mut flowing = 0usize;
     let mut ports =
-        PortAllocator::holding(HeldPorts::from_reports(&observed.hops, &observed.nodes));
+        PortAllocator::holding(HopReports::from_reports(&observed.hops, &observed.nodes));
     let mut hop_ids = HopIds::default();
 
     for stream in &streams {

@@ -242,19 +242,21 @@ impl SocketAt {
     }
 }
 
-/// The ports nodes report their running hops listening on, read once per tick.
+/// What nodes report their hops running, read once per tick: the nodes running
+/// each hop, and the ports its listening sockets hold.
 ///
 /// A report counts unless its state is `failed`. A socket counts when its
 /// resolved host is `0.0.0.0` or one of the node's own listener hosts, which is
 /// how an adapter reports a listener; a caller resolves to the address it
 /// dials. A RIST listener also holds the port after it, for RTCP.
 #[derive(Debug, Default)]
-pub struct HeldPorts {
+pub struct HopReports {
+    running: HashMap<String, Vec<String>>,
     by_socket: HashMap<(String, SocketAt), u16>,
     held: HashMap<String, HashSet<u16>>,
 }
 
-impl HeldPorts {
+impl HopReports {
     #[must_use]
     pub fn from_reports(reports: &[HopStatus], nodes: &[NodeDescriptor]) -> Self {
         let mut held = Self::default();
@@ -262,6 +264,10 @@ impl HeldPorts {
             .iter()
             .filter(|report| report.state != HopState::Failed)
         {
+            held.running
+                .entry(report.id.clone())
+                .or_default()
+                .push(report.node_id.clone());
             let Some(node) = find_node(nodes, &report.node_id) else {
                 continue;
             };
@@ -323,6 +329,10 @@ impl HeldPorts {
         self.by_socket.get(&(node.to_string(), at.clone())).copied()
     }
 
+    fn running(&self, hop_id: &str) -> &[String] {
+        self.running.get(hop_id).map_or(&[], Vec::as_slice)
+    }
+
     fn is_held(&self, node: &str, port: u16) -> bool {
         self.held
             .get(node)
@@ -343,7 +353,7 @@ impl HeldPorts {
 
 /// Per-tick, per-node port occupancy. Assigns every port a path needs from the
 /// node's declared range. A listening socket keeps the port its node reports it
-/// running on, see [`HeldPorts`]; no other socket is given a held port. Any
+/// running on, see [`HopReports`]; no other socket is given a held port. Any
 /// other socket prefers a deterministic FNV offset then probes forward
 /// (wrapping within the range) to the first free port, so a given stream set
 /// always resolves to the same collision-free assignment. An SRT port passes
@@ -351,7 +361,7 @@ impl HeldPorts {
 #[derive(Debug, Clone, Default)]
 pub struct PortAllocator {
     used: HashMap<String, HashSet<u16>>,
-    held: Arc<HeldPorts>,
+    held: Arc<HopReports>,
     /// Held ports a claim may still take once no other port is free: while a
     /// stream plans its first paths, those its own running second paths hold.
     yielding: Arc<HashMap<String, HashSet<u16>>>,
@@ -366,7 +376,7 @@ impl PortAllocator {
 
     /// An allocator that keeps the ports in `held` for the sockets holding them.
     #[must_use]
-    pub fn holding(held: HeldPorts) -> Self {
+    pub fn holding(held: HopReports) -> Self {
         Self {
             used: HashMap::new(),
             held: Arc::new(held),
@@ -668,10 +678,13 @@ pub fn shared_hop_id(left: &StreamDefinition, right: &StreamDefinition) -> Optio
 /// Unless the stream sets `allow_cleartext_links`, the stream is planned as if
 /// no node offered RIST. When it cannot be placed that way but could with RIST,
 /// the error is [`PlacementError::CleartextLink`].
+///
+/// What nodes report running reaches planning through `committed_ports`, built
+/// once per tick with [`PortAllocator::holding`].
 pub fn derive_stream(
     stream: &StreamDefinition,
     nodes: &[NodeDescriptor],
-    observed: &[HopStatus],
+    _observed: &[HopStatus],
     committed_ports: &mut PortAllocator,
     keys: &LinkKeys,
 ) -> Result<PlannedStream, PlacementError> {
@@ -680,11 +693,11 @@ pub fn derive_stream(
     } else {
         Cow::Owned(nodes.iter().map(without_rist).collect::<Vec<_>>())
     };
-    derive_on(stream, &keyed, observed, committed_ports, keys).map_err(|error| {
+    derive_on(stream, &keyed, committed_ports, keys).map_err(|error| {
         if matches!(keyed, Cow::Borrowed(_)) {
             return error;
         }
-        derive_on(stream, nodes, observed, &mut committed_ports.clone(), keys)
+        derive_on(stream, nodes, &mut committed_ports.clone(), keys)
             .ok()
             .and_then(|planned| rist_listener_node(&planned.path))
             .map_or(error, |node| PlacementError::CleartextLink { node })
@@ -734,7 +747,6 @@ fn rist_listener_node(path: &Path) -> Option<String> {
 fn derive_on(
     stream: &StreamDefinition,
     nodes: &[NodeDescriptor],
-    observed: &[HopStatus],
     committed_ports: &mut PortAllocator,
     keys: &LinkKeys,
 ) -> Result<PlannedStream, PlacementError> {
@@ -759,7 +771,7 @@ fn derive_on(
     let mut downstream = Vec::new();
     let mut first_paths = Vec::new();
     let mut single_path = Vec::new();
-    let mut relays = RelayCache::new(observed);
+    let mut relays = RelayCache::new(Arc::clone(&ports.held));
     ports.yielding = Arc::new(ports.held.held_by(|at| is_second_path_socket(stream, at)));
 
     let mut destinations: Vec<_> = stream.destinations.iter().collect();
@@ -1464,33 +1476,23 @@ fn chain_hops<'a, 'n>(
 
 /// The online nodes an upstream station can link to as a relay, and how, found
 /// once per upstream for one stream's planning. Without it every relayed
-/// destination rescans every node. Also the nodes that report running each hop,
-/// leaving out reports whose state is `failed`.
+/// destination rescans every node. Also the tick's [`HopReports`], shared with
+/// the port allocator rather than rebuilt per stream.
 struct RelayCache<'n> {
     reachable: HashMap<Station, Vec<(&'n NodeDescriptor, LinkChoice)>>,
-    running: HashMap<String, Vec<String>>,
+    reports: Arc<HopReports>,
 }
 
 impl<'n> RelayCache<'n> {
-    fn new(observed: &[HopStatus]) -> Self {
-        let mut running: HashMap<String, Vec<String>> = HashMap::new();
-        for status in observed
-            .iter()
-            .filter(|status| status.state != HopState::Failed)
-        {
-            running
-                .entry(status.id.clone())
-                .or_default()
-                .push(status.node_id.clone());
-        }
+    fn new(reports: Arc<HopReports>) -> Self {
         Self {
             reachable: HashMap::new(),
-            running,
+            reports,
         }
     }
 
     fn running(&self, hop_id: &str) -> &[String] {
-        self.running.get(hop_id).map_or(&[], Vec::as_slice)
+        self.reports.running(hop_id)
     }
 
     /// The nodes that report running the bridges of `destination`'s second path.

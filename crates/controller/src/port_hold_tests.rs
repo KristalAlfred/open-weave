@@ -266,3 +266,52 @@ fn running_streams_keep_their_ports_when_another_stream_joins_runs_or_fails() {
     }
     assert_eq!(moved, Vec::<String>::new());
 }
+
+fn streams(count: usize) -> Vec<StreamDefinition> {
+    (0..count)
+        .map(|index| stream(&format!("feed-{index}"), &["studio"]))
+        .collect()
+}
+
+/// Nodes with room for `streams` direct streams: a sender ingress each on
+/// `source`, and a receiver ingress and consumer each on `studio`.
+fn roomy_pair(streams: u16) -> Vec<NodeDescriptor> {
+    let mut nodes = public_pair();
+    for node in &mut nodes {
+        node.topology.attachments[0]
+            .listeners
+            .srt
+            .as_mut()
+            .unwrap()
+            .port_range = PortRange {
+            start: 20_000,
+            end: 20_000 + 3 * streams,
+        };
+    }
+    nodes
+}
+
+/// Times a reconcile of `count` running streams against their own reports.
+fn time_a_reconcile_with_reports(count: usize) -> std::time::Duration {
+    let nodes = roomy_pair(u16::try_from(count).unwrap());
+    let definitions = streams(count);
+    let first = run(&definitions, &nodes, Vec::new());
+    assert_eq!(first.len(), count, "every stream is placed");
+    let reports = reported(&first, &nodes, &[]);
+    let started = std::time::Instant::now();
+    let again = run(&definitions, &nodes, reports);
+    let elapsed = started.elapsed();
+    assert_eq!(again, first);
+    eprintln!(
+        "{count} streams, {} reports: reconcile {elapsed:?}",
+        first.values().map(Vec::len).sum::<usize>()
+    );
+    elapsed
+}
+
+#[test]
+#[ignore = "timing; run with `cargo test -p weave-controller reconcile_with_reports -- --ignored --nocapture --test-threads=1`"]
+fn a_reconcile_with_reports_at_one_and_two_thousand_streams() {
+    time_a_reconcile_with_reports(1000);
+    time_a_reconcile_with_reports(2000);
+}
