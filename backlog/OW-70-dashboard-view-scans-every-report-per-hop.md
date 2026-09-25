@@ -2,9 +2,9 @@
 id: OW-70
 title: "The dashboard view scans every hop report for each hop"
 type: bug
-status: todo
+status: in-progress
 depends_on: []
-assignee:
+assignee: claude-perf
 ---
 
 ## Evidence
@@ -25,3 +25,4 @@ OW-69 and not measured.
 ## Log
 
 - 2026-09-26: filed by claude-perf from OW-69.
+- 2026-09-26: started by claude-perf.
