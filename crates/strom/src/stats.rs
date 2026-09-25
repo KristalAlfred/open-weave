@@ -59,6 +59,13 @@ impl FlowStats {
         })
     }
 
+    /// Every `srtsink` element: a hop's SRT egress sockets.
+    pub fn egresses(&self) -> impl Iterator<Item = &ElementStats> {
+        self.elements
+            .iter()
+            .filter(|entry| is_srt_element(&entry.id, "srtsink"))
+    }
+
     fn element_named(&self, element: &str) -> Option<&ElementStats> {
         self.elements
             .iter()

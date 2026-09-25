@@ -1,10 +1,10 @@
 # open-weave
 
 open-weave takes a file describing the live media streams you want and makes them
-happen. It plans the SRT, WHIP and WHEP links between your media nodes, tells
-each node's adapter what to build, and keeps reconciling as nodes come and go. It
-works out which end of a link dials the other, and inserts a relay hop when both
-ends sit behind NAT.
+happen. It plans the SRT, WHIP, WHEP and RIST links between your media nodes,
+tells each node's adapter what to build, and keeps reconciling as nodes come and
+go. It works out which end of a link dials the other, and inserts a relay hop
+when both ends sit behind NAT.
 
 ```yaml
 name: cam1-to-studio
@@ -50,10 +50,10 @@ deprecation window. Adapters declare `PROTOCOL_VERSION`, and a mismatch is
 refused rather than smoothed over.
 
 Built: the three control-plane services, the `weave` CLI, one southbound adapter
-(`weave-adapter-strom`), and a browser node. Links carry SRT, WHIP or WHEP, and
-the controller plans NAT traversal through relay nodes. SRT links between nodes
-are encrypted with keys the controller derives. Several controllers can share
-one Postgres: one leads and the others stand by. All of it is verified on
+(`weave-adapter-strom`), and a browser node. Links carry SRT, WHIP, WHEP or
+RIST, and the controller plans NAT traversal through relay nodes. SRT links
+between nodes are encrypted with keys the controller derives. Several controllers
+can share one Postgres: one leads and the others stand by. All of it is verified on
 the docker-compose bench in `bench/`, which runs real Strom instances behind
 per-node `netem` routers, and nowhere else. Two things are exceptions, covered
 only by planner and status tests: redundant paths, since no shipped node merges
@@ -246,7 +246,9 @@ SRT socket `params` carry a `passphrase` and `pbkeylen` (see
 build its end of every keyed link in the clear, which the other end refuses.
 The same version adds a hop profile's `merge`, a desired hop's
 `merge_ingress`, and the hop status that reports it (see
-[Redundant paths](#redundant-paths)).
+[Redundant paths](#redundant-paths)), and the `rist` transport and socket (see
+[Capabilities and topology](#capabilities-and-topology)), which an adapter at
+`4` cannot read.
 
 ### Hop status and fan-out
 
@@ -616,6 +618,7 @@ Where keys appear:
 - A node token reads only its own node's desired hops, so each node learns the
   keys of its own sockets and no others. Whoever holds `WEAVE_SOUTHBOUND_KEY` can
   make any node's token, and so read every key.
+- A link between nodes that runs over RIST carries no key (`backlog/OW-41`).
 - Strom returns the keys in its own `GET /api/flows`, and its SRT blocks log them
   at INFO. `WEAVE_STROM_TOKEN` guards that API when Strom requires a token;
   nothing in open-weave changes what Strom logs.
@@ -823,7 +826,8 @@ capabilities:
       max_egresses: 1
 ```
 
-Strom advertises `srt-forward`, `whip-to-srt`, and `srt-to-whep`. The browser
+Strom advertises `srt-forward`, `whip-to-srt`, `srt-to-whep`, `srt-to-rist`
+and `rist-to-srt`. The browser
 advertises `camera-to-whip` and `whep-to-display`, both with one egress. It does
 not advertise WHIP to WHEP or mixed-transport fan-out. The controller writes the
 selected `profile_id` into every `DesiredHop`; adapters validate and dispatch on
@@ -875,6 +879,15 @@ A producer's or consumer's SRT socket, and the address
 `GET /streams/{name}/endpoints` reports for it, use the same order: the
 node's SRT listener on the lowest network, then the lowest attachment id,
 among those on the endpoint's `network` when it names one.
+
+A `rist` listener takes a `host` and a `port_range`, as an SRT one does. RIST
+here is the simple profile: the receiver binds an even port for RTP and the port
+after it for RTCP, and the sender pushes to both. Only the downstream end of a
+link can host it, so a receiver behind NAT cannot take RIST. The planner tries
+RIST after SRT, WHIP and WHEP, so it carries a link only where none of those
+can, and a link that planned before RIST existed keeps its transport. Give RIST
+its own port range: in a range it shares with SRT, an SRT port can take one half
+of the last free pair. A RIST link carries no key (`backlog/OW-41`).
 
 Planning first tries a direct link. If none works, it tries one online transit
 node whose profile supports the required ingress-to-egress shape and whose
@@ -1077,6 +1090,13 @@ southbound and translates them into Strom flow create/start/delete calls.
 Strom UI/API edits are **drift**, like direct edits to Kubernetes managed
 objects. The source of truth is open-weave desired state; out-of-band Strom
 changes should be reconciled back or explicitly adopted into desired state.
+
+Strom reports no RIST statistics, so the adapter reads a RIST socket's condition
+from the SRT side of the same hop. A sender's RIST egress reads `flowing`
+whenever its SRT ingress advances, whether or not anything receives what it
+pushes. A receiver's RIST ingress reads `flowing` only while its SRT output has a
+consumer pulling bytes. Strom advertises no RIST-to-RIST
+profile, so no hop has RIST on both sides.
 
 The adapter writes each SRT socket's latency and key into its `srt://` URI, since
 setting an srt element's `uri` resets both and Strom sets element properties in no

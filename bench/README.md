@@ -149,6 +149,13 @@ standby. A restarted or killed leader can take the lease again: after `kill`
 both controllers wait for the lease to run out (`WEAVE_LEASE_TTL_SECS`, 10 s)
 and either may get it.
 
+`just bench topology rist` restarts adapter-2 with `config/adapter-2-rist.yaml`,
+where node 2 dials nothing and offers only a RIST listener to the internet, its
+SRT listener serving consumers on its own LAN. `just bench stream-up rist` then
+drives a stream whose link from node 1 to node 2 the planner puts on RIST.
+`just bench topology default` puts adapter-2 back, and so does the next
+`just bench up`.
+
 ## Topology
 
 ```

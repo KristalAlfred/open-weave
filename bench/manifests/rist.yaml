@@ -1,0 +1,14 @@
+# basic, for node 2's RIST-only topology (`just bench topology rist`): the
+# planner puts the link between the nodes on RIST, since node 2 offers nothing
+# else to the internet. Under the default topology it plans SRT like basic.
+name: rist
+enabled: true
+source:
+  srt:
+    node: strom-node-1
+    latency: 200
+destinations:
+  - id: output
+    srt:
+      node: strom-node-2
+      latency: 1000

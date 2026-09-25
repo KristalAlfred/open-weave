@@ -65,6 +65,20 @@ wait:
 down:
     {{compose}} --profile producer --profile consumer --profile browser down -v --remove-orphans
 
+# Remount node 2's adapter config and restart it: `rist` for a site reachable
+# only over RIST (config/adapter-2-rist.yaml), `default` for adapter-2.yaml.
+[group("stack")]
+topology name="default":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{name}}" in
+        default) config=adapter-2.yaml ;;
+        rist) config=adapter-2-rist.yaml ;;
+        *) echo "unknown topology {{name}}: use default or rist" >&2; exit 1 ;;
+    esac
+    WEAVE_ADAPTER_2_CONFIG="$config" {{compose}} up -d adapter-2
+    echo "adapter-2 runs with config/$config"
+
 # Container states for every bench service.
 [group("stack")]
 ps:

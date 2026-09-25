@@ -268,8 +268,8 @@ function addrChip(tag, text, title) {
   return el;
 }
 
-// SRT and a device end are the unremarkable cases and draw a bare arrow; a
-// WebRTC transport is named on the arrow.
+// SRT and a device end are the unremarkable cases and draw a bare arrow; any
+// other transport is named on the arrow.
 function arrow(socket) {
   const transport = socket && socket.transport;
   const bare = !transport || transport === "srt" || transport === DEVICE_TRANSPORT;

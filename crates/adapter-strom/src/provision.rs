@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 use weave_core::{
-    DesiredHop, HopState, LinkCondition, ResolvedAddr, SocketRole, SocketSpec, SrtSocket,
-    is_managed_hop_id,
+    DesiredHop, HopState, LinkCondition, ResolvedAddr, RistSocket, SocketRole, SocketSpec,
+    SrtSocket, is_managed_hop_id,
 };
 use weave_strom::{SrtUri, StromFlow, hop_srt_uris};
 
@@ -153,16 +153,20 @@ pub fn diff_hops(desired: &[DesiredHop], flows: &[StromFlow]) -> HopPlan {
 }
 
 /// Whether an adopted flow's sockets diverge from the desired hop: its SRT
-/// sockets (element `uri`s and block `srt_uri`s, with every parameter in them)
-/// or its WHIP/WHEP endpoint ids (block `endpoint_id`s). A flow exposing neither
+/// sockets (element `uri`s and block `srt_uri`s, with every parameter in them),
+/// its RIST addresses (`ristsrc` port, `ristsink` address and port) or its
+/// WHIP/WHEP endpoint ids (block `endpoint_id`s). A flow exposing none of these
 /// cannot be compared, so it is adopted rather than recreated.
 fn flow_drifted(flow: &StromFlow, hop: &DesiredHop) -> bool {
     let actual_srt = sorted(flow_srt_uris(flow));
+    let actual_rist = sorted(flow_rist_endpoints(flow));
     let actual_ids = sorted(flow_endpoint_ids(flow));
-    if actual_srt.is_empty() && actual_ids.is_empty() {
+    if actual_srt.is_empty() && actual_rist.is_empty() && actual_ids.is_empty() {
         return false;
     }
-    actual_srt != sorted(hop_srt_uris(hop)) || actual_ids != sorted(hop_endpoint_ids(hop))
+    actual_srt != sorted(hop_srt_uris(hop))
+        || actual_rist != sorted(hop_rist_endpoints(hop))
+        || actual_ids != sorted(hop_endpoint_ids(hop))
 }
 
 fn sorted<T: Ord>(mut values: Vec<T>) -> Vec<T> {
@@ -186,6 +190,33 @@ fn flow_srt_uris(flow: &StromFlow) -> Vec<SrtUri> {
         .collect()
 }
 
+/// `(host, port)` of each RIST element: an empty host for a `ristsrc`, which
+/// binds, and the `address` a `ristsink` sends to.
+fn flow_rist_endpoints(flow: &StromFlow) -> Vec<(String, u16)> {
+    flow.elements
+        .iter()
+        .filter_map(|element| {
+            let port = element.properties.get("port")?.as_u64()?;
+            let host = match element.element_type.as_str() {
+                "ristsrc" => String::new(),
+                "ristsink" => element.properties.get("address")?.as_str()?.to_string(),
+                _ => return None,
+            };
+            Some((host, u16::try_from(port).ok()?))
+        })
+        .collect()
+}
+
+fn hop_rist_endpoints(hop: &DesiredHop) -> Vec<(String, u16)> {
+    hop_sockets(hop)
+        .filter_map(|spec| match spec {
+            SocketSpec::Rist(RistSocket::Listen { port }) => Some((String::new(), *port)),
+            SocketSpec::Rist(RistSocket::Connect { host, port }) => Some((host.clone(), *port)),
+            _ => None,
+        })
+        .collect()
+}
+
 fn flow_endpoint_ids(flow: &StromFlow) -> Vec<String> {
     flow.blocks
         .iter()
@@ -203,7 +234,7 @@ fn hop_endpoint_ids(hop: &DesiredHop) -> Vec<String> {
     hop_sockets(hop)
         .filter_map(|spec| match spec {
             SocketSpec::Whip(socket) | SocketSpec::Whep(socket) => Some(socket.endpoint_id.clone()),
-            SocketSpec::Srt(_) | SocketSpec::Device(_) => None,
+            SocketSpec::Srt(_) | SocketSpec::Rist(_) | SocketSpec::Device(_) => None,
         })
         .collect()
 }
@@ -272,6 +303,22 @@ pub fn webrtc_condition(
     }
 }
 
+/// Map a RIST socket to its link condition, read from the SRT side of its hop:
+/// Strom reports nothing about RIST elements. The rule is [`webrtc_condition`]'s,
+/// with the SRT side's connection standing in for a session. A sender's RIST
+/// egress follows its SRT ingress and cannot tell whether anything receives; a
+/// receiver's RIST ingress follows its SRT egresses, so it waits until a
+/// consumer pulls.
+#[must_use]
+pub fn rist_condition(
+    role: SocketRole,
+    srt_side_connected: bool,
+    advanced: bool,
+    stalled: bool,
+) -> LinkCondition {
+    webrtc_condition(role, srt_side_connected, advanced, stalled)
+}
+
 /// Best-effort resolved address for a socket spec. A listener resolves to the
 /// node's advertised data-plane host so peers connect to a concrete address,
 /// falling back to the wildcard when the node declares none; a socket carrying
@@ -282,7 +329,11 @@ pub fn resolved_addr(spec: &SocketSpec, listener_host: Option<&str>) -> Option<R
         SocketSpec::Srt(SrtSocket::Listen { port, .. }) => {
             (listener_host.unwrap_or("0.0.0.0").to_string(), *port)
         }
-        SocketSpec::Srt(SrtSocket::Connect { host, port, .. }) => (host.clone(), *port),
+        SocketSpec::Srt(SrtSocket::Connect { host, port, .. })
+        | SocketSpec::Rist(RistSocket::Connect { host, port }) => (host.clone(), *port),
+        SocketSpec::Rist(RistSocket::Listen { port }) => {
+            (listener_host.unwrap_or("0.0.0.0").to_string(), *port)
+        }
         SocketSpec::Whip(_) | SocketSpec::Whep(_) | SocketSpec::Device(_) => return None,
     };
     Some(ResolvedAddr { host, port })
@@ -433,6 +484,64 @@ mod tests {
             assert_eq!(plan.delete, vec!["id-a".to_string()], "{ingress} {egress}");
             assert_eq!(plan.create.len(), 1, "{ingress} {egress}");
         }
+    }
+
+    fn rist_sender(address: &str, port: u16) -> StromFlow {
+        serde_json::from_value(serde_json::json!({
+            "id": "id-a",
+            "name": "weave-a",
+            "running": true,
+            "elements": [
+                { "element_type": "srtsrc",
+                  "properties": { "uri": "srt://:7001?mode=listener&latency=200" } },
+                { "element_type": "ristsink",
+                  "properties": { "address": address, "port": port } },
+            ],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_rist_flow_is_adopted_until_its_address_changes() {
+        let mut sender = hop("weave-a");
+        sender.profile_id = "srt-to-rist".to_string();
+        sender.egresses[0].socket = SocketSpec::Rist(RistSocket::Connect {
+            host: "10.0.0.2".to_string(),
+            port: 7100,
+        });
+        let desired = vec![sender];
+        assert!(diff_hops(&desired, &[rist_sender("10.0.0.2", 7100)]).is_empty());
+        for flow in [rist_sender("10.0.0.3", 7100), rist_sender("10.0.0.2", 7102)] {
+            let plan = diff_hops(&desired, &[flow]);
+            assert_eq!(plan.delete, vec!["id-a".to_string()]);
+            assert_eq!(plan.create.len(), 1);
+        }
+    }
+
+    #[test]
+    fn rist_condition_follows_the_srt_side() {
+        assert_eq!(
+            rist_condition(SocketRole::Listen, false, false, false),
+            LinkCondition::Idle,
+            "a receiver with no consumer on its SRT output waits"
+        );
+        assert_eq!(
+            rist_condition(SocketRole::Connect, false, false, false),
+            LinkCondition::Connecting,
+            "a sender with no producer on its SRT input has nothing to push"
+        );
+        assert_eq!(
+            rist_condition(SocketRole::Connect, true, true, false),
+            LinkCondition::Flowing
+        );
+        assert_eq!(
+            rist_condition(SocketRole::Listen, true, false, false),
+            LinkCondition::Connected
+        );
+        assert_eq!(
+            rist_condition(SocketRole::Listen, true, false, true),
+            LinkCondition::Stalled
+        );
     }
 
     fn keyed(socket: SocketSpec, passphrase: &str) -> SocketSpec {

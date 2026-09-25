@@ -56,6 +56,7 @@ fn listeners(host: &str, signalling: &str) -> NetworkListeners {
         whep: Some(SignallingListener {
             base_url: format!("{signalling}/whep"),
         }),
+        rist: None,
     }
 }
 

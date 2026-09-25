@@ -5,9 +5,9 @@ use std::collections::{HashMap, HashSet};
 use weave_core::{
     DesiredEgress, DesiredHop, DestinationEndpoint, DeviceKind, EndpointAddr, HOP_ID_PREFIX,
     HopConditions, HopRole, HopState, HopStatus, NetworkAttachment, NodeDescriptor, NodeStatus,
-    Passphrase, Path, PathStatus, PortRange, RemoteAddr, SignallingEndpoint, SignallingTransport,
-    SocketRole, SocketSpec, SrtParams, SrtSocket, StreamDefinition, StreamEndpoints,
-    StreamTransport, Transport, roll_up_path,
+    Passphrase, Path, PathStatus, PortRange, RemoteAddr, RistListener, RistSocket,
+    SignallingEndpoint, SignallingTransport, SocketRole, SocketSpec, SrtParams, SrtSocket,
+    StreamDefinition, StreamEndpoints, StreamTransport, Transport, roll_up_path,
 };
 
 use crate::keys::LinkKeys;
@@ -18,8 +18,14 @@ const RECV_CONSUMER_LATENCY: u32 = 200;
 /// AES key length, in bytes, set on every keyed SRT socket.
 const SRT_PBKEYLEN: u8 = 32;
 
-/// Link transports in the order the planner prefers them.
-const TRANSPORT_PREFERENCE: [Transport; 3] = [Transport::Srt, Transport::Whip, Transport::Whep];
+/// Link transports in the order the planner prefers them. RIST comes last, so a
+/// link any other transport can carry keeps it.
+const TRANSPORT_PREFERENCE: [Transport; 4] = [
+    Transport::Srt,
+    Transport::Whip,
+    Transport::Whep,
+    Transport::Rist,
+];
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PlacementError {
@@ -237,7 +243,7 @@ impl PortAllocator {
     }
 
     /// Whether `node` has a free port for each of `listeners`, taken in turn.
-    fn can_claim(&self, node: &NodeDescriptor, listeners: &[NetworkAttachment]) -> bool {
+    fn can_claim(&self, node: &NodeDescriptor, listeners: &[PortListener]) -> bool {
         let mut trial = Self {
             used: self
                 .used
@@ -245,9 +251,40 @@ impl PortAllocator {
                 .map(|ports| HashMap::from([(node.id.clone(), ports.clone())]))
                 .unwrap_or_default(),
         };
-        listeners
-            .iter()
-            .all(|attachment| trial.claim(node, attachment, "").is_ok())
+        listeners.iter().all(|listener| match listener {
+            PortListener::Srt(attachment) => trial.claim(node, attachment, "").is_ok(),
+            PortListener::Rist(listener) => trial.claim_rist(node, listener, "").is_ok(),
+        })
+    }
+
+    /// Claim an even port from `listener` for a RIST receiver, and the port
+    /// after it for RTCP.
+    fn claim_rist(
+        &mut self,
+        node: &NodeDescriptor,
+        listener: &RistListener,
+        key: &str,
+    ) -> Result<u16, PlacementError> {
+        let pairs: Vec<u16> = listener.port_range.rist_pairs().collect();
+        let count = pairs.len();
+        if count == 0 {
+            return Err(PlacementError::NoPortRange {
+                node: node.id.clone(),
+            });
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let preferred = (fnv1a(key) % count as u64) as usize;
+        let occupied = self.used.entry(node.id.clone()).or_default();
+        for step in 0..count {
+            let port = pairs[(preferred + step) % count];
+            if !occupied.contains(&port) && !occupied.contains(&(port + 1)) {
+                occupied.extend([port, port + 1]);
+                return Ok(port);
+            }
+        }
+        Err(PlacementError::PortRangeExhausted {
+            node: node.id.clone(),
+        })
     }
 }
 
@@ -844,7 +881,7 @@ fn pick_remote_relay<'n>(
                         && profile.max_egresses.is_none_or(|maximum| maximum >= 1)
                 })
                 .then(|| {
-                    let listeners = srt_listener_at(link, Listener::Downstream)
+                    let listeners = port_listener_at(link, Listener::Downstream)
                         .into_iter()
                         .collect();
                     (*node, listeners)
@@ -1154,9 +1191,9 @@ fn relay_before<'n>(
 }
 
 /// The online relay node that can carry both halves of a link no transport
-/// connects directly and has a free port for every SRT listener it would host:
-/// one of `keep` when one qualifies, otherwise the lowest-id one. Sorting keeps
-/// the choice stable across ticks, and `keep` keeps a bridge on the relay
+/// connects directly and has free ports for every SRT or RIST listener it would
+/// host: one of `keep` when one qualifies, otherwise the lowest-id one. Sorting
+/// keeps the choice stable across ticks, and `keep` keeps a bridge on the relay
 /// running it when an earlier relay comes back.
 ///
 /// When none qualifies the error names why the direct link failed: two ends that
@@ -1196,9 +1233,9 @@ fn pick_relay<'n>(
                         && profile.max_egresses.is_none_or(|max| max >= 1)
                 })
                 .then(|| {
-                    let listeners = srt_listener_at(ingress, Listener::Downstream)
+                    let listeners = port_listener_at(ingress, Listener::Downstream)
                         .into_iter()
-                        .chain(srt_listener_at(&egress, Listener::Upstream))
+                        .chain(port_listener_at(&egress, Listener::Upstream))
                         .collect();
                     (*node, listeners)
                 })
@@ -1209,17 +1246,35 @@ fn pick_relay<'n>(
     }
 }
 
-/// The attachment a relay listens on for `link` over SRT, when the relay is the
-/// link's `end` and SRT carries it. A WHIP or WHEP listener claims no port.
-fn srt_listener_at(link: &LinkChoice, end: Listener) -> Option<NetworkAttachment> {
-    (link.listener == end && link.transport == Transport::Srt).then(|| link.attachment.clone())
+/// The listener a relay claims ports on for `link`, when the relay is the link's
+/// `end` and SRT or RIST carries it. A WHIP or WHEP listener claims no port.
+fn port_listener_at(link: &LinkChoice, end: Listener) -> Option<PortListener> {
+    if link.listener != end {
+        return None;
+    }
+    match link.transport {
+        Transport::Srt => Some(PortListener::Srt(link.attachment.clone())),
+        Transport::Rist => link
+            .attachment
+            .listeners
+            .rist
+            .clone()
+            .map(PortListener::Rist),
+        Transport::Whip | Transport::Whep => None,
+    }
 }
 
-/// The candidate with a free port for each SRT listener it would host, one of
-/// `keep` before the lowest-id one; `PortRangeExhausted` for the lowest-id one
-/// when none has, or `None` when there are no candidates.
+/// A listener a relay would claim ports on.
+enum PortListener {
+    Srt(NetworkAttachment),
+    Rist(RistListener),
+}
+
+/// The candidate with free ports for each SRT or RIST listener it would host,
+/// one of `keep` before the lowest-id one; `PortRangeExhausted` for the lowest-id
+/// one when none has, or `None` when there are no candidates.
 fn relay_with_ports<'a>(
-    candidates: impl Iterator<Item = (&'a NodeDescriptor, Vec<NetworkAttachment>)>,
+    candidates: impl Iterator<Item = (&'a NodeDescriptor, Vec<PortListener>)>,
     ports: &PortAllocator,
     keep: &[String],
 ) -> Option<Result<&'a NodeDescriptor, PlacementError>> {
@@ -1395,7 +1450,7 @@ fn link_transport(
     for transport in TRANSPORT_PREFERENCE {
         let listeners: &[Listener] = match transport {
             Transport::Srt => &[Listener::Downstream, Listener::Upstream],
-            Transport::Whip => &[Listener::Downstream],
+            Transport::Whip | Transport::Rist => &[Listener::Downstream],
             Transport::Whep => &[Listener::Upstream],
         };
         for &listener in listeners {
@@ -1455,6 +1510,7 @@ fn has_listener(attachment: &NetworkAttachment, transport: Transport) -> bool {
         Transport::Srt => attachment.listeners.srt.is_some(),
         Transport::Whip => attachment.listeners.whip.is_some(),
         Transport::Whep => attachment.listeners.whep.is_some(),
+        Transport::Rist => attachment.listeners.rist.is_some(),
     }
 }
 
@@ -1488,6 +1544,9 @@ fn plan_link(
         Listener::Upstream => &up,
     };
     let (listen, connect) = match choice.transport.signalling() {
+        None if choice.transport == Transport::Rist => {
+            rist_sockets(host.node, &choice.attachment, downstream.hop_id, ports)?
+        }
         None => {
             let listener = choice
                 .attachment
@@ -1547,6 +1606,29 @@ fn plan_link(
             },
         },
     })
+}
+
+/// A RIST link's `(listen, connect)` sockets: the receiver binds a port pair on
+/// `attachment`, and the sender pushes to its listener host.
+fn rist_sockets(
+    node: &NodeDescriptor,
+    attachment: &NetworkAttachment,
+    hop_id: &str,
+    ports: &mut PortAllocator,
+) -> Result<(SocketSpec, SocketSpec), PlacementError> {
+    let listener = attachment
+        .listeners
+        .rist
+        .as_ref()
+        .expect("RIST link choice has a RIST listener");
+    let port = ports.claim_rist(node, listener, hop_id)?;
+    Ok((
+        SocketSpec::Rist(RistSocket::Listen { port }),
+        SocketSpec::Rist(RistSocket::Connect {
+            host: listener.host.clone(),
+            port,
+        }),
+    ))
 }
 
 fn srt_params(latency: u32, passphrase: Option<Passphrase>) -> SrtParams {
@@ -1818,15 +1900,19 @@ fn srt_listener_attachment<'a>(
 /// ticks while the allocator still avoids collisions.
 fn preferred_offset(range: PortRange, key: &str) -> u32 {
     let span = u64::from(range.span()) + 1;
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        (fnv1a(key) % span) as u32
+    }
+}
+
+fn fnv1a(key: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in key.bytes() {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    #[allow(clippy::cast_possible_truncation)]
-    {
-        (hash % span) as u32
-    }
+    hash
 }
 
 fn find_node<'a>(nodes: &'a [NodeDescriptor], id: &str) -> Option<&'a NodeDescriptor> {
@@ -2033,6 +2119,7 @@ mod contract_tests {
                 }),
                 whip: None,
                 whep: None,
+                rist: None,
             },
         }
     }
@@ -2603,6 +2690,23 @@ mod contract_tests {
             "the manifest passphrase does not replace the link key"
         );
     }
+
+    #[test]
+    fn a_relay_is_checked_for_a_free_rist_pair() {
+        let relay = node("relay", Vec::new());
+        let listener = RistListener {
+            host: "192.0.2.9".to_string(),
+            port_range: PortRange {
+                start: 21_000,
+                end: 21_001,
+            },
+        };
+        let listeners = [PortListener::Rist(listener.clone())];
+        let mut ports = PortAllocator::new();
+        assert!(ports.can_claim(&relay, &listeners));
+        assert_eq!(ports.claim_rist(&relay, &listener, "hop"), Ok(21_000));
+        assert!(!ports.can_claim(&relay, &listeners));
+    }
 }
 
 #[cfg(test)]
@@ -2678,6 +2782,7 @@ mod tests {
             }),
             whip: None,
             whep: None,
+            rist: None,
         }
     }
 

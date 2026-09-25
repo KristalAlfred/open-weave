@@ -42,6 +42,7 @@ not measured.
 | `disabled` | `enabled: false` | `idle` | `idle` | `idle` |
 | `srt-latency` | non-default SRT latency (120ms / 2000ms) | `awaiting_input` | `degraded` | `flowing` |
 | `encrypted` | `basic` with a passphrase on the ingress and the output | — | — | `flowing` |
+| `rist` | `basic` under `just bench topology rist`: the link goes over RIST | — | — | `flowing` |
 | `via` | pinned transit: node-1 → bridge on node-2 → node-1 | `awaiting_input` | — | `flowing` |
 | `nat-egress` | NAT'd node-3 contributes out to node-1 | `awaiting_input` | — | `flowing` |
 | `nat-ingress` | node-1 delivers into NAT'd node-3 (link reverses) | `awaiting_input` | — | `flowing` |
@@ -118,6 +119,12 @@ Notes:
   reads `degraded`. Given the manifest's passphrase again it reads `flowing`
   within a few polls. The link between the nodes carries a key the controller
   derives, the same in both Strom flows' URIs.
+- **`rist`**: under the default topology it plans SRT like `basic`. After
+  `just bench topology rist`, node 2 offers the internet only a RIST listener,
+  so the sender on node-1 pushes RIST to it (`srt-to-rist`, `rist-to-srt`).
+  Observed `flowing` with RTP on the even port and RTCP both ways on the next.
+  Every stream through node 2 replans under that topology, so `basic` moves to
+  RIST too; `just bench topology default` puts it back.
 - **`via`**: three hops — `weave-via-sender` on node-1,
   `weave-via-bridge-output-0` on node-2, `weave-via-receiver-output` back on
   node-1 — so the media crosses both

@@ -85,6 +85,7 @@
                 "srt",
                 "whip",
                 "whep",
+                "rist",
                 "device"
               ],
               "type": "string"
@@ -187,6 +188,7 @@
               "srt",
               "whip",
               "whep",
+              "rist",
               "device"
             ],
             "type": "string"
@@ -283,6 +285,7 @@
               "srt",
               "whip",
               "whep",
+              "rist",
               "device"
             ],
             "type": "string"

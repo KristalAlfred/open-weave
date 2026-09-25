@@ -1,0 +1,62 @@
+{
+  "elements": [
+    {
+      "element_type": "ristsrc",
+      "id": "ristsrc_0",
+      "position": [
+        100.0,
+        200.0
+      ],
+      "properties": {
+        "encoding-name": "MP2T",
+        "port": 7100
+      }
+    },
+    {
+      "element_type": "rtpmp2tdepay",
+      "id": "rtpmp2tdepay_0",
+      "position": [
+        250.0,
+        200.0
+      ],
+      "properties": {}
+    },
+    {
+      "element_type": "queue",
+      "id": "queue_0",
+      "position": [
+        400.0,
+        200.0
+      ],
+      "properties": {}
+    },
+    {
+      "element_type": "srtsink",
+      "id": "srtsink_0",
+      "position": [
+        550.0,
+        200.0
+      ],
+      "properties": {
+        "uri": "srt://:7003?mode=listener&latency=200",
+        "wait-for-connection": false
+      }
+    }
+  ],
+  "id": "00000000-0000-0000-0000-000000000000",
+  "links": [
+    {
+      "from": "ristsrc_0:src",
+      "to": "rtpmp2tdepay_0:sink"
+    },
+    {
+      "from": "rtpmp2tdepay_0:src",
+      "to": "queue_0:sink"
+    },
+    {
+      "from": "queue_0:src",
+      "to": "srtsink_0:sink"
+    }
+  ],
+  "name": "weave-feed-receiver-studio"
+}

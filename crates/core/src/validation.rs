@@ -209,6 +209,22 @@ pub fn validate_node(node: &NodeDescriptor) -> Vec<ValidationIssue> {
                 ));
             }
         }
+        if let Some(listener) = &attachment.listeners.rist {
+            if listener.host.trim().is_empty() {
+                issues.push(ValidationIssue::new(
+                    format!("{base}.listeners.rist.host"),
+                    "blank",
+                    "RIST listener host must not be blank",
+                ));
+            }
+            if listener.port_range.rist_pairs().next().is_none() {
+                issues.push(ValidationIssue::new(
+                    format!("{base}.listeners.rist.port_range"),
+                    "invalid_range",
+                    "RIST port range must hold an even port and the port after it",
+                ));
+            }
+        }
     }
     issues
 }

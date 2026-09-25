@@ -1,0 +1,28 @@
+# Node 2 as a site that takes contribution over RIST only: it dials nothing, its
+# internet attachment offers only a RIST listener, and its SRT listener serves
+# consumers on its own LAN. `just bench topology rist` mounts this in place of
+# adapter-2.yaml.
+node:
+  id: strom-node-2
+  southbound_url: http://10.97.25.21:8081
+  listen: 0.0.0.0:8091
+  public_endpoint: http://10.97.27.11:8091
+  topology:
+    attachments:
+      - id: routed
+        network: internet
+        dial: false
+        listeners:
+          rist:
+            host: 10.97.27.10
+            port_range: { start: 21000, end: 21999 }
+      - id: site
+        network: node2-lan
+        dial: false
+        listeners:
+          srt:
+            host: 10.97.27.10
+            port_range: { start: 20000, end: 20999 }
+strom:
+  url: http://10.97.27.10:8080
+  poll_interval_secs: 5

@@ -18,6 +18,8 @@ mod redundant_paths_tests;
 #[cfg(test)]
 mod relay_choice_tests;
 #[cfg(test)]
+mod rist_tests;
+#[cfg(test)]
 mod scale_tests;
 mod store;
 mod webhook;
@@ -320,7 +322,7 @@ struct SocketView {
 
 impl From<&weave_core::SocketSpec> for SocketView {
     fn from(spec: &weave_core::SocketSpec) -> Self {
-        use weave_core::{DEVICE_TRANSPORT, SocketSpec, SrtSocket, Transport};
+        use weave_core::{DEVICE_TRANSPORT, RistSocket, SocketSpec, SrtSocket, Transport};
 
         let (transport, mode, host, port, url) = match spec {
             SocketSpec::Srt(socket) => (
@@ -346,6 +348,16 @@ impl From<&weave_core::SocketSpec> for SocketView {
                 None,
                 None,
                 Some(socket.url.clone()),
+            ),
+            SocketSpec::Rist(socket) => (
+                Transport::Rist.name(),
+                socket.role().name(),
+                match socket {
+                    RistSocket::Connect { host, .. } => Some(host.clone()),
+                    RistSocket::Listen { .. } => None,
+                },
+                Some(socket.port()),
+                None,
             ),
             SocketSpec::Device(kind) => (DEVICE_TRANSPORT, kind.name(), None, None, None),
         };
@@ -3015,6 +3027,7 @@ mod tests {
                             }),
                             whip: None,
                             whep: None,
+                            rist: None,
                         },
                     }],
                 },
@@ -6772,6 +6785,7 @@ mod key_exposure_tests {
                 }),
                 whip: None,
                 whep: None,
+                rist: None,
             },
         }
     }

@@ -140,6 +140,82 @@ mod contract_tests {
     }
 
     #[test]
+    fn a_rist_socket_round_trips_and_carries_no_params() {
+        for socket in [
+            SocketSpec::Rist(RistSocket::Listen { port: 7100 }),
+            SocketSpec::Rist(RistSocket::Connect {
+                host: "10.0.0.2".to_string(),
+                port: 7100,
+            }),
+        ] {
+            let value = serde_json::to_value(&socket).unwrap();
+            assert_eq!(value["transport"], "rist");
+            assert_eq!(serde_json::from_value::<SocketSpec>(value).unwrap(), socket);
+        }
+        let keyed = serde_json::from_value::<SocketSpec>(serde_json::json!({
+            "transport": "rist",
+            "role": "listen",
+            "port": 7100,
+            "params": { "passphrase": "0123456789" }
+        }));
+        assert!(keyed.is_err(), "a rist socket carries no params");
+    }
+
+    #[test]
+    fn rist_pairs_are_even_ports_whose_next_port_is_in_range() {
+        let pairs = |start, end| PortRange { start, end }.rist_pairs().collect::<Vec<_>>();
+        assert_eq!(pairs(20_000, 20_005), vec![20_000, 20_002, 20_004]);
+        assert_eq!(pairs(20_001, 20_004), vec![20_002]);
+        assert_eq!(pairs(20_000, 20_000), Vec::<u16>::new());
+        assert_eq!(pairs(65_534, 65_535), vec![65_534]);
+    }
+
+    #[test]
+    fn a_rist_listener_needs_a_host_and_a_port_pair() {
+        let node = |host: &str, start, end| NodeDescriptor {
+            id: "studio".to_string(),
+            endpoint: "http://studio".to_string(),
+            status: NodeStatus::Ready,
+            capabilities: NodeCapabilities::default(),
+            topology: NodeTopology {
+                attachments: vec![NetworkAttachment {
+                    id: "wan".to_string(),
+                    network: "internet".to_string(),
+                    dial: false,
+                    listeners: NetworkListeners {
+                        rist: Some(RistListener {
+                            host: host.to_string(),
+                            port_range: PortRange { start, end },
+                        }),
+                        ..NetworkListeners::default()
+                    },
+                }],
+            },
+        };
+        assert!(validate_node(&node("10.0.0.2", 21_000, 21_001)).is_empty());
+        let codes = |node| {
+            validate_node(&node)
+                .into_iter()
+                .map(|issue| (issue.field, issue.code))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            codes(node("10.0.0.2", 21_001, 21_002)),
+            vec![(
+                "node.topology.attachments[0].listeners.rist.port_range".to_string(),
+                "invalid_range".to_string()
+            )]
+        );
+        assert_eq!(
+            codes(node(" ", 21_000, 21_001)),
+            vec![(
+                "node.topology.attachments[0].listeners.rist.host".to_string(),
+                "blank".to_string()
+            )]
+        );
+    }
+
+    #[test]
     fn a_socket_without_a_key_decodes_unkeyed() {
         let socket: SocketSpec = serde_json::from_value(serde_json::json!({
             "transport": "srt",
@@ -575,6 +651,9 @@ pub enum SocketSpec {
     Whip(SignallingSocket),
     /// WebRTC playback: the `Connect` end pulls media from the `Listen` end's URL.
     Whep(SignallingSocket),
+    /// RIST simple profile: the `Connect` end pushes RTP to the `Listen` end's
+    /// port.
+    Rist(RistSocket),
     /// The node's own device, where the media starts or ends.
     Device(DeviceKind),
 }
@@ -642,6 +721,7 @@ impl SocketSpec {
         match self {
             Self::Srt(socket) => socket.role().name(),
             Self::Whip(socket) | Self::Whep(socket) => socket.role.name(),
+            Self::Rist(socket) => socket.role().name(),
             Self::Device(kind) => kind.name(),
         }
     }
@@ -653,6 +733,7 @@ impl std::fmt::Display for SocketSpec {
             Self::Srt(_) => f.write_str(Transport::Srt.name()),
             Self::Whip(_) => f.write_str(Transport::Whip.name()),
             Self::Whep(_) => f.write_str(Transport::Whep.name()),
+            Self::Rist(_) => f.write_str(Transport::Rist.name()),
             Self::Device(kind) => write!(f, "{kind} device"),
         }
     }
@@ -698,6 +779,31 @@ impl SrtSocket {
     pub fn params_mut(&mut self) -> &mut SrtParams {
         match self {
             Self::Listen { params, .. } | Self::Connect { params, .. } => params,
+        }
+    }
+}
+
+/// One end of a RIST link. The receiver binds an even port for RTP and the port
+/// after it for RTCP; the sender pushes to them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RistSocket {
+    Listen { port: u16 },
+    Connect { host: String, port: u16 },
+}
+
+impl RistSocket {
+    #[must_use]
+    pub fn role(&self) -> SocketRole {
+        match self {
+            Self::Listen { .. } => SocketRole::Listen,
+            Self::Connect { .. } => SocketRole::Connect,
+        }
+    }
+
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        match self {
+            Self::Listen { port } | Self::Connect { port, .. } => *port,
         }
     }
 }
@@ -754,6 +860,7 @@ enum SocketTransport {
     Srt,
     Whip,
     Whep,
+    Rist,
     Device,
 }
 
@@ -856,6 +963,15 @@ impl From<&SocketSpec> for SocketRepr {
                 endpoint_id: Some(socket.endpoint_id.clone()),
                 ..bare(SocketTransport::Whep, socket.role.into())
             },
+            SocketSpec::Rist(RistSocket::Listen { port }) => Self {
+                port: Some(*port),
+                ..bare(SocketTransport::Rist, SocketEnd::Listen)
+            },
+            SocketSpec::Rist(RistSocket::Connect { host, port }) => Self {
+                host: Some(host.clone()),
+                port: Some(*port),
+                ..bare(SocketTransport::Rist, SocketEnd::Connect)
+            },
             SocketSpec::Device(kind) => bare(SocketTransport::Device, (*kind).into()),
         }
     }
@@ -926,6 +1042,28 @@ impl TryFrom<SocketRepr> for SocketSpec {
                     Self::Whep(socket)
                 })
             }
+            SocketTransport::Rist => {
+                reject_extra_fields(
+                    "rist",
+                    [
+                        ("url", url.is_some()),
+                        ("endpoint_id", endpoint_id.is_some()),
+                        ("params", params.is_some()),
+                    ],
+                )?;
+                let port = port.ok_or_else(|| "a rist socket needs a port".to_string())?;
+                match role.link_role()? {
+                    SocketRole::Listen => {
+                        reject_extra_fields("listening rist", [("host", host.is_some())])?;
+                        Ok(Self::Rist(RistSocket::Listen { port }))
+                    }
+                    SocketRole::Connect => {
+                        let host =
+                            host.ok_or_else(|| "a sending rist socket needs a host".to_string())?;
+                        Ok(Self::Rist(RistSocket::Connect { host, port }))
+                    }
+                }
+            }
             SocketTransport::Device => {
                 reject_extra_fields(
                     DEVICE_TRANSPORT,
@@ -991,6 +1129,8 @@ pub enum Transport {
     /// WebRTC playback. The `Connect` end pulls media from the `Listen` end's
     /// signalling URL.
     Whep,
+    /// RIST simple profile. The `Connect` end pushes to the `Listen` end.
+    Rist,
 }
 
 impl Transport {
@@ -1001,6 +1141,7 @@ impl Transport {
             Self::Srt => "srt",
             Self::Whip => "whip",
             Self::Whep => "whep",
+            Self::Rist => "rist",
         }
     }
 
@@ -1008,7 +1149,7 @@ impl Transport {
     #[must_use]
     pub fn signalling(self) -> Option<SignallingTransport> {
         match self {
-            Self::Srt => None,
+            Self::Srt | Self::Rist => None,
             Self::Whip => Some(SignallingTransport::Whip),
             Self::Whep => Some(SignallingTransport::Whep),
         }
@@ -1418,6 +1559,9 @@ impl HopEndpointClass {
             (Self::Transport(class), SocketSpec::Whep(socket)) => {
                 class.transport == Transport::Whep && class.roles.contains(socket.role)
             }
+            (Self::Transport(class), SocketSpec::Rist(socket)) => {
+                class.transport == Transport::Rist && class.roles.contains(socket.role())
+            }
             (Self::Device(class), SocketSpec::Device(device)) => class.device == *device,
             _ => false,
         }
@@ -1472,12 +1616,15 @@ pub struct NetworkListeners {
     pub whip: Option<SignallingListener>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub whep: Option<SignallingListener>,
+    /// Each RIST link takes an even port from `port_range` and the one after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rist: Option<RistListener>,
 }
 
 impl NetworkListeners {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.srt.is_none() && self.whip.is_none() && self.whep.is_none()
+        self.srt.is_none() && self.whip.is_none() && self.whep.is_none() && self.rist.is_none()
     }
 
     #[must_use]
@@ -1492,6 +1639,13 @@ impl NetworkListeners {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SrtListener {
+    pub host: String,
+    pub port_range: PortRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RistListener {
     pub host: String,
     pub port_range: PortRange,
 }
@@ -1515,6 +1669,13 @@ impl PortRange {
     #[must_use]
     pub fn span(self) -> u16 {
         self.end.saturating_sub(self.start)
+    }
+
+    /// The even ports in the range whose next port is in it too: where a RIST
+    /// receiver can bind RTP, with RTCP one above.
+    pub fn rist_pairs(self) -> impl Iterator<Item = u16> {
+        let first = self.start.saturating_add(self.start % 2);
+        (first..self.end).step_by(2)
     }
 }
 
@@ -1585,16 +1746,36 @@ impl NodeConfig {
             if !ids.insert(&attachment.id) {
                 return Err(ConfigError::DuplicateAttachment(attachment.id.clone()));
             }
-            if let Some(listener) = &attachment.listeners.srt {
-                if listener.host.trim().is_empty() {
+            let port_listeners = attachment
+                .listeners
+                .srt
+                .iter()
+                .map(|listener| (&listener.host, listener.port_range))
+                .chain(
+                    attachment
+                        .listeners
+                        .rist
+                        .iter()
+                        .map(|listener| (&listener.host, listener.port_range)),
+                );
+            for (host, range) in port_listeners {
+                if host.trim().is_empty() {
                     return Err(ConfigError::BlankListener);
                 }
-                if listener.port_range.start > listener.port_range.end {
+                if range.start > range.end {
                     return Err(ConfigError::InvalidPortRange {
-                        start: listener.port_range.start,
-                        end: listener.port_range.end,
+                        start: range.start,
+                        end: range.end,
                     });
                 }
+            }
+            if let Some(listener) = &attachment.listeners.rist
+                && listener.port_range.rist_pairs().next().is_none()
+            {
+                return Err(ConfigError::NoRistPortPair {
+                    start: listener.port_range.start,
+                    end: listener.port_range.end,
+                });
             }
             if attachment
                 .listeners
@@ -1625,6 +1806,8 @@ pub enum ConfigError {
     BlankListener,
     #[error("port_range start {start} exceeds end {end}")]
     InvalidPortRange { start: u16, end: u16 },
+    #[error("rist port_range {start}..={end} holds no even port with the port after it")]
+    NoRistPortPair { start: u16, end: u16 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2343,6 +2526,7 @@ mod tests {
                         }),
                         whip: None,
                         whep: None,
+                        rist: None,
                     },
                 }],
             },
@@ -2780,7 +2964,7 @@ mod tests {
         assert!(no_role.is_err(), "a transport offered in no role");
 
         let unknown: Result<TransportClass, _> =
-            serde_json::from_value(serde_json::json!({ "transport": "rist", "roles": ["listen"] }));
+            serde_json::from_value(serde_json::json!({ "transport": "zixi", "roles": ["listen"] }));
         assert!(unknown.is_err(), "an unknown transport name is an error");
     }
 

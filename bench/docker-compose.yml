@@ -380,7 +380,7 @@ services:
     environment:
       WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_ADAPTER_2_TOKEN:-strom-node-2.0.f6a9e27d3f0c5cac5cadb705f27e8659a31a43836822b29d2aac602607ea79f3}
     volumes:
-      - ./config/adapter-2.yaml:/etc/weave/node.yaml:ro
+      - ./config/${WEAVE_ADAPTER_2_CONFIG:-adapter-2.yaml}:/etc/weave/node.yaml:ro
     networks:
       net_node2:
         ipv4_address: 10.97.27.11

@@ -1,0 +1,77 @@
+{
+  "elements": [
+    {
+      "element_type": "srtsrc",
+      "id": "srtsrc_0",
+      "position": [
+        100.0,
+        200.0
+      ],
+      "properties": {
+        "keep-listening": true,
+        "uri": "srt://:7001?mode=listener&latency=200"
+      }
+    },
+    {
+      "element_type": "capsfilter",
+      "id": "capsfilter_0",
+      "position": [
+        250.0,
+        200.0
+      ],
+      "properties": {
+        "caps": "video/mpegts,systemstream=true,packetsize=188"
+      }
+    },
+    {
+      "element_type": "queue",
+      "id": "queue_0",
+      "position": [
+        400.0,
+        200.0
+      ],
+      "properties": {}
+    },
+    {
+      "element_type": "rtpmp2tpay",
+      "id": "rtpmp2tpay_0",
+      "position": [
+        550.0,
+        200.0
+      ],
+      "properties": {}
+    },
+    {
+      "element_type": "ristsink",
+      "id": "ristsink_0",
+      "position": [
+        700.0,
+        200.0
+      ],
+      "properties": {
+        "address": "172.31.0.10",
+        "port": 7100
+      }
+    }
+  ],
+  "id": "00000000-0000-0000-0000-000000000000",
+  "links": [
+    {
+      "from": "srtsrc_0:src",
+      "to": "capsfilter_0:sink"
+    },
+    {
+      "from": "capsfilter_0:src",
+      "to": "queue_0:sink"
+    },
+    {
+      "from": "queue_0:src",
+      "to": "rtpmp2tpay_0:sink"
+    },
+    {
+      "from": "rtpmp2tpay_0:src",
+      "to": "ristsink_0:sink"
+    }
+  ],
+  "name": "weave-feed-sender"
+}

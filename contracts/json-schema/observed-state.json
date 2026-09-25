@@ -637,6 +637,11 @@
                                   "const": "whep",
                                   "description": "WebRTC playback. The `Connect` end pulls media from the `Listen` end's\n signalling URL.",
                                   "type": "string"
+                                },
+                                {
+                                  "const": "rist",
+                                  "description": "RIST simple profile. The `Connect` end pushes to the `Listen` end.",
+                                  "type": "string"
                                 }
                               ]
                             }
@@ -706,6 +711,11 @@
                                 {
                                   "const": "whep",
                                   "description": "WebRTC playback. The `Connect` end pulls media from the `Listen` end's\n signalling URL.",
+                                  "type": "string"
+                                },
+                                {
+                                  "const": "rist",
+                                  "description": "RIST simple profile. The `Connect` end pushes to the `Listen` end.",
                                   "type": "string"
                                 }
                               ]
@@ -801,6 +811,45 @@
                       "additionalProperties": false,
                       "default": {},
                       "properties": {
+                        "rist": {
+                          "additionalProperties": false,
+                          "description": "Each RIST link takes an even port from `port_range` and the one after it.",
+                          "properties": {
+                            "host": {
+                              "type": "string"
+                            },
+                            "port_range": {
+                              "description": "Inclusive `[start, end]` range of ports a node offers for controller-side\n assignment.",
+                              "properties": {
+                                "end": {
+                                  "format": "uint16",
+                                  "maximum": 65535,
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "start": {
+                                  "format": "uint16",
+                                  "maximum": 65535,
+                                  "minimum": 0,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "start",
+                                "end"
+                              ],
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "host",
+                            "port_range"
+                          ],
+                          "type": [
+                            "object",
+                            "null"
+                          ]
+                        },
                         "srt": {
                           "additionalProperties": false,
                           "properties": {

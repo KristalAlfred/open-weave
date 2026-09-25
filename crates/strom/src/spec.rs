@@ -3,7 +3,7 @@
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use weave_core::{DesiredHop, Passphrase, SignallingSocket, SocketSpec, SrtSocket};
+use weave_core::{DesiredHop, Passphrase, RistSocket, SignallingSocket, SocketSpec, SrtSocket};
 
 const PLACEHOLDER_ID: &str = "00000000-0000-0000-0000-000000000000";
 const DEFAULT_SRC_LATENCY: u32 = 200;
@@ -82,6 +82,10 @@ pub enum MappingError {
 ///   muxer. Several egresses tee after the encoder.
 /// - `srt → whep`: `mpegtssrt_input(decode) → whep_output`. Several egresses tee
 ///   the decoded video and audio.
+/// - `srt → rist`: srtsrc→capsfilter→queue→rtpmp2tpay→ristsink, the MPEG-TS
+///   payloaded into RTP. Several egresses tee after the capsfilter.
+/// - `rist → srt`: ristsrc→rtpmp2tdepay→queue→srtsink. Several egresses tee after
+///   the depayloader.
 ///
 /// Every egress of a hop must ask for one shape; a hop asked to fan out over two
 /// is [`MappingError::MixedEgress`]. No shape merges two ingresses, so a hop
@@ -98,11 +102,15 @@ pub fn flow_spec_from_hop(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
         "srt-forward" if shapes == (Shape::Srt, Shape::Srt) => srt_relay_flow(hop),
         "whip-to-srt" if shapes == (Shape::Whip, Shape::Srt) => whip_to_srt_flow(hop),
         "srt-to-whep" if shapes == (Shape::Srt, Shape::Whep) => srt_to_whep_flow(hop),
-        "srt-forward" | "whip-to-srt" | "srt-to-whep" => Err(MappingError::ProfileMismatch {
-            profile: hop.profile_id.clone(),
-            ingress: hop.ingress.to_string(),
-            egress: egress.to_string(),
-        }),
+        "srt-to-rist" if shapes == (Shape::Srt, Shape::Rist) => srt_to_rist_flow(hop),
+        "rist-to-srt" if shapes == (Shape::Rist, Shape::Srt) => rist_to_srt_flow(hop),
+        "srt-forward" | "whip-to-srt" | "srt-to-whep" | "srt-to-rist" | "rist-to-srt" => {
+            Err(MappingError::ProfileMismatch {
+                profile: hop.profile_id.clone(),
+                ingress: hop.ingress.to_string(),
+                egress: egress.to_string(),
+            })
+        }
         _ => Err(MappingError::UnknownProfile(hop.profile_id.clone())),
     }
 }
@@ -113,6 +121,7 @@ enum Shape {
     Srt,
     Whip,
     Whep,
+    Rist,
     Device,
 }
 
@@ -121,6 +130,7 @@ fn shape(spec: &SocketSpec) -> Shape {
         SocketSpec::Srt(_) => Shape::Srt,
         SocketSpec::Whip(_) => Shape::Whip,
         SocketSpec::Whep(_) => Shape::Whep,
+        SocketSpec::Rist(_) => Shape::Rist,
         SocketSpec::Device(_) => Shape::Device,
     }
 }
@@ -163,6 +173,14 @@ fn srt_relay_flow(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
 fn srt_socket(spec: &SocketSpec) -> Result<&SrtSocket, MappingError> {
     match spec {
         SocketSpec::Srt(socket) => Ok(socket),
+        other => Err(MappingError::UnsupportedSocket(other.to_string())),
+    }
+}
+
+/// The RIST socket a `ristsrc` or `ristsink` element is built from.
+fn rist_socket(spec: &SocketSpec) -> Result<&RistSocket, MappingError> {
+    match spec {
+        SocketSpec::Rist(socket) => Ok(socket),
         other => Err(MappingError::UnsupportedSocket(other.to_string())),
     }
 }
@@ -271,6 +289,137 @@ fn link(from: &str, to: &str) -> Link {
         from: from.to_string(),
         to: to.to_string(),
     }
+}
+
+fn element_with(
+    id: &str,
+    element_type: &str,
+    properties: Map<String, Value>,
+    position: [f64; 2],
+) -> Element {
+    Element {
+        properties,
+        ..element(id, element_type, position)
+    }
+}
+
+/// `head` linked in a chain, then each of `branches` after it through a queue:
+/// straight from the last head element for one branch, through a tee for
+/// several. Each element links `<id>:src` to the next one's `<id>:sink`.
+fn chain_flow(name: &str, head: Vec<Element>, branches: Vec<Vec<Element>>) -> FlowSpec {
+    let mut spec = empty_flow(name);
+    let mut x = 100.0;
+    let mut previous: Option<String> = None;
+    for mut element in head {
+        element.position = [x, 200.0];
+        x += 150.0;
+        if let Some(from) = &previous {
+            spec.links.push(link(
+                &format!("{from}:src"),
+                &format!("{}:sink", element.id),
+            ));
+        }
+        previous = Some(element.id.clone());
+        spec.elements.push(element);
+    }
+    let head = previous.expect("a chain flow has a head");
+    let fork = if branches.len() > 1 {
+        spec.elements.push(element("tee_0", "tee", [x, 200.0]));
+        spec.links.push(link(&format!("{head}:src"), "tee_0:sink"));
+        x += 150.0;
+        None
+    } else {
+        Some(format!("{head}:src"))
+    };
+    for (i, branch) in branches.into_iter().enumerate() {
+        let y = 200.0 + (i as f64) * 150.0;
+        let queue = format!("queue_{i}");
+        spec.elements.push(element(&queue, "queue", [x, y]));
+        let from = fork.clone().unwrap_or_else(|| format!("tee_0:src_{i}"));
+        spec.links.push(link(&from, &format!("{queue}:sink")));
+        let mut previous = queue;
+        let mut bx = x + 150.0;
+        for mut element in branch {
+            element.position = [bx, y];
+            bx += 150.0;
+            spec.links.push(link(
+                &format!("{previous}:src"),
+                &format!("{}:sink", element.id),
+            ));
+            previous = element.id.clone();
+            spec.elements.push(element);
+        }
+    }
+    spec
+}
+
+/// `srtsrc → capsfilter → rtpmp2tpay → ristsink`, one payloader and sink per
+/// egress.
+fn srt_to_rist_flow(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
+    let mut caps = Map::new();
+    caps.insert(
+        "caps".to_string(),
+        Value::String("video/mpegts,systemstream=true,packetsize=188".to_string()),
+    );
+    let head = vec![
+        element_with(
+            "srtsrc_0",
+            "srtsrc",
+            src_props(srt_socket(&hop.ingress)?),
+            [0.0; 2],
+        ),
+        element_with("capsfilter_0", "capsfilter", caps, [0.0; 2]),
+    ];
+    let branches = hop
+        .egresses
+        .iter()
+        .enumerate()
+        .map(|(i, egress)| {
+            let RistSocket::Connect { host, port } = rist_socket(&egress.socket)? else {
+                return Err(MappingError::UnsupportedSocket(egress.socket.to_string()));
+            };
+            let mut props = Map::new();
+            props.insert("address".to_string(), Value::String(host.clone()));
+            props.insert("port".to_string(), Value::from(*port));
+            Ok(vec![
+                element(&format!("rtpmp2tpay_{i}"), "rtpmp2tpay", [0.0; 2]),
+                element_with(&format!("ristsink_{i}"), "ristsink", props, [0.0; 2]),
+            ])
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(chain_flow(&hop.id, head, branches))
+}
+
+/// `ristsrc → rtpmp2tdepay → srtsink`, one sink per egress.
+fn rist_to_srt_flow(hop: &DesiredHop) -> Result<FlowSpec, MappingError> {
+    let RistSocket::Listen { port } = rist_socket(&hop.ingress)? else {
+        return Err(MappingError::UnsupportedSocket(hop.ingress.to_string()));
+    };
+    let mut props = Map::new();
+    props.insert("port".to_string(), Value::from(*port));
+    props.insert(
+        "encoding-name".to_string(),
+        Value::String("MP2T".to_string()),
+    );
+    let head = vec![
+        element_with("ristsrc_0", "ristsrc", props, [0.0; 2]),
+        element("rtpmp2tdepay_0", "rtpmp2tdepay", [0.0; 2]),
+    ];
+    let branches = hop
+        .egresses
+        .iter()
+        .enumerate()
+        .map(|(i, egress)| {
+            let socket = srt_socket(&egress.socket)?;
+            Ok(vec![element_with(
+                &format!("srtsink_{i}"),
+                "srtsink",
+                sink_props(socket),
+                [0.0; 2],
+            )])
+        })
+        .collect::<Result<Vec<_>, MappingError>>()?;
+    Ok(chain_flow(&hop.id, head, branches))
 }
 
 /// A decoded video and audio pair fanned out to `count` consumers. One consumer
@@ -600,8 +749,8 @@ fn tee_srt_flow(
 mod tests {
     use super::*;
     use weave_core::{
-        DesiredEgress, DeviceKind, HopRole, SignallingSocket, SignallingTransport, SocketRole,
-        SrtParams,
+        DesiredEgress, DeviceKind, HopRole, RistSocket, SignallingSocket, SignallingTransport,
+        SocketRole, SrtParams,
     };
 
     fn egress(branch_id: &str, socket: SocketSpec) -> DesiredEgress {
@@ -1011,6 +1160,96 @@ mod tests {
             error.to_string(),
             "no Strom flow shape fans one srt ingress out over both whep and srt egresses"
         );
+    }
+
+    fn rist_sender_hop() -> DesiredHop {
+        DesiredHop {
+            id: "weave-feed-sender".to_string(),
+            node_id: "strom-node-1".to_string(),
+            profile_id: "srt-to-rist".to_string(),
+            role: HopRole::Sender,
+            ingress: SocketSpec::srt_listen(7001, 200),
+            merge_ingress: None,
+            egresses: vec![egress(
+                "studio",
+                SocketSpec::Rist(RistSocket::Connect {
+                    host: "172.31.0.10".to_string(),
+                    port: 7100,
+                }),
+            )],
+        }
+    }
+
+    fn rist_receiver_hop() -> DesiredHop {
+        DesiredHop {
+            id: "weave-feed-receiver-studio".to_string(),
+            node_id: "strom-node-2".to_string(),
+            profile_id: "rist-to-srt".to_string(),
+            role: HopRole::Receiver,
+            ingress: SocketSpec::Rist(RistSocket::Listen { port: 7100 }),
+            merge_ingress: None,
+            egresses: vec![egress("studio", SocketSpec::srt_listen(7003, 200))],
+        }
+    }
+
+    #[test]
+    fn maps_rist_hops_to_known_good_payloads() {
+        for (hop, golden) in [
+            (rist_sender_hop(), include_str!("testdata/srt-rist.json")),
+            (rist_receiver_hop(), include_str!("testdata/rist-srt.json")),
+        ] {
+            let produced = serde_json::to_value(flow_spec_from_hop(&hop).expect("map")).unwrap();
+            let golden: Value = serde_json::from_str(golden).expect("parse golden");
+            assert_eq!(
+                produced,
+                golden,
+                "{}",
+                serde_json::to_string_pretty(&produced).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn rist_fanout_tees_into_one_queue_per_branch() {
+        let mut hop = rist_sender_hop();
+        hop.egresses.push(egress(
+            "preview",
+            SocketSpec::Rist(RistSocket::Connect {
+                host: "172.31.0.20".to_string(),
+                port: 7100,
+            }),
+        ));
+        let spec = flow_spec_from_hop(&hop).expect("map");
+        let has = |from: &str, to: &str| spec.links.iter().any(|l| l.from == from && l.to == to);
+        assert!(has("capsfilter_0:src", "tee_0:sink"));
+        assert!(has("tee_0:src_1", "queue_1:sink"));
+        assert!(has("queue_1:src", "rtpmp2tpay_1:sink"));
+        assert!(has("rtpmp2tpay_1:src", "ristsink_1:sink"));
+        let sink = spec
+            .elements
+            .iter()
+            .find(|element| element.id == "ristsink_1")
+            .expect("second sink");
+        assert_eq!(sink.properties["address"], Value::from("172.31.0.20"));
+
+        let mut receiver = rist_receiver_hop();
+        receiver
+            .egresses
+            .push(egress("preview", SocketSpec::srt_listen(7005, 200)));
+        let spec = flow_spec_from_hop(&receiver).expect("map");
+        let has = |from: &str, to: &str| spec.links.iter().any(|l| l.from == from && l.to == to);
+        assert!(has("rtpmp2tdepay_0:src", "tee_0:sink"));
+        assert!(has("queue_1:src", "srtsink_1:sink"));
+    }
+
+    #[test]
+    fn a_rist_socket_outside_a_rist_profile_is_refused() {
+        let mut hop = rist_sender_hop();
+        hop.profile_id = "srt-forward".to_string();
+        assert!(matches!(
+            flow_spec_from_hop(&hop),
+            Err(MappingError::ProfileMismatch { .. })
+        ));
     }
 
     #[test]

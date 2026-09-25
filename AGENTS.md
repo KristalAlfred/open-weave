@@ -1,10 +1,10 @@
 # AGENTS.md
 
 open-weave is a control plane for live media contribution. An operator applies a
-stream manifest; the controller plans SRT/WHIP/WHEP hops across registered media
-nodes and each node's adapter builds them. `README.md` is the reference for every
-contract; this file is the short version plus the things that are easy to get
-wrong.
+stream manifest; the controller plans SRT/WHIP/WHEP/RIST hops across registered
+media nodes and each node's adapter builds them. `README.md` is the reference for
+every contract; this file is the short version plus the things that are easy to
+get wrong.
 
 ## Commands
 

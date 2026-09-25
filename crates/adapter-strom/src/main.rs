@@ -28,8 +28,8 @@ use weave_strom::{
 
 use config::AdapterConfig;
 use provision::{
-    Side, SideObservation, StallTracker, diff_hops, hop_state, resolved_addr, socket_condition,
-    webrtc_condition,
+    Side, SideObservation, StallTracker, diff_hops, hop_state, resolved_addr, rist_condition,
+    socket_condition, webrtc_condition,
 };
 
 #[derive(Debug, Parser)]
@@ -451,6 +451,7 @@ impl SocketReading {
             SocketSpec::Whip(_) | SocketSpec::Whep(_) => webrtc
                 .map(|stats| Self::sessions(stats.ingress(), |b| b.bytes_received))
                 .unwrap_or_default(),
+            SocketSpec::Rist(_) => Self::srt_egresses(srt),
             SocketSpec::Device(_) => Self::default(),
         }
     }
@@ -466,6 +467,7 @@ impl SocketReading {
             SocketSpec::Whip(_) | SocketSpec::Whep(_) => webrtc
                 .map(|stats| Self::sessions(stats.egress_at(index), |b| b.bytes_sent))
                 .unwrap_or_default(),
+            SocketSpec::Rist(_) => Self::srt_ingress(srt),
             SocketSpec::Device(_) => Self::default(),
         }
     }
@@ -476,6 +478,26 @@ impl SocketReading {
             connected: element.is_some_and(|e| e.connected),
             rate_mbps: element.map_or(0.0, |e| e.rate_mbps),
             stats: element.map(LinkStats::from),
+        }
+    }
+
+    /// A RIST egress, read from the SRT ingress feeding it.
+    fn srt_ingress(srt: Option<&FlowStats>) -> Self {
+        let element = srt.and_then(FlowStats::ingress);
+        Self {
+            bytes: element.map(|e| e.bytes_received),
+            connected: element.is_some_and(|e| e.connected),
+            ..Self::default()
+        }
+    }
+
+    /// A RIST ingress, read from every SRT egress it feeds.
+    fn srt_egresses(srt: Option<&FlowStats>) -> Self {
+        let sinks: Vec<&ElementStats> = srt.map(|s| s.egresses().collect()).unwrap_or_default();
+        Self {
+            bytes: srt.map(|_| sinks.iter().map(|e| e.bytes_sent).sum()),
+            connected: sinks.iter().any(|e| e.connected),
+            ..Self::default()
         }
     }
 
@@ -496,6 +518,9 @@ impl SocketReading {
             }
             SocketSpec::Whip(socket) | SocketSpec::Whep(socket) => {
                 webrtc_condition(socket.role, self.connected, advanced, stalled)
+            }
+            SocketSpec::Rist(socket) => {
+                rist_condition(socket.role(), self.connected, advanced, stalled)
             }
             SocketSpec::Device(_) => LinkCondition::Idle,
         }
@@ -582,6 +607,22 @@ fn strom_hop_profiles() -> Vec<HopProfile> {
             id: "srt-to-whep".to_string(),
             ingress: transport_class(Transport::Srt, RoleSet::both()),
             egress: transport_class(Transport::Whep, RoleSet::only(SocketRole::Listen)),
+            max_egresses: None,
+            merge: false,
+            accepts: None,
+        },
+        HopProfile {
+            id: "srt-to-rist".to_string(),
+            ingress: transport_class(Transport::Srt, RoleSet::both()),
+            egress: transport_class(Transport::Rist, RoleSet::only(SocketRole::Connect)),
+            max_egresses: None,
+            merge: false,
+            accepts: None,
+        },
+        HopProfile {
+            id: "rist-to-srt".to_string(),
+            ingress: transport_class(Transport::Rist, RoleSet::only(SocketRole::Listen)),
+            egress: transport_class(Transport::Srt, RoleSet::both()),
             max_egresses: None,
             merge: false,
             accepts: None,
