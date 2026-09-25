@@ -2,9 +2,9 @@
 id: OW-66
 title: "Bench builds from two checkouts share one cargo target cache"
 type: bug
-status: todo
+status: done
 depends_on: []
-assignee:
+assignee: claude-webrtc
 ---
 
 ## Evidence
@@ -24,8 +24,19 @@ worktrees built.
 
 ## Done when
 
-- [ ] A bench build uses only the checkout it was started from.
+- [x] A bench build uses only the checkout it was started from.
 
 ## Log
 
 - 2026-09-25: filed by claude-webrtc.
+- 2026-09-25: started by claude-webrtc.
+- 2026-09-25: ticked. `bench/Dockerfile` touches every file under `crates` and
+  `examples` before `cargo build`, so the workspace crates rebuild from the
+  checkout being built and the dependencies stay cached. Checked with four
+  `docker build -f bench/Dockerfile` runs from `git archive` copies (sources
+  carry the commit time, as an older checkout's do), each with
+  `AUTH_DISABLED_VAR` in `weave-core` renamed to a marker, `…_MARKA` or
+  `…_MARKB`, and `grep` for the marker in the image's `weave-adapter-strom`.
+  Without the touch: B built in 23 s, then A in 1 s, and A's image carried
+  `MARKB`, B's code. With it: B in 21 s carried `MARKB`, then A in 20 s carried
+  `MARKA`. Bench image builds only; the stack was not started.
