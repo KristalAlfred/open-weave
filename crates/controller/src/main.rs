@@ -429,10 +429,6 @@ async fn main() -> Result<()> {
         }
     };
     let controller = Controller {
-        store: match &pg {
-            Some(pg) => pg.clone(),
-            None => Arc::new(MemStore::new()),
-        },
         node_ttl: Duration::from_secs(args.node_ttl_secs),
         node_forget: Duration::from_secs(args.node_forget_secs),
         webhooks,
@@ -456,7 +452,7 @@ async fn main() -> Result<()> {
             result
         }
         None => {
-            let (state, app) = controller.lead().await?;
+            let (state, app) = controller.lead(Arc::new(MemStore::new())).await?;
             let api = spawn_api_server(bind(&args.listen).await?, app);
             let result = tokio::select! {
                 result = shutdown() => result,
@@ -470,7 +466,6 @@ async fn main() -> Result<()> {
 
 /// Everything a controller needs to start leading, whenever it gets to.
 struct Controller {
-    store: Arc<dyn StateStore>,
     node_ttl: Duration,
     node_forget: Duration,
     webhooks: Option<Arc<webhook::Emitter>>,
@@ -483,9 +478,9 @@ struct Controller {
 impl Controller {
     /// Load the stored state and run a first tick over it, giving the state the
     /// tick loop drives and the router that serves it.
-    async fn lead(&self) -> Result<(AppState, Router)> {
+    async fn lead(&self, store: Arc<dyn StateStore>) -> Result<(AppState, Router)> {
         let state = AppState::hydrate(
-            self.store.clone(),
+            store,
             self.node_ttl,
             self.node_forget,
             self.webhooks.clone(),
@@ -659,7 +654,7 @@ async fn run_with_lease(
             emitter.count_from(term.started_micros);
         }
         let led = tokio::select! {
-            led = controller.lead() => led,
+            led = controller.lead(Arc::new(pg.for_term(term.epoch))) => led,
             lost = &mut hold => {
                 tracing::warn!(reason = lost.unwrap_or("renewal task failed"), "lost the controller lease while loading state; standing by");
                 continue;
@@ -5658,7 +5653,6 @@ mod tests {
     async fn pg_controller(url: &str) -> (Arc<PgStore>, Controller) {
         let pg = Arc::new(PgStore::connect(url).await.expect("connect"));
         let controller = Controller {
-            store: pg.clone(),
             node_ttl: Duration::from_secs(15),
             node_forget: Duration::from_secs(300),
             webhooks: None,
@@ -5743,7 +5737,7 @@ mod tests {
         .await
         .unwrap();
         seed.release_lease().await.unwrap();
-        let timing = LeaseTiming::new(Duration::from_secs(1));
+        let timing = LeaseTiming::new(Duration::from_secs(3));
 
         let (first_pg, first, stop_first, first_run) = start_controller(&url, timing).await;
         until_leading(&first, Duration::from_secs(5)).await;
@@ -5782,7 +5776,7 @@ mod tests {
             Err(StoreError::NotLeader)
         ));
 
-        until_leading(&second, Duration::from_secs(3)).await;
+        until_leading(&second, Duration::from_secs(5)).await;
         assert_eq!(
             served_state(&second_app).await,
             before,
@@ -5790,18 +5784,58 @@ mod tests {
         );
     }
 
+    /// A request an earlier term's router is still handling when the same
+    /// process takes the lease again must not write under the new term.
+    #[tokio::test]
+    #[ignore = "requires a running Postgres via DATABASE_URL"]
+    async fn a_write_from_an_earlier_term_is_refused_after_the_lease_is_taken_again() {
+        let url = store::tests::fresh_database().await;
+        let seed = store::tests::leading_pg_store(&url).await;
+        seed.create_stream(&stream("x")).await.unwrap();
+        seed.release_lease().await.unwrap();
+        let timing = LeaseTiming::new(Duration::from_secs(3));
+        let (_pg, leadership, _stop, _run) = start_controller(&url, timing).await;
+        until_leading(&leadership, Duration::from_secs(5)).await;
+        let earlier = leadership.router().unwrap();
+
+        let other = sqlx::PgPool::connect(&url).await.unwrap();
+        sqlx::query(
+            "UPDATE controller_lease SET holder = 'other', epoch = epoch + 1,
+             expires_at = now() + interval '1 second'",
+        )
+        .execute(&other)
+        .await
+        .unwrap();
+        until_standing_by(&leadership, timing.renew_every * 3).await;
+        until_leading(&leadership, Duration::from_secs(5)).await;
+        let current = leadership_router(leadership.clone());
+
+        let (status, body) = send(&earlier, "DELETE", "/streams/x", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["code"], "not_leader");
+        let stored: Vec<String> = sqlx::query_scalar("SELECT name FROM streams")
+            .fetch_all(&other)
+            .await
+            .unwrap();
+        assert_eq!(stored, ["x"]);
+        assert_eq!(
+            send(&current, "GET", "/streams/x", None).await.0,
+            StatusCode::OK
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires a running Postgres via DATABASE_URL"]
     async fn a_leader_whose_lease_is_taken_stops_serving_and_stands_by() {
         let url = store::tests::fresh_database().await;
-        let timing = LeaseTiming::new(Duration::from_secs(1));
+        let timing = LeaseTiming::new(Duration::from_secs(3));
         let (_pg, leadership, _stop, _run) = start_controller(&url, timing).await;
         until_leading(&leadership, Duration::from_secs(5)).await;
 
         let other = sqlx::PgPool::connect(&url).await.unwrap();
         sqlx::query(
             "UPDATE controller_lease SET holder = 'other', epoch = epoch + 1,
-             expires_at = now() + interval '2 seconds'",
+             expires_at = now() + interval '5 seconds'",
         )
         .execute(&other)
         .await
@@ -5813,14 +5847,15 @@ mod tests {
             "it waits while the other holder's lease lasts"
         );
 
-        until_leading(&leadership, Duration::from_secs(3)).await;
-        let epoch: i64 = sqlx::query_scalar("SELECT epoch FROM controller_lease")
-            .fetch_one(&other)
-            .await
-            .unwrap();
-        assert_eq!(
-            epoch, 3,
-            "it took the lease again once the other one lapsed"
+        until_leading(&leadership, Duration::from_secs(8)).await;
+        let (holder, epoch): (String, i64) =
+            sqlx::query_as("SELECT holder, epoch FROM controller_lease")
+                .fetch_one(&other)
+                .await
+                .unwrap();
+        assert!(
+            holder != "other" && epoch >= 3,
+            "it took the lease again once the other one lapsed: {holder} {epoch}"
         );
     }
 

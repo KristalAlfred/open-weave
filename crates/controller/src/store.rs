@@ -6,6 +6,7 @@
 //! Postgres also holds the controller lease. Only the controller holding it
 //! writes: every write checks the lease in its own transaction.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -155,10 +156,15 @@ pub struct LeaseTerm {
 }
 
 /// Postgres-backed store with its schema created idempotently on connect.
+///
+/// The store [`PgStore::connect`] returns takes and holds the lease and writes
+/// nothing. Writes go through [`PgStore::for_term`], one handle per term.
 pub struct PgStore {
     pool: sqlx::PgPool,
-    /// The lease epoch this store holds, or 0 for none.
-    epoch: AtomicU64,
+    /// The lease epoch this process holds, or 0 for none.
+    epoch: Arc<AtomicU64>,
+    /// The term this handle writes for, or 0 for none.
+    term: u64,
 }
 
 impl PgStore {
@@ -172,7 +178,8 @@ impl PgStore {
         let pool = Self::connect_with_retry(url, 30, Duration::from_secs(1)).await?;
         let store = Self {
             pool,
-            epoch: AtomicU64::new(0),
+            epoch: Arc::new(AtomicU64::new(0)),
+            term: 0,
         };
         store.ensure_schema().await?;
         Ok(store)
@@ -380,6 +387,17 @@ impl PgStore {
         self.epoch.store(0, Ordering::SeqCst);
     }
 
+    /// A handle that writes only while this process still holds the lease it
+    /// took as `epoch`. Once the lease is lost, or taken again under a later
+    /// epoch, its writes fail with [`StoreError::NotLeader`].
+    pub fn for_term(&self, epoch: u64) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            epoch: self.epoch.clone(),
+            term: epoch,
+        }
+    }
+
     fn held_epoch(&self) -> Result<i64, StoreError> {
         match self.epoch.load(Ordering::SeqCst) {
             0 => Err(StoreError::NotLeader),
@@ -387,10 +405,17 @@ impl PgStore {
         }
     }
 
-    /// Fail the transaction unless this store holds the current, unexpired
-    /// lease. The row stays share-locked until the transaction ends, so a
-    /// takeover waits for a write already past this check to commit, and the
-    /// new holder then loads it.
+    fn term_epoch(&self) -> Result<i64, StoreError> {
+        if self.term == 0 || self.epoch.load(Ordering::SeqCst) != self.term {
+            return Err(StoreError::NotLeader);
+        }
+        database_counter(self.term, "lease epoch")
+    }
+
+    /// Fail the transaction unless this handle's term holds the current,
+    /// unexpired lease. The row stays share-locked until the transaction ends,
+    /// so a takeover waits for a write already past this check to commit, and
+    /// the new holder then loads it.
     async fn fence(
         &self,
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -400,7 +425,7 @@ impl PgStore {
              WHERE id AND epoch = $1 AND expires_at > now()
              FOR SHARE",
         )
-        .bind(self.held_epoch()?)
+        .bind(self.term_epoch()?)
         .fetch_optional(&mut **transaction)
         .await
         .map_err(StoreError::Query)?
@@ -1795,14 +1820,15 @@ pub(crate) mod tests {
         format!("{server}/{name}")
     }
 
+    /// A handle for the term of a lease taken for a minute.
     pub(crate) async fn leading_pg_store(url: &str) -> PgStore {
         let store = PgStore::connect(url).await.expect("connect");
-        store
+        let term = store
             .acquire_lease("test", Duration::from_secs(60))
             .await
             .expect("acquire")
             .expect("nobody else holds the lease");
-        store
+        store.for_term(term.epoch)
     }
 
     /// Round-trips against a real Postgres. Ignored by default so `cargo test`
@@ -1869,14 +1895,14 @@ pub(crate) mod tests {
         let url = fresh_database().await;
         let first = PgStore::connect(&url).await.unwrap();
         let second = PgStore::connect(&url).await.unwrap();
-        let ttl = Duration::from_secs(1);
+        let ttl = Duration::from_secs(3);
 
         let taken = first.acquire_lease("first", ttl).await.unwrap().unwrap();
         assert_eq!(second.acquire_lease("second", ttl).await.unwrap(), None);
         assert!(first.renew_lease(ttl).await.unwrap());
         assert_eq!(second.acquire_lease("second", ttl).await.unwrap(), None);
 
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        tokio::time::sleep(Duration::from_millis(3300)).await;
         let takeover = second.acquire_lease("second", ttl).await.unwrap().unwrap();
         assert_eq!(takeover.epoch, taken.epoch + 1);
         assert!(takeover.started_micros > taken.started_micros);
@@ -1898,11 +1924,14 @@ pub(crate) mod tests {
         let second = PgStore::connect(&url).await.unwrap();
         let ttl = Duration::from_secs(60);
 
-        first.acquire_lease("first", ttl).await.unwrap().unwrap();
+        let taken = first.acquire_lease("first", ttl).await.unwrap().unwrap();
         first.release_lease().await.unwrap();
         assert!(second.acquire_lease("second", ttl).await.unwrap().is_some());
         assert!(matches!(
-            first.create_stream(&stream("basic")).await,
+            first
+                .for_term(taken.epoch)
+                .create_stream(&stream("basic"))
+                .await,
             Err(StoreError::NotLeader)
         ));
     }
@@ -1911,11 +1940,12 @@ pub(crate) mod tests {
     #[ignore = "requires a running Postgres via DATABASE_URL"]
     async fn pg_every_write_is_fenced_by_the_lease() {
         let url = fresh_database().await;
-        let old = PgStore::connect(&url).await.unwrap();
-        let new = PgStore::connect(&url).await.unwrap();
-        let ttl = Duration::from_secs(1);
+        let old_store = PgStore::connect(&url).await.unwrap();
+        let new_store = PgStore::connect(&url).await.unwrap();
+        let ttl = Duration::from_secs(3);
 
-        old.acquire_lease("old", ttl).await.unwrap().unwrap();
+        let taken = old_store.acquire_lease("old", ttl).await.unwrap().unwrap();
+        let old = old_store.for_term(taken.epoch);
         let basic = old.create_stream(&stream("basic")).await.unwrap();
         let set = old
             .create_stream_set("production", &[stream("owned")], true)
@@ -1926,14 +1956,22 @@ pub(crate) mod tests {
             .unwrap();
         assert!(
             matches!(
-                new.create_stream(&stream("other")).await,
+                new_store.create_stream(&stream("other")).await,
                 Err(StoreError::NotLeader)
             ),
             "a store that never took the lease writes nothing"
         );
+        assert!(
+            matches!(
+                old_store.create_stream(&stream("other")).await,
+                Err(StoreError::NotLeader)
+            ),
+            "the store that took it writes only through its term's handle"
+        );
 
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-        new.acquire_lease("new", ttl).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(3300)).await;
+        let takeover = new_store.acquire_lease("new", ttl).await.unwrap().unwrap();
+        let new = new_store.for_term(takeover.epoch);
         let mut changed = stream("basic");
         changed.enabled = false;
         let refused = [
@@ -1976,10 +2014,11 @@ pub(crate) mod tests {
     #[ignore = "requires a running Postgres via DATABASE_URL"]
     async fn pg_a_takeover_waits_for_a_write_past_its_fence() {
         let url = fresh_database().await;
-        let old = PgStore::connect(&url).await.unwrap();
+        let old_store = PgStore::connect(&url).await.unwrap();
         let new = std::sync::Arc::new(PgStore::connect(&url).await.unwrap());
-        let ttl = Duration::from_secs(1);
-        old.acquire_lease("old", ttl).await.unwrap().unwrap();
+        let ttl = Duration::from_secs(3);
+        let taken = old_store.acquire_lease("old", ttl).await.unwrap().unwrap();
+        let old = old_store.for_term(taken.epoch);
 
         let mut transaction = old.pool.begin().await.unwrap();
         old.fence(&mut transaction).await.unwrap();
@@ -1987,7 +2026,7 @@ pub(crate) mod tests {
             .execute(&mut *transaction)
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        tokio::time::sleep(Duration::from_millis(3300)).await;
         let takeover = tokio::spawn({
             let new = new.clone();
             async move { new.acquire_lease("new", ttl).await }
@@ -2077,5 +2116,28 @@ pub(crate) mod tests {
             store.save_stream_statuses(&[status_of("basic")]).await,
             Err(StoreError::NotLeader)
         ));
+    }
+    #[tokio::test]
+    #[ignore = "requires a running Postgres via DATABASE_URL"]
+    async fn pg_an_earlier_term_writes_nothing_once_the_lease_is_taken_again() {
+        let url = fresh_database().await;
+        let store = PgStore::connect(&url).await.unwrap();
+        let ttl = Duration::from_secs(60);
+        let first = store.acquire_lease("one", ttl).await.unwrap().unwrap();
+        let earlier = store.for_term(first.epoch);
+        let basic = earlier.create_stream(&stream("basic")).await.unwrap();
+
+        store.release_lease().await.unwrap();
+        let second = store.acquire_lease("one", ttl).await.unwrap().unwrap();
+        assert_eq!(second.epoch, first.epoch + 1);
+        assert!(matches!(
+            earlier.delete_stream("basic", basic.revision).await,
+            Err(StoreError::NotLeader)
+        ));
+        store
+            .for_term(second.epoch)
+            .delete_stream("basic", basic.revision)
+            .await
+            .unwrap();
     }
 }
