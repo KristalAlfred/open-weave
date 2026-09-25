@@ -4871,6 +4871,8 @@ mod node_auth_tests {
     use tower::ServiceExt;
     use weave_core::auth::{NodeKey, Token};
 
+    use super::tests::{NORTH_ROUTES, SHARED_READ_ROUTES, SOUTH_ROUTES};
+
     const NORTH: &str = "north-test-token";
     const KEY: &str = "south-test-key";
 
@@ -5040,6 +5042,105 @@ mod node_auth_tests {
             let (status, _) = send(&app, "GET", "/nodes", &authorization, None).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{authorization}");
         }
+    }
+
+    async fn send_auth(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        authorization: Option<&str>,
+    ) -> (StatusCode, Option<String>) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(authorization) = authorization {
+            request = request.header("authorization", authorization);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from("{}")).unwrap())
+            .await
+            .unwrap();
+        let challenge = response
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .map(|value| value.to_str().unwrap().to_string());
+        (response.status(), challenge)
+    }
+
+    /// The dashboard surface is unauthenticated — it is browser-loaded and cannot
+    /// carry a bearer token. `/health` is open for healthchecks.
+    #[tokio::test]
+    async fn dashboard_and_health_stay_open() {
+        let (app, _) = app().await;
+        for uri in ["/", "/ui", "/health", "/view", "/status"] {
+            let (status, _) = send_auth(&app, "GET", uri, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri} must not require a token");
+        }
+    }
+
+    #[tokio::test]
+    async fn api_routes_reject_missing_and_wrong_tokens() {
+        let (app, _) = app().await;
+
+        for authorization in [None, Some("Bearer wrong-token"), Some("Basic ignored")] {
+            for (method, uri) in NORTH_ROUTES
+                .iter()
+                .chain(&SOUTH_ROUTES)
+                .chain(&SHARED_READ_ROUTES)
+            {
+                let (status, challenge) = send_auth(&app, method, uri, authorization).await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "{method} {uri} with authorization={authorization:?}"
+                );
+                assert_eq!(challenge.as_deref(), Some("Bearer"));
+            }
+        }
+    }
+
+    /// The surfaces are separated, not merely authenticated: a node's token
+    /// cannot create or delete streams, and the operator token cannot register
+    /// nodes or read their desired hops.
+    #[tokio::test]
+    async fn each_surface_rejects_the_other_surfaces_token() {
+        let (app, _) = app().await;
+        let north = format!("Bearer {NORTH}");
+        let node = node_bearer("strom-node-1");
+
+        for (method, uri) in NORTH_ROUTES {
+            let (status, _) = send_auth(&app, method, uri, Some(&node)).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} must reject a node token"
+            );
+        }
+        for (method, uri) in SOUTH_ROUTES {
+            let (status, _) = send_auth(&app, method, uri, Some(&north)).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} must reject the northbound token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn each_surface_accepts_its_own_token() {
+        let (app, _) = app().await;
+
+        // Past the guard is enough: these are covered behaviourally elsewhere, so
+        // only "not 401" matters here.
+        let (status, _) =
+            send_auth(&app, "GET", "/streams", Some(&format!("Bearer {NORTH}"))).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) =
+            send_auth(&app, "GET", "/state", Some(&node_bearer("strom-node-1"))).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]

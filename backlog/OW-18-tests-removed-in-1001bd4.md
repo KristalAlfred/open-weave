@@ -192,3 +192,17 @@ Status section and the header of `bench/manifests/nat-relay.yaml` still cite.
   `ui_is_served_at_root_and_ui`, `versioned_api_paths_are_not_served`), with
   the route lists the last one walks. No changes to their assertions. All
   pass; unit tests only.
+- 2026-09-25: `crates/controller/src/main.rs`, auth: 4 of 5 back in
+  `node_auth_tests`, next to that module's per-node token helpers
+  (`dashboard_and_health_stay_open`,
+  `api_routes_reject_missing_and_wrong_tokens`,
+  `each_surface_rejects_the_other_surfaces_token`,
+  `each_surface_accepts_its_own_token`). The southbound token they used became
+  a per-node token derived from `WEAVE_SOUTHBOUND_TOKEN` in `4b62c4b` (OW-3),
+  so the ports present `node_bearer("strom-node-1")` where the old tests
+  presented the shared south token. Not ported:
+  `node_inventory_accepts_either_surface_token`, because
+  `node_inventory_accepts_the_north_token_or_any_node_token` (OW-3) already
+  checks the same route with the same tokens, plus the wrong ones. All pass;
+  unit tests only. Every one of the 43 removed `main.rs` tests is now back,
+  covered by a later test, or listed here as removed behaviour.
