@@ -132,9 +132,14 @@ async fn post(app: &Router, uri: &str, body: &impl Serialize, create: bool) -> S
 }
 
 async fn fan_out(label: &str, nodes: Vec<NodeRegistration>) -> AppState {
-    let state = AppState::hydrate(Arc::new(MemStore::new()), Duration::from_secs(15), None)
-        .await
-        .unwrap();
+    let state = AppState::hydrate(
+        Arc::new(MemStore::new()),
+        Duration::from_secs(15),
+        Duration::from_secs(300),
+        None,
+    )
+    .await
+    .unwrap();
     let app = router(state.clone(), Guard::Disabled, Guard::Disabled);
     for node in &nodes {
         assert_eq!(

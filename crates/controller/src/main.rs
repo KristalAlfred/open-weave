@@ -64,6 +64,11 @@ struct Args {
     /// adapter resumes on the same deterministic ports.
     #[arg(long, env = "WEAVE_NODE_TTL_SECS", default_value_t = 15)]
     node_ttl_secs: u64,
+    /// An offline node is removed, from memory and from the store, once this
+    /// many seconds elapse without a heartbeat. A node a stored stream names is
+    /// kept.
+    #[arg(long, env = "WEAVE_NODE_FORGET_SECS", default_value_t = 300)]
+    node_forget_secs: u64,
     /// Postgres connection URL. When unset the controller runs with an
     /// in-memory store and does not persist state across restarts.
     #[arg(long, env = "DATABASE_URL")]
@@ -98,6 +103,7 @@ struct AppState {
     nodes: Arc<RwLock<BTreeMap<String, NodeRegistration>>>,
     last_seen: Arc<RwLock<BTreeMap<String, Instant>>>,
     node_ttl: Duration,
+    node_forget: Duration,
     desired: Arc<RwLock<BTreeMap<String, desired::DesiredSnapshot>>>,
     view: Arc<RwLock<ControllerView>>,
     /// `None` when no receiver is configured; every emit site is then a no-op.
@@ -114,6 +120,7 @@ impl AppState {
     async fn hydrate(
         store: Arc<dyn StateStore>,
         node_ttl: Duration,
+        node_forget: Duration,
         webhooks: Option<Arc<webhook::Emitter>>,
     ) -> Result<Self> {
         let loaded_streams = store.load_streams().await.context("hydrating streams")?;
@@ -183,6 +190,7 @@ impl AppState {
             nodes: Arc::new(RwLock::new(nodes)),
             last_seen: Arc::new(RwLock::new(last_seen)),
             node_ttl,
+            node_forget,
             desired: Arc::new(RwLock::new(BTreeMap::new())),
             view: Arc::new(RwLock::new(ControllerView::default())),
             webhooks,
@@ -333,6 +341,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let interval = Duration::from_secs(args.interval_secs);
     let node_ttl = Duration::from_secs(args.node_ttl_secs);
+    let node_forget = Duration::from_secs(args.node_forget_secs);
 
     let store: Arc<dyn StateStore> = match &args.database_url {
         Some(url) => {
@@ -366,7 +375,7 @@ async fn main() -> Result<()> {
     })
     .map(Arc::new);
 
-    let state = AppState::hydrate(store, node_ttl, webhooks).await?;
+    let state = AppState::hydrate(store, node_ttl, node_forget, webhooks).await?;
     let app = router_after_first_tick(&state, north, south).await;
     let api = spawn_api_server(args.listen.clone(), app);
 
@@ -398,19 +407,36 @@ async fn router_after_first_tick(state: &AppState, north: Guard, south: Guard) -
 async fn reconcile_tick(state: &AppState) {
     let streams = state.streams.read().await;
     let definitions = streams.values().map(|stream| stream.spec.clone()).collect();
-    let (observed, went_offline) = {
+    let (observed, went_offline, forgotten) = {
         let mut nodes = state.nodes.write().await;
-        let last_seen = state.last_seen.read().await;
-        let transitioned = mark_offline(&mut nodes, &last_seen, Instant::now(), state.node_ttl);
-        let summaries: Vec<NodeSummary> = transitioned
+        let mut last_seen = state.last_seen.write().await;
+        let now = Instant::now();
+        let transitioned = mark_offline(&mut nodes, &last_seen, now, state.node_ttl);
+        let went_offline: Vec<NodeSummary> = transitioned
             .iter()
             .filter_map(|id| nodes.get(id))
             .map(|registration| NodeSummary::from(&registration.node))
             .collect();
-        (observed_state(&nodes), summaries)
+        let named = named_nodes(streams.values().map(|stream| &stream.spec));
+        let mut forgotten = Vec::new();
+        for id in forgettable(&nodes, &last_seen, &named, now, state.node_forget) {
+            if let Err(err) = state.store.delete_node(&id).await {
+                tracing::warn!(%err, node_id = %id, "forgetting an offline node failed; retrying next tick");
+                continue;
+            }
+            last_seen.remove(&id);
+            if let Some(registration) = nodes.remove(&id) {
+                tracing::info!(node_id = %id, "forgot an offline node that no stream names");
+                forgotten.push(NodeSummary::from(&registration.node));
+            }
+        }
+        (observed_state(&nodes), went_offline, forgotten)
     };
     for node in went_offline {
         state.emit(EventType::NodeOffline, node);
+    }
+    for node in forgotten {
+        state.emit(EventType::NodeForgotten, node);
     }
     let mut outcome = reconcile(definitions, &observed);
     for status in &mut outcome.streams {
@@ -656,6 +682,48 @@ fn mark_offline(
         }
     }
     transitioned
+}
+
+/// Offline nodes that have not heartbeated for longer than `after` and that
+/// `named` does not hold.
+fn forgettable(
+    nodes: &BTreeMap<String, NodeRegistration>,
+    last_seen: &BTreeMap<String, Instant>,
+    named: &BTreeSet<&str>,
+    now: Instant,
+    after: Duration,
+) -> Vec<String> {
+    nodes
+        .iter()
+        .filter(|(id, registration)| {
+            registration.node.status == NodeStatus::Offline
+                && !named.contains(id.as_str())
+                && last_seen
+                    .get(*id)
+                    .is_some_and(|seen| now.saturating_duration_since(*seen) > after)
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Every node a stream names as its source, a destination, or a `via` relay.
+fn named_nodes<'a>(streams: impl IntoIterator<Item = &'a StreamDefinition>) -> BTreeSet<&'a str> {
+    let mut named = BTreeSet::new();
+    for stream in streams {
+        let endpoints = std::iter::once(&stream.source).chain(
+            stream
+                .destinations
+                .iter()
+                .map(|destination| &destination.endpoint),
+        );
+        for endpoint in endpoints {
+            named.extend(endpoint.node());
+            if let weave_core::StreamTransport::Srt(srt) = endpoint {
+                named.extend(srt.via.iter().map(String::as_str));
+            }
+        }
+    }
+    named
 }
 
 fn observed_state(nodes: &BTreeMap<String, NodeRegistration>) -> ObservedState {
@@ -2232,6 +2300,7 @@ mod tests {
             nodes: Arc::new(RwLock::new(BTreeMap::new())),
             last_seen: Arc::new(RwLock::new(BTreeMap::new())),
             node_ttl: Duration::from_secs(15),
+            node_forget: Duration::from_secs(300),
             desired: Arc::new(RwLock::new(BTreeMap::new())),
             view: Arc::new(RwLock::new(ControllerView::default())),
             webhooks: None,
@@ -2561,7 +2630,7 @@ mod tests {
         let registration = node_registration("node/one", "172.26.0.10");
         mem.upsert_node(&registration).await.unwrap();
 
-        let state = AppState::hydrate(mem, Duration::from_secs(15), None)
+        let state = AppState::hydrate(mem, Duration::from_secs(15), Duration::from_secs(300), None)
             .await
             .expect("invalid cached nodes must not prevent startup");
 
@@ -2977,13 +3046,23 @@ mod tests {
     /// on the way up.
     async fn assert_a_restart_serves_the_stored_hops(store: Arc<dyn StateStore>) {
         seed_restart_case(store.as_ref()).await;
-        let before = AppState::hydrate(store.clone(), Duration::from_secs(15), None)
-            .await
-            .unwrap();
+        let before = AppState::hydrate(
+            store.clone(),
+            Duration::from_secs(15),
+            Duration::from_secs(300),
+            None,
+        )
+        .await
+        .unwrap();
         let before = router_after_first_tick(&before, Guard::Disabled, Guard::Disabled).await;
-        let after = AppState::hydrate(store, Duration::from_secs(15), None)
-            .await
-            .unwrap();
+        let after = AppState::hydrate(
+            store,
+            Duration::from_secs(15),
+            Duration::from_secs(300),
+            None,
+        )
+        .await
+        .unwrap();
         let after = router_after_first_tick(&after, Guard::Disabled, Guard::Disabled).await;
 
         for node in ["restart-node-1", "restart-node-2"] {
@@ -3234,9 +3313,14 @@ mod tests {
             ..webhook::Config::default()
         })
         .map(Arc::new);
-        let state = AppState::hydrate(mem, Duration::from_secs(15), webhooks)
-            .await
-            .unwrap();
+        let state = AppState::hydrate(
+            mem,
+            Duration::from_secs(15),
+            Duration::from_secs(300),
+            webhooks,
+        )
+        .await
+        .unwrap();
 
         reconcile_tick(&state).await;
         reconcile_tick(&state).await;
@@ -3333,5 +3417,197 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), reconcile_tick(&state))
             .await
             .expect("a tick must not wait on the webhook receiver");
+    }
+
+    #[test]
+    fn only_unnamed_offline_nodes_past_the_interval_are_forgettable() {
+        let offline = |id: &str| {
+            let mut registration = node_registration(id, "172.26.0.10");
+            registration.node.status = NodeStatus::Offline;
+            (id.to_string(), registration)
+        };
+        let mut nodes = BTreeMap::from([
+            offline("stale"),
+            offline("named"),
+            offline("edge"),
+            offline("recent"),
+            (
+                "silent".to_string(),
+                node_registration("silent", "172.26.0.10"),
+            ),
+        ]);
+        nodes.get_mut("silent").unwrap().node.status = NodeStatus::Ready;
+        let after = Duration::from_secs(300);
+        let now = Instant::now();
+        let last_seen = BTreeMap::from([
+            ("stale".to_string(), now - Duration::from_secs(301)),
+            ("named".to_string(), now - Duration::from_secs(301)),
+            ("edge".to_string(), now - after),
+            ("recent".to_string(), now - Duration::from_secs(20)),
+            ("silent".to_string(), now - Duration::from_secs(301)),
+        ]);
+        let named = BTreeSet::from(["named"]);
+
+        assert_eq!(
+            forgettable(&nodes, &last_seen, &named, now, after),
+            ["stale"]
+        );
+    }
+
+    #[test]
+    fn a_stream_names_its_source_destinations_and_via_relays() {
+        let mut definition = stream_between("basic", "source-node", "studio-node");
+        let StreamTransport::Srt(studio) = &mut definition.destinations[0].endpoint else {
+            unreachable!()
+        };
+        studio.via = vec!["relay-node".to_string()];
+        definition.destinations.push(StreamDestination {
+            id: "partner".to_string(),
+            endpoint: StreamTransport::Srt(SrtEndpoint {
+                node: None,
+                remote: Some(weave_core::RemoteAddr {
+                    host: "203.0.113.7".to_string(),
+                    port: 9000,
+                    network: "internet".to_string(),
+                }),
+                via: vec!["egress-node".to_string()],
+                format: None,
+                accepts: None,
+                network: None,
+                latency: None,
+            }),
+        });
+        let mut disabled = stream_between("spare", "spare-node", "studio-node");
+        disabled.enabled = false;
+
+        assert_eq!(
+            named_nodes([&definition, &disabled]),
+            BTreeSet::from([
+                "egress-node",
+                "relay-node",
+                "source-node",
+                "spare-node",
+                "studio-node"
+            ])
+        );
+    }
+
+    fn event_types(events: &[weave_core::webhook::Event]) -> Vec<EventType> {
+        events.iter().map(|event| event.event_type).collect()
+    }
+
+    async fn deliveries(sink: &mut Sink) -> Vec<weave_core::webhook::Event> {
+        let mut events = Vec::new();
+        while let Ok(delivery) = tokio::time::timeout(Duration::from_millis(300), sink.next()).await
+        {
+            events.push(delivery.event);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn a_tick_forgets_an_offline_node_no_stream_names() {
+        let mut sink = sink(StatusCode::OK).await;
+        let (mut state, mem) = mem_state();
+        state.webhooks = webhook::Emitter::new(webhook::Config {
+            url: Some(sink.url.clone()),
+            events: vec!["node.offline".to_string(), "node.forgotten".to_string()],
+            ..webhook::Config::default()
+        })
+        .map(Arc::new);
+        two_nodes_and_basic(&state).await;
+        let guest = node_registration("guest-1", "172.28.0.10");
+        mem.upsert_node(&guest).await.unwrap();
+        state
+            .nodes
+            .write()
+            .await
+            .insert("guest-1".to_string(), guest.clone());
+        {
+            let now = Instant::now();
+            let mut seen = state.last_seen.write().await;
+            seen.insert("strom-node-1".to_string(), now);
+            seen.insert("strom-node-2".to_string(), now);
+            seen.insert("guest-1".to_string(), now - Duration::from_secs(301));
+        }
+        let app = open_router(state.clone());
+        reconcile_tick(&state).await;
+        let placed = desired_hops(&app, "strom-node-1").await;
+
+        let events = deliveries(&mut sink).await;
+        assert_eq!(
+            event_types(&events),
+            [EventType::NodeOffline, EventType::NodeForgotten]
+        );
+        assert_eq!(events[1].subject.id(), "guest-1");
+        let (_, body) = send(&app, "GET", "/nodes", None).await;
+        let listed: Vec<NodeDescriptor> = serde_json::from_value(body).unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            ["strom-node-1", "strom-node-2"]
+        );
+        assert!(!state.last_seen.read().await.contains_key("guest-1"));
+        assert!(
+            mem.load_nodes()
+                .await
+                .unwrap()
+                .iter()
+                .all(|registration| registration.node.id != "guest-1")
+        );
+        assert_eq!(desired_hops(&app, "guest-1").await.0, StatusCode::NOT_FOUND);
+
+        reconcile_tick(&state).await;
+        assert_eq!(
+            desired_hops(&app, "strom-node-1").await,
+            placed,
+            "forgetting a node no stream names moves no hop"
+        );
+
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/nodes/guest-1/heartbeat",
+            Some(json!({ "node_id": "guest-1", "status": "ready" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/nodes/register",
+            Some(serde_json::to_value(&guest).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(state.nodes.read().await.contains_key("guest-1"));
+    }
+
+    #[tokio::test]
+    async fn a_node_a_stream_names_stays_listed_as_offline() {
+        let (state, _mem) = mem_state();
+        two_nodes_and_basic(&state).await;
+        {
+            let now = Instant::now();
+            let mut seen = state.last_seen.write().await;
+            seen.insert("strom-node-1".to_string(), now - Duration::from_secs(301));
+            seen.insert("strom-node-2".to_string(), now);
+        }
+
+        reconcile_tick(&state).await;
+
+        let app = open_router(state);
+        let (_, body) = send(&app, "GET", "/nodes", None).await;
+        let listed: Vec<NodeDescriptor> = serde_json::from_value(body).unwrap();
+        let node1 = listed
+            .iter()
+            .find(|node| node.id == "strom-node-1")
+            .unwrap();
+        assert_eq!(node1.status, NodeStatus::Offline);
+        let (status, body) = desired_hops(&app, "strom-node-1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
     }
 }

@@ -605,6 +605,7 @@
         "node.registered",
         "node.online",
         "node.offline",
+        "node.forgotten",
         "stream.changed"
       ],
       "type": "string"

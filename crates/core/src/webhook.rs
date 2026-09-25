@@ -64,16 +64,19 @@ pub enum EventType {
     NodeOnline,
     #[serde(rename = "node.offline")]
     NodeOffline,
+    #[serde(rename = "node.forgotten")]
+    NodeForgotten,
     #[serde(rename = "stream.changed")]
     StreamChanged,
 }
 
 impl EventType {
     /// Every type: a node's lifecycle in order, then the stream event.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::NodeRegistered,
         Self::NodeOnline,
         Self::NodeOffline,
+        Self::NodeForgotten,
         Self::StreamChanged,
     ];
 
@@ -83,6 +86,7 @@ impl EventType {
             Self::NodeRegistered => "node.registered",
             Self::NodeOnline => "node.online",
             Self::NodeOffline => "node.offline",
+            Self::NodeForgotten => "node.forgotten",
             Self::StreamChanged => "stream.changed",
         }
     }

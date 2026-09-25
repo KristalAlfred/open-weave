@@ -112,7 +112,19 @@ stateless proxies onto it. There is no URL version before the project declares a
 stable release. Routes, payloads, and error shapes may change between pre-release
 versions without aliases or a deprecation window.
 
-`GET /nodes` lists registered nodes for operator and adapter reads.
+`GET /nodes` lists registered nodes for operator and adapter reads. A node the
+controller has not heard from is first marked `offline`, then removed from the
+listing and from the store:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WEAVE_NODE_TTL_SECS` | `15` | Seconds without a heartbeat before a node reads `offline`. |
+| `WEAVE_NODE_FORGET_SECS` | `300` | Seconds without a heartbeat before an offline node is removed. |
+
+A node that a stored stream names as its source, a destination or a `via` relay
+is never removed, and stays listed as `offline`. A removed node's next heartbeat
+gets `404 node_not_found`, and both shipped nodes then register again. For a
+node loaded from the store, both intervals count from the controller's start.
 
 `GET /nodes/{id}/desired` returns the full list of hops the last reconcile tick
 computed for that node. A node that tick did not cover, because it is unknown or
@@ -484,6 +496,7 @@ or `degraded`, rather than polling `/nodes` and `/status`.
 | `node.registered` | Every accepted registration, including a re-registration of a node already online — a page reload does exactly this. |
 | `node.online` | A node heartbeats after having been marked offline. |
 | `node.offline` | A node crosses `WEAVE_NODE_TTL_SECS` without a heartbeat. |
+| `node.forgotten` | An offline node crosses `WEAVE_NODE_FORGET_SECS` without a heartbeat and is removed. A node a stored stream names is never removed. |
 | `stream.changed` | A reconcile tick computes a stream's conditions for the first time, or computes conditions that differ from the previous tick's in `type`, `status` or `reason`, on the stream or on any destination. |
 
 ```json
@@ -563,7 +576,8 @@ alone sends nothing, and deleting a stream sends nothing. An event follows the
 change it reports by up to one reconcile interval plus an adapter poll.
 
 An empty `WEAVE_WEBHOOK_EVENTS` delivers every type, `stream.changed` included.
-Set it to `node.registered,node.online,node.offline` for node events only.
+Set it to `node.registered,node.online,node.offline,node.forgotten` for node
+events only.
 
 Emitting never blocks a registration or a reconcile tick. Events are queued and
 delivered by one background worker, in order, retried with backoff on a connect

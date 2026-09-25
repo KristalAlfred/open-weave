@@ -96,6 +96,7 @@ pub trait StateStore: Send + Sync {
     ) -> Result<StreamSetWrite, StoreError>;
     async fn load_nodes(&self) -> Result<Vec<NodeRegistration>, StoreError>;
     async fn upsert_node(&self, registration: &NodeRegistration) -> Result<(), StoreError>;
+    async fn delete_node(&self, id: &str) -> Result<(), StoreError>;
 }
 
 /// Decode stored registrations, dropping any a running node will send again.
@@ -702,6 +703,15 @@ impl StateStore for PgStore {
         .map_err(StoreError::Query)?;
         Ok(())
     }
+
+    async fn delete_node(&self, id: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM nodes WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Query)?;
+        Ok(())
+    }
 }
 
 fn stored_stream_from_row(
@@ -1039,6 +1049,11 @@ impl StateStore for MemStore {
         inner
             .nodes
             .insert(registration.node.id.clone(), registration.clone());
+        Ok(())
+    }
+
+    async fn delete_node(&self, id: &str) -> Result<(), StoreError> {
+        self.lock().nodes.remove(id);
         Ok(())
     }
 }
@@ -1514,6 +1529,9 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].node.id, "strom-node-1");
         assert_eq!(store.upsert_node_calls(), 1);
+
+        store.delete_node("strom-node-1").await.unwrap();
+        assert!(store.load_nodes().await.unwrap().is_empty());
     }
 
     /// Round-trips against a real Postgres. Ignored by default so `cargo test`
@@ -1543,6 +1561,18 @@ mod tests {
             .expect("upsert node");
         assert!(
             store
+                .load_nodes()
+                .await
+                .expect("load nodes")
+                .iter()
+                .any(|n| n.node.id == "strom-node-1")
+        );
+        store
+            .delete_node("strom-node-1")
+            .await
+            .expect("delete node");
+        assert!(
+            !store
                 .load_nodes()
                 .await
                 .expect("load nodes")
