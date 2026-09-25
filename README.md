@@ -854,7 +854,11 @@ among those on the endpoint's `network` when it names one.
 
 Planning first tries a direct link. If none works, it tries one online transit
 node whose profile supports the required ingress-to-egress shape and whose
-attachments carry both halves. There is no `relay` flag. An explicit `via`
+attachments carry both halves. Of those, it takes the lowest id that still has a
+free port for each SRT listener the bridge would host, so a fan-out that fills
+one relay's port range moves on to the next. When every such node is out of
+ports, the stream stays unplaced and the reason names the lowest-id one. There
+is no `relay` flag. An explicit `via`
 chain remains an exact node constraint:
 
 ```yaml

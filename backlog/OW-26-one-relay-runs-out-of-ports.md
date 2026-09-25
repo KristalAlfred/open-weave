@@ -2,9 +2,9 @@
 id: OW-26
 title: "Every relayed destination lands on one relay until its ports run out"
 type: bug
-status: todo
+status: done
 depends_on: []
-assignee:
+assignee: claude-planner
 ---
 
 ## Evidence
@@ -21,7 +21,7 @@ hops. Unit test only; not run on the bench.
 
 ## Done when
 
-- [ ] A test shows a relayed fan-out that exceeds one relay's port range placed
+- [x] A test shows a relayed fan-out that exceeds one relay's port range placed
       over a second eligible relay, or reported as unplaceable with a reason
       that names the port range.
 
@@ -40,3 +40,18 @@ hops. Unit test only; not run on the bench.
 ## Log
 
 - 2026-09-25: filed from OW-12 by claude-planner.
+- 2026-09-25: started by claude-planner.
+- 2026-09-25: `pick_relay` and `pick_remote_relay` (`crates/controller/src/path.rs`)
+  now take the lowest-id eligible relay that still has a free port for each SRT
+  listener its bridge would host, checked against the tick's allocator. When
+  every eligible relay is out of ports the stream fails with
+  `PortRangeExhausted` naming the lowest-id one, which the placement condition
+  reports as "node relay-a has no free port left in its range". The relay is
+  still the lowest id whenever it has room, so no existing placement moves.
+  `a_relayed_fan_out_moves_on_to_the_next_relay_when_one_is_out_of_ports`
+  (three NAT'd receivers, relays with four ports each: two land on `relay-a`,
+  the third on `relay-b`) failed before the change with `PortRangeExhausted`;
+  `a_relayed_fan_out_no_relay_has_ports_for_names_the_full_relay` covers the
+  other branch. A scratch copy of the OW-12 relayed test at 501 receivers with
+  the 1000-port range now places 500 bridges on `relay-a` and 1 on `relay-b`
+  (plan 788 ms, debug, loaded host). Unit tests only.

@@ -172,7 +172,7 @@ load-bearing: adding a return route would silently delete the boundary and the
 Nodes 1 and 2 declare SRT listeners on the `internet` network that nodes 3 and 4
 dial out on, so either can carry transit between the two NAT'd sites. The
 controller picks the eligible node with the lowest id, so node 1 unless it is
-offline.
+offline or out of ports.
 
 Because a NAT'd node's sockets can only be dialled from inside its network, the
 bench carries a pair of media endpoints on each NAT'd subnet (`producer-3` and
