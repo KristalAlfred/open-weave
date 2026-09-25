@@ -339,10 +339,8 @@ impl HopReports {
         self.running.get(hop_id).map_or(&[], Vec::as_slice)
     }
 
-    fn is_held(&self, node: &str, port: u16) -> bool {
-        self.held
-            .get(node)
-            .is_some_and(|ports| ports.contains(&port))
+    fn held_on(&self, node: &str) -> Option<&HashSet<u16>> {
+        self.held.get(node)
     }
 
     /// The ports held by the second paths of `stream`'s destinations that ask
@@ -455,51 +453,58 @@ impl PortAllocator {
             occupied.insert(port);
             return Ok(port);
         }
-        let probe = (0..count).map(|step| {
-            #[allow(clippy::cast_possible_truncation)]
-            let offset = ((preferred + step) % count) as u16;
-            range.start.saturating_add(offset)
-        });
+        let held = held.held_on(&node.id);
         let yielding = self.yielding.get(&node.id);
-        let free = |port: u16| !occupied.contains(&port) && !held.is_held(&node.id, port);
-        let port = probe
-            .clone()
-            .find(|&port| free(port) && !splits_rist_pair(port, &rist, occupied))
-            .or_else(|| probe.clone().find(|&port| free(port)))
-            .or_else(|| {
-                probe.clone().find(|port| {
-                    !occupied.contains(port) && yielding.is_some_and(|ports| ports.contains(port))
-                })
-            })
-            .ok_or_else(|| PlacementError::PortRangeExhausted {
-                node: node.id.clone(),
-            })?;
+        let (mut whole, mut splitting, mut yielded) = (None, None, None);
+        for step in 0..count {
+            #[allow(clippy::cast_possible_truncation)]
+            let port = range
+                .start
+                .saturating_add(((preferred + step) % count) as u16);
+            if occupied.contains(&port) {
+                continue;
+            }
+            if held.is_some_and(|ports| ports.contains(&port)) {
+                if yielded.is_none() && yielding.is_some_and(|ports| ports.contains(&port)) {
+                    yielded = Some(port);
+                }
+            } else if splits_rist_pair(port, &rist, occupied) {
+                splitting.get_or_insert(port);
+            } else {
+                whole = Some(port);
+                break;
+            }
+        }
+        let port =
+            whole
+                .or(splitting)
+                .or(yielded)
+                .ok_or_else(|| PlacementError::PortRangeExhausted {
+                    node: node.id.clone(),
+                })?;
         occupied.insert(port);
         Ok(port)
     }
 
-    /// Claim a port for each of `listeners` on `node`, as [`Self::can_claim`]
-    /// found them.
-    fn reserve(&mut self, node: &NodeDescriptor, listeners: &[PortListener]) {
-        for listener in listeners {
-            let _ = match listener {
-                PortListener::Srt(attachment, at) => self.claim_at(node, attachment, "", Some(at)),
-                PortListener::Rist(listener, at) => {
-                    self.claim_rist_at(node, listener, "", Some(at))
-                }
-            };
-        }
+    #[cfg(test)]
+    fn can_claim(&self, node: &NodeDescriptor, listeners: &[PortListener], yielding: bool) -> bool {
+        self.claimable(node, listeners, &[], yielding).is_some()
     }
 
-    /// Whether `node` has a free port for each of `listeners`, taken in turn,
-    /// counting [`Self::yielding`] ports only when `yielding` is set.
-    fn can_claim(&self, node: &NodeDescriptor, listeners: &[PortListener], yielding: bool) -> bool {
+    /// The ports `node` would give each of `listeners`, taken in turn, with
+    /// `taken` in use as well, counting [`Self::yielding`] ports only when
+    /// `yielding` is set. `None` when one of them finds no free port.
+    fn claimable(
+        &self,
+        node: &NodeDescriptor,
+        listeners: &[PortListener],
+        taken: &[u16],
+        yielding: bool,
+    ) -> Option<Vec<u16>> {
+        let mut used = self.used.get(&node.id).cloned().unwrap_or_default();
+        used.extend(taken);
         let mut trial = Self {
-            used: self
-                .used
-                .get(&node.id)
-                .map(|ports| HashMap::from([(node.id.clone(), ports.clone())]))
-                .unwrap_or_default(),
+            used: HashMap::from([(node.id.clone(), used)]),
             held: Arc::clone(&self.held),
             yielding: if yielding {
                 Arc::clone(&self.yielding)
@@ -507,14 +512,19 @@ impl PortAllocator {
                 Arc::default()
             },
         };
-        listeners.iter().all(|listener| match listener {
-            PortListener::Srt(attachment, at) => {
-                trial.claim_at(node, attachment, "", Some(at)).is_ok()
+        let mut claimed = Vec::with_capacity(listeners.len());
+        for listener in listeners {
+            match listener {
+                PortListener::Srt(attachment, at) => {
+                    claimed.push(trial.claim_at(node, attachment, "", Some(at)).ok()?);
+                }
+                PortListener::Rist(listener, at) => {
+                    let port = trial.claim_rist_at(node, listener, "", Some(at)).ok()?;
+                    claimed.extend([port, port + 1]);
+                }
             }
-            PortListener::Rist(listener, at) => {
-                trial.claim_rist_at(node, listener, "", Some(at)).is_ok()
-            }
-        })
+        }
+        Some(claimed)
     }
 
     #[cfg(test)]
@@ -555,25 +565,64 @@ impl PortAllocator {
             occupied.extend([port, port + 1]);
             return Ok(port);
         }
+        let held = held.held_on(&node.id);
         let yielding = self.yielding.get(&node.id);
-        let unheld = |port: u16| !held.is_held(&node.id, port) && !held.is_held(&node.id, port + 1);
-        let yielded = |port: u16| {
-            [port, port + 1].iter().all(|port| {
-                !held.is_held(&node.id, *port) || yielding.is_some_and(|ports| ports.contains(port))
-            })
-        };
-        let probe = (0..count).map(|step| pairs[(preferred + step) % count]);
-        let pair = probe
-            .clone()
-            .find(|&port| free(port) && unheld(port))
-            .or_else(|| probe.clone().find(|&port| free(port) && yielded(port)));
-        if let Some(port) = pair {
+        let is_held = |port: &u16| held.is_some_and(|ports| ports.contains(port));
+        let yields =
+            |port: &u16| !is_held(port) || yielding.is_some_and(|ports| ports.contains(port));
+        let (mut unheld, mut yielded) = (None, None);
+        for port in (0..count).map(|step| pairs[(preferred + step) % count]) {
+            if !free(port) {
+                continue;
+            }
+            if !is_held(&port) && !is_held(&(port + 1)) {
+                unheld = Some(port);
+                break;
+            }
+            if yielded.is_none() && yields(&port) && yields(&(port + 1)) {
+                yielded = Some(port);
+            }
+        }
+        if let Some(port) = unheld.or(yielded) {
             occupied.extend([port, port + 1]);
             return Ok(port);
         }
         Err(PlacementError::PortRangeExhausted {
             node: node.id.clone(),
         })
+    }
+}
+
+/// A scratch copy of a [`PortAllocator`] for relay picks: the ports reserved
+/// on each node on top of the allocator, which it does not copy.
+struct ScratchPorts<'p> {
+    base: &'p PortAllocator,
+    reserved: HashMap<String, Vec<u16>>,
+}
+
+impl<'p> ScratchPorts<'p> {
+    fn new(base: &'p PortAllocator) -> Self {
+        Self {
+            base,
+            reserved: HashMap::new(),
+        }
+    }
+
+    fn claimable(
+        &self,
+        node: &NodeDescriptor,
+        listeners: &[PortListener],
+        yielding: bool,
+    ) -> Option<Vec<u16>> {
+        let reserved = self.reserved.get(&node.id).map_or(&[][..], Vec::as_slice);
+        self.base.claimable(node, listeners, reserved, yielding)
+    }
+
+    fn reserve(&mut self, node: &NodeDescriptor, ports: Vec<u16>) {
+        self.reserved
+            .entry(node.id.clone())
+            .or_default()
+            .extend(ports);
     }
 }
 
@@ -1120,7 +1169,7 @@ fn place_second_path<'n>(
         &receiver,
         nodes,
         (&first.relays, &[]),
-        &mut ports.clone(),
+        &mut ScratchPorts::new(&ports),
         relays,
     )?;
     let bridges: Vec<ChainHop> = stations
@@ -1254,7 +1303,7 @@ fn pick_remote_relay<'n>(
                     (*node, listeners)
                 })
         });
-    match relay_with_ports(candidates, ports, &keep, &[]) {
+    match relay_with_ports(candidates, &ScratchPorts::new(ports), &keep, &[]) {
         Some(relay) => relay.map(|(node, _)| node.id.clone()),
         None => Err(PlacementError::CannotDialNetwork {
             node: upstream.node_id.clone(),
@@ -1439,7 +1488,7 @@ fn chain_hops<'a, 'n>(
     relays: &mut RelayCache<'n>,
     shun: &[String],
 ) -> Result<Chain<'a>, PlacementError> {
-    let mut ports = ports.clone();
+    let mut ports = ScratchPorts::new(ports);
     let mut stations: Vec<Station> = Vec::with_capacity(dest.via.len());
     for station in dest.via.iter().map(|id| Station::relay(id)) {
         relay_before(
@@ -1565,13 +1614,13 @@ fn relay_before<'n>(
     next: &Station,
     nodes: &'n [NodeDescriptor],
     (avoid_relays, shun): (&[String], &[String]),
-    ports: &mut PortAllocator,
+    ports: &mut ScratchPorts,
     relays: &mut RelayCache<'n>,
 ) -> Result<(), PlacementError> {
     let upstream = chain.last().unwrap_or(source);
     if let Err(failure) = station_link(upstream, next, nodes) {
         let bridge = bridge_hop_id(stream, branch, chain.len());
-        let (relay, listeners) = pick_relay(
+        let (relay, claimed) = pick_relay(
             nodes,
             upstream,
             next,
@@ -1581,7 +1630,7 @@ fn relay_before<'n>(
             relays,
             (&bridge, branch),
         )?;
-        ports.reserve(relay, &listeners);
+        ports.reserve(relay, claimed);
         chain.push(Station::relay(&relay.id));
     }
     Ok(())
@@ -1604,10 +1653,10 @@ fn pick_relay<'n>(
     downstream: &Station,
     failure: LinkFailure,
     (avoid, shun): (&[String], &[String]),
-    ports: &PortAllocator,
+    ports: &ScratchPorts,
     relays: &mut RelayCache<'n>,
     (bridge, branch): (&str, &str),
-) -> Result<(&'n NodeDescriptor, Vec<PortListener>), PlacementError> {
+) -> Result<(&'n NodeDescriptor, Vec<u16>), PlacementError> {
     let keep = relays.running(bridge).to_vec();
     let candidates = relays
         .reachable_from(upstream, nodes)
@@ -1668,29 +1717,30 @@ fn port_listener_at(link: &LinkChoice, end: Listener, at: SocketAt) -> Option<Po
 }
 
 /// A listener a relay would claim ports on.
-#[derive(Clone)]
 enum PortListener {
     Srt(NetworkAttachment, SocketAt),
     Rist(RistListener, SocketAt),
 }
 
-/// The candidate with free ports for each SRT or RIST listener it would host:
-/// one of `keep`, else the lowest-id one not in `shun`, else the lowest-id one,
+/// The candidate with free ports for each SRT or RIST listener it would host,
+/// and those ports: one of `keep`, else the lowest-id one not in `shun`, else the lowest-id one,
 /// and only then one whose room is ports this stream's running second paths
 /// hold (see [`PortAllocator::yielding`]). `PortRangeExhausted` for the
 /// lowest-id one when none has room, or `None` when there are no candidates.
 fn relay_with_ports<'a>(
     candidates: impl Iterator<Item = (&'a NodeDescriptor, Vec<PortListener>)>,
-    ports: &PortAllocator,
+    ports: &ScratchPorts,
     keep: &[String],
     shun: &[String],
-) -> Option<Result<(&'a NodeDescriptor, Vec<PortListener>), PlacementError>> {
+) -> Option<Result<(&'a NodeDescriptor, Vec<u16>), PlacementError>> {
     let mut candidates: Vec<_> = candidates.collect();
     candidates.sort_by(|(left, _), (right, _)| left.id.cmp(&right.id));
     let (lowest, _) = candidates.first()?;
     let with_room = |yielding| {
-        move |(node, listeners): &&(&'a NodeDescriptor, Vec<PortListener>)| {
-            ports.can_claim(node, listeners, yielding)
+        move |(node, listeners): &(&'a NodeDescriptor, Vec<PortListener>)| {
+            ports
+                .claimable(node, listeners, yielding)
+                .map(|claimed| (*node, claimed))
         }
     };
     Some(
@@ -1702,10 +1752,9 @@ fn relay_with_ports<'a>(
                     .iter()
                     .filter(|(node, _)| !shun.contains(&node.id)),
             )
-            .find(with_room(false))
-            .or_else(|| candidates.iter().find(with_room(false)))
-            .or_else(|| candidates.iter().find(with_room(true)))
-            .map(|(node, listeners)| (*node, listeners.clone()))
+            .find_map(with_room(false))
+            .or_else(|| candidates.iter().find_map(with_room(false)))
+            .or_else(|| candidates.iter().find_map(with_room(true)))
             .ok_or_else(|| PlacementError::PortRangeExhausted {
                 node: lowest.id.clone(),
             }),
