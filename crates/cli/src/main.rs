@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::RequestBuilder;
 use reqwest::header::{ETAG, HeaderValue, IF_MATCH, IF_NONE_MATCH};
 use tracing_subscriber::EnvFilter;
-use weave_core::auth::{self, Token};
+use weave_core::auth::{self, NodeKey, Token};
 use weave_core::{
     ApiError, NodeDescriptor, PathStatus, PlanStatus, ReconcileStatus, StatusResponse,
     StreamAccepted, StreamDefinition, StreamEndpoints, StreamPlan, StreamResource,
@@ -81,6 +81,15 @@ enum Command {
     Delete {
         #[command(subcommand)]
         resource: DeleteResource,
+    },
+    /// Print a node's southbound token, derived from the southbound key. Calls
+    /// no service.
+    NodeToken {
+        /// Node id the token authenticates as.
+        id: String,
+        /// Key southbound and the controller hold.
+        #[arg(long, env = auth::SOUTHBOUND_KEY_VAR, hide_env_values = true)]
+        key: Option<String>,
     },
 }
 
@@ -160,7 +169,24 @@ async fn main() -> Result<()> {
                 delete_stream(&url, token.as_ref(), &name, output).await
             }
         },
+        Command::NodeToken { id, key } => {
+            println!("{}", node_token(key.as_deref(), &id)?);
+            Ok(())
+        }
     }
+}
+
+fn node_token(key: Option<&str>, id: &str) -> Result<String> {
+    if let Err(error) = validate_resource_id(id) {
+        bail!("invalid node id: {error}");
+    }
+    let key = key.and_then(NodeKey::new).with_context(|| {
+        format!(
+            "no southbound key: pass --key or set {}",
+            auth::SOUTHBOUND_KEY_VAR
+        )
+    })?;
+    Ok(key.token_for(id))
 }
 
 /// Present the bearer token when one is configured. Without it northbound
@@ -915,6 +941,18 @@ mod tests {
         ApiErrorCode, SrtEndpoint, StreamAccepted, StreamDestination, StreamSetMemberResult,
         StreamTransport,
     };
+
+    #[test]
+    fn node_token_is_the_node_id_and_its_mac() {
+        assert_eq!(
+            node_token(Some("bench-southbound-key"), "strom-node-1").unwrap(),
+            "strom-node-1.35e6718c0cdacc8a30175b4036cb8ebf271c7674e59f9b99f2db900b1c8532f7"
+        );
+        assert!(node_token(Some("k"), "Not_An_Id").is_err());
+        let error = node_token(None, "strom-node-1").unwrap_err().to_string();
+        assert!(error.contains(auth::SOUTHBOUND_KEY_VAR), "{error}");
+        assert!(node_token(Some("  "), "strom-node-1").is_err());
+    }
 
     #[test]
     fn parses_fanout_yaml_with_defaults_and_srt_tag() {

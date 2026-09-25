@@ -9,7 +9,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use serde::Serialize;
 use tower::ServiceExt;
-use weave_core::auth::Guard;
+use weave_core::auth::{Guard, NodeGuard};
 use weave_core::{
     HopEndpointClass, HopProfile, HopRole, NetworkAttachment, NetworkListeners, NodeCapabilities,
     NodeDescriptor, NodeRegistration, NodeStatus, NodeTopology, PROTOCOL_VERSION, PortRange,
@@ -140,7 +140,7 @@ async fn fan_out(label: &str, nodes: Vec<NodeRegistration>) -> AppState {
     )
     .await
     .unwrap();
-    let app = router(state.clone(), Guard::Disabled, Guard::Disabled);
+    let app = router(state.clone(), Guard::Disabled, NodeGuard::Disabled);
     for node in &nodes {
         assert_eq!(
             post(&app, "/nodes/register", node, false).await,

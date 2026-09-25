@@ -16,11 +16,14 @@ const RESOURCE_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
 
 const config = readConfig();
 let fatal = null;
+const tokenOwner = tokenNodeId(config.token);
 const nodeId = readNodeId();
 const hops = new Map();
 let registered = false;
 if (!validResourceId(nodeId)) {
   fatal = "node id must be 1–63 lowercase letters, digits, or hyphens and start and end with a letter or digit";
+} else if (tokenOwner && tokenOwner !== nodeId) {
+  fatal = `the token belongs to node ${tokenOwner}, not ${nodeId}`;
 }
 
 function readConfig() {
@@ -34,11 +37,18 @@ function readConfig() {
   };
 }
 
+// A node token is `<node id>.<mac>`, so it names the node it authenticates as.
+function tokenNodeId(token) {
+  const dot = token.indexOf(".");
+  return dot > 0 ? token.slice(0, dot) : "";
+}
+
 // `#node=<id>` pins the id, for a page that must keep its name across restarts.
-// Otherwise one id per tab for as long as it lives: a reload keeps the node, a
-// new tab is a new node.
+// Otherwise the token's node id, and without one, one id per tab for as long as
+// it lives: a reload keeps the node, a new tab is a new node.
 function readNodeId() {
   if (config.node) return config.node;
+  if (tokenOwner) return tokenOwner;
   let id = sessionStorage.getItem(NODE_ID_KEY);
   if (!id) {
     const bytes = crypto.getRandomValues(new Uint8Array(4));
@@ -100,7 +110,7 @@ function registration() {
 
 async function register() {
   const response = await southbound("POST", "/nodes/register", registration());
-  if (response.status === 400 || response.status === 409) {
+  if (response.status === 400 || response.status === 403 || response.status === 409) {
     fatal = `southbound refused registration: ${response.status} ${await response.text()}`;
     throw new Error(fatal);
   }

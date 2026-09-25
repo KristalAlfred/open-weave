@@ -24,12 +24,13 @@ Tests are `#[cfg(test)]` modules beside the code they cover; there is no
 
 ## Running it
 
-Every service refuses to start without its surface token, so either export both
-or opt out explicitly:
+Every service refuses to start without its secret, and the adapter without its
+node token, so either export them or opt out explicitly:
 
 ```sh
 export WEAVE_NORTHBOUND_TOKEN=$(openssl rand -hex 32)
-export WEAVE_SOUTHBOUND_TOKEN=$(openssl rand -hex 32)
+export WEAVE_SOUTHBOUND_KEY=$(openssl rand -hex 32)       # southbound, controller
+export WEAVE_SOUTHBOUND_TOKEN=$(just cli node-token strom-node-1)  # the adapter
 # or, for local work only:
 export WEAVE_AUTH_DISABLED=1
 ```
@@ -91,8 +92,8 @@ docker-compose stack of real Strom instances behind per-node `netem` routers.
 The items in `backlog/` are the authority on gaps, with the evidence behind each
 one, and `BACKLOG.md` says how to work them. Do not infer from the code that
 something works; if an open item lists it, it does not.
-Not implemented today: TLS, controller HA, per-node tokens, format conversion,
-and every adapter except Strom.
+Not implemented today: TLS, controller HA, format conversion, and every adapter
+except Strom.
 
 Anything only verified on the `bench/` stack is verified there and nowhere else.
 Say which one a claim rests on.

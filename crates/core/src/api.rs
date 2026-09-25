@@ -265,6 +265,7 @@ pub enum ApiErrorCode {
     InvalidRequest,
     InvalidJson,
     Unauthorized,
+    Forbidden,
     RouteNotFound,
     MethodNotAllowed,
     StreamNotFound,

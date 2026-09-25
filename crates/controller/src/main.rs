@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
@@ -28,7 +28,10 @@ use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
-use weave_core::auth::{self, Guard, require_bearer};
+use weave_core::auth::{
+    self, Guard, NodeCaller, NodeGuard, refuse_other_node, require_bearer, require_node_token,
+    unauthorized,
+};
 use weave_core::webhook::{EventType, NodeSummary, StreamSummary, Subject};
 use weave_core::{
     AcceptedState, ApiError, ApiErrorCode, DesiredHop, EndpointDescriptor, HopStatus, NodeAccepted,
@@ -113,7 +116,7 @@ struct AppState {
 #[derive(Clone)]
 struct SharedReadGuards {
     north: Guard,
-    south: Guard,
+    south: NodeGuard,
 }
 
 impl AppState {
@@ -359,7 +362,7 @@ async fn main() -> Result<()> {
     };
 
     let north = Guard::from_env(auth::NORTHBOUND_TOKEN_VAR)?;
-    let south = Guard::from_env(auth::SOUTHBOUND_TOKEN_VAR)?;
+    let south = NodeGuard::from_env(auth::SOUTHBOUND_KEY_VAR)?;
     if north.is_disabled() {
         tracing::warn!(
             "{}=1: controller serves its API without authentication",
@@ -399,7 +402,7 @@ async fn main() -> Result<()> {
 
 /// The router, built only once a reconcile tick has filled the desired map.
 /// Serving any earlier answers a restarted controller's nodes from nothing.
-async fn router_after_first_tick(state: &AppState, north: Guard, south: Guard) -> Router {
+async fn router_after_first_tick(state: &AppState, north: Guard, south: NodeGuard) -> Router {
     reconcile_tick(state).await;
     router(state.clone(), north, south)
 }
@@ -737,9 +740,10 @@ fn observed_state(nodes: &BTreeMap<String, NodeRegistration>) -> ObservedState {
 /// The controller serves the union of both contracts. Northbound and southbound
 /// are stateless proxies onto it.
 ///
-/// It backs both surfaces, so it validates both tokens and requires the one
-/// matching the surface a route belongs to. Node inventory is a shared read;
-/// mutations and node desired state remain separated.
+/// It backs both surfaces, so it validates both kinds of token and requires the
+/// one matching the surface a route belongs to. Node inventory is a shared read
+/// open to the northbound token and to any node token; mutations and node
+/// desired state remain separated, and a node token acts only for its own node.
 ///
 /// `/health` is used by compose healthchecks and load balancers. The dashboard
 /// (`/`, `/ui`, `/view`) ships inside this
@@ -750,7 +754,7 @@ fn observed_state(nodes: &BTreeMap<String, NodeRegistration>) -> ObservedState {
 /// page load without a cookie/session mechanism or a reverse proxy.
 /// They expose topology and allocated ports, so **the controller port must not be
 /// publicly exposed** — put it behind a proxy or keep it on a private network.
-fn router(state: AppState, north: Guard, south: Guard) -> Router {
+fn router(state: AppState, north: Guard, south: NodeGuard) -> Router {
     let shared_reads = Router::new().route(ROUTE_NODES, get(list_nodes)).layer(
         axum::middleware::from_fn_with_state(
             SharedReadGuards {
@@ -776,7 +780,10 @@ fn router(state: AppState, north: Guard, south: Guard) -> Router {
         .route(ROUTE_NODE_DESIRED, get(get_desired))
         .route(ROUTE_ENDPOINTS, get(list_endpoints))
         .route(ROUTE_STATE, get(get_state))
-        .layer(axum::middleware::from_fn_with_state(south, require_bearer));
+        .layer(axum::middleware::from_fn_with_state(
+            south,
+            require_node_token,
+        ));
 
     let api = Router::new()
         .route(ROUTE_STATUS, get(get_status))
@@ -812,23 +819,12 @@ async fn require_shared_read_bearer(
                 .north
                 .token()
                 .is_some_and(|token| token.matches_header(value))
-                || guards
-                    .south
-                    .token()
-                    .is_some_and(|token| token.matches_header(value))
+                || guards.south.caller(Some(value)).is_some()
         });
     if authorized {
         return next.run(request).await;
     }
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"))],
-        Json(ApiError::new(
-            ApiErrorCode::Unauthorized,
-            "missing or invalid bearer token",
-        )),
-    )
-        .into_response()
+    unauthorized()
 }
 
 fn spawn_api_server(addr: String, app: Router) -> JoinHandle<Result<()>> {
@@ -1587,6 +1583,7 @@ async fn get_state(State(state): State<AppState>) -> Json<ObservedState> {
 /// this controller does not speak is turned away here.
 async fn register_node(
     State(state): State<AppState>,
+    Extension(caller): Extension<NodeCaller>,
     payload: Result<Json<NodeRegistration>, JsonRejection>,
 ) -> Response {
     let Json(registration) = match payload {
@@ -1594,6 +1591,9 @@ async fn register_node(
         Err(rejection) => return invalid_json(rejection),
     };
     let node_id = registration.node.id.clone();
+    if let Some(response) = refuse_other_node(&caller, &node_id) {
+        return response;
+    }
     let endpoint_count = registration.endpoints.len();
 
     if !protocol_compatible(registration.protocol_version) {
@@ -1675,9 +1675,13 @@ async fn register_node(
 /// Heartbeats update only in-memory observed fields; they never touch the store.
 async fn node_heartbeat(
     State(state): State<AppState>,
+    Extension(caller): Extension<NodeCaller>,
     Path(node_id): Path<String>,
     payload: Result<Json<NodeHeartbeat>, JsonRejection>,
 ) -> Response {
+    if let Some(response) = refuse_other_node(&caller, &node_id) {
+        return response;
+    }
     let Json(heartbeat) = match payload {
         Ok(payload) => payload,
         Err(rejection) => return invalid_json(rejection),
@@ -1754,7 +1758,14 @@ async fn node_heartbeat(
 /// Serve the desired hops computed for a node on the last reconcile tick. A
 /// node that tick did not cover gets `404`, never an empty list: an adapter
 /// removes every hop it runs when told it should run none.
-async fn get_desired(State(state): State<AppState>, Path(node_id): Path<String>) -> Response {
+async fn get_desired(
+    State(state): State<AppState>,
+    Extension(caller): Extension<NodeCaller>,
+    Path(node_id): Path<String>,
+) -> Response {
+    if let Some(response) = refuse_other_node(&caller, &node_id) {
+        return response;
+    }
     if let Err(reason) = validate_resource_id(&node_id) {
         return invalid_request(
             "node id is invalid",
@@ -2288,7 +2299,7 @@ mod tests {
     use crate::webhook::tests::{Sink, sink};
 
     fn open_router(state: AppState) -> Router {
-        router(state, Guard::Disabled, Guard::Disabled)
+        router(state, Guard::Disabled, NodeGuard::Disabled)
     }
 
     fn mem_state() -> (AppState, Arc<MemStore>) {
@@ -3054,7 +3065,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let before = router_after_first_tick(&before, Guard::Disabled, Guard::Disabled).await;
+        let before = router_after_first_tick(&before, Guard::Disabled, NodeGuard::Disabled).await;
         let after = AppState::hydrate(
             store,
             Duration::from_secs(15),
@@ -3063,7 +3074,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let after = router_after_first_tick(&after, Guard::Disabled, Guard::Disabled).await;
+        let after = router_after_first_tick(&after, Guard::Disabled, NodeGuard::Disabled).await;
 
         for node in ["restart-node-1", "restart-node-2"] {
             let (status, served) = desired_hops(&before, node).await;
@@ -3093,7 +3104,7 @@ mod tests {
     #[tokio::test]
     async fn a_node_the_last_tick_did_not_cover_gets_404_for_its_desired_hops() {
         let (state, _mem) = mem_state();
-        let app = router_after_first_tick(&state, Guard::Disabled, Guard::Disabled).await;
+        let app = router_after_first_tick(&state, Guard::Disabled, NodeGuard::Disabled).await;
 
         let (status, body) = desired_hops(&app, "strom-node-1").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -3609,5 +3620,202 @@ mod tests {
         let (status, body) = desired_hops(&app, "strom-node-1").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body.as_array().map(Vec::len), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod node_auth_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    use weave_core::auth::{NodeKey, Token};
+
+    const NORTH: &str = "north-test-token";
+    const KEY: &str = "south-test-key";
+
+    async fn app() -> (Router, AppState) {
+        let state = AppState::hydrate(
+            Arc::new(MemStore::new()),
+            Duration::from_secs(15),
+            Duration::from_secs(300),
+            None,
+        )
+        .await
+        .unwrap();
+        let app = router_after_first_tick(
+            &state,
+            Guard::Required(Token::new(NORTH).unwrap()),
+            NodeGuard::Required(NodeKey::new(KEY).unwrap()),
+        )
+        .await;
+        (app, state)
+    }
+
+    fn node_bearer(node_id: &str) -> String {
+        format!("Bearer {}", NodeKey::new(KEY).unwrap().token_for(node_id))
+    }
+
+    fn registration(node_id: &str) -> Value {
+        json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "node": {
+                "id": node_id,
+                "endpoint": format!("http://{node_id}:8091"),
+                "status": "ready",
+                "capabilities": { "adapters": [], "hop_profiles": [] },
+                "topology": {
+                    "attachments": [{ "id": "wan", "network": "internet", "dial": true, "listeners": {} }]
+                }
+            },
+            "endpoints": [],
+            "hop_status": []
+        })
+    }
+
+    fn heartbeat(node_id: &str) -> Value {
+        json!({ "node_id": node_id, "status": "ready", "endpoints": [], "hop_status": [] })
+    }
+
+    async fn send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        authorization: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", authorization)
+            .header("content-type", "application/json")
+            .body(body.map_or_else(Body::empty, |body| Body::from(body.to_string())))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    async fn node_ids(app: &Router) -> Vec<String> {
+        let (status, nodes) = send(app, "GET", "/nodes", &format!("Bearer {NORTH}"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        nodes
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_node_registers_heartbeats_and_reads_desired_as_itself() {
+        let (app, state) = app().await;
+        let me = node_bearer("strom-node-1");
+
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/nodes/register",
+            &me,
+            Some(registration("strom-node-1")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/nodes/strom-node-1/heartbeat",
+            &me,
+            Some(heartbeat("strom-node-1")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        reconcile_tick(&state).await;
+        let (status, hops) = send(&app, "GET", "/nodes/strom-node-1/desired", &me, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(hops, json!([]));
+        assert_eq!(node_ids(&app).await, ["strom-node-1"]);
+    }
+
+    #[tokio::test]
+    async fn a_node_token_is_refused_for_another_node() {
+        let (app, _) = app().await;
+        let other = node_bearer("strom-node-2");
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/nodes/register",
+            &node_bearer("strom-node-1"),
+            Some(registration("strom-node-1")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        for (method, uri, body) in [
+            (
+                "POST",
+                "/nodes/register",
+                Some(registration("strom-node-1")),
+            ),
+            (
+                "POST",
+                "/nodes/register",
+                Some(registration("strom-node-3")),
+            ),
+            (
+                "POST",
+                "/nodes/strom-node-1/heartbeat",
+                Some(heartbeat("strom-node-1")),
+            ),
+            ("GET", "/nodes/strom-node-1/desired", None),
+        ] {
+            let (status, error) = send(&app, method, uri, &other, body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+            assert_eq!(error["code"], "forbidden", "{method} {uri}");
+        }
+        assert_eq!(
+            node_ids(&app).await,
+            ["strom-node-1"],
+            "a forged registration is not recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_inventory_accepts_the_north_token_or_any_node_token() {
+        let (app, _) = app().await;
+        for authorization in [format!("Bearer {NORTH}"), node_bearer("browser-a1b2")] {
+            let (status, _) = send(&app, "GET", "/nodes", &authorization, None).await;
+            assert_eq!(status, StatusCode::OK, "{authorization}");
+        }
+        for authorization in [
+            "Bearer wrong".to_string(),
+            format!("Bearer {KEY}"),
+            "Bearer south-test-token".to_string(),
+        ] {
+            let (status, _) = send(&app, "GET", "/nodes", &authorization, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{authorization}");
+        }
+    }
+
+    #[tokio::test]
+    async fn surfaces_do_not_accept_each_others_tokens() {
+        let (app, _) = app().await;
+        let (status, _) = send(&app, "GET", "/streams", &node_bearer("strom-node-1"), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        for (uri, past_auth) in [
+            ("/endpoints", StatusCode::OK),
+            ("/state", StatusCode::OK),
+            ("/nodes/strom-node-1/desired", StatusCode::NOT_FOUND),
+        ] {
+            let (status, _) = send(&app, "GET", uri, &format!("Bearer {NORTH}"), None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+            let (status, _) = send(&app, "GET", uri, &node_bearer("strom-node-1"), None).await;
+            assert_eq!(status, past_auth, "{uri}");
+        }
     }
 }

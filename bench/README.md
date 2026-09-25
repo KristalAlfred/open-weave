@@ -79,6 +79,7 @@ exits `0`, `unplaceable` reports that nothing matched its hops and exits `1`.
 ```sh
 just bench up          # build + start + wait for healthy
 just bench status      # health, registered nodes, controller view, streams
+just bench auth-check  # a node token is refused for another node's id
 just bench ps          # container states
 just bench logs controller   # follow one service's logs
 just bench down        # tear down (containers, networks, volumes)
@@ -222,9 +223,9 @@ just bench browser-down    # detach, delete both streams, stop the page
 `browser-cam` sends the page's camera to node-1 (the planner picks WHIP hosted
 on Strom; the consumer pulls the SRT output). `browser-return` feeds the
 producer into node-1 and plays it on the page (the planner picks WHEP hosted on
-Strom). Both manifests are templates: `browser-stream` fills in the node id,
-which `docker-compose.yml` pins to `browser-bench` so the manifests keep
-pointing at the page across restarts.
+Strom). Both manifests are templates: `browser-stream` fills in the node id.
+The page takes that id from its token, which `docker-compose.yml` sets to
+`browser-bench`'s, so the manifests keep pointing at the page across restarts.
 
 `browser-return` reaches `flowing`. **`browser-cam` does not** — Strom's
 `whip_input` accepts only H264 and the Playwright image's Chromium has no H264
@@ -250,10 +251,11 @@ just bench host-cam            # apply browser-cam-host for that seat
 just bench host-cam-down       # delete it again
 ```
 
-`just bench page` pins the page's node id with `#node=<seat>` (default
-`guest-1`), so a page that reloads keeps its name and the applied stream keeps
-pointing at it. Unpinned, every tab is a new node. Pass
-`just bench page 8000 guest-2` for a second, concurrent guest.
+`just bench page` gives the page the token for `<seat>` (default `guest-1`) and
+pins its node id with `#node=<seat>`, so a page that reloads keeps its name and
+the applied stream keeps pointing at it. Pass `just bench page 8000 guest-2` for
+a second, concurrent guest. `just bench node-token <seat>` prints a seat's token
+on its own.
 
 A browser on the host generally cannot reach `10.97.26.10:8080`, so node 1
 advertises a second attachment on the `docker-host` network, with the same SRT
@@ -307,32 +309,38 @@ payload and the delivery guarantees.
 
 ## Authentication
 
-The API surfaces require a bearer token (see the root README for the model). The
-bench defaults to development values so `just bench up` stays a single command:
+The API surfaces require a bearer token (see the root README for the model).
+Northbound takes one shared token. Southbound and the controller hold a key and
+take from each node a token derived from it for that node's id. The bench
+defaults to development values so `just bench up` stays a single command:
 
 | Variable | Default | Used by |
 |---|---|---|
 | `WEAVE_NORTHBOUND_TOKEN` | `bench-northbound-token` | northbound, controller, CLI, `endpoints.sh` |
-| `WEAVE_SOUTHBOUND_TOKEN` | `bench-southbound-token` | southbound, controller, the three adapters, the browser page |
+| `WEAVE_SOUTHBOUND_KEY` | `bench-southbound-key` | southbound, controller, `just bench node-token` |
+| `WEAVE_ADAPTER_{1,2,3}_TOKEN` | `strom-node-{1,2,3}`'s token under the default key | adapter-1, 2 and 3; the recipes present node 1's for southbound reads |
+| `WEAVE_BROWSER_TOKEN` | `browser-bench`'s token under the default key | the in-bench browser page, which takes its node id from it |
 
-Export either variable to override it; `docker-compose.yml` and the recipes read
-the same defaults, so both stay in step. The adapter configs leave
-`node.southbound_token` unset and inherit the env var instead, keeping the value
-out of the repo.
+`docker-compose.yml` passes each adapter its token as `WEAVE_SOUTHBOUND_TOKEN`.
+The adapter configs leave `node.southbound_token` unset and inherit it. The node
+tokens are written out in `docker-compose.yml` and the bench `justfile`, so
+exporting `WEAVE_SOUTHBOUND_KEY` means exporting the four token variables too;
+`just bench node-token <id>` prints each one under the exported key.
 
 The `just` recipes add the right header for you. Calling the APIs by hand needs
 it explicitly:
 
 ```sh
-curl -s -H "Authorization: Bearer bench-southbound-token" localhost:29081/nodes | jq
+curl -s -H "Authorization: Bearer $(just bench node-token strom-node-1)" localhost:29081/nodes | jq
 curl -s -H "Authorization: Bearer bench-northbound-token" localhost:29080/streams | jq
 ```
 
-Without a valid token these return `401` and `WWW-Authenticate: Bearer`. Every
-service **refuses to start** if its token variable is missing, so a
-`docker compose up` that exits immediately with a `WEAVE_..._TOKEN is unset`
-error is the fail-closed default working, not a bug. `WEAVE_AUTH_DISABLED=1`
-opts out for local runs.
+Without a valid token these return `401` and `WWW-Authenticate: Bearer`. A node
+token used for another node's id gets `403`; `just bench auth-check` tries that
+against southbound and the controller. Every service **refuses to start** if its
+secret is missing, so a `docker compose up` that exits immediately with a
+`WEAVE_... is unset` error is the fail-closed default working, not a bug.
+`WEAVE_AUTH_DISABLED=1` opts out for local runs.
 
 `/health` on all three services, the controller's dashboard (`/ui`, `/view`),
 and the `/status` rollup need no token, so anyone who can reach port 29082

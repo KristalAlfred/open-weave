@@ -10,6 +10,7 @@
               "invalid_request",
               "invalid_json",
               "unauthorized",
+              "forbidden",
               "route_not_found",
               "method_not_allowed",
               "stream_not_found",

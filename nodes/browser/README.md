@@ -2,12 +2,15 @@
 
 A web page that is an open-weave node. Plain HTML and JavaScript, no build step.
 
-Open `index.html` from any static server with the southbound address and token
-in the URL fragment, so neither reaches a server log:
+Open `index.html` from any static server with the southbound address and the
+page's node token in the URL fragment, so neither reaches a server log:
 
 ```
-http://host:8000/#southbound=http://southbound:8081&token=<WEAVE_SOUTHBOUND_TOKEN>
+http://host:8000/#southbound=http://southbound:8081&token=<node token>
 ```
+
+`weave node-token <id>` prints the token for node `<id>` (see "Authentication"
+in the root README).
 
 The page needs a secure context for the camera: serve it over `https`, or over
 `http` from `localhost` / `127.0.0.1`; on any other `http` origin the sender hop
@@ -17,12 +20,15 @@ permission for the browser) leaves `getUserMedia` pending, and a pending request
 blocks every later one in the page, so the choice is made up front rather than
 by falling back.
 
-The page generates a `browser-<8 hex>` node id per tab (`&node=<id>` pins one
-instead, so a page that restarts keeps its name). A pinned id must be 1–63
-lowercase ASCII letters, digits, or interior hyphens. An invalid pin is shown as
-rejected and is not retried. The page registers a valid id with
-`camera-to-whip` and `whep-to-display` hop profiles, plus one dial-only
-attachment to the `internet` network. `&network=<id>` selects another network.
+The page's node id is the one its token names, so a page that restarts keeps its
+name. `&node=<id>` pins the id instead, and must then name the token's id. With
+neither a node token nor a pin, the page generates a `browser-<8 hex>` id per tab,
+which only a southbound with authentication disabled accepts. A pinned id must be
+1–63 lowercase ASCII letters, digits, or interior hyphens. An invalid pin, a pin
+naming another node than the token, and a registration southbound refuses with
+`400`, `403` or `409` are shown as rejected and are not retried. The page
+registers a valid id with `camera-to-whip` and `whep-to-display` hop profiles,
+plus one dial-only attachment to the `internet` network. `&network=<id>` selects another network.
 It heartbeats every 5 s and polls desired hops every 2 s. It realises two hop
 shapes and nothing else:
 
@@ -45,7 +51,7 @@ node to appear in `GET /nodes`:
 
 ```sh
 pnpm install
-node check.mjs --southbound http://127.0.0.1:8081 --token "$WEAVE_SOUTHBOUND_TOKEN" --serve 8000
+node check.mjs --southbound http://127.0.0.1:8081 --token "$(weave node-token browser-1)" --serve 8000
 ```
 
 `--serve` hosts this directory on loopback only, so the page is opened from the

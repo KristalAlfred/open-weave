@@ -40,8 +40,7 @@ implemented: [Strom](https://github.com/Eyevinn/strom), via
 - File-based or VOD work. Every contract here describes live links between nodes.
 - Deciding what to route. Scheduling, bookings and who gets which feed belong to
   an application that drives open-weave through northbound.
-- Production, yet. No TLS, no controller HA, no per-node tokens — see
-  [Status](#status).
+- Production, yet. No TLS, no controller HA — see [Status](#status).
 
 ## Status
 
@@ -56,8 +55,8 @@ the docker-compose bench in `bench/`, which runs real Strom instances behind
 per-node `netem` routers, and nowhere else. Automatic relay insertion is the
 exception: the bench has one NAT'd site, so only planner tests cover it.
 
-Not built: TLS, controller HA, per-node tokens, format conversion, and any
-adapter other than Strom. The items in `backlog/` list the known gaps with the
+Not built: TLS, controller HA, format conversion, and any adapter other than
+Strom. The items in `backlog/` list the known gaps with the
 evidence behind each one.
 
 ## Crates and binaries
@@ -414,39 +413,77 @@ changes when the condition status changes, not when only its detail changes.
 
 ## Authentication
 
-Each API surface is protected by one shared bearer token, supplied through the
-environment. Requests present it as `Authorization: Bearer <token>`; anything else
-gets `401` with a `WWW-Authenticate: Bearer` challenge. Tokens are compared in
-constant time and never logged.
+Requests present a bearer token as `Authorization: Bearer <token>`. A missing or
+invalid one gets `401` with a `WWW-Authenticate: Bearer` challenge. Tokens are
+compared in constant time and never logged.
 
-| Variable | Presented by | Accepted by |
+| Variable | Held by | Accepted by |
 |---|---|---|
 | `WEAVE_NORTHBOUND_TOKEN` | operators, the `weave` CLI (`--token`), northbound → controller | northbound (every operator route), controller (every operator route but `/status`) |
-| `WEAVE_SOUTHBOUND_TOKEN` | adapters and media nodes, southbound → controller | southbound, controller |
+| `WEAVE_SOUTHBOUND_KEY` | southbound, controller | nothing: node tokens are derived from it, and it is never a token itself |
+| `WEAVE_SOUTHBOUND_TOKEN` | each adapter and media node, holding its own node token | southbound, controller |
 
-The controller backs both surfaces, so it needs both variables and requires the
-one matching the surface a route belongs to — an adapter's southbound token
-cannot create streams. Northbound and southbound each re-present their own
-surface token on the hop to the controller, so one secret covers a surface end to
-end. Nodes may instead carry the token in their config file as
-`node.southbound_token`, which takes precedence over the environment.
+The northbound token is one shared secret. On southbound every node has a token
+of its own:
 
-Controller `GET /nodes` accepts either token because both surfaces expose the
-same read-only inventory. This does not cross the mutation boundary: operator
-stream writes accept only the northbound token, and node lifecycle writes accept
-only the southbound token.
+```
+<node id>.<lowercase hex HMAC-SHA256(WEAVE_SOUTHBOUND_KEY, node id)>
+```
 
-A browser node (`nodes/browser/`) is a media node too: the page presents
-`WEAVE_SOUTHBOUND_TOKEN` on every southbound call, passed in through the URL
-fragment so it never reaches a server log. Because the page runs on a different
-origin from southbound, southbound sends CORS headers on its API routes when
-`WEAVE_SOUTHBOUND_CORS_ORIGIN` is set — an exact origin such as
-`https://studio.example`, or `*` for development. Unset, no CORS headers are
-sent and only non-browser adapters can register. The preflight is answered
-before the bearer check and allows `Authorization` and `Content-Type`. A page
-holds the shared southbound secret. A browser node registers with a
-`browser://<id>` endpoint, which is a placeholder: the controller never dials any
-node's endpoint.
+Southbound and the controller hold the key, recompute the MAC, and read the node
+id off the token. They keep no list of nodes, so adding a node needs a new token
+and no restart. `weave node-token <id>` prints a node's token from
+`WEAVE_SOUTHBOUND_KEY` (or `--key`) without calling any service. openssl gives
+the same value:
+
+```sh
+id=strom-node-1
+printf '%s.%s\n' "$id" "$(printf %s "$id" | openssl dgst -sha256 -hmac "$WEAVE_SOUTHBOUND_KEY" -r | cut -d' ' -f1)"
+```
+
+A node token acts only for its own node. `POST /nodes/register` whose
+`node.id`, and `POST /nodes/{id}/heartbeat` or `GET /nodes/{id}/desired` whose
+path id, is another node's gets `403`:
+
+```json
+{ "code": "forbidden", "message": "token does not belong to node strom-node-2" }
+```
+
+Southbound forwards the node's own `Authorization` header to the controller
+rather than a credential of its own. Both check the token and the id, and
+nothing about a refused registration is recorded. `weave-adapter-strom` treats a
+`403` at registration as fatal and exits, as it does a protocol-version `409`.
+The inventory reads `GET /nodes`, `GET /endpoints` and `GET /state` accept any
+node's token. They list every node, endpoint and hop status, but no node's
+desired hops.
+
+One node's token cannot be revoked on its own: rotating the key replaces every
+node's token (`backlog/OW-28-revoke-one-node-token.md`).
+
+The controller backs both surfaces, so it needs `WEAVE_NORTHBOUND_TOKEN` and
+`WEAVE_SOUTHBOUND_KEY`, and requires the credential matching the surface a route
+belongs to — a node token cannot create streams. Northbound re-presents its
+token on the hop to the controller. Nodes may instead carry their token in their
+config file as `node.southbound_token`, which takes precedence over the
+environment.
+
+Controller `GET /nodes` accepts the northbound token or any node token, because
+both surfaces expose the same read-only inventory. This does not cross the
+mutation boundary: operator stream writes accept only the northbound token, and
+node lifecycle writes accept only the node's own token.
+
+A browser node (`nodes/browser/`) is a media node too: the page presents its
+node token on every southbound call, passed in through the URL fragment so it
+never reaches a server log. Without `#node=`, the page takes its node id from the
+token; a `#node=` naming another id is shown as rejected and never registers.
+Because the page runs on a different origin from southbound, southbound sends
+CORS headers on its API routes when `WEAVE_SOUTHBOUND_CORS_ORIGIN` is set — an
+exact origin such as `https://studio.example`, or `*` for development. Unset, no
+CORS headers are sent and only non-browser adapters can register. The preflight
+is answered before the bearer check and allows `Authorization` and
+`Content-Type`. A page holds its own node's token and no other. A browser node
+registers with a `browser://<id>` endpoint, which is a placeholder: the
+controller never dials any node's endpoint.
 
 The Strom adapter also presents a token that open-weave never accepts, so it
 is not in the table. When Strom requires a bearer token, the adapter presents
@@ -454,8 +491,9 @@ is not in the table. When Strom requires a bearer token, the adapter presents
 With neither set no `Authorization` header is sent, so an unauthenticated Strom
 keeps working.
 
-**Services fail closed.** A service whose token variable is unset or empty
-refuses to start rather than serve unauthenticated traffic. For local development
+**Services fail closed.** A service whose secret (`WEAVE_NORTHBOUND_TOKEN`,
+`WEAVE_SOUTHBOUND_KEY`) is unset or empty refuses to start rather than serve
+unauthenticated traffic, and so does an adapter without a node token. For local development
 set `WEAVE_AUTH_DISABLED=1` to opt out explicitly; only `1` or `true` disable it,
 so `WEAVE_AUTH_DISABLED=0` leaves authentication on.
 
@@ -474,8 +512,7 @@ Left unauthenticated on purpose:
   authenticated, so an exposed port leaks read-only dashboard data rather than
   write access.
 
-There is no TLS: terminate it at a reverse proxy. There are no per-node tokens
-and no mTLS.
+There is no TLS: terminate it at a reverse proxy. There is no mTLS.
 
 ## Webhooks
 
@@ -754,12 +791,14 @@ To run the services directly instead, note that `run-north`, `run-south`,
 `run-controller` and `run-strom-adapter` are each a long-running server and want
 a terminal of their own.
 
-Every service needs its surface token (see [Authentication](#authentication)), so
-export both first — or set `WEAVE_AUTH_DISABLED=1` to run without any:
+Every service needs its secret (see [Authentication](#authentication)), so
+export both first, and the adapter its node token — or set
+`WEAVE_AUTH_DISABLED=1` to run without any:
 
 ```sh
 export WEAVE_NORTHBOUND_TOKEN=$(openssl rand -hex 32)
-export WEAVE_SOUTHBOUND_TOKEN=$(openssl rand -hex 32)
+export WEAVE_SOUTHBOUND_KEY=$(openssl rand -hex 32)
+export WEAVE_SOUTHBOUND_TOKEN=$(just cli node-token strom-node-1)
 ```
 
 ```sh

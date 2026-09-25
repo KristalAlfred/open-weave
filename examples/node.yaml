@@ -4,7 +4,8 @@ node:
   id: strom-node-1
   # Southbound API the adapter registers with and polls for desired hops.
   southbound_url: http://10.97.25.21:8081
-  # Optional; bearer token presented to southbound. Takes precedence over
+  # Optional; this node's own southbound token, which `weave node-token
+  # strom-node-1` prints from the key southbound holds. Takes precedence over
   # WEAVE_SOUTHBOUND_TOKEN, which is the usual way to supply it so the secret
   # stays out of config files. The adapter refuses to start without one unless
   # WEAVE_AUTH_DISABLED=1.

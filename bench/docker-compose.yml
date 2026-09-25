@@ -73,10 +73,13 @@ networks:
 
 services:
   # --- control plane (net_core) ---
-  # Every service authenticates with a shared bearer token per API surface, and
-  # refuses to start without one. The bench defaults below keep `just up` a single
-  # command; export WEAVE_{NORTHBOUND,SOUTHBOUND}_TOKEN to override. They are
-  # development values, not secrets — the bench sits on a private subnet.
+  # Northbound takes one shared bearer token. Southbound and the controller hold
+  # WEAVE_SOUTHBOUND_KEY and take from each node a token derived from it for that
+  # node's id (`weave node-token <id>`). Every service refuses to start without
+  # its secret. The bench defaults below keep `just up` a single command, and the
+  # node tokens are the ones the default key gives: exporting WEAVE_SOUTHBOUND_KEY
+  # means exporting WEAVE_ADAPTER_{1,2,3}_TOKEN and WEAVE_BROWSER_TOKEN too. They
+  # are development values, not secrets — the bench sits on a private subnet.
   northbound:
     <<: *weave
     container_name: ow-northbound
@@ -107,7 +110,7 @@ services:
     environment:
       WEAVE_SOUTHBOUND_ADDR: 0.0.0.0:8081
       WEAVE_CONTROLLER_URL: http://10.97.25.22:8082
-      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_SOUTHBOUND_TOKEN:-bench-southbound-token}
+      WEAVE_SOUTHBOUND_KEY: ${WEAVE_SOUTHBOUND_KEY:-bench-southbound-key}
       # The browser node is a web page on another origin. `*` is a development
       # value like the tokens above; a deployment names the page's origin.
       WEAVE_SOUTHBOUND_CORS_ORIGIN: ${WEAVE_SOUTHBOUND_CORS_ORIGIN:-*}
@@ -135,7 +138,7 @@ services:
       WEAVE_RECONCILE_INTERVAL_SECS: "5"
       DATABASE_URL: postgres://weave:weave@10.97.25.23:5432/weave
       WEAVE_NORTHBOUND_TOKEN: ${WEAVE_NORTHBOUND_TOKEN:-bench-northbound-token}
-      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_SOUTHBOUND_TOKEN:-bench-southbound-token}
+      WEAVE_SOUTHBOUND_KEY: ${WEAVE_SOUTHBOUND_KEY:-bench-southbound-key}
       # Webhooks, delivered to `just bench hook-sink` on this
       # host. Unset WEAVE_WEBHOOK_URL to switch them off.
       WEAVE_WEBHOOK_URL: ${WEAVE_WEBHOOK_URL-http://host.docker.internal:29099}
@@ -291,7 +294,7 @@ services:
     container_name: ow-adapter-1
     command: ["weave-adapter-strom", "--config", "/etc/weave/node.yaml"]
     environment:
-      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_SOUTHBOUND_TOKEN:-bench-southbound-token}
+      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_ADAPTER_1_TOKEN:-strom-node-1.35e6718c0cdacc8a30175b4036cb8ebf271c7674e59f9b99f2db900b1c8532f7}
     volumes:
       - ./config/adapter-1.yaml:/etc/weave/node.yaml:ro
     networks:
@@ -330,7 +333,7 @@ services:
     container_name: ow-adapter-2
     command: ["weave-adapter-strom", "--config", "/etc/weave/node.yaml"]
     environment:
-      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_SOUTHBOUND_TOKEN:-bench-southbound-token}
+      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_ADAPTER_2_TOKEN:-strom-node-2.60ea0904cf04d925103eeb5604855ace5de6e2211b56c95f73587ad4a75bf362}
     volumes:
       - ./config/adapter-2.yaml:/etc/weave/node.yaml:ro
     networks:
@@ -372,7 +375,7 @@ services:
     container_name: ow-adapter-3
     command: ["weave-adapter-strom", "--config", "/etc/weave/node.yaml"]
     environment:
-      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_SOUTHBOUND_TOKEN:-bench-southbound-token}
+      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_ADAPTER_3_TOKEN:-strom-node-3.7342aab2d514b2e93166dc0493e45e16b09ebe954d680413129fef9ce559864f}
     volumes:
       - ./config/adapter-3.yaml:/etc/weave/node.yaml:ro
     networks:
@@ -399,7 +402,7 @@ services:
     shm_size: "1gb"
     environment:
       WEAVE_SOUTHBOUND_URL: http://10.97.25.21:8081
-      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_SOUTHBOUND_TOKEN:-bench-southbound-token}
+      WEAVE_SOUTHBOUND_TOKEN: ${WEAVE_BROWSER_TOKEN:-browser-bench.e80cca6bc515a183bc4f9f53cb08ecaf3e860bfd47536ffc95e7cda33629f820}
     volumes:
       - ../nodes/browser:/work:ro
       # check.mjs compares the page's PROTOCOL_VERSION with the Rust constant and
@@ -409,9 +412,10 @@ services:
     networks:
       net_core:
         ipv4_address: 10.97.25.40
-    # The node id is pinned so the browser manifests keep naming the same node
-    # across restarts; the `browser-id` recipe reads the same default.
-    command: ["node", "/work/check.mjs", "--serve", "8000", "--stay", "--node", "${WEAVE_BROWSER_NODE_ID:-browser-bench}"]
+    # The page takes its node id from its token, so the browser manifests keep
+    # naming the same node across restarts; the `browser-id` recipe reads the id
+    # off the same default token.
+    command: ["node", "/work/check.mjs", "--serve", "8000", "--stay"]
 
   # --- external verification endpoints (NOT part of the system) ---
   # Off by default (profiles). Started explicitly via the bench producer/consumer

@@ -540,8 +540,8 @@ fn strom_hop_profiles() -> Vec<HopProfile> {
 }
 
 /// Registration the control plane will never accept, however long this adapter
-/// keeps dialling — currently only a protocol-version mismatch, which the
-/// controller answers with `409`. Distinct from a transient failure: the sync loop
+/// keeps dialling: a protocol-version mismatch (`409`), or a token that belongs
+/// to another node (`403`). Distinct from a transient failure: the sync loop
 /// stops on it instead of retrying.
 #[derive(Debug, thiserror::Error)]
 #[error("southbound rejected registration permanently: {status}: {body}")]
@@ -558,7 +558,10 @@ async fn register_node(southbound: &Southbound, registration: &NodeRegistration)
         .await
         .context("registering Strom adapter")?;
 
-    if response.status() == StatusCode::CONFLICT {
+    if matches!(
+        response.status(),
+        StatusCode::CONFLICT | StatusCode::FORBIDDEN
+    ) {
         return Err(RegistrationRejected {
             status: response.status(),
             body: response_body(response).await,

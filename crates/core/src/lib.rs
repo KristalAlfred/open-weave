@@ -1280,7 +1280,7 @@ pub struct NodeConfig {
     )]
     pub id: String,
     pub southbound_url: String,
-    /// Bearer token presented to southbound. Falls back to
+    /// This node's own southbound token (see [`auth`]). Falls back to
     /// [`auth::SOUTHBOUND_TOKEN_VAR`] when unset here, so a deployment can keep
     /// the secret out of the config file — see
     /// [`NodeConfig::resolve_southbound_token`].

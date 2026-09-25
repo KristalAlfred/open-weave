@@ -360,6 +360,7 @@ pub fn southbound_openapi() -> Value {
                         "202": response("Node accepted", Some(schema_ref("NodeAccepted"))),
                         "400": error_response("Invalid registration"),
                         "401": error_response("Authentication failed"),
+                        "403": error_response("Token belongs to another node"),
                         "409": error_response("Incompatible protocol version"),
                         "500": error_response("Persistence failed"),
                         "502": error_response("Controller unavailable")
@@ -375,6 +376,7 @@ pub fn southbound_openapi() -> Value {
                         "202": response("Heartbeat accepted", Some(schema_ref("NodeAccepted"))),
                         "400": error_response("Invalid heartbeat"),
                         "401": error_response("Authentication failed"),
+                        "403": error_response("Token belongs to another node"),
                         "404": error_response("Node not found"),
                         "502": error_response("Controller unavailable")
                     }
@@ -388,6 +390,7 @@ pub fn southbound_openapi() -> Value {
                         "200": response("Desired hops", Some(schema_ref("DesiredHopList"))),
                         "400": error_response("Invalid node id"),
                         "401": error_response("Authentication failed"),
+                        "403": error_response("Token belongs to another node"),
                         "404": error_response("Node not reconciled yet"),
                         "502": error_response("Controller unavailable")
                     }

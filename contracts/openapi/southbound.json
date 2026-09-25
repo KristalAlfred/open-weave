@@ -10,6 +10,7 @@
               "invalid_request",
               "invalid_json",
               "unauthorized",
+              "forbidden",
               "route_not_found",
               "method_not_allowed",
               "stream_not_found",
@@ -2383,6 +2384,16 @@
             },
             "description": "Authentication failed"
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Token belongs to another node"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -2463,6 +2474,16 @@
             },
             "description": "Authentication failed"
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Token belongs to another node"
+          },
           "404": {
             "content": {
               "application/json": {
@@ -2542,6 +2563,16 @@
               }
             },
             "description": "Authentication failed"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Token belongs to another node"
           },
           "404": {
             "content": {

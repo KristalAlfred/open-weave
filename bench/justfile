@@ -9,17 +9,22 @@ strom2  := "http://localhost:28081"
 strom3  := "http://localhost:28082"
 page_dir := source_directory() / ".." / "nodes" / "browser"
 
-# Bearer tokens per API surface. Defaults match docker-compose.yml so the bench
-# needs no exports; override by exporting either variable. `/health` and the
-# controller dashboard need no token.
+# Northbound's bearer token, and the key southbound derives node tokens from.
+# Defaults match docker-compose.yml so the bench needs no exports. `/health` and
+# the controller dashboard need no token.
 nb_token := env("WEAVE_NORTHBOUND_TOKEN", "bench-northbound-token")
-sb_token := env("WEAVE_SOUTHBOUND_TOKEN", "bench-southbound-token")
 nb_auth  := "-H 'Authorization: Bearer " + nb_token + "'"
+sb_key   := env("WEAVE_SOUTHBOUND_KEY", "bench-southbound-key")
+
+# Southbound's inventory reads accept any node's token; these recipes present
+# node 1's, the one docker-compose.yml gives adapter-1 under the default key.
+sb_token := env("WEAVE_ADAPTER_1_TOKEN", "strom-node-1.35e6718c0cdacc8a30175b4036cb8ebf271c7674e59f9b99f2db900b1c8532f7")
 sb_auth  := "-H 'Authorization: Bearer " + sb_token + "'"
 
-# Node id the browser page registers under, pinned on the `browser` service's
-# `command:` in docker-compose.yml so the browser manifests keep naming it.
-browser_node := env("WEAVE_BROWSER_NODE_ID", "browser-bench")
+# The in-bench page takes its node id from its token, so the browser manifests
+# keep naming it across restarts.
+browser_token := env("WEAVE_BROWSER_TOKEN", "browser-bench.e80cca6bc515a183bc4f9f53cb08ecaf3e860bfd47536ffc95e7cda33629f820")
+browser_node  := replace_regex(browser_token, '\..*', '')
 
 # Port `just hook-sink` listens on. docker-compose.yml points the controller's
 # WEAVE_WEBHOOK_URL at this port on host.docker.internal.
@@ -82,6 +87,34 @@ status:
     @curl -sf {{ctrl}}/status | (jq . 2>/dev/null || cat)
     @echo "== streams (northbound) =="
     @curl -sf {{nb_auth}} {{nb}}/streams | (jq . 2>/dev/null || cat)
+
+# Presents node 1's token for node 2, to southbound and to the controller
+# directly (it checks again), then two values that are not node tokens: the
+# shared token southbound took before, and the key.
+[doc("Check that a node token acts only for its own node.")]
+[group("stack")]
+auth-check:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    me="Authorization: Bearer {{sb_token}}"
+    json="Content-Type: application/json"
+    heartbeat='{"node_id":"strom-node-2","status":"ready","endpoints":[],"hop_status":[]}'
+    failed=0
+    expect() {
+        local want="$1" what="$2"; shift 2
+        local got; got="$(curl -s -o /dev/null -w '%{http_code}' "$@")"
+        printf '%-46s %s\n' "$what" "$got"
+        [ "$got" = "$want" ] || { echo "  expected $want" >&2; failed=1; }
+    }
+    expect 200 "southbound: desired hops as strom-node-1" -H "$me" {{sb}}/nodes/strom-node-1/desired
+    expect 403 "southbound: desired hops as strom-node-2" -H "$me" {{sb}}/nodes/strom-node-2/desired
+    expect 403 "southbound: heartbeat as strom-node-2" -H "$me" -H "$json" -d "$heartbeat" {{sb}}/nodes/strom-node-2/heartbeat
+    expect 403 "southbound: register as strom-node-2" -H "$me" -H "$json" -d '{"node":{"id":"strom-node-2"}}' {{sb}}/nodes/register
+    expect 403 "controller: desired hops as strom-node-2" -H "$me" {{ctrl}}/nodes/strom-node-2/desired
+    expect 403 "controller: heartbeat as strom-node-2" -H "$me" -H "$json" -d "$heartbeat" {{ctrl}}/nodes/strom-node-2/heartbeat
+    expect 401 "southbound: old shared token" -H "Authorization: Bearer bench-southbound-token" {{sb}}/nodes
+    expect 401 "southbound: the key as a token" -H "Authorization: Bearer {{sb_key}}" {{sb}}/nodes
+    exit "$failed"
 
 # List the available stream manifests with their one-line description.
 [group("streams")]
@@ -233,7 +266,7 @@ browser-up:
     {{compose}} --profile browser up -d --build browser
     @just browser-id
 
-# Wait for the pinned browser node to appear in southbound's registry, then echo it.
+# Wait for the browser node to appear in southbound's registry, then echo it.
 [group("browser")]
 browser-id:
     #!/usr/bin/env bash
@@ -285,16 +318,21 @@ browser-down:
 
 # Serve the page for a browser on this host. It needs a localhost origin for the
 # camera, and southbound's CORS default of `*` lets it register from there.
-# `seat` pins the page's node id via `#node=`, the way the in-bench page is
-# pinned on its `command:`. Without it the page mints a fresh id per tab, so a
-# guest who rejoins leaves the applied stream pointing at a node that is gone —
-# and open-live, which keys its source doc on the stream, loses the mixer input
-# the operator had assigned. Concurrent guests need distinct seats.
+# `seat` is the page's node id: the URL carries that seat's token and pins the
+# id with `#node=`. A guest who rejoins with the same seat keeps the id, so the
+# applied stream keeps pointing at a live node — and open-live, which keys its
+# source doc on the stream, keeps the mixer input the operator had assigned.
+# Concurrent guests need distinct seats.
 [doc("Serve nodes/browser on localhost:<port> pinned to <seat>, for a browser on this host; prints the URL to open.")]
 [group("browser")]
 page port="8000" seat="guest-1":
-    @echo "open  http://localhost:{{port}}/#southbound={{sb}}&token={{sb_token}}&node={{seat}}&network=docker-host"
+    @echo "open  http://localhost:{{port}}/#southbound={{sb}}&token=$(just node-token {{seat}})&node={{seat}}&network=docker-host"
     python3 -m http.server {{port}} -d {{page_dir}} --bind 127.0.0.1
+
+# Print the southbound token for node <id> under the bench key.
+[group("browser")]
+node-token id:
+    @WEAVE_SOUTHBOUND_KEY={{sb_key}} cargo run --quiet -p weave-cli -- node-token {{id}}
 
 # The stream a page on this host feeds: WHIP signalled at localhost:28080 via node
 # 1's `docker-host` attachment, SRT out on the node subnet for open-live's Strom.
@@ -307,9 +345,10 @@ host-cam seat="guest-1":
     sed "s/browser-placeholder/{{seat}}/" {{manifests}}/browser-cam-host.yaml > "$tmp"
     WEAVE_NORTHBOUND_URL={{nb}} WEAVE_NORTHBOUND_TOKEN={{nb_token}} \
         cargo run --quiet -p weave-cli -- apply -f "$tmp"
+    seat_auth="Authorization: Bearer $(just node-token {{seat}})"
     url=""
     for _ in $(seq 1 15); do
-        url="$(curl -sf {{sb_auth}} {{sb}}/nodes/{{seat}}/desired \
+        url="$(curl -sf -H "$seat_auth" {{sb}}/nodes/{{seat}}/desired \
             | jq -r '.[] | select(.id=="weave-browser-cam-host-sender") | .egresses[0].url' 2>/dev/null || true)"
         [ -n "$url" ] && break
         sleep 2

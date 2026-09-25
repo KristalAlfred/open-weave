@@ -1,20 +1,21 @@
 //! Southbound API — the adapter-facing surface. Stateless: every request is
 //! proxied to the controller, which owns all node and desired state. Adapters
-//! keep dialing this service; it simply relays to the controller.
+//! keep dialing this service; it relays to the controller with the node's own
+//! token.
 
 use anyhow::{Context, Result};
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Bytes,
     extract::{Path, State},
-    http::{HeaderValue, Method, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::{Value, json};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing_subscriber::EnvFilter;
-use weave_core::auth::{self, Guard, Token, require_bearer};
+use weave_core::auth::{self, NodeCaller, NodeGuard, refuse_other_node, require_node_token};
 use weave_core::{
     ApiError, ApiErrorCode, ROUTE_ENDPOINTS, ROUTE_NODE_DESIRED, ROUTE_NODE_HEARTBEAT,
     ROUTE_NODE_REGISTER, ROUTE_NODES, ROUTE_STATE, resource_id_issue, validate_resource_id,
@@ -32,17 +33,13 @@ const CORS_ORIGIN_VAR: &str = "WEAVE_SOUTHBOUND_CORS_ORIGIN";
 struct AppState {
     http: reqwest::Client,
     controller_url: String,
-    /// Re-presented to the controller on every proxied request. `None` when
-    /// authentication is disabled.
-    token: Option<Token>,
 }
 
 impl AppState {
-    fn new(controller_url: String, token: Option<Token>) -> Self {
+    fn new(controller_url: String) -> Self {
         Self {
             http: reqwest::Client::new(),
             controller_url,
-            token,
         }
     }
 }
@@ -59,7 +56,7 @@ async fn main() -> Result<()> {
     let controller_url = std::env::var("WEAVE_CONTROLLER_URL")
         .unwrap_or_else(|_| DEFAULT_CONTROLLER_URL.to_string());
 
-    let guard = Guard::from_env(auth::SOUTHBOUND_TOKEN_VAR)?;
+    let guard = NodeGuard::from_env(auth::SOUTHBOUND_KEY_VAR)?;
     if guard.is_disabled() {
         tracing::warn!(
             "{}=1: southbound serves and proxies without authentication",
@@ -73,11 +70,7 @@ async fn main() -> Result<()> {
         }
         _ => None,
     };
-    let app = router(
-        AppState::new(controller_url.clone(), guard.token().cloned()),
-        guard,
-        cors,
-    );
+    let app = router(AppState::new(controller_url.clone()), guard, cors);
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
@@ -92,13 +85,15 @@ async fn main() -> Result<()> {
 
 /// `/health` stays open for compose healthchecks and load balancers.
 /// Everything else — registration, heartbeats, and the desired-state and topology
-/// reads — requires the southbound bearer token.
+/// reads — requires a node token. Registration, heartbeat and desired hops also
+/// require the token to belong to the node named, which the controller checks
+/// again.
 ///
 /// A browser-hosted node calls this contract from a web page, so API routes
 /// optionally carry CORS headers. The layer sits outside the bearer
 /// check: a preflight carries no `Authorization` header and must be answered
 /// before it, not refused by it.
-fn router(state: AppState, guard: Guard, cors: Option<CorsLayer>) -> Router {
+fn router(state: AppState, guard: NodeGuard, cors: Option<CorsLayer>) -> Router {
     let mut nodes = Router::new()
         .route(ROUTE_NODES, get(list_nodes))
         .route(ROUTE_NODE_REGISTER, post(register_node))
@@ -108,7 +103,10 @@ fn router(state: AppState, guard: Guard, cors: Option<CorsLayer>) -> Router {
         .route(ROUTE_STATE, get(get_state))
         .fallback(api_route_not_found)
         .method_not_allowed_fallback(api_method_not_allowed)
-        .layer(axum::middleware::from_fn_with_state(guard, require_bearer));
+        .layer(axum::middleware::from_fn_with_state(
+            guard,
+            require_node_token,
+        ));
     if let Some(cors) = cors {
         nodes = nodes.layer(cors);
     }
@@ -150,32 +148,62 @@ async fn api_method_not_allowed() -> Response {
         .response(StatusCode::METHOD_NOT_ALLOWED)
 }
 
-async fn list_nodes(State(state): State<AppState>) -> Response {
-    proxy(&state, reqwest::Method::GET, "/nodes", None).await
+async fn list_nodes(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    proxy(&state, &headers, reqwest::Method::GET, "/nodes", None).await
 }
 
-async fn list_endpoints(State(state): State<AppState>) -> Response {
-    proxy(&state, reqwest::Method::GET, "/endpoints", None).await
+async fn list_endpoints(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    proxy(&state, &headers, reqwest::Method::GET, "/endpoints", None).await
 }
 
-async fn get_state(State(state): State<AppState>) -> Response {
-    proxy(&state, reqwest::Method::GET, "/state", None).await
+async fn get_state(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    proxy(&state, &headers, reqwest::Method::GET, "/state", None).await
 }
 
-async fn register_node(State(state): State<AppState>, body: Bytes) -> Response {
-    proxy(&state, reqwest::Method::POST, "/nodes/register", Some(body)).await
+/// A body that does not name a node id is forwarded as it is, for the
+/// controller to refuse with its own validation error.
+async fn register_node(
+    State(state): State<AppState>,
+    Extension(caller): Extension<NodeCaller>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(node_id) = registering_node_id(&body)
+        && let Some(response) = refuse_other_node(&caller, &node_id)
+    {
+        return response;
+    }
+    proxy(
+        &state,
+        &headers,
+        reqwest::Method::POST,
+        "/nodes/register",
+        Some(body),
+    )
+    .await
+}
+
+fn registering_node_id(body: &[u8]) -> Option<String> {
+    let registration: Value = serde_json::from_slice(body).ok()?;
+    registration["node"]["id"].as_str().map(str::to_string)
 }
 
 async fn node_heartbeat(
     State(state): State<AppState>,
+    Extension(caller): Extension<NodeCaller>,
     Path(node_id): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     if let Err(error) = validate_resource_id(&node_id) {
         return invalid_node_id(error);
     }
+    if let Some(response) = refuse_other_node(&caller, &node_id) {
+        return response;
+    }
     proxy(
         &state,
+        &headers,
         reqwest::Method::POST,
         &format!("/nodes/{node_id}/heartbeat"),
         Some(body),
@@ -183,12 +211,21 @@ async fn node_heartbeat(
     .await
 }
 
-async fn get_desired(State(state): State<AppState>, Path(node_id): Path<String>) -> Response {
+async fn get_desired(
+    State(state): State<AppState>,
+    Extension(caller): Extension<NodeCaller>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     if let Err(error) = validate_resource_id(&node_id) {
         return invalid_node_id(error);
     }
+    if let Some(response) = refuse_other_node(&caller, &node_id) {
+        return response;
+    }
     proxy(
         &state,
+        &headers,
         reqwest::Method::GET,
         &format!("/nodes/{node_id}/desired"),
         None,
@@ -196,18 +233,20 @@ async fn get_desired(State(state): State<AppState>, Path(node_id): Path<String>)
     .await
 }
 
-/// Forward a request to the controller, passing its status and body back
-/// faithfully. Handlers name the same paths this service serves.
+/// Forward a request to the controller with the caller's `Authorization`,
+/// passing its status and body back faithfully. Handlers name the same paths
+/// this service serves.
 async fn proxy(
     state: &AppState,
+    headers: &HeaderMap,
     method: reqwest::Method,
     path: &str,
     body: Option<Bytes>,
 ) -> Response {
     let url = format!("{}{path}", state.controller_url.trim_end_matches('/'));
     let mut request = state.http.request(method, &url);
-    if let Some(token) = &state.token {
-        request = request.header(reqwest::header::AUTHORIZATION, token.header_value());
+    if let Some(authorization) = headers.get(header::AUTHORIZATION) {
+        request = request.header(reqwest::header::AUTHORIZATION, authorization.as_bytes());
     }
     if let Some(body) = body {
         request = request
@@ -262,8 +301,9 @@ mod tests {
     use http_body_util::BodyExt;
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
+    use weave_core::auth::NodeKey;
 
-    const TOKEN: &str = "southbound-test-token";
+    const KEY: &str = "southbound-test-key";
 
     #[derive(Clone, Default)]
     struct Captured {
@@ -314,22 +354,23 @@ mod tests {
         (format!("http://{addr}"), captured)
     }
 
-    fn token() -> Token {
-        Token::new(TOKEN).unwrap()
+    fn guard() -> NodeGuard {
+        NodeGuard::Required(NodeKey::new(KEY).unwrap())
+    }
+
+    /// `Authorization` value presenting `node_id`'s token under [`KEY`].
+    fn bearer(node_id: &str) -> String {
+        format!("Bearer {}", NodeKey::new(KEY).unwrap().token_for(node_id))
     }
 
     /// A router with authentication switched off, for the proxy-fidelity tests.
     fn open_app(controller_url: String) -> Router {
-        router(AppState::new(controller_url, None), Guard::Disabled, None)
+        router(AppState::new(controller_url), NodeGuard::Disabled, None)
     }
 
-    /// A router requiring [`TOKEN`], which it also re-presents to the controller.
+    /// A router requiring node tokens derived from [`KEY`].
     fn guarded_app(controller_url: String) -> Router {
-        router(
-            AppState::new(controller_url, Some(token())),
-            Guard::Required(token()),
-            None,
-        )
+        router(AppState::new(controller_url), guard(), None)
     }
 
     async fn body_json(response: Response) -> Value {
@@ -340,8 +381,8 @@ mod tests {
     /// [`guarded_app`] that also admits a browser page served from `origin`.
     fn cors_app(controller_url: String, origin: &str) -> Router {
         router(
-            AppState::new(controller_url, Some(token())),
-            Guard::Required(token()),
+            AppState::new(controller_url),
+            guard(),
             Some(cors_layer(origin).unwrap()),
         )
     }
@@ -401,7 +442,7 @@ mod tests {
                 Request::builder()
                     .uri("/nodes/browser-a1b2/desired")
                     .header("origin", PAGE)
-                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .header("authorization", bearer("browser-a1b2"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -422,7 +463,7 @@ mod tests {
                 Request::builder()
                     .uri("/nodes/browser-a1b2/desired")
                     .header("origin", "http://evil.example")
-                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .header("authorization", bearer("browser-a1b2"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -446,7 +487,7 @@ mod tests {
                 Request::builder()
                     .uri("/nodes")
                     .header("origin", "http://localhost:3000")
-                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .header("authorization", bearer("browser-a1b2"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -489,7 +530,7 @@ mod tests {
                 Request::builder()
                     .uri("/nodes")
                     .header("origin", PAGE)
-                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .header("authorization", bearer("browser-a1b2"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -752,10 +793,19 @@ mod tests {
     }
 
     /// Registering a node id and pulling that node's topology and allocated ports
-    /// are both unreachable without the token, and neither reaches the controller.
+    /// are both unreachable without a node token, and neither reaches the
+    /// controller. The key itself and a pre-node-token shared secret are not
+    /// tokens.
     #[tokio::test]
     async fn node_routes_reject_missing_and_wrong_tokens() {
-        for header in [None, Some("Bearer wrong-token"), Some("Basic ignored")] {
+        let key_as_token = format!("Bearer {KEY}");
+        for header in [
+            None,
+            Some("Bearer wrong-token"),
+            Some("Bearer bench-southbound-token"),
+            Some(key_as_token.as_str()),
+            Some("Basic ignored"),
+        ] {
             let (url, captured) = stub_controller(StatusCode::ACCEPTED).await;
             let app = guarded_app(url);
 
@@ -798,13 +848,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn correct_token_is_accepted_and_re_presented_to_the_controller() {
+    async fn node_token_is_forwarded_to_the_controller_verbatim() {
         let (url, captured) = stub_controller(StatusCode::OK).await;
         let response = guarded_app(url)
             .oneshot(
                 Request::builder()
                     .uri("/nodes/strom-node-1/desired")
-                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .header("authorization", bearer("strom-node-1"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -819,8 +869,72 @@ mod tests {
             .expect("controller saw a request");
         assert_eq!(
             seen.authorization.as_deref(),
-            Some(format!("Bearer {TOKEN}").as_str()),
-            "southbound authenticates its own hop to the controller"
+            Some(bearer("strom-node-1").as_str()),
+            "the controller checks the node's own token again"
         );
+    }
+
+    #[tokio::test]
+    async fn a_node_token_is_refused_for_another_node() {
+        let (url, captured) = stub_controller(StatusCode::ACCEPTED).await;
+        let app = guarded_app(url);
+        let registration = json!({ "node": { "id": "strom-node-2" } }).to_string();
+        let heartbeat = json!({ "node_id": "strom-node-2" }).to_string();
+
+        for (method, uri, body) in [
+            ("POST", "/nodes/register", registration),
+            ("POST", "/nodes/strom-node-2/heartbeat", heartbeat),
+            ("GET", "/nodes/strom-node-2/desired", String::new()),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("authorization", bearer("strom-node-1"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+            assert_eq!(body_json(response).await["code"], "forbidden");
+        }
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "a refused request never reaches the controller"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_registers_as_itself_and_reads_shared_inventory() {
+        for (method, uri, body) in [
+            (
+                "POST",
+                "/nodes/register",
+                json!({ "node": { "id": "strom-node-1" } }).to_string(),
+            ),
+            ("GET", "/nodes", String::new()),
+            ("GET", "/endpoints", String::new()),
+            ("GET", "/state", String::new()),
+        ] {
+            let (url, captured) = stub_controller(StatusCode::OK).await;
+            let response = guarded_app(url)
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("authorization", bearer("strom-node-1"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{method} {uri}");
+            assert!(captured.lock().unwrap().is_some(), "{method} {uri}");
+        }
     }
 }

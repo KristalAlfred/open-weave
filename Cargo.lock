@@ -2466,9 +2466,11 @@ name = "weave-core"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "hmac",
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tracing",
 ]
