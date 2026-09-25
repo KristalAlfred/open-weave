@@ -88,6 +88,14 @@ impl StromClient {
         Ok(())
     }
 
+    pub async fn stop_flow(&self, id: &str) -> Result<(), StromError> {
+        self.request(Method::POST, &format!("/api/flows/{id}/stop"))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     pub async fn delete_flow(&self, id: &str) -> Result<(), StromError> {
         self.request(Method::DELETE, &format!("/api/flows/{id}"))
             .send()

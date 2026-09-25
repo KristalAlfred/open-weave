@@ -18,8 +18,8 @@ use weave_core::{
     AdapterDescriptor, AdapterKind, AudioCodec, AudioConstraint, DesiredHop, EgressStatus,
     EndpointDescriptor, EndpointKind, FormatConstraint, HopEndpointClass, HopProfile, HopStatus,
     LinkCondition, LinkStats, NodeCapabilities, NodeDescriptor, NodeHeartbeat, NodeRegistration,
-    NodeStatus, PROTOCOL_VERSION, RoleSet, SocketRole, SocketSpec, SocketStatus, Transport,
-    TransportClass, VideoCodec, VideoConstraint,
+    NodeStatus, PROTOCOL_VERSION, RoleSet, SocketRole, SocketSpec, SocketStatus, SrtSocket,
+    Transport, TransportClass, VideoCodec, VideoConstraint,
 };
 use weave_strom::{
     ElementStats, FlowSpec, FlowStats, SessionStats, StromClient, StromError, StromFlow,
@@ -258,6 +258,7 @@ trait FlowApi {
     async fn list_flows(&self) -> Result<Vec<StromFlow>, StromError>;
     async fn create_flow(&self, spec: &FlowSpec) -> Result<String, StromError>;
     async fn start_flow(&self, id: &str) -> Result<(), StromError>;
+    async fn stop_flow(&self, id: &str) -> Result<(), StromError>;
     async fn delete_flow(&self, id: &str) -> Result<(), StromError>;
     async fn srt_stats(&self, id: &str) -> Result<Value, StromError>;
     async fn webrtc_stats(&self, id: &str) -> Result<Value, StromError>;
@@ -273,6 +274,9 @@ impl FlowApi for StromClient {
     }
     async fn start_flow(&self, id: &str) -> Result<(), StromError> {
         StromClient::start_flow(self, id).await
+    }
+    async fn stop_flow(&self, id: &str) -> Result<(), StromError> {
+        StromClient::stop_flow(self, id).await
     }
     async fn delete_flow(&self, id: &str) -> Result<(), StromError> {
         StromClient::delete_flow(self, id).await
@@ -343,7 +347,50 @@ async fn reconcile(
     let desired_ids: std::collections::HashSet<&str> =
         desired.iter().map(|h| h.id.as_str()).collect();
     tracker.retain(&desired_ids);
-    hop_statuses(flow_api, desired, current, listener_host, &failed, tracker).await
+    let statuses = hop_statuses(flow_api, desired, current, listener_host, &failed, tracker).await;
+    redial_unconnected_callers(flow_api, desired, current, tracker).await;
+    statuses
+}
+
+/// Restart each running flow whose SRT caller ingress has stayed unconnected.
+///
+/// An `srtsrc` caller that its listener refused once, for a wrong passphrase,
+/// never dials again while Strom goes on reporting the flow running
+/// (`backlog/OW-22`). Stopping and starting the flow makes it dial.
+async fn redial_unconnected_callers(
+    flow_api: &dyn FlowApi,
+    desired: &[DesiredHop],
+    flows: &[StromFlow],
+    tracker: &mut StallTracker,
+) {
+    for hop in desired {
+        let Some(flow) = flows
+            .iter()
+            .find(|flow| flow.name == hop.id && flow.running)
+        else {
+            continue;
+        };
+        if !tracker.caller_due_restart(&hop.id) {
+            continue;
+        }
+        let restarted = match flow_api.stop_flow(&flow.id).await {
+            Ok(()) => flow_api.start_flow(&flow.id).await,
+            Err(error) => Err(error),
+        };
+        match restarted {
+            Ok(()) => tracing::info!(
+                hop = %hop.id,
+                flow_id = %flow.id,
+                "restarted a flow whose SRT caller stayed unconnected"
+            ),
+            Err(error) => tracing::warn!(
+                hop = %hop.id,
+                flow_id = %flow.id,
+                %error,
+                "restarting a flow whose SRT caller stayed unconnected failed"
+            ),
+        }
+    }
 }
 
 async fn hop_statuses(
@@ -399,6 +446,7 @@ async fn hop_statuses(
         };
 
         let ingress = SocketReading::ingress(&hop.ingress, srt.as_ref(), webrtc.as_ref());
+        let ingress_connected = ingress.connected;
         let ingress = observe(Side::Ingress, &hop.ingress, &ingress);
         let egresses = hop
             .egresses
@@ -413,6 +461,12 @@ async fn hop_statuses(
                 }
             })
             .collect();
+        if running
+            && srt.is_some()
+            && matches!(hop.ingress, SocketSpec::Srt(SrtSocket::Connect { .. }))
+        {
+            tracker.note_caller(&hop.id, ingress_connected);
+        }
 
         statuses.push(HopStatus {
             id: hop.id.clone(),
@@ -818,6 +872,7 @@ mod tests {
     enum Op {
         Create(String),
         Start(String),
+        Stop(String),
         Delete(String),
     }
 
@@ -874,6 +929,10 @@ mod tests {
         }
         async fn start_flow(&self, id: &str) -> Result<(), StromError> {
             self.record(Op::Start(id.to_string()));
+            Ok(())
+        }
+        async fn stop_flow(&self, id: &str) -> Result<(), StromError> {
+            self.record(Op::Stop(id.to_string()));
             Ok(())
         }
         async fn delete_flow(&self, id: &str) -> Result<(), StromError> {
@@ -1050,6 +1109,40 @@ mod tests {
                 .as_ref()
                 .map(|stats| stats.rate_mbps),
             Some(0.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_ingress_left_unconnected_is_restarted_and_a_listener_is_not() {
+        let unconnected = json!({
+            "stats": { "connections": {
+                "srtsrc_0": { "connected": false, "callers": [
+                    { "bytes_received": 0 }
+                ]},
+                "srtsink_0": { "connected": false, "callers": [] }
+            }}
+        });
+        let mut caller = hop("weave-feed-receiver-studio", 7002);
+        caller.ingress = SocketSpec::srt_connect("10.0.0.1", 7002, 1000);
+        let listener = hop("weave-feed-sender", 7000);
+        let flows = vec![
+            flow("weave-feed-receiver-studio", "id-caller"),
+            flow("weave-feed-sender", "id-listener"),
+        ];
+        let fake = RecordingFlowApi::default().with_stats(unconnected);
+        let mut tracker = StallTracker::default();
+        let desired = vec![caller, listener];
+        for _ in 0..5 {
+            let _ = reconcile(&fake, &desired, &flows, None, &mut tracker).await;
+        }
+        assert!(fake.ops().is_empty(), "{:?}", fake.ops());
+        let _ = reconcile(&fake, &desired, &flows, None, &mut tracker).await;
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::Stop("id-caller".to_string()),
+                Op::Start("id-caller".to_string())
+            ]
         );
     }
 

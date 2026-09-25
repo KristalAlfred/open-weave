@@ -1098,6 +1098,12 @@ pushes. A receiver's RIST ingress reads `flowing` only while its SRT output has 
 consumer pulling bytes. Strom advertises no RIST-to-RIST
 profile, so no hop has RIST on both sides.
 
+A running flow whose SRT caller ingress stays unconnected for six polls in a
+row is stopped and started again. An `srtsrc` caller that its listener refused
+once, as for a wrong passphrase, does not dial again by itself while Strom goes
+on reporting the flow running; a caller still waiting for its listener only
+redials.
+
 The adapter writes each SRT socket's latency and key into its `srt://` URI, since
 setting an srt element's `uri` resets both and Strom sets element properties in no
 fixed order. A flow whose SRT address, latency or key differs from its desired hop,

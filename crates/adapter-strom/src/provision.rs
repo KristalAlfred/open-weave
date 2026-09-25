@@ -40,12 +40,18 @@ pub enum Side {
     Egress(usize),
 }
 
-/// In-memory byte-progress tracker keyed by hop id and side. Byte progress
-/// across polls is the only reliable signal that a connected socket is truly
-/// flowing; no single instantaneous field separates a dead flow from a live one.
+/// Consecutive polls an SRT caller ingress may stay unconnected in a running flow
+/// before the flow is restarted. At the default 5s poll this is ~30s.
+const REDIAL_POLLS: u32 = 6;
+
+/// In-memory byte-progress tracker keyed by hop id and side, plus how long each
+/// hop's SRT caller ingress has gone unconnected. Byte progress across polls is
+/// the only reliable signal that a connected socket is truly flowing; no single
+/// instantaneous field separates a dead flow from a live one.
 #[derive(Debug, Default)]
 pub struct StallTracker {
     hops: HashMap<(String, Side), HopProgress>,
+    unconnected_callers: HashMap<String, u32>,
 }
 
 impl StallTracker {
@@ -89,6 +95,34 @@ impl StallTracker {
     /// Drop tracked hops no longer desired so state cannot grow without bound.
     pub fn retain(&mut self, desired: &HashSet<&str>) {
         self.hops.retain(|(id, _), _| desired.contains(id.as_str()));
+        self.unconnected_callers
+            .retain(|id, _| desired.contains(id.as_str()));
+    }
+
+    /// Fold one poll of a running flow's SRT caller ingress: whether Strom
+    /// reports it connected.
+    pub fn note_caller(&mut self, hop_id: &str, connected: bool) {
+        if connected {
+            self.unconnected_callers.remove(hop_id);
+        } else {
+            *self
+                .unconnected_callers
+                .entry(hop_id.to_string())
+                .or_default() += 1;
+        }
+    }
+
+    /// Whether `hop_id`'s flow is due a restart: its SRT caller ingress has been
+    /// unconnected for [`REDIAL_POLLS`] polls in a row. A due restart starts the
+    /// count again.
+    pub fn caller_due_restart(&mut self, hop_id: &str) -> bool {
+        match self.unconnected_callers.get_mut(hop_id) {
+            Some(polls) if *polls >= REDIAL_POLLS => {
+                *polls = 0;
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -649,6 +683,26 @@ mod tests {
             running: true,
             gst_paused: false,
         }
+    }
+
+    #[test]
+    fn an_unconnected_caller_is_due_a_restart_every_redial_polls() {
+        let mut tracker = StallTracker::default();
+        let mut poll = |connected| {
+            tracker.note_caller("weave-a", connected);
+            tracker.caller_due_restart("weave-a")
+        };
+        let due: Vec<bool> = (0..2 * REDIAL_POLLS).map(|_| poll(false)).collect();
+        let expected: Vec<bool> = (1..=2 * REDIAL_POLLS)
+            .map(|polls| polls % REDIAL_POLLS == 0)
+            .collect();
+        assert_eq!(due, expected);
+
+        for _ in 0..REDIAL_POLLS - 1 {
+            assert!(!poll(false));
+        }
+        assert!(!poll(true), "connected");
+        assert!(!poll(false), "a connection starts the count again");
     }
 
     #[test]
