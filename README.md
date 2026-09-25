@@ -250,6 +250,14 @@ the destination id and bridge position. Reordering the manifest list changes no
 hop ids, ports, or desired snapshots. A destination's second path carries
 `{id}.2` instead (see [Redundant paths](#redundant-paths)).
 
+Hop ids join names with `-`, so two valid streams can spell the same id: the
+sender of stream `x-receiver-a` and the receiver of stream `x` for destination
+`a-sender` are both `weave-x-receiver-a-sender`. A hop id names one hop, since it
+is the flow name on its node and the input to the key of the link feeding it.
+Streams are planned in name order, and a stream that would plan an id an earlier
+stream holds stays unplaced, with reason `placement_failed` and a detail naming
+the id and the stream holding it.
+
 ```json
 {
   "id": "weave-cam1-to-studio-sender",

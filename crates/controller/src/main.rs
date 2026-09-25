@@ -4,6 +4,8 @@
 //! hops on a fixed interval, entirely from in-memory state.
 
 mod desired;
+#[cfg(test)]
+mod hop_id_tests;
 mod keys;
 mod path;
 #[cfg(test)]
@@ -52,7 +54,7 @@ use weave_core::{
 
 use keys::{LinkKeys, SecretSource};
 use path::{
-    PlacementError, PortAllocator, SinglePath, derive_stream, destination_nodes,
+    HopIds, PlacementError, PortAllocator, SinglePath, derive_stream, destination_nodes,
     destination_path_status, path_status, stream_endpoints,
 };
 use store::{
@@ -2154,6 +2156,7 @@ fn reconcile(
     let mut enabled = 0usize;
     let mut flowing = 0usize;
     let mut ports = PortAllocator::new();
+    let mut hop_ids = HopIds::default();
 
     for stream in &streams {
         if !stream.enabled {
@@ -2185,9 +2188,18 @@ fn reconcile(
         }
         enabled += 1;
 
-        let status = match derive_stream(stream, &observed.nodes, &observed.hops, &mut ports, keys)
-        {
+        let mut stream_ports = ports.clone();
+        let placed = derive_stream(
+            stream,
+            &observed.nodes,
+            &observed.hops,
+            &mut stream_ports,
+            keys,
+        )
+        .and_then(|planned| hop_ids.claim(&planned.path).map(|()| planned));
+        let status = match placed {
             Ok(planned) => {
+                ports = stream_ports;
                 let path = planned.path;
                 hops_by_stream.insert(stream.name.clone(), path.hops.clone());
                 let mut nodes = Vec::new();

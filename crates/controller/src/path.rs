@@ -78,6 +78,8 @@ pub enum PlacementError {
     NoMergeProfile { node: String },
     #[error("a remote destination has no receiver to merge a second path")]
     NoMergeReceiver,
+    #[error("hop id {hop} is already planned for stream {stream}")]
+    HopIdTaken { hop: String, stream: String },
 }
 
 /// Names `socket` for [`PlacementError::NotAnSrtListener`]. A device's `Display`
@@ -202,6 +204,38 @@ impl PortAllocator {
         Err(PlacementError::PortRangeExhausted {
             node: node.id.clone(),
         })
+    }
+}
+
+/// The hop ids placed streams hold in one tick, each with the stream holding it.
+///
+/// Hop ids join names with `-`, so two streams can spell the same one, and an
+/// id names a flow on its node and the key of the link feeding it.
+#[derive(Debug, Default)]
+pub struct HopIds {
+    held: HashMap<String, String>,
+}
+
+impl HopIds {
+    /// Hold every hop id of `path` for its stream, or fail naming the first one
+    /// another stream holds. Holds nothing on failure.
+    pub fn claim(&mut self, path: &Path) -> Result<(), PlacementError> {
+        if let Some((hop, stream)) = path
+            .hops
+            .iter()
+            .find_map(|hop| self.held.get(&hop.id).map(|stream| (&hop.id, stream)))
+        {
+            return Err(PlacementError::HopIdTaken {
+                hop: hop.clone(),
+                stream: stream.clone(),
+            });
+        }
+        self.held.extend(
+            path.hops
+                .iter()
+                .map(|hop| (hop.id.clone(), path.stream.clone())),
+        );
+        Ok(())
     }
 }
 
