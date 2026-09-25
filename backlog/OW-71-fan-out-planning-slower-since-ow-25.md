@@ -2,9 +2,9 @@
 id: OW-71
 title: "Planning a large fan-out got slower after OW-25"
 type: bug
-status: todo
+status: in-progress
 depends_on: []
-assignee:
+assignee: claude-perf
 ---
 
 ## Evidence
@@ -48,3 +48,4 @@ checked whether those changes are why they are slower.
 ## Log
 
 - 2026-09-26: filed by claude-perf from OW-69, with the numbers above.
+- 2026-09-26: started by claude-perf.
