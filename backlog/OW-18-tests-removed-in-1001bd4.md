@@ -100,3 +100,28 @@ Status section and the header of `bench/manifests/nat-relay.yaml` still cite.
   `transports` list, and the required `default` data-plane alias). No ported
   test failed. Checked with `cargo test -p weave-adapter-strom`, unit tests
   only.
+- 2026-09-25: `crates/controller/src/path.rs`: 64 of 65 back in a `tests`
+  module beside `contract_tests`, ported to topology attachments and
+  destination ids. A dialable node is an `internet` attachment with an SRT
+  listener; a NAT'd node is a dial-only `internet` attachment plus a listener on
+  its own site network, so each NAT'd node is its own routing domain. The
+  NAT-pair tests are back: `outbound_only_pair_relays_through_a_node_both_dial`,
+  `outbound_only_pair_without_a_relay_is_unplaceable`,
+  `an_outbound_only_relay_is_never_chosen`, the three relay-choice tests,
+  `an_offline_relay_alone_leaves_the_pair_unplaceable`,
+  `a_pinned_via_still_gets_a_relay_when_its_own_link_is_undialable` and
+  `fanout_relays_only_the_destination_that_needs_it`. Renamed where the old
+  name was a removed concept: alias became network, port range became SRT
+  listener, signalling base became signalling listener. Three contract changes
+  show in the ports. A WebRTC link whose host declares no WHIP or WHEP listener
+  now fails as `NoRelayAvailable` instead of `NoSignalling`; `NoSignalling` is
+  no longer produced by `derive_path`, since `has_listener` and
+  `NetworkListeners::signalling` read the same field. Two browsers no longer
+  bridge through a relay carrying only Strom's profiles (OW-16); the ported
+  test checks that, then adds a `whip-to-whep` profile no shipped adapter
+  advertises and checks the planner bridges them. `srt_only_endpoints_json_shape_is_unchanged`
+  now checks the `destinations` list that replaced `outputs`. Removed
+  behaviour: `via_pins_a_node_that_need_not_advertise_as_a_relay`, since there
+  is no `relay` flag and every hop, pinned or not, needs a matching hop profile
+  in `select_profile`. No ported test failed. Checked with
+  `cargo test -p weave-controller path::tests`, unit tests only.

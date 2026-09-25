@@ -1538,3 +1538,1719 @@ mod contract_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use weave_core::{
+        DeviceClass, EgressStatus, HopEndpointClass, HopProfile, HopState, LinkCondition,
+        NetworkListeners, NodeCapabilities, NodeEndpoint, NodeTopology, ResolvedAddr, RoleSet,
+        SignallingListener, SignallingTransport, SocketStatus, SrtEndpoint, SrtListener,
+        StreamDestination, TransportClass,
+    };
+
+    const SHARED: &str = "internet";
+
+    /// The SRT socket a spec carries, for tests asserting on an address.
+    fn srt(spec: &SocketSpec) -> &SrtSocket {
+        match spec {
+            SocketSpec::Srt(socket) => socket,
+            other => panic!("planned a {other} socket"),
+        }
+    }
+
+    fn host(spec: &SocketSpec) -> Option<&str> {
+        match srt(spec) {
+            SrtSocket::Connect { host, .. } => Some(host),
+            SrtSocket::Listen { .. } => None,
+        }
+    }
+
+    /// The address behind an end that has one; a device end reads `None`.
+    fn addr(end: &Option<EndpointAddr>) -> &EndpointAddr {
+        end.as_ref().expect("a dialable endpoint")
+    }
+
+    fn class(transport: Transport, roles: RoleSet) -> HopEndpointClass {
+        HopEndpointClass::Transport(TransportClass { transport, roles })
+    }
+
+    fn device(kind: DeviceKind) -> HopEndpointClass {
+        HopEndpointClass::Device(DeviceClass { device: kind })
+    }
+
+    fn profile(
+        id: &str,
+        ingress: HopEndpointClass,
+        egress: HopEndpointClass,
+        max_egresses: Option<usize>,
+    ) -> HopProfile {
+        HopProfile {
+            id: id.to_string(),
+            ingress,
+            egress,
+            max_egresses,
+        }
+    }
+
+    fn srt_forward() -> HopProfile {
+        profile(
+            "srt-forward",
+            class(Transport::Srt, RoleSet::both()),
+            class(Transport::Srt, RoleSet::both()),
+            None,
+        )
+    }
+
+    fn srt_listener(host: &str, start: u16, end: u16) -> NetworkListeners {
+        NetworkListeners {
+            srt: Some(SrtListener {
+                host: host.to_string(),
+                port_range: PortRange { start, end },
+            }),
+            whip: None,
+            whep: None,
+        }
+    }
+
+    fn attachment(
+        id: &str,
+        network: &str,
+        dial: bool,
+        listeners: NetworkListeners,
+    ) -> NetworkAttachment {
+        NetworkAttachment {
+            id: id.to_string(),
+            network: network.to_string(),
+            dial,
+            listeners,
+        }
+    }
+
+    fn node_with(id: &str, attachments: Vec<NetworkAttachment>) -> NodeDescriptor {
+        NodeDescriptor {
+            id: id.to_string(),
+            endpoint: format!("http://{id}:8080"),
+            status: NodeStatus::Ready,
+            capabilities: NodeCapabilities {
+                adapters: Vec::new(),
+                hop_profiles: vec![srt_forward()],
+            },
+            topology: NodeTopology { attachments },
+        }
+    }
+
+    /// A node every peer on the shared network can dial.
+    fn node(id: &str, host: &str) -> NodeDescriptor {
+        node_with(
+            id,
+            vec![attachment(
+                "wan",
+                SHARED,
+                true,
+                srt_listener(host, 7000, 7999),
+            )],
+        )
+    }
+
+    /// A node behind NAT: it dials the shared network but no peer can dial it.
+    /// Its SRT listener sits on its own site network, where local producers and
+    /// consumers reach it.
+    fn nat_node(id: &str, host: &str) -> NodeDescriptor {
+        node_with(
+            id,
+            vec![
+                attachment("outbound", SHARED, true, NetworkListeners::default()),
+                attachment(
+                    "site",
+                    &format!("{id}-site"),
+                    true,
+                    srt_listener(host, 7000, 7999),
+                ),
+            ],
+        )
+    }
+
+    fn node_with_range(id: &str, start: u16, end: u16) -> NodeDescriptor {
+        node_with(
+            id,
+            vec![attachment(
+                "wan",
+                SHARED,
+                true,
+                srt_listener("10.0.0.1", start, end),
+            )],
+        )
+    }
+
+    fn node_ref(id: &str, latency: u32) -> SrtEndpoint {
+        SrtEndpoint {
+            node: Some(id.to_string()),
+            remote: None,
+            via: Vec::new(),
+            format: None,
+            accepts: None,
+            network: None,
+            latency: Some(latency),
+        }
+    }
+
+    fn remote_dest() -> SrtEndpoint {
+        SrtEndpoint {
+            node: None,
+            remote: Some(RemoteAddr {
+                host: "198.51.100.5".to_string(),
+                port: 9000,
+                network: SHARED.to_string(),
+            }),
+            via: Vec::new(),
+            format: None,
+            accepts: None,
+            network: None,
+            latency: Some(800),
+        }
+    }
+
+    fn dest(id: &str, endpoint: SrtEndpoint) -> StreamDestination {
+        StreamDestination {
+            id: id.to_string(),
+            endpoint: StreamTransport::Srt(endpoint),
+        }
+    }
+
+    fn contribution() -> StreamDefinition {
+        StreamDefinition {
+            name: "contribution".to_string(),
+            enabled: true,
+            source: StreamTransport::Srt(node_ref("strom-node-1", 200)),
+            destinations: vec![dest("studio", node_ref("strom-node-2", 1000))],
+        }
+    }
+
+    fn srt_dest(stream: &mut StreamDefinition, index: usize) -> &mut SrtEndpoint {
+        match &mut stream.destinations[index].endpoint {
+            StreamTransport::Srt(endpoint) => endpoint,
+            StreamTransport::Device(_) => unreachable!("fixture endpoint is srt"),
+        }
+    }
+
+    fn srt_source(stream: &mut StreamDefinition) -> &mut SrtEndpoint {
+        match &mut stream.source {
+            StreamTransport::Srt(endpoint) => endpoint,
+            StreamTransport::Device(_) => unreachable!("fixture endpoint is srt"),
+        }
+    }
+
+    fn nodes() -> Vec<NodeDescriptor> {
+        vec![
+            node("strom-node-1", "172.26.0.10"),
+            node("strom-node-2", "172.27.0.10"),
+        ]
+    }
+
+    /// `nodes`, with node-2 also listening on a second network node-1 can dial.
+    fn nodes_with_a_public_network() -> Vec<NodeDescriptor> {
+        let mut nodes = nodes();
+        nodes[0].topology.attachments.push(attachment(
+            "public",
+            "public",
+            true,
+            NetworkListeners::default(),
+        ));
+        nodes[1].topology.attachments.push(attachment(
+            "public",
+            "public",
+            true,
+            srt_listener("203.0.113.7", 7000, 7999),
+        ));
+        nodes
+    }
+
+    fn derive(stream: &StreamDefinition, nodes: &[NodeDescriptor]) -> Result<Path, PlacementError> {
+        derive_path(stream, nodes, &[], &mut PortAllocator::new())
+    }
+
+    #[test]
+    fn places_sender_and_receiver_by_node() {
+        let path = derive(&contribution(), &nodes()).expect("derive");
+        assert_eq!(path.hops.len(), 2);
+
+        let sender = &path.hops[0];
+        assert_eq!(sender.role, HopRole::Sender);
+        assert_eq!(sender.node_id, "strom-node-1");
+        assert_eq!(srt(&sender.ingress).role(), SocketRole::Listen);
+        let ingress_port = srt(&sender.ingress).port();
+        assert!((7000..=7999).contains(&ingress_port));
+        assert_eq!(sender.egresses.len(), 1);
+        assert_eq!(srt(&sender.egresses[0]).role(), SocketRole::Connect);
+        assert_eq!(host(&sender.egresses[0]), Some("172.27.0.10"));
+
+        let receiver = &path.hops[1];
+        assert_eq!(receiver.role, HopRole::Receiver);
+        assert_eq!(receiver.node_id, "strom-node-2");
+        let dest_port = srt(&receiver.ingress).port();
+        assert_eq!(srt(&sender.egresses[0]).port(), dest_port);
+        assert!((7000..=7999).contains(&srt(&receiver.egresses[0]).port()));
+    }
+
+    #[test]
+    fn receiver_is_placed_on_its_declared_node() {
+        let mut stream = contribution();
+        srt_dest(&mut stream, 0).node = Some("strom-node-1".to_string());
+
+        let path = derive(&stream, &nodes()).expect("derive");
+        assert_eq!(path.hops[1].node_id, "strom-node-1");
+    }
+
+    #[test]
+    fn source_on_unregistered_node_is_not_registered() {
+        let mut stream = contribution();
+        srt_source(&mut stream).node = Some("ghost".to_string());
+
+        assert_eq!(
+            derive(&stream, &nodes()),
+            Err(PlacementError::NodeNotRegistered {
+                node: "ghost".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn node_ref_destination_resolves_host_and_assigns_port_in_range() {
+        let stream = contribution();
+
+        let path = derive(&stream, &nodes()).expect("derive");
+        let egress = &path.hops[0].egresses[0];
+        assert_eq!(host(egress), Some("172.27.0.10"));
+        let port = srt(egress).port();
+        assert!((7000..=7999).contains(&port), "port {port} within range");
+        assert_eq!(
+            srt(&path.hops[1].ingress).port(),
+            port,
+            "receiver listens on it"
+        );
+    }
+
+    #[test]
+    fn node_ref_destination_resolves_named_network() {
+        let mut stream = contribution();
+        srt_dest(&mut stream, 0).network = Some("public".to_string());
+
+        let path = derive(&stream, &nodes_with_a_public_network()).expect("derive");
+        assert_eq!(host(&path.hops[0].egresses[0]), Some("203.0.113.7"));
+    }
+
+    #[test]
+    fn node_ref_destination_with_unknown_network_is_rejected() {
+        let mut stream = contribution();
+        srt_dest(&mut stream, 0).network = Some("mgmt".to_string());
+
+        assert_eq!(
+            derive(&stream, &nodes()),
+            Err(PlacementError::UnknownNetwork {
+                node: "strom-node-2".to_string(),
+                network: "mgmt".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn node_ref_destination_on_unregistered_node_is_not_registered() {
+        let mut stream = contribution();
+        srt_dest(&mut stream, 0).node = Some("strom-node-404".to_string());
+
+        assert_eq!(
+            derive(&stream, &nodes()),
+            Err(PlacementError::NodeNotRegistered {
+                node: "strom-node-404".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn node_ref_destination_without_an_srt_listener_is_rejected() {
+        let stream = contribution();
+
+        let node2 = node_with(
+            "strom-node-2",
+            vec![attachment("wan", SHARED, true, NetworkListeners::default())],
+        );
+        let nodes = vec![node("strom-node-1", "172.26.0.10"), node2];
+
+        assert_eq!(
+            derive(&stream, &nodes),
+            Err(PlacementError::NoPortRange {
+                node: "strom-node-2".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn assigned_ports_are_deterministic() {
+        let node = node("n", "10.0.0.1");
+        let wan = &node.topology.attachments[0];
+        let a = PortAllocator::new()
+            .claim(&node, wan, "weave-x")
+            .expect("claim");
+        let b = PortAllocator::new()
+            .claim(&node, wan, "weave-x")
+            .expect("claim");
+        assert_eq!(a, b, "same key alone maps to the same port");
+        assert!((7000..=7999).contains(&a));
+
+        // Distinct keys on one allocator never collide.
+        let mut ports = PortAllocator::new();
+        let x = ports
+            .claim(&node, wan, "weave-contribution-receiver-0")
+            .unwrap();
+        let y = ports
+            .claim(&node, wan, "weave-contribution-receiver-1")
+            .unwrap();
+        assert_ne!(x, y, "distinct keys claim distinct ports");
+
+        // Whole-path derivation is stable across ticks.
+        let stream = contribution();
+        let first = derive(&stream, &nodes()).expect("derive");
+        let second = derive(&stream, &nodes()).expect("derive");
+        assert_eq!(
+            srt(&first.hops[0].egresses[0]).port(),
+            srt(&second.hops[0].egresses[0]).port()
+        );
+    }
+
+    #[test]
+    fn allocator_probes_past_a_collision_to_a_distinct_port() {
+        let range = PortRange {
+            start: 7000,
+            end: 7001,
+        };
+        // Two ports means at most two preferred offsets, so colliding keys exist.
+        let mut seen: HashMap<u32, String> = HashMap::new();
+        let mut collision = None;
+        for i in 0..1000 {
+            let key = format!("weave-collide-{i}");
+            let offset = preferred_offset(range, &key);
+            if let Some(prev) = seen.get(&offset) {
+                collision = Some((prev.clone(), key));
+                break;
+            }
+            seen.insert(offset, key);
+        }
+        let (first, second) = collision.expect("two colliding keys within a 2-port range");
+
+        let node = node_with_range("n", 7000, 7001);
+        let wan = &node.topology.attachments[0];
+        let mut ports = PortAllocator::new();
+        let a = ports.claim(&node, wan, &first).expect("claim first");
+        let b = ports.claim(&node, wan, &second).expect("claim second");
+        assert_ne!(a, b, "linear probe yields a distinct port on collision");
+        assert!((7000..=7001).contains(&a) && (7000..=7001).contains(&b));
+    }
+
+    #[test]
+    fn allocator_errors_when_range_is_exhausted() {
+        let node = node_with_range("n", 7000, 7000);
+        let wan = &node.topology.attachments[0];
+        let mut ports = PortAllocator::new();
+        assert_eq!(ports.claim(&node, wan, "a").expect("first claim"), 7000);
+        assert_eq!(
+            ports.claim(&node, wan, "b"),
+            Err(PlacementError::PortRangeExhausted {
+                node: "n".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn port_range_exhaustion_surfaces_as_a_placement_error() {
+        let nodes = vec![
+            node("strom-node-1", "172.26.0.10"),
+            node_with_range("strom-node-2", 7000, 7000),
+        ];
+        // The receiver needs an ingress port and a consumer port, but only one
+        // port exists on its node.
+        assert_eq!(
+            derive(&contribution(), &nodes),
+            Err(PlacementError::PortRangeExhausted {
+                node: "strom-node-2".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn consumer_port_is_within_range_and_distinct_from_ingress() {
+        let path = derive(&contribution(), &nodes()).expect("derive");
+        let receiver = &path.hops[1];
+        let ingress = srt(&receiver.ingress).port();
+        let consumer = srt(&receiver.egresses[0]).port();
+        assert!((7000..=7999).contains(&consumer));
+        assert_ne!(ingress, consumer, "consumer never collides with ingress");
+    }
+
+    #[test]
+    fn listener_host_change_on_reregistration_reconverges() {
+        let stream = contribution();
+
+        let before = vec![
+            node("strom-node-1", "172.26.0.10"),
+            node("strom-node-2", "172.27.0.10"),
+        ];
+        let path = derive(&stream, &before).expect("derive");
+        assert_eq!(host(&path.hops[0].egresses[0]), Some("172.27.0.10"));
+
+        let after = vec![
+            node("strom-node-1", "172.26.0.10"),
+            node("strom-node-2", "172.27.0.55"),
+        ];
+        let path = derive(&stream, &after).expect("derive");
+        assert_eq!(host(&path.hops[0].egresses[0]), Some("172.27.0.55"));
+    }
+
+    #[test]
+    fn sender_egress_uses_planned_delivery_without_a_reported_ingress_address() {
+        let path = derive(&contribution(), &nodes()).expect("derive");
+        assert_eq!(host(&path.hops[0].egresses[0]), Some("172.27.0.10"));
+        assert_eq!(
+            srt(&path.hops[0].egresses[0]).port(),
+            srt(&path.hops[1].ingress).port()
+        );
+    }
+
+    #[test]
+    fn sender_egress_ignores_a_reported_ingress_address_even_for_a_named_network() {
+        let mut stream = contribution();
+        srt_dest(&mut stream, 0).network = Some("public".to_string());
+        let nodes = nodes_with_a_public_network();
+
+        // A reported ingress address on the shared-network host must not
+        // rewrite the planned delivery on the named network.
+        let observed = vec![HopStatus {
+            id: receiver_hop_id("contribution", "studio"),
+            node_id: "strom-node-2".to_string(),
+            state: HopState::Provisioned,
+            ingress: SocketStatus {
+                condition: LinkCondition::Idle,
+                resolved: Some(ResolvedAddr {
+                    host: "172.27.0.10".to_string(),
+                    port: 9002,
+                }),
+                stats: None,
+            },
+            egresses: vec![EgressStatus {
+                branch_id: "studio".to_string(),
+                status: SocketStatus {
+                    condition: LinkCondition::Idle,
+                    resolved: None,
+                    stats: None,
+                },
+            }],
+        }];
+
+        let path =
+            derive_path(&stream, &nodes, &observed, &mut PortAllocator::new()).expect("derive");
+        assert_eq!(
+            host(&path.hops[0].egresses[0]),
+            Some("203.0.113.7"),
+            "keeps the named network's host"
+        );
+        assert_eq!(
+            srt(&path.hops[0].egresses[0]).port(),
+            srt(&path.hops[1].ingress).port(),
+            "keeps the planned port"
+        );
+    }
+
+    #[test]
+    fn hop_ids_are_deterministic_and_managed() {
+        let a = derive(&contribution(), &nodes()).expect("derive");
+        let b = derive(&contribution(), &nodes()).expect("derive");
+        assert_eq!(a.hops[0].id, b.hops[0].id);
+        assert_eq!(a.hops[0].id, "weave-contribution-sender");
+        assert_eq!(a.hops[1].id, "weave-contribution-receiver-studio");
+        assert!(weave_core::is_managed_hop_id(&a.hops[0].id));
+        assert!(weave_core::is_managed_hop_id(&a.hops[1].id));
+    }
+
+    #[test]
+    fn missing_destination_is_an_error() {
+        let mut stream = contribution();
+        stream.destinations.clear();
+        assert_eq!(
+            derive(&stream, &nodes()),
+            Err(PlacementError::NoDestination)
+        );
+    }
+
+    #[test]
+    fn remote_destination_adds_egress_without_a_receiver_hop() {
+        let mut stream = contribution();
+        stream.destinations = vec![dest("uplink", remote_dest())];
+
+        let path = derive(&stream, &nodes()).expect("derive");
+        assert_eq!(path.hops.len(), 1, "only the sender hop is placed");
+        let sender = &path.hops[0];
+        assert_eq!(sender.egresses.len(), 1);
+        assert_eq!(srt(&sender.egresses[0]).role(), SocketRole::Connect);
+        assert_eq!(host(&sender.egresses[0]), Some("198.51.100.5"));
+        assert_eq!(srt(&sender.egresses[0]).port(), 9000);
+
+        let endpoints = stream_endpoints(&stream, &path, &nodes()).expect("endpoints");
+        assert_eq!(endpoints.destinations.len(), 1);
+        let output = addr(&endpoints.destinations[0].endpoint);
+        assert_eq!(output.url, "srt://198.51.100.5:9000");
+        assert!(output.node.is_empty());
+    }
+
+    #[test]
+    fn mixed_node_and_remote_destinations() {
+        let mut stream = contribution();
+        stream.destinations = vec![
+            dest("studio", node_ref("strom-node-2", 1000)),
+            dest("uplink", remote_dest()),
+        ];
+
+        let path = derive(&stream, &nodes()).expect("derive");
+        assert_eq!(
+            path.hops.len(),
+            2,
+            "sender plus one receiver for the node dest"
+        );
+        let sender = &path.hops[0];
+        assert_eq!(sender.egresses.len(), 2, "one egress per destination");
+        assert_eq!(sender.egresses[1].branch_id, "uplink");
+        assert_eq!(host(&sender.egresses[1]), Some("198.51.100.5"));
+        assert_eq!(path.hops[1].id, receiver_hop_id("contribution", "studio"));
+
+        let endpoints = stream_endpoints(&stream, &path, &nodes()).expect("endpoints");
+        assert_eq!(endpoints.destinations.len(), 2);
+        assert_eq!(
+            addr(&endpoints.destinations[0].endpoint).node,
+            "strom-node-2"
+        );
+        assert_eq!(
+            addr(&endpoints.destinations[1].endpoint).url,
+            "srt://198.51.100.5:9000"
+        );
+    }
+
+    #[test]
+    fn remote_source_is_rejected() {
+        let mut stream = contribution();
+        stream.source = StreamTransport::Srt(remote_dest());
+        assert_eq!(derive(&stream, &nodes()), Err(PlacementError::RemoteSource));
+    }
+
+    #[test]
+    fn endpoint_with_neither_node_nor_remote_is_rejected() {
+        let mut stream = contribution();
+        stream.destinations = vec![dest(
+            "studio",
+            SrtEndpoint {
+                node: None,
+                remote: None,
+                via: Vec::new(),
+                format: None,
+                accepts: None,
+                network: None,
+                latency: None,
+            },
+        )];
+        assert_eq!(
+            derive(&stream, &nodes()),
+            Err(PlacementError::EndpointPlacement)
+        );
+    }
+
+    fn fanout() -> StreamDefinition {
+        let mut stream = contribution();
+        stream.name = "fanout".to_string();
+        stream.destinations = vec![
+            dest("studio", node_ref("strom-node-2", 1000)),
+            dest("venue", node_ref("strom-node-1", 1000)),
+        ];
+        stream
+    }
+
+    #[test]
+    fn fanout_builds_a_sender_teeing_to_one_receiver_per_destination() {
+        let path = derive(&fanout(), &nodes()).expect("derive");
+        assert_eq!(path.hops.len(), 3);
+
+        let sender = &path.hops[0];
+        assert_eq!(sender.id, "weave-fanout-sender");
+        assert_eq!(sender.role, HopRole::Sender);
+        assert_eq!(sender.node_id, "strom-node-1");
+        assert_eq!(sender.egresses.len(), 2, "one egress per destination");
+        assert_eq!(sender.egresses[0].branch_id, "studio");
+        assert_eq!(sender.egresses[1].branch_id, "venue");
+        assert_eq!(host(&sender.egresses[0]), Some("172.27.0.10"));
+        assert_eq!(host(&sender.egresses[1]), Some("172.26.0.10"));
+
+        let studio = &path.hops[1];
+        assert_eq!(studio.id, "weave-fanout-receiver-studio");
+        assert_eq!(studio.role, HopRole::Receiver);
+        assert_eq!(studio.node_id, "strom-node-2");
+        assert_eq!(studio.egresses[0].branch_id, "studio");
+
+        let venue = &path.hops[2];
+        assert_eq!(venue.id, "weave-fanout-receiver-venue");
+        assert_eq!(venue.role, HopRole::Receiver);
+        assert_eq!(
+            venue.node_id, "strom-node-1",
+            "second destination is co-located with the source node"
+        );
+        assert_eq!(venue.egresses[0].branch_id, "venue");
+    }
+
+    #[test]
+    fn fanout_status_checks_every_branch_and_the_reporting_node() {
+        let path = derive(&fanout(), &nodes()).expect("derive");
+        let mut observed: Vec<HopStatus> = path
+            .hops
+            .iter()
+            .map(|hop| HopStatus {
+                id: hop.id.clone(),
+                node_id: hop.node_id.clone(),
+                state: HopState::Provisioned,
+                ingress: SocketStatus {
+                    condition: LinkCondition::Flowing,
+                    resolved: None,
+                    stats: None,
+                },
+                egresses: hop
+                    .egresses
+                    .iter()
+                    .map(|egress| EgressStatus {
+                        branch_id: egress.branch_id.clone(),
+                        status: SocketStatus {
+                            condition: LinkCondition::Flowing,
+                            resolved: None,
+                            stats: None,
+                        },
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        assert_eq!(path_status(&path, &observed), PathStatus::Flowing);
+        observed[0].egresses[1].status.condition = LinkCondition::Connecting;
+        assert_eq!(path_status(&path, &observed), PathStatus::Degraded);
+
+        observed[0].egresses[1].status.condition = LinkCondition::Flowing;
+        observed[0].node_id = "wrong-node".to_string();
+        assert_eq!(path_status(&path, &observed), PathStatus::Pending);
+    }
+
+    #[test]
+    fn fanout_is_all_or_nothing_when_a_destination_is_unplaceable() {
+        let mut stream = fanout();
+        srt_dest(&mut stream, 1).node = Some("ghost".to_string());
+        assert_eq!(
+            derive(&stream, &nodes()),
+            Err(PlacementError::NodeNotRegistered {
+                node: "ghost".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn dialable_destination_keeps_the_sender_calling() {
+        let path = derive(&contribution(), &nodes()).expect("derive");
+        assert_eq!(srt(&path.hops[0].egresses[0]).role(), SocketRole::Connect);
+        assert_eq!(srt(&path.hops[1].ingress).role(), SocketRole::Listen);
+    }
+
+    #[test]
+    fn outbound_only_destination_reverses_the_link() {
+        let nodes = vec![
+            node("strom-node-1", "172.26.0.10"),
+            nat_node("strom-node-2", "172.27.0.10"),
+        ];
+
+        let path = derive(&contribution(), &nodes).expect("derive");
+        assert_eq!(path.hops.len(), 2, "no relay is needed; the link reverses");
+
+        let sender_egress = &path.hops[0].egresses[0];
+        let receiver = &path.hops[1];
+        assert_eq!(
+            srt(sender_egress).role(),
+            SocketRole::Listen,
+            "the dialable end listens"
+        );
+        assert_eq!(
+            srt(&receiver.ingress).role(),
+            SocketRole::Connect,
+            "the NAT'd end dials out"
+        );
+        assert_eq!(
+            host(&receiver.ingress),
+            Some("172.26.0.10"),
+            "it dials the source node's listener"
+        );
+        assert_eq!(srt(&receiver.ingress).port(), srt(sender_egress).port());
+    }
+
+    #[test]
+    fn reversed_link_claims_its_port_on_the_listening_node() {
+        // Disjoint ranges make the owning node legible from the port alone: an
+        // egress in 7xxx was claimed on node-1, in 8xxx on node-2.
+        let mut nat = nat_node("strom-node-2", "172.27.0.10");
+        nat.topology.attachments[1].listeners = srt_listener("172.27.0.10", 8000, 8999);
+        let nodes = vec![node("strom-node-1", "172.26.0.10"), nat];
+
+        let path = derive(&contribution(), &nodes).expect("derive");
+        let sender = &path.hops[0];
+        let receiver = &path.hops[1];
+
+        let egress_port = srt(&sender.egresses[0]).port();
+        assert!(
+            (7000..=7999).contains(&egress_port),
+            "the reversed link listens on node-1, so its port comes from node-1's range"
+        );
+        assert_ne!(srt(&sender.ingress).port(), srt(&sender.egresses[0]).port());
+        assert!(
+            (8000..=8999).contains(&srt(&receiver.egresses[0]).port()),
+            "the consumer socket still belongs to the destination node"
+        );
+    }
+
+    #[test]
+    fn outbound_only_pair_relays_through_a_node_both_dial() {
+        let nodes = vec![
+            nat_node("strom-node-1", "172.26.0.10"),
+            nat_node("strom-node-2", "172.27.0.10"),
+            node("edge-relay", "198.51.100.9"),
+        ];
+
+        let path = derive(&contribution(), &nodes).expect("derive");
+        assert_eq!(path.hops.len(), 3, "sender, bridge, receiver");
+
+        let sender = &path.hops[0];
+        let bridge = &path.hops[1];
+        let receiver = &path.hops[2];
+
+        assert_eq!(bridge.role, HopRole::Bridge);
+        assert_eq!(bridge.node_id, "edge-relay");
+        assert_eq!(bridge.id, "weave-contribution-bridge-studio-0");
+
+        assert_eq!(
+            srt(&sender.egresses[0]).role(),
+            SocketRole::Connect,
+            "the NAT'd source calls out"
+        );
+        assert_eq!(host(&sender.egresses[0]), Some("198.51.100.9"));
+        assert_eq!(
+            srt(&receiver.ingress).role(),
+            SocketRole::Connect,
+            "the NAT'd destination calls out too"
+        );
+        assert_eq!(host(&receiver.ingress), Some("198.51.100.9"));
+
+        assert_eq!(
+            srt(&bridge.ingress).role(),
+            SocketRole::Listen,
+            "the relay listens on both sides"
+        );
+        assert_eq!(srt(&bridge.egresses[0]).role(), SocketRole::Listen);
+        assert_eq!(srt(&bridge.ingress).port(), srt(&sender.egresses[0]).port());
+        assert_eq!(
+            srt(&bridge.egresses[0]).port(),
+            srt(&receiver.ingress).port()
+        );
+        assert_ne!(
+            srt(&bridge.ingress).port(),
+            srt(&bridge.egresses[0]).port(),
+            "the relay's two sockets are distinct"
+        );
+    }
+
+    #[test]
+    fn outbound_only_pair_without_a_relay_is_unplaceable() {
+        let mut bystander = node("bystander", "198.51.100.9");
+        bystander.capabilities.hop_profiles.clear();
+        let nodes = vec![
+            nat_node("strom-node-1", "172.26.0.10"),
+            nat_node("strom-node-2", "172.27.0.10"),
+            // Dialable, but offers no hop profile to carry the transit.
+            bystander,
+        ];
+
+        assert_eq!(
+            derive(&contribution(), &nodes),
+            Err(PlacementError::NoRelayAvailable {
+                upstream: "strom-node-1".to_string(),
+                downstream: "strom-node-2".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn an_outbound_only_relay_is_never_chosen() {
+        let nodes = vec![
+            nat_node("strom-node-1", "172.26.0.10"),
+            nat_node("strom-node-2", "172.27.0.10"),
+            nat_node("edge-relay", "198.51.100.9"),
+        ];
+
+        assert!(
+            matches!(
+                derive(&contribution(), &nodes),
+                Err(PlacementError::NoRelayAvailable { .. })
+            ),
+            "a relay nobody can dial cannot bridge anything"
+        );
+    }
+
+    #[test]
+    fn relay_choice_is_the_lowest_id_and_stable_across_ticks() {
+        let nodes = vec![
+            nat_node("strom-node-1", "172.26.0.10"),
+            nat_node("strom-node-2", "172.27.0.10"),
+            node("relay-b", "198.51.100.20"),
+            node("relay-a", "198.51.100.10"),
+        ];
+
+        let first = derive(&contribution(), &nodes).expect("derive");
+        let second = derive(&contribution(), &nodes).expect("derive");
+        assert_eq!(first.hops[1].node_id, "relay-a");
+        assert_eq!(first, second, "re-derivation is stable");
+    }
+
+    #[test]
+    fn an_offline_relay_is_passed_over_for_a_healthy_one() {
+        let mut lost = node("relay-a", "198.51.100.10");
+        lost.status = NodeStatus::Offline;
+        let nodes = vec![
+            nat_node("strom-node-1", "172.26.0.10"),
+            nat_node("strom-node-2", "172.27.0.10"),
+            lost,
+            node("relay-b", "198.51.100.20"),
+        ];
+
+        let path = derive(&contribution(), &nodes).expect("derive");
+        assert_eq!(path.hops.len(), 3, "sender, bridge, receiver");
+        assert_eq!(path.hops[1].node_id, "relay-b");
+        assert_eq!(
+            host(&path.hops[0].egresses[0]),
+            Some("198.51.100.20"),
+            "the source calls the relay that is up"
+        );
+    }
+
+    #[test]
+    fn relay_choice_is_the_lowest_online_id_and_stable_across_ticks() {
+        let mut lost = node("relay-a", "198.51.100.10");
+        lost.status = NodeStatus::Offline;
+        let nodes = vec![
+            nat_node("strom-node-1", "172.26.0.10"),
+            nat_node("strom-node-2", "172.27.0.10"),
+            node("relay-c", "198.51.100.30"),
+            lost,
+            node("relay-b", "198.51.100.20"),
+        ];
+
+        let first = derive(&contribution(), &nodes).expect("derive");
+        let second = derive(&contribution(), &nodes).expect("derive");
+        assert_eq!(first.hops[1].node_id, "relay-b");
+        assert_eq!(first, second, "re-derivation is stable");
+    }
+
+    #[test]
+    fn an_offline_relay_alone_leaves_the_pair_unplaceable() {
+        let mut lost = node("edge-relay", "198.51.100.9");
+        lost.status = NodeStatus::Offline;
+        let nodes = vec![
+            nat_node("strom-node-1", "172.26.0.10"),
+            nat_node("strom-node-2", "172.27.0.10"),
+            lost,
+        ];
+
+        assert_eq!(
+            derive(&contribution(), &nodes),
+            Err(PlacementError::NoRelayAvailable {
+                upstream: "strom-node-1".to_string(),
+                downstream: "strom-node-2".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn via_pins_a_bridge_on_an_otherwise_direct_link() {
+        let mut stream = contribution();
+        srt_dest(&mut stream, 0).via = vec!["edge-relay".to_string()];
+
+        let mut nodes = nodes();
+        nodes.push(node("edge-relay", "198.51.100.9"));
+
+        let path = derive(&stream, &nodes).expect("derive");
+        assert_eq!(
+            path.hops.len(),
+            3,
+            "the pin is honoured, not optimised away"
+        );
+        assert_eq!(path.hops[1].node_id, "edge-relay");
+        assert_eq!(path.hops[1].role, HopRole::Bridge);
+        assert_eq!(
+            srt(&path.hops[2].ingress).role(),
+            SocketRole::Listen,
+            "both ends are dialable, so the relay calls the receiver"
+        );
+        assert_eq!(srt(&path.hops[1].egresses[0]).role(), SocketRole::Connect);
+    }
+
+    #[test]
+    fn via_chains_multiple_relays_in_order() {
+        let mut stream = contribution();
+        srt_dest(&mut stream, 0).via = vec!["relay-first".to_string(), "relay-second".to_string()];
+
+        let mut nodes = nodes();
+        nodes.push(node("relay-first", "198.51.100.10"));
+        nodes.push(node("relay-second", "198.51.100.20"));
+
+        let path = derive(&stream, &nodes).expect("derive");
+        assert_eq!(path.hops.len(), 4);
+        assert_eq!(path.hops[1].node_id, "relay-first");
+        assert_eq!(path.hops[2].node_id, "relay-second");
+        assert_eq!(path.hops[3].node_id, "strom-node-2");
+        assert_eq!(path.hops[1].id, "weave-contribution-bridge-studio-0");
+        assert_eq!(path.hops[2].id, "weave-contribution-bridge-studio-1");
+        assert_eq!(
+            host(&path.hops[1].egresses[0]),
+            Some("198.51.100.20"),
+            "each bridge dials the next"
+        );
+    }
+
+    #[test]
+    fn via_relays_out_to_a_remote_destination() {
+        let mut stream = contribution();
+        let mut uplink = remote_dest();
+        uplink.via = vec!["edge-relay".to_string()];
+        stream.destinations = vec![dest("uplink", uplink)];
+
+        let mut nodes = nodes();
+        nodes.push(node("edge-relay", "198.51.100.9"));
+
+        let path = derive(&stream, &nodes).expect("derive");
+        assert_eq!(path.hops.len(), 2, "sender and bridge; no receiver hop");
+        let bridge = &path.hops[1];
+        assert_eq!(bridge.role, HopRole::Bridge);
+        assert_eq!(
+            host(&bridge.egresses[0]),
+            Some("198.51.100.5"),
+            "the bridge dials the external listener"
+        );
+        assert_eq!(srt(&bridge.egresses[0]).port(), 9000);
+
+        let endpoints = stream_endpoints(&stream, &path, &nodes).expect("endpoints");
+        assert_eq!(
+            addr(&endpoints.destinations[0].endpoint).url,
+            "srt://198.51.100.5:9000"
+        );
+    }
+
+    #[test]
+    fn a_pinned_via_still_gets_a_relay_when_its_own_link_is_undialable() {
+        // node-1 and the pinned transit node are both outbound-only, so the link
+        // between them needs a relay of its own on top of the pin.
+        let mut stream = contribution();
+        srt_dest(&mut stream, 0).via = vec!["transit".to_string()];
+
+        let nodes = vec![
+            nat_node("strom-node-1", "172.26.0.10"),
+            node("strom-node-2", "172.27.0.10"),
+            nat_node("transit", "172.28.0.10"),
+            node("edge-relay", "198.51.100.9"),
+        ];
+
+        let path = derive(&stream, &nodes).expect("derive");
+        let via_nodes: Vec<&str> = path.hops[1..].iter().map(|h| h.node_id.as_str()).collect();
+        assert_eq!(via_nodes, vec!["edge-relay", "transit", "strom-node-2"]);
+    }
+
+    #[test]
+    fn fanout_relays_only_the_destination_that_needs_it() {
+        let mut stream = fanout();
+        stream.destinations = vec![
+            dest("studio", node_ref("strom-node-2", 1000)),
+            dest("truck", node_ref("nat-node", 1000)),
+        ];
+
+        let nodes = vec![
+            nat_node("strom-node-1", "172.26.0.10"),
+            node("strom-node-2", "172.27.0.10"),
+            nat_node("nat-node", "172.28.0.10"),
+            node("edge-relay", "198.51.100.9"),
+        ];
+
+        let path = derive(&stream, &nodes).expect("derive");
+        let placed: Vec<(&str, &str)> = path
+            .hops
+            .iter()
+            .map(|h| (h.id.as_str(), h.node_id.as_str()))
+            .collect();
+        assert_eq!(
+            placed,
+            vec![
+                ("weave-fanout-sender", "strom-node-1"),
+                ("weave-fanout-receiver-studio", "strom-node-2"),
+                ("weave-fanout-bridge-truck-0", "edge-relay"),
+                ("weave-fanout-receiver-truck", "nat-node"),
+            ]
+        );
+        assert_eq!(
+            path.hops[0].egresses.len(),
+            2,
+            "the sender still tees once per destination"
+        );
+    }
+
+    #[test]
+    fn source_via_is_rejected() {
+        let mut stream = contribution();
+        srt_source(&mut stream).via = vec!["edge-relay".to_string()];
+        assert_eq!(derive(&stream, &nodes()), Err(PlacementError::SourceVia));
+    }
+
+    #[test]
+    fn via_to_an_unregistered_node_is_not_registered() {
+        let mut stream = contribution();
+        srt_dest(&mut stream, 0).via = vec!["ghost".to_string()];
+
+        assert_eq!(
+            derive(&stream, &nodes()),
+            Err(PlacementError::NodeNotRegistered {
+                node: "ghost".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn bridge_hops_are_managed_and_deterministic() {
+        let mut stream = contribution();
+        srt_dest(&mut stream, 0).via = vec!["edge-relay".to_string()];
+
+        let mut nodes = nodes();
+        nodes.push(node("edge-relay", "198.51.100.9"));
+
+        let a = derive(&stream, &nodes).expect("derive");
+        let b = derive(&stream, &nodes).expect("derive");
+        assert_eq!(a, b);
+        assert!(weave_core::is_managed_hop_id(&a.hops[1].id));
+    }
+
+    #[test]
+    fn stream_endpoints_are_unchanged_by_an_intervening_bridge() {
+        let mut stream = contribution();
+        srt_dest(&mut stream, 0).via = vec!["edge-relay".to_string()];
+
+        let mut nodes = nodes();
+        nodes.push(node("edge-relay", "198.51.100.9"));
+
+        let path = derive(&stream, &nodes).expect("derive");
+        let endpoints = stream_endpoints(&stream, &path, &nodes).expect("endpoints");
+
+        assert_eq!(addr(&endpoints.ingress).node, "strom-node-1");
+        assert_eq!(
+            addr(&endpoints.ingress).port,
+            srt(&path.hops[0].ingress).port()
+        );
+        assert_eq!(endpoints.destinations.len(), 1);
+        assert_eq!(
+            addr(&endpoints.destinations[0].endpoint).node,
+            "strom-node-2",
+            "the consumer still attaches at the destination, not the relay"
+        );
+        let consumer_port = srt(&path.hops[2].egresses[0]).port();
+        assert_eq!(
+            addr(&endpoints.destinations[0].endpoint).port,
+            consumer_port
+        );
+    }
+
+    #[test]
+    fn stream_endpoints_resolve_ingress_and_outputs() {
+        let stream = contribution();
+        let nodes = nodes();
+        let path = derive(&stream, &nodes).expect("derive");
+        let endpoints = stream_endpoints(&stream, &path, &nodes).expect("endpoints");
+
+        let ingress_port = srt(&path.hops[0].ingress).port();
+        let ingress = addr(&endpoints.ingress);
+        assert_eq!(ingress.node, "strom-node-1");
+        assert_eq!(ingress.host, "172.26.0.10");
+        assert_eq!(ingress.port, ingress_port);
+        assert_eq!(ingress.url, format!("srt://172.26.0.10:{ingress_port}"));
+
+        assert_eq!(endpoints.destinations.len(), 1);
+        assert_eq!(endpoints.destinations[0].id, "studio");
+        let output = addr(&endpoints.destinations[0].endpoint);
+        let consumer_port = srt(&path.hops[1].egresses[0]).port();
+        assert_eq!(output.node, "strom-node-2");
+        assert_eq!(output.host, "172.27.0.10");
+        assert_eq!(output.port, consumer_port);
+        assert_eq!(output.url, format!("srt://172.27.0.10:{consumer_port}"));
+    }
+
+    #[test]
+    fn stream_endpoints_follow_named_network() {
+        let mut stream = contribution();
+        srt_dest(&mut stream, 0).network = Some("public".to_string());
+        let nodes = nodes_with_a_public_network();
+
+        let path = derive(&stream, &nodes).expect("derive");
+        let endpoints = stream_endpoints(&stream, &path, &nodes).expect("endpoints");
+        assert_eq!(
+            addr(&endpoints.destinations[0].endpoint).host,
+            "203.0.113.7"
+        );
+    }
+
+    #[test]
+    fn stream_endpoints_on_unregistered_node_error() {
+        let stream = contribution();
+        let path = derive(&stream, &nodes()).expect("derive");
+        assert_eq!(
+            stream_endpoints(&stream, &path, &[]),
+            Err(PlacementError::NodeNotRegistered {
+                node: "strom-node-1".to_string()
+            })
+        );
+    }
+
+    /// A web page: pushes WHIP from its camera, pulls WHEP to its screen, and
+    /// dials out with no listener of its own.
+    fn browser_node(id: &str) -> NodeDescriptor {
+        NodeDescriptor {
+            id: id.to_string(),
+            endpoint: format!("browser://{id}"),
+            status: NodeStatus::Ready,
+            capabilities: NodeCapabilities {
+                adapters: Vec::new(),
+                hop_profiles: vec![
+                    profile(
+                        "camera-to-whip",
+                        device(DeviceKind::Capture),
+                        class(Transport::Whip, RoleSet::only(SocketRole::Connect)),
+                        Some(1),
+                    ),
+                    profile(
+                        "whep-to-display",
+                        class(Transport::Whep, RoleSet::only(SocketRole::Connect)),
+                        device(DeviceKind::Display),
+                        Some(1),
+                    ),
+                ],
+            },
+            topology: NodeTopology {
+                attachments: vec![attachment(
+                    "client",
+                    SHARED,
+                    true,
+                    NetworkListeners::default(),
+                )],
+            },
+        }
+    }
+
+    /// A Strom node that also hosts WHIP ingest and WHEP playback. The bases it
+    /// declares are its own to choose, so they are nothing the planner could
+    /// have guessed.
+    fn webrtc_node(id: &str, host: &str) -> NodeDescriptor {
+        let mut node = node(id, host);
+        node.capabilities.hop_profiles.extend([
+            profile(
+                "whip-to-srt",
+                class(Transport::Whip, RoleSet::only(SocketRole::Listen)),
+                class(Transport::Srt, RoleSet::both()),
+                None,
+            ),
+            profile(
+                "srt-to-whep",
+                class(Transport::Srt, RoleSet::both()),
+                class(Transport::Whep, RoleSet::only(SocketRole::Listen)),
+                None,
+            ),
+        ]);
+        let listeners = listeners_of(&mut node);
+        listeners.whip = Some(SignallingListener {
+            base_url: format!("http://{host}:8080/ingest"),
+        });
+        listeners.whep = Some(SignallingListener {
+            base_url: format!("http://{host}:8080/playback"),
+        });
+        node
+    }
+
+    fn listeners_of(node: &mut NodeDescriptor) -> &mut NetworkListeners {
+        &mut node.topology.attachments[0].listeners
+    }
+
+    fn device_ref(id: &str) -> StreamTransport {
+        StreamTransport::Device(NodeEndpoint {
+            node: id.to_string(),
+            network: None,
+        })
+    }
+
+    fn device_dest(id: &str, node: &str) -> StreamDestination {
+        StreamDestination {
+            id: id.to_string(),
+            endpoint: device_ref(node),
+        }
+    }
+
+    fn alice_cam() -> StreamDefinition {
+        StreamDefinition {
+            name: "alice-cam".to_string(),
+            enabled: true,
+            source: device_ref("browser-a1b2"),
+            destinations: vec![dest("studio", node_ref("strom-node-2", 1000))],
+        }
+    }
+
+    fn alice_return() -> StreamDefinition {
+        StreamDefinition {
+            name: "alice-return".to_string(),
+            enabled: true,
+            source: StreamTransport::Srt(node_ref("strom-node-2", 200)),
+            destinations: vec![device_dest("guest", "browser-a1b2")],
+        }
+    }
+
+    fn webrtc_nodes() -> Vec<NodeDescriptor> {
+        vec![
+            browser_node("browser-a1b2"),
+            webrtc_node("strom-node-2", "172.27.0.10"),
+        ]
+    }
+
+    #[test]
+    fn device_sender_to_strom_is_whip_hosted_on_strom() {
+        let path = derive(&alice_cam(), &webrtc_nodes()).expect("derive");
+        assert_eq!(path.hops.len(), 2);
+        let signalled = SocketSpec::signalling(
+            SignallingTransport::Whip,
+            SocketRole::Listen,
+            "http://172.27.0.10:8080/ingest",
+            "weave-alice-cam-receiver-studio",
+        );
+
+        let sender = &path.hops[0];
+        assert_eq!(sender.node_id, "browser-a1b2");
+        assert_eq!(
+            sender.ingress,
+            SocketSpec::Device(DeviceKind::Capture),
+            "the media starts at the camera"
+        );
+        assert_eq!(sender.egresses.len(), 1);
+        assert_eq!(sender.egresses[0].branch_id, "studio");
+        assert_eq!(
+            sender.egresses[0].socket,
+            SocketSpec::signalling(
+                SignallingTransport::Whip,
+                SocketRole::Connect,
+                "http://172.27.0.10:8080/ingest",
+                "weave-alice-cam-receiver-studio",
+            )
+        );
+
+        let receiver = &path.hops[1];
+        assert_eq!(receiver.node_id, "strom-node-2");
+        assert_eq!(receiver.ingress, signalled, "Strom hosts the ingest");
+        assert_eq!(srt(&receiver.egresses[0]).role(), SocketRole::Listen);
+        assert!((7000..=7999).contains(&srt(&receiver.egresses[0]).port()));
+
+        let endpoints = stream_endpoints(&alice_cam(), &path, &webrtc_nodes()).expect("endpoints");
+        assert_eq!(endpoints.ingress, None, "a camera has nothing to dial");
+        assert_eq!(endpoints.destinations.len(), 1);
+        assert_eq!(
+            addr(&endpoints.destinations[0].endpoint).node,
+            "strom-node-2"
+        );
+    }
+
+    #[test]
+    fn strom_to_device_receiver_is_whep_hosted_on_strom() {
+        let path = derive(&alice_return(), &webrtc_nodes()).expect("derive");
+        assert_eq!(path.hops.len(), 2);
+        let signalled = SocketSpec::signalling(
+            SignallingTransport::Whep,
+            SocketRole::Listen,
+            "http://172.27.0.10:8080/playback",
+            "weave-alice-return-receiver-guest",
+        );
+
+        let sender = &path.hops[0];
+        assert_eq!(sender.node_id, "strom-node-2");
+        assert_eq!(srt(&sender.ingress).role(), SocketRole::Listen);
+        assert_eq!(sender.egresses.len(), 1);
+        assert_eq!(
+            sender.egresses[0].socket, signalled,
+            "Strom hosts the playback the browser pulls"
+        );
+
+        let receiver = &path.hops[1];
+        assert_eq!(receiver.node_id, "browser-a1b2");
+        assert_eq!(
+            receiver.ingress,
+            SocketSpec::signalling(
+                SignallingTransport::Whep,
+                SocketRole::Connect,
+                "http://172.27.0.10:8080/playback",
+                "weave-alice-return-receiver-guest",
+            )
+        );
+        assert_eq!(receiver.egresses.len(), 1);
+        assert_eq!(
+            receiver.egresses[0].socket,
+            SocketSpec::Device(DeviceKind::Display),
+            "the media ends on the screen"
+        );
+
+        let endpoints =
+            stream_endpoints(&alice_return(), &path, &webrtc_nodes()).expect("endpoints");
+        assert_eq!(addr(&endpoints.ingress).node, "strom-node-2");
+        assert_eq!(
+            endpoints.destinations,
+            vec![DestinationEndpoint {
+                id: "guest".to_string(),
+                endpoint: None,
+            }],
+            "a screen has nothing to dial"
+        );
+    }
+
+    #[test]
+    fn a_hosting_nodes_declared_base_takes_the_hop_id_and_nothing_else() {
+        let mut strom = webrtc_node("strom-node-2", "172.27.0.10");
+        listeners_of(&mut strom).whip = Some(SignallingListener {
+            base_url: "https://edge.example/sessions/".to_string(),
+        });
+        let nodes = vec![browser_node("browser-a1b2"), strom];
+
+        let path = derive(&alice_cam(), &nodes).expect("derive");
+        assert_eq!(
+            path.hops[1].ingress,
+            SocketSpec::signalling(
+                SignallingTransport::Whip,
+                SocketRole::Listen,
+                "https://edge.example/sessions",
+                "weave-alice-cam-receiver-studio",
+            )
+        );
+    }
+
+    #[test]
+    fn hosting_webrtc_without_a_signalling_listener_is_unplaceable() {
+        let mut strom = webrtc_node("strom-node-2", "172.27.0.10");
+        let listeners = listeners_of(&mut strom);
+        listeners.whip = None;
+        listeners.whep = None;
+        let nodes = vec![browser_node("browser-a1b2"), strom];
+        assert_eq!(
+            derive(&alice_cam(), &nodes),
+            Err(PlacementError::NoRelayAvailable {
+                upstream: "browser-a1b2".to_string(),
+                downstream: "strom-node-2".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_listener_for_one_webrtc_transport_does_not_serve_the_other() {
+        let mut strom = webrtc_node("strom-node-2", "172.27.0.10");
+        listeners_of(&mut strom).whep = None;
+        let nodes = vec![browser_node("browser-a1b2"), strom];
+
+        derive(&alice_cam(), &nodes).expect("the whip listener still hosts the camera's link");
+        assert_eq!(
+            derive(&alice_return(), &nodes),
+            Err(PlacementError::NoRelayAvailable {
+                upstream: "strom-node-2".to_string(),
+                downstream: "browser-a1b2".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn endpoints_serialize_device_ends_as_null() {
+        let nodes = webrtc_nodes();
+        let cam = derive(&alice_cam(), &nodes).expect("derive");
+        let value =
+            serde_json::to_value(stream_endpoints(&alice_cam(), &cam, &nodes).unwrap()).unwrap();
+        assert!(value["ingress"].is_null());
+        assert_eq!(value["destinations"][0]["endpoint"]["node"], "strom-node-2");
+        assert!(
+            value["destinations"][0]["endpoint"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("srt://172.27.0.10:")
+        );
+
+        let ret = derive(&alice_return(), &nodes).expect("derive");
+        let value =
+            serde_json::to_value(stream_endpoints(&alice_return(), &ret, &nodes).unwrap()).unwrap();
+        assert_eq!(value["ingress"]["node"], "strom-node-2");
+        assert_eq!(
+            value["destinations"],
+            serde_json::json!([{ "id": "guest", "endpoint": null }])
+        );
+    }
+
+    #[test]
+    fn srt_only_endpoints_serialize_ingress_and_destination_addresses() {
+        let path = derive(&contribution(), &nodes()).expect("derive");
+        let value =
+            serde_json::to_value(stream_endpoints(&contribution(), &path, &nodes()).unwrap())
+                .unwrap();
+        let ingress = value["ingress"].as_object().unwrap();
+        let mut keys: Vec<&str> = ingress.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["host", "node", "port", "url"]);
+        assert_eq!(value["destinations"].as_array().unwrap().len(), 1);
+        assert_eq!(value["destinations"][0]["id"], "studio");
+        assert!(value["destinations"][0]["endpoint"].is_object());
+    }
+
+    #[test]
+    fn srt_is_preferred_when_both_ends_offer_it() {
+        let pair = vec![
+            webrtc_node("strom-node-1", "172.26.0.10"),
+            webrtc_node("strom-node-2", "172.27.0.10"),
+        ];
+        let path = derive(&contribution(), &pair).expect("derive");
+        assert!(matches!(
+            path.hops[0].egresses[0].socket,
+            SocketSpec::Srt(_)
+        ));
+        assert!(matches!(path.hops[1].ingress, SocketSpec::Srt(_)));
+        assert_eq!(
+            path,
+            derive(&contribution(), &nodes()).expect("derive"),
+            "offering WebRTC as well plans the same as offering SRT alone"
+        );
+    }
+
+    #[test]
+    fn two_browsers_without_a_relay_share_no_transport() {
+        let mut stream = alice_cam();
+        stream.destinations = vec![device_dest("guest", "browser-c3d4")];
+        let nodes = vec![browser_node("browser-a1b2"), browser_node("browser-c3d4")];
+
+        assert_eq!(
+            derive(&stream, &nodes),
+            Err(PlacementError::NoCommonTransport {
+                upstream: "browser-a1b2".to_string(),
+                downstream: "browser-c3d4".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn two_browsers_bridge_only_through_a_relay_with_a_whip_to_whep_profile() {
+        let mut stream = alice_cam();
+        stream.destinations = vec![device_dest("guest", "browser-c3d4")];
+        let mut relay = webrtc_node("strom-node-1", "172.26.0.10");
+        let mut nodes = vec![
+            browser_node("browser-a1b2"),
+            browser_node("browser-c3d4"),
+            relay.clone(),
+        ];
+        assert_eq!(
+            derive(&stream, &nodes),
+            Err(PlacementError::NoCommonTransport {
+                upstream: "browser-a1b2".to_string(),
+                downstream: "browser-c3d4".to_string(),
+            }),
+            "Strom's own profiles carry no WHIP to WHEP hop"
+        );
+
+        relay.capabilities.hop_profiles.push(profile(
+            "whip-to-whep",
+            class(Transport::Whip, RoleSet::only(SocketRole::Listen)),
+            class(Transport::Whep, RoleSet::only(SocketRole::Listen)),
+            None,
+        ));
+        nodes[2] = relay;
+
+        let path = derive(&stream, &nodes).expect("derive");
+        let placed: Vec<(&str, &str)> = path
+            .hops
+            .iter()
+            .map(|h| (h.id.as_str(), h.node_id.as_str()))
+            .collect();
+        assert_eq!(
+            placed,
+            vec![
+                ("weave-alice-cam-sender", "browser-a1b2"),
+                ("weave-alice-cam-bridge-guest-0", "strom-node-1"),
+                ("weave-alice-cam-receiver-guest", "browser-c3d4"),
+            ]
+        );
+        let bridge = &path.hops[1];
+        assert_eq!(bridge.profile_id, "whip-to-whep");
+        assert_eq!(
+            bridge.ingress,
+            SocketSpec::signalling(
+                SignallingTransport::Whip,
+                SocketRole::Listen,
+                "http://172.26.0.10:8080/ingest",
+                "weave-alice-cam-bridge-guest-0",
+            )
+        );
+        assert_eq!(bridge.egresses.len(), 1);
+        assert_eq!(
+            bridge.egresses[0].socket,
+            SocketSpec::signalling(
+                SignallingTransport::Whep,
+                SocketRole::Listen,
+                "http://172.26.0.10:8080/playback",
+                "weave-alice-cam-receiver-guest",
+            )
+        );
+        assert_eq!(path.hops[0].egresses.len(), 1);
+        assert_eq!(
+            path.hops[0].egresses[0].socket,
+            SocketSpec::signalling(
+                SignallingTransport::Whip,
+                SocketRole::Connect,
+                "http://172.26.0.10:8080/ingest",
+                "weave-alice-cam-bridge-guest-0",
+            ),
+            "the camera pushes into the relay's ingest"
+        );
+        assert_eq!(
+            path.hops[2].ingress,
+            SocketSpec::signalling(
+                SignallingTransport::Whep,
+                SocketRole::Connect,
+                "http://172.26.0.10:8080/playback",
+                "weave-alice-cam-receiver-guest",
+            ),
+            "the far browser pulls it back out"
+        );
+        assert_eq!(path.hops[2].egresses.len(), 1);
+        assert_eq!(
+            path.hops[2].egresses[0].socket,
+            SocketSpec::Device(DeviceKind::Display)
+        );
+    }
+
+    #[test]
+    fn a_relay_that_cannot_carry_both_halves_is_passed_over() {
+        let mut stream = alice_cam();
+        stream.destinations = vec![device_dest("guest", "browser-c3d4")];
+        // SRT-only relay: dialable, but a browser speaks no SRT.
+        let nodes = vec![
+            browser_node("browser-a1b2"),
+            browser_node("browser-c3d4"),
+            node("srt-relay", "198.51.100.9"),
+        ];
+        assert!(matches!(
+            derive(&stream, &nodes),
+            Err(PlacementError::NoCommonTransport { .. })
+        ));
+    }
+
+    #[test]
+    fn a_device_endpoint_needs_a_node_that_offers_one() {
+        let mut stream = alice_cam();
+        let StreamTransport::Device(source) = &mut stream.source else {
+            unreachable!()
+        };
+        source.node = "strom-node-2".to_string();
+        assert_eq!(
+            derive(&stream, &webrtc_nodes()),
+            Err(PlacementError::NoDevice {
+                node: "strom-node-2".to_string(),
+                kind: DeviceKind::Capture,
+            })
+        );
+
+        let mut stream = alice_return();
+        stream.destinations = vec![device_dest("guest", "strom-node-2")];
+        assert_eq!(
+            derive(&stream, &webrtc_nodes()),
+            Err(PlacementError::NoDevice {
+                node: "strom-node-2".to_string(),
+                kind: DeviceKind::Display,
+            })
+        );
+    }
+
+    #[test]
+    fn a_strom_node_that_only_speaks_srt_is_never_handed_a_webrtc_socket() {
+        // node-2 offers only srt-forward; the browser cannot reach it, and there
+        // is no relay, so the stream stays unplaced rather than misplanned.
+        let nodes = vec![
+            browser_node("browser-a1b2"),
+            node("strom-node-2", "172.27.0.10"),
+        ];
+        assert!(matches!(
+            derive(&alice_cam(), &nodes),
+            Err(PlacementError::NoCommonTransport { .. })
+        ));
+    }
+
+    #[test]
+    fn webrtc_plans_are_deterministic() {
+        let a = derive(&alice_cam(), &webrtc_nodes()).expect("derive");
+        let b = derive(&alice_cam(), &webrtc_nodes()).expect("derive");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn endpoints_name_a_hop_the_path_is_missing() {
+        let stream = contribution();
+        let mut path = derive(&stream, &nodes()).expect("derive");
+        path.hops.retain(|hop| hop.role != HopRole::Receiver);
+        assert_eq!(
+            stream_endpoints(&stream, &path, &nodes()),
+            Err(PlacementError::MissingHop {
+                stream: "contribution".to_string(),
+                hop: "weave-contribution-receiver-studio".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn endpoints_name_a_receiver_with_no_consumer_socket() {
+        let stream = contribution();
+        let mut path = derive(&stream, &nodes()).expect("derive");
+        path.hops[1].egresses.clear();
+        assert_eq!(
+            stream_endpoints(&stream, &path, &nodes()),
+            Err(PlacementError::NoConsumerSocket {
+                hop: "weave-contribution-receiver-studio".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn endpoints_name_a_consumer_socket_that_is_not_an_srt_listener() {
+        let stream = contribution();
+        let mut path = derive(&stream, &nodes()).expect("derive");
+        path.hops[1].egresses[0].socket = SocketSpec::Device(DeviceKind::Display);
+        let error = stream_endpoints(&stream, &path, &nodes()).unwrap_err();
+        assert_eq!(
+            error,
+            PlacementError::NotAnSrtListener {
+                hop: "weave-contribution-receiver-studio".to_string(),
+                socket: SocketSpec::Device(DeviceKind::Display),
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "hop weave-contribution-receiver-studio carries a display device socket where an SRT listener is needed"
+        );
+
+        path.hops[1].egresses[0].socket = SocketSpec::srt_connect("198.51.100.5", 9000, 200);
+        let error = stream_endpoints(&stream, &path, &nodes()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "hop weave-contribution-receiver-studio carries a srt connect socket where an SRT listener is needed",
+            "names the caller, not just the transport"
+        );
+    }
+}
