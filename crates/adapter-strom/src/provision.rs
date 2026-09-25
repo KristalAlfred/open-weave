@@ -248,30 +248,26 @@ pub fn socket_condition(
     }
 }
 
-/// Map a WebRTC socket to its link condition.
+/// Map a WHIP or WHEP socket to its link condition, read from its own sessions
+/// in Strom's `webrtc-stats`.
 ///
-/// Strom exposes no per-session stats for WHIP/WHEP: sessions run in their own
-/// pipelines, outside the flow that `srt-stats` and `webrtc-stats` inspect. So
-/// the condition is read off the flow and the SRT side of the same hop. A
-/// `stalled` SRT side overrides all else, as in [`socket_condition`]. Otherwise
-/// a flow that is not playing has no session: the socket waits, `Idle` when it
-/// hosts and `Connecting` when it dials. A playing flow whose SRT side advanced
-/// this poll is carrying media through, so the WebRTC side is `Flowing`; a
-/// playing flow with frozen SRT bytes is `Connected`.
+/// A socket with no session carrying RTP waits, `Idle` when it hosts and
+/// `Connecting` when it dials, whatever its bytes did: Strom stops reporting RTP
+/// for a session whose peer has gone. With a session up, a `stalled` verdict
+/// wins, as in [`socket_condition`]; otherwise the socket is `Flowing` when its
+/// bytes advanced this poll and `Connected` when they did not.
 #[must_use]
 pub fn webrtc_condition(
     role: SocketRole,
-    playing: bool,
-    srt_side_advanced: bool,
-    srt_side_stalled: bool,
+    in_session: bool,
+    advanced: bool,
+    stalled: bool,
 ) -> LinkCondition {
-    if srt_side_stalled {
-        return LinkCondition::Stalled;
-    }
-    match (playing, role) {
+    match (in_session, role) {
         (false, SocketRole::Listen) => LinkCondition::Idle,
         (false, SocketRole::Connect) => LinkCondition::Connecting,
-        (true, _) if srt_side_advanced => LinkCondition::Flowing,
+        (true, _) if stalled => LinkCondition::Stalled,
+        (true, _) if advanced => LinkCondition::Flowing,
         (true, _) => LinkCondition::Connected,
     }
 }
@@ -723,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn webrtc_condition_is_inferred_from_the_flow_and_the_srt_side() {
+    fn webrtc_condition_waits_without_a_session_and_flows_on_byte_progress() {
         assert_eq!(
             webrtc_condition(SocketRole::Listen, false, false, false),
             LinkCondition::Idle
@@ -743,15 +739,19 @@ mod tests {
     }
 
     #[test]
-    fn webrtc_condition_reports_a_stalled_srt_side() {
+    fn webrtc_condition_reports_a_stall_only_while_a_session_is_up() {
         assert_eq!(
             webrtc_condition(SocketRole::Listen, true, false, true),
             LinkCondition::Stalled
         );
         assert_eq!(
+            webrtc_condition(SocketRole::Listen, false, false, true),
+            LinkCondition::Idle,
+            "a peer that left is waited for, not stalled"
+        );
+        assert_eq!(
             webrtc_condition(SocketRole::Connect, false, false, true),
-            LinkCondition::Stalled,
-            "a stall outranks the waiting states, as in socket_condition"
+            LinkCondition::Connecting
         );
     }
 

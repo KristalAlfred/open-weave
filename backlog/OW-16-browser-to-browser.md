@@ -2,9 +2,9 @@
 id: OW-16
 title: "Browser-to-browser media has no supported Strom profile"
 type: feature
-status: todo
+status: in-progress
 depends_on: []
-assignee:
+assignee: claude-webrtc
 ---
 
 ## Evidence
@@ -28,3 +28,4 @@ is sent.
 ## Log
 
 - 2026-09-25: moved from `BACKLOG.md` into its own file.
+- 2026-09-25: started by claude-webrtc, box 1 first: WHIP/WHEP conditions from `webrtc-stats`.

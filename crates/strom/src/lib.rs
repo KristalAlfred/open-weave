@@ -1,4 +1,4 @@
-//! Strom HTTP client, flow-spec mapping, and srt-stats parsing for open-weave.
+//! Strom HTTP client, flow-spec mapping, and stats parsing for open-weave.
 
 mod client;
 mod flow;
@@ -10,4 +10,6 @@ pub use flow::{FlowListResponse, StromBlock, StromElement, StromFlow};
 pub use spec::{
     Block, Element, FlowSpec, Link, MappingError, SrtUri, flow_spec_from_hop, hop_srt_uris,
 };
-pub use stats::{FlowStats, parse_flow_stats};
+pub use stats::{
+    ElementStats, FlowStats, SessionStats, WebRtcStats, parse_flow_stats, parse_webrtc_stats,
+};

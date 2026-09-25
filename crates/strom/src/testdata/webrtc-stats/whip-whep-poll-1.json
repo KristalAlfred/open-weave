@@ -1,0 +1,129 @@
+{
+  "flow_id": "7b2ee3ec-9c53-41e5-b0a9-d1d9ed022370",
+  "stats": {
+    "connections": {
+      "whep_out_0:session_692b1d97-2d02-4c61-8cb9-6b8e15de017f:webrtcbin-692b1d97-2d02-4c61-8cb9-6b8e15de017f": {
+        "inbound_rtp": [],
+        "outbound_rtp": [
+          {
+            "ssrc": 1273465882,
+            "media_type": "video",
+            "codec": "codec-stats-sink_0",
+            "bytes": 554553,
+            "packets": 525,
+            "packets_lost": null,
+            "fraction_lost": null,
+            "jitter": null,
+            "round_trip_time": 0.0011444091796875,
+            "bitrate": 793856
+          },
+          {
+            "ssrc": 1574003862,
+            "media_type": "audio",
+            "codec": "codec-stats-sink_1",
+            "bytes": 50231,
+            "packets": 311,
+            "packets_lost": null,
+            "fraction_lost": null,
+            "jitter": null,
+            "round_trip_time": 0.0045166015625,
+            "bitrate": 84887
+          }
+        ],
+        "ice_candidates": {
+          "local_candidate_type": "host",
+          "remote_candidate_type": "host",
+          "state": null,
+          "local_address": "172.17.0.2",
+          "local_port": 44284,
+          "local_protocol": "udp",
+          "remote_address": "172.17.0.5",
+          "remote_port": 47739,
+          "remote_protocol": "udp"
+        },
+        "transport": {
+          "bytes_sent": null,
+          "bytes_received": null,
+          "packets_sent": null,
+          "packets_received": null
+        },
+        "codecs": [
+          {
+            "mime_type": "video/VP9",
+            "clock_rate": 90000,
+            "payload_type": 98,
+            "channels": null
+          },
+          {
+            "mime_type": "audio/OPUS",
+            "clock_rate": 48000,
+            "payload_type": 111,
+            "channels": 2
+          }
+        ],
+        "raw": {}
+      },
+      "whip_in:session_whip-client:webrtcbin0": {
+        "inbound_rtp": [
+          {
+            "ssrc": 2469320587,
+            "media_type": "video",
+            "codec": "codec-stats-src_1",
+            "bytes": 601663,
+            "packets": 837,
+            "packets_lost": 0,
+            "fraction_lost": 0.0,
+            "jitter": 0.00038888888888888887,
+            "round_trip_time": null,
+            "bitrate": 473017
+          },
+          {
+            "ssrc": 2549936684,
+            "media_type": "audio",
+            "codec": "codec-stats-src_0",
+            "bytes": 47216,
+            "packets": 584,
+            "packets_lost": 0,
+            "fraction_lost": 0.0,
+            "jitter": 0.026270833333333334,
+            "round_trip_time": null,
+            "bitrate": 54836
+          }
+        ],
+        "outbound_rtp": [],
+        "ice_candidates": {
+          "local_candidate_type": "host",
+          "remote_candidate_type": "host",
+          "state": null,
+          "local_address": "172.17.0.2",
+          "local_port": 50571,
+          "local_protocol": "udp",
+          "remote_address": "172.17.0.5",
+          "remote_port": 53229,
+          "remote_protocol": "udp"
+        },
+        "transport": {
+          "bytes_sent": null,
+          "bytes_received": null,
+          "packets_sent": null,
+          "packets_received": null
+        },
+        "codecs": [
+          {
+            "mime_type": "video/H264",
+            "clock_rate": 90000,
+            "payload_type": 100,
+            "channels": null
+          },
+          {
+            "mime_type": "audio/OPUS",
+            "clock_rate": 48000,
+            "payload_type": 111,
+            "channels": 2
+          }
+        ],
+        "raw": {}
+      }
+    }
+  }
+}

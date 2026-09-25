@@ -1,0 +1,43 @@
+{
+  "flow_id": "7b2ee3ec-9c53-41e5-b0a9-d1d9ed022370",
+  "stats": {
+    "connections": {
+      "whep_out_0:session_692b1d97-2d02-4c61-8cb9-6b8e15de017f:webrtcbin-692b1d97-2d02-4c61-8cb9-6b8e15de017f": {
+        "inbound_rtp": [],
+        "outbound_rtp": [],
+        "ice_candidates": {
+          "local_candidate_type": "host",
+          "remote_candidate_type": "host",
+          "state": null,
+          "local_address": "172.17.0.2",
+          "local_port": 44284,
+          "local_protocol": "udp",
+          "remote_address": "172.17.0.5",
+          "remote_port": 47739,
+          "remote_protocol": "udp"
+        },
+        "transport": {
+          "bytes_sent": null,
+          "bytes_received": null,
+          "packets_sent": null,
+          "packets_received": null
+        },
+        "codecs": [
+          {
+            "mime_type": "video/VP9",
+            "clock_rate": 90000,
+            "payload_type": 98,
+            "channels": null
+          },
+          {
+            "mime_type": "audio/OPUS",
+            "clock_rate": 48000,
+            "payload_type": 111,
+            "channels": 2
+          }
+        ],
+        "raw": {}
+      }
+    }
+  }
+}

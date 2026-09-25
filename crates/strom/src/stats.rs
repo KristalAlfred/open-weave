@@ -1,4 +1,7 @@
-//! Defensive parsing of Strom's `srt-stats` payload (shape inferred, all fields optional).
+//! Defensive parsing of Strom's `srt-stats` (shape inferred) and `webrtc-stats`
+//! payloads. All fields are optional.
+
+use std::collections::BTreeMap;
 
 use serde_json::Value;
 
@@ -143,6 +146,84 @@ pub fn parse_flow_stats(value: &Value) -> FlowStats {
     }
 
     stats
+}
+
+/// Media through one WebRTC block, summed over the sessions Strom reports for it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionStats {
+    /// The block id, such as `whip_in` or `whep_out_0`.
+    pub block: String,
+    /// Sessions carrying at least one RTP stream. Strom keeps a session's entry
+    /// for a while after it ends, with no RTP streams, and those are not counted.
+    pub sessions: usize,
+    pub bytes_received: i64,
+    pub bytes_sent: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WebRtcStats {
+    pub blocks: Vec<SessionStats>,
+}
+
+impl WebRtcStats {
+    /// The `whip_in` block: a hop's WHIP ingress.
+    #[must_use]
+    pub fn ingress(&self) -> Option<&SessionStats> {
+        self.block("whip_in")
+    }
+
+    /// The `whep_out_{index}` block carrying desired egress `index`.
+    #[must_use]
+    pub fn egress_at(&self, index: usize) -> Option<&SessionStats> {
+        self.block(&format!("whep_out_{index}"))
+    }
+
+    #[must_use]
+    pub fn block(&self, id: &str) -> Option<&SessionStats> {
+        self.blocks.iter().find(|block| block.block == id)
+    }
+}
+
+/// Parse per-block session counts and byte totals from a `webrtc-stats`
+/// payload. Its `connections` are keyed `<block>:session_<consumer>:<webrtcbin>`,
+/// one per session; a key with no block prefix is skipped. Every field is
+/// optional; missing shapes yield defaults.
+#[must_use]
+pub fn parse_webrtc_stats(value: &Value) -> WebRtcStats {
+    let Some(connections) = value
+        .pointer("/stats/connections")
+        .and_then(Value::as_object)
+    else {
+        return WebRtcStats::default();
+    };
+
+    let mut blocks = BTreeMap::<&str, SessionStats>::new();
+    for (key, connection) in connections {
+        let Some((block_id, _)) = key.split_once(':') else {
+            continue;
+        };
+        let inbound = rtp_streams(connection, "inbound_rtp");
+        let outbound = rtp_streams(connection, "outbound_rtp");
+        let block = blocks.entry(block_id).or_insert_with(|| SessionStats {
+            block: block_id.to_string(),
+            ..SessionStats::default()
+        });
+        if !inbound.is_empty() || !outbound.is_empty() {
+            block.sessions += 1;
+        }
+        block.bytes_received += inbound.iter().map(|s| field_i64(s, "bytes")).sum::<i64>();
+        block.bytes_sent += outbound.iter().map(|s| field_i64(s, "bytes")).sum::<i64>();
+    }
+    WebRtcStats {
+        blocks: blocks.into_values().collect(),
+    }
+}
+
+fn rtp_streams<'a>(connection: &'a Value, key: &str) -> &'a [Value] {
+    connection
+        .get(key)
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
 }
 
 fn field_i64(value: &Value, key: &str) -> i64 {
@@ -304,6 +385,82 @@ mod tests {
         let ingress = stats.ingress().expect("ingress element");
         assert!(ingress.connected);
         assert_eq!(ingress.rate_mbps, 0.0);
+    }
+
+    fn recorded(name: &str) -> Value {
+        let text = match name {
+            "poll-0" => include_str!("testdata/webrtc-stats/whip-whep-poll-0.json"),
+            "poll-1" => include_str!("testdata/webrtc-stats/whip-whep-poll-1.json"),
+            "ended" => include_str!("testdata/webrtc-stats/whip-whep-ended.json"),
+            other => panic!("no recording {other}"),
+        };
+        serde_json::from_str(text).expect("recorded webrtc-stats")
+    }
+
+    /// Recorded from Strom 0.6.6: a WebKit page sending H264 and Opus over WHIP
+    /// into `whip_in`, and a Chromium page playing `whep_out_0` over WHEP.
+    #[test]
+    fn sums_each_blocks_session_bytes_by_direction() {
+        let stats = parse_webrtc_stats(&recorded("poll-1"));
+
+        let ingress = stats.ingress().expect("whip_in");
+        assert_eq!(ingress.sessions, 1);
+        assert_eq!(ingress.bytes_received, 601_663 + 47_216);
+        assert_eq!(ingress.bytes_sent, 0);
+
+        let egress = stats.egress_at(0).expect("whep_out_0");
+        assert_eq!(egress.sessions, 1);
+        assert_eq!(egress.bytes_sent, 554_553 + 50_231);
+        assert_eq!(egress.bytes_received, 0);
+        assert!(stats.egress_at(1).is_none());
+    }
+
+    #[test]
+    fn byte_totals_advance_between_recorded_polls() {
+        let (first, second) = (
+            parse_webrtc_stats(&recorded("poll-0")),
+            parse_webrtc_stats(&recorded("poll-1")),
+        );
+        let received = |s: &WebRtcStats| s.ingress().map(|b| b.bytes_received);
+        let sent = |s: &WebRtcStats| s.egress_at(0).map(|b| b.bytes_sent);
+        assert!(received(&second) > received(&first));
+        assert!(sent(&second) > sent(&first));
+    }
+
+    /// Recorded ~18 s after both pages closed their peer connections: the WHIP
+    /// session is gone and the WHEP session's entry remains with no RTP streams.
+    #[test]
+    fn an_ended_session_is_not_counted() {
+        let stats = parse_webrtc_stats(&recorded("ended"));
+        assert!(stats.ingress().is_none());
+        let egress = stats.egress_at(0).expect("the entry Strom kept");
+        assert_eq!(egress.sessions, 0);
+        assert_eq!(egress.bytes_sent, 0);
+    }
+
+    #[test]
+    fn sessions_of_one_block_are_summed() {
+        let stream = |bytes: i64| serde_json::json!({ "media_type": "video", "bytes": bytes });
+        let value = serde_json::json!({ "stats": { "connections": {
+            "whep_out_0:session_a:webrtcbin-a": { "inbound_rtp": [], "outbound_rtp": [stream(100)] },
+            "whep_out_0:session_b:webrtcbin-b": { "inbound_rtp": [], "outbound_rtp": [stream(50)] },
+            "whep_out_0:session_c:webrtcbin-c": { "inbound_rtp": [], "outbound_rtp": [] },
+            "webrtcbin7": { "inbound_rtp": [stream(9)], "outbound_rtp": [] }
+        }}});
+        let stats = parse_webrtc_stats(&value);
+        assert_eq!(stats.blocks.len(), 1, "a key without a block is skipped");
+        let egress = stats.egress_at(0).expect("whep_out_0");
+        assert_eq!((egress.sessions, egress.bytes_sent), (2, 150));
+    }
+
+    #[test]
+    fn an_unfed_flow_or_absent_stats_have_no_blocks() {
+        let unfed = serde_json::json!({ "flow_id": "x", "stats": { "connections": {} } });
+        assert_eq!(parse_webrtc_stats(&unfed), WebRtcStats::default());
+        assert_eq!(
+            parse_webrtc_stats(&serde_json::json!({})),
+            WebRtcStats::default()
+        );
     }
 
     #[test]

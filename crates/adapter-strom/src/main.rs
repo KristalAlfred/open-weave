@@ -21,7 +21,8 @@ use weave_core::{
     SocketRole, SocketSpec, SocketStatus, Transport, TransportClass,
 };
 use weave_strom::{
-    FlowSpec, FlowStats, StromClient, StromError, StromFlow, flow_spec_from_hop, parse_flow_stats,
+    ElementStats, FlowSpec, FlowStats, SessionStats, StromClient, StromError, StromFlow,
+    WebRtcStats, flow_spec_from_hop, parse_flow_stats, parse_webrtc_stats,
 };
 
 use config::AdapterConfig;
@@ -258,6 +259,7 @@ trait FlowApi {
     async fn start_flow(&self, id: &str) -> Result<(), StromError>;
     async fn delete_flow(&self, id: &str) -> Result<(), StromError>;
     async fn srt_stats(&self, id: &str) -> Result<Value, StromError>;
+    async fn webrtc_stats(&self, id: &str) -> Result<Value, StromError>;
 }
 
 #[async_trait::async_trait]
@@ -276,6 +278,9 @@ impl FlowApi for StromClient {
     }
     async fn srt_stats(&self, id: &str) -> Result<Value, StromError> {
         StromClient::srt_stats(self, id).await
+    }
+    async fn webrtc_stats(&self, id: &str) -> Result<Value, StromError> {
+        StromClient::webrtc_stats(self, id).await
     }
 }
 
@@ -351,7 +356,7 @@ async fn hop_statuses(
     let mut statuses = Vec::with_capacity(desired.len());
     for hop in desired {
         let flow = flows.iter().find(|f| f.name == hop.id);
-        let stats = match flow {
+        let srt = match flow {
             Some(flow) => match strom.srt_stats(&flow.id).await {
                 Ok(value) => Some(parse_flow_stats(&value)),
                 Err(error) => {
@@ -361,102 +366,139 @@ async fn hop_statuses(
             },
             None => None,
         };
-
-        let ingress = stats.as_ref().and_then(FlowStats::ingress);
-        let (ingress_connected, ingress_rate) =
-            ingress.map_or((false, 0.0), |e| (e.connected, e.rate_mbps));
+        let webrtc = match flow {
+            Some(flow) if carries_webrtc(hop) => match strom.webrtc_stats(&flow.id).await {
+                Ok(value) => Some(parse_webrtc_stats(&value)),
+                Err(error) => {
+                    tracing::debug!(hop = %hop.id, %error, "webrtc-stats unavailable");
+                    None
+                }
+            },
+            _ => None,
+        };
         let running = flow.is_some_and(|f| f.running);
         let gst_paused = flow.and_then(|f| f.gst_state.as_deref()) == Some("Paused");
-        let ingress_stalled = tracker.observe(
-            &hop.id,
-            Side::Ingress,
-            SideObservation {
-                bytes: ingress.map(|e| e.bytes_received),
-                running,
-                gst_paused,
-            },
-        );
-        let mut egress_stalled = Vec::with_capacity(hop.egresses.len());
-        for (index, _) in hop.egresses.iter().enumerate() {
-            let branch_stats = stats.as_ref().and_then(|stats| stats.egress_at(index));
-            egress_stalled.push(tracker.observe(
+
+        let mut observe = |side: Side, spec: &SocketSpec, reading: &SocketReading| {
+            let stalled = tracker.observe(
                 &hop.id,
-                Side::Egress(index),
+                side,
                 SideObservation {
-                    bytes: branch_stats.map(|stats| stats.bytes_sent),
+                    bytes: reading.bytes,
                     running,
-                    gst_paused,
+                    gst_paused: gst_paused && matches!(spec, SocketSpec::Srt(_)),
                 },
-            ));
-        }
-        let playing = running && !gst_paused;
-        let any_egress_advanced = hop
+            );
+            let condition = reading.condition(spec, tracker.advanced(&hop.id, side), stalled);
+            SocketStatus {
+                condition,
+                resolved: resolved_addr(spec, listener_host),
+                stats: reading.stats,
+            }
+        };
+
+        let ingress = SocketReading::ingress(&hop.ingress, srt.as_ref(), webrtc.as_ref());
+        let ingress = observe(Side::Ingress, &hop.ingress, &ingress);
+        let egresses = hop
             .egresses
             .iter()
             .enumerate()
-            .any(|(index, _)| tracker.advanced(&hop.id, Side::Egress(index)));
-        let all_egresses_stalled =
-            !egress_stalled.is_empty() && egress_stalled.iter().all(|stalled| *stalled);
+            .map(|(index, egress)| {
+                let reading =
+                    SocketReading::egress(&egress.socket, index, srt.as_ref(), webrtc.as_ref());
+                EgressStatus {
+                    branch_id: egress.branch_id.clone(),
+                    status: observe(Side::Egress(index), &egress.socket, &reading),
+                }
+            })
+            .collect();
 
         statuses.push(HopStatus {
             id: hop.id.clone(),
             node_id: hop.node_id.clone(),
             state: hop_state(flow, failed.contains(&hop.id)),
-            ingress: SocketStatus {
-                condition: match &hop.ingress {
-                    SocketSpec::Srt(socket) => socket_condition(
-                        socket.role(),
-                        ingress_connected,
-                        ingress_rate,
-                        ingress_stalled,
-                    ),
-                    SocketSpec::Whip(socket) | SocketSpec::Whep(socket) => webrtc_condition(
-                        socket.role,
-                        playing,
-                        any_egress_advanced,
-                        all_egresses_stalled,
-                    ),
-                    SocketSpec::Device(_) => LinkCondition::Idle,
-                },
-                resolved: resolved_addr(&hop.ingress, listener_host),
-                stats: ingress.map(LinkStats::from),
-            },
+            ingress,
             merge_ingress: None,
-            egresses: hop
-                .egresses
-                .iter()
-                .enumerate()
-                .map(|(index, egress)| {
-                    let branch_stats = stats.as_ref().and_then(|stats| stats.egress_at(index));
-                    EgressStatus {
-                        branch_id: egress.branch_id.clone(),
-                        status: SocketStatus {
-                            condition: match &egress.socket {
-                                SocketSpec::Srt(socket) => socket_condition(
-                                    socket.role(),
-                                    branch_stats.is_some_and(|stats| stats.connected),
-                                    branch_stats.map_or(0.0, |stats| stats.rate_mbps),
-                                    egress_stalled[index],
-                                ),
-                                SocketSpec::Whip(socket) | SocketSpec::Whep(socket) => {
-                                    webrtc_condition(
-                                        socket.role,
-                                        playing,
-                                        tracker.advanced(&hop.id, Side::Ingress),
-                                        ingress_stalled,
-                                    )
-                                }
-                                SocketSpec::Device(_) => LinkCondition::Idle,
-                            },
-                            resolved: resolved_addr(&egress.socket, listener_host),
-                            stats: branch_stats.map(LinkStats::from),
-                        },
-                    }
-                })
-                .collect(),
+            egresses,
         });
     }
     statuses
+}
+
+fn carries_webrtc(hop: &DesiredHop) -> bool {
+    std::iter::once(&hop.ingress)
+        .chain(hop.egresses.iter().map(|egress| &egress.socket))
+        .any(|spec| matches!(spec, SocketSpec::Whip(_) | SocketSpec::Whep(_)))
+}
+
+/// One socket of a hop as this poll's stats show it.
+#[derive(Debug, Default)]
+struct SocketReading {
+    /// Cumulative bytes through the socket, `None` when its stats are unavailable.
+    bytes: Option<i64>,
+    /// An SRT socket has a connection; a WHIP or WHEP socket has a session
+    /// carrying RTP.
+    connected: bool,
+    rate_mbps: f64,
+    stats: Option<LinkStats>,
+}
+
+impl SocketReading {
+    fn ingress(spec: &SocketSpec, srt: Option<&FlowStats>, webrtc: Option<&WebRtcStats>) -> Self {
+        match spec {
+            SocketSpec::Srt(_) => Self::srt(srt.and_then(FlowStats::ingress), |e| e.bytes_received),
+            SocketSpec::Whip(_) | SocketSpec::Whep(_) => webrtc
+                .map(|stats| Self::sessions(stats.ingress(), |b| b.bytes_received))
+                .unwrap_or_default(),
+            SocketSpec::Device(_) => Self::default(),
+        }
+    }
+
+    fn egress(
+        spec: &SocketSpec,
+        index: usize,
+        srt: Option<&FlowStats>,
+        webrtc: Option<&WebRtcStats>,
+    ) -> Self {
+        match spec {
+            SocketSpec::Srt(_) => Self::srt(srt.and_then(|s| s.egress_at(index)), |e| e.bytes_sent),
+            SocketSpec::Whip(_) | SocketSpec::Whep(_) => webrtc
+                .map(|stats| Self::sessions(stats.egress_at(index), |b| b.bytes_sent))
+                .unwrap_or_default(),
+            SocketSpec::Device(_) => Self::default(),
+        }
+    }
+
+    fn srt(element: Option<&ElementStats>, bytes: fn(&ElementStats) -> i64) -> Self {
+        Self {
+            bytes: element.map(bytes),
+            connected: element.is_some_and(|e| e.connected),
+            rate_mbps: element.map_or(0.0, |e| e.rate_mbps),
+            stats: element.map(LinkStats::from),
+        }
+    }
+
+    /// A block missing from Strom's reply carries nothing now, so its bytes read
+    /// zero rather than unknown.
+    fn sessions(block: Option<&SessionStats>, bytes: fn(&SessionStats) -> i64) -> Self {
+        Self {
+            bytes: Some(block.map_or(0, bytes)),
+            connected: block.is_some_and(|b| b.sessions > 0),
+            ..Self::default()
+        }
+    }
+
+    fn condition(&self, spec: &SocketSpec, advanced: bool, stalled: bool) -> LinkCondition {
+        match spec {
+            SocketSpec::Srt(socket) => {
+                socket_condition(socket.role(), self.connected, self.rate_mbps, stalled)
+            }
+            SocketSpec::Whip(socket) | SocketSpec::Whep(socket) => {
+                webrtc_condition(socket.role, self.connected, advanced, stalled)
+            }
+            SocketSpec::Device(_) => LinkCondition::Idle,
+        }
+    }
 }
 
 async fn provision_hop(strom: &dyn FlowApi, hop: &DesiredHop) -> Result<()> {
@@ -709,7 +751,7 @@ async fn health() -> Json<Value> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    use weave_core::{DesiredEgress, HopRole};
+    use weave_core::{DesiredEgress, HopRole, SignallingTransport};
 
     #[derive(Debug, Clone, PartialEq)]
     enum Op {
@@ -723,6 +765,7 @@ mod tests {
         ops: Mutex<Vec<Op>>,
         flows_after: Vec<(String, String)>,
         stats: Value,
+        webrtc: Value,
     }
 
     impl RecordingFlowApi {
@@ -738,6 +781,11 @@ mod tests {
 
         fn with_stats(mut self, stats: Value) -> Self {
             self.stats = stats;
+            self
+        }
+
+        fn with_webrtc(mut self, webrtc: Value) -> Self {
+            self.webrtc = webrtc;
             self
         }
 
@@ -773,6 +821,9 @@ mod tests {
         }
         async fn srt_stats(&self, _id: &str) -> Result<Value, StromError> {
             Ok(self.stats.clone())
+        }
+        async fn webrtc_stats(&self, _id: &str) -> Result<Value, StromError> {
+            Ok(self.webrtc.clone())
         }
     }
 
@@ -978,5 +1029,192 @@ mod tests {
             last_delete < first_create,
             "all deletes must precede all creates within one cycle: {ops:?}"
         );
+    }
+
+    fn recorded_webrtc(name: &str) -> Value {
+        let text = match name {
+            "poll-0" => include_str!("../../strom/src/testdata/webrtc-stats/whip-whep-poll-0.json"),
+            "poll-1" => include_str!("../../strom/src/testdata/webrtc-stats/whip-whep-poll-1.json"),
+            "poll-2" => include_str!("../../strom/src/testdata/webrtc-stats/whip-whep-poll-2.json"),
+            "ended" => include_str!("../../strom/src/testdata/webrtc-stats/whip-whep-ended.json"),
+            other => panic!("no recording {other}"),
+        };
+        serde_json::from_str(text).expect("recorded webrtc-stats")
+    }
+
+    fn flow_in_state(name: &str, gst_state: &str) -> StromFlow {
+        serde_json::from_value(json!({
+            "id": "id-a", "name": name, "running": true, "gst_state": gst_state,
+        }))
+        .expect("flow fixture")
+    }
+
+    fn signalling(transport: SignallingTransport, endpoint_id: &str) -> SocketSpec {
+        SocketSpec::signalling(
+            transport,
+            SocketRole::Listen,
+            "http://10.97.26.10:8080",
+            endpoint_id,
+        )
+    }
+
+    fn whip_to_srt_hop() -> DesiredHop {
+        DesiredHop {
+            id: "weave-browser-cam-receiver-output".to_string(),
+            node_id: "strom-node-1".to_string(),
+            profile_id: "whip-to-srt".to_string(),
+            role: HopRole::Receiver,
+            ingress: signalling(
+                SignallingTransport::Whip,
+                "weave-browser-cam-receiver-output",
+            ),
+            merge_ingress: None,
+            egresses: vec![DesiredEgress {
+                branch_id: "output".to_string(),
+                socket: SocketSpec::srt_listen(7003, 1000),
+            }],
+        }
+    }
+
+    fn srt_to_whep_hop() -> DesiredHop {
+        DesiredHop {
+            id: "weave-browser-return-sender".to_string(),
+            node_id: "strom-node-1".to_string(),
+            profile_id: "srt-to-whep".to_string(),
+            role: HopRole::Sender,
+            ingress: SocketSpec::srt_listen(7001, 200),
+            merge_ingress: None,
+            egresses: vec![DesiredEgress {
+                branch_id: "display".to_string(),
+                socket: signalling(
+                    SignallingTransport::Whep,
+                    "weave-browser-return-receiver-display",
+                ),
+            }],
+        }
+    }
+
+    /// One poll of `hop` against `flow`, with `srt` and `webrtc` as Strom's stats.
+    async fn poll(
+        hop: &DesiredHop,
+        flow: StromFlow,
+        srt: Value,
+        webrtc: Value,
+        tracker: &mut StallTracker,
+    ) -> HopStatus {
+        let fake = RecordingFlowApi::default()
+            .with_stats(srt)
+            .with_webrtc(webrtc);
+        let mut statuses = hop_statuses(
+            &fake,
+            std::slice::from_ref(hop),
+            &[flow],
+            None,
+            &std::collections::HashSet::new(),
+            tracker,
+        )
+        .await;
+        statuses.remove(0)
+    }
+
+    /// Strom 0.6.6 holds a WHIP flow at `Paused` until both decoders preroll, so
+    /// a video-only sender leaves it there while media flows.
+    #[tokio::test]
+    async fn a_whip_ingress_reads_its_sessions_not_the_flow_state() {
+        let hop = whip_to_srt_hop();
+        let mut tracker = StallTracker::default();
+        let mut conditions = Vec::new();
+        for recording in ["poll-0", "poll-1", "poll-2", "ended"] {
+            let status = poll(
+                &hop,
+                flow_in_state(&hop.id, "Paused"),
+                json!({}),
+                recorded_webrtc(recording),
+                &mut tracker,
+            )
+            .await;
+            conditions.push(status.ingress.condition);
+            assert_eq!(status.egresses[0].status.condition, LinkCondition::Idle);
+        }
+        assert_eq!(
+            conditions,
+            [
+                LinkCondition::Connected,
+                LinkCondition::Flowing,
+                LinkCondition::Flowing,
+                LinkCondition::Idle,
+            ]
+        );
+    }
+
+    /// Strom 0.6.9 and later report an unfed WHIP flow as `Playing`.
+    #[tokio::test]
+    async fn a_playing_whip_flow_without_a_session_is_idle() {
+        let hop = whip_to_srt_hop();
+        let mut tracker = StallTracker::default();
+        let unfed = json!({ "flow_id": "id-a", "stats": { "connections": {} } });
+        for _ in 0..4 {
+            let status = poll(
+                &hop,
+                flow_in_state(&hop.id, "Playing"),
+                json!({}),
+                unfed.clone(),
+                &mut tracker,
+            )
+            .await;
+            assert_eq!(status.ingress.condition, LinkCondition::Idle);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_whep_egress_reads_its_sessions() {
+        let hop = srt_to_whep_hop();
+        let srt = json!({ "stats": { "connections": {
+            "srt_in:srtsrc": { "connected": true, "callers": [
+                { "recv_rate_mbps": 2.5, "bytes_received": 1000 }
+            ]}
+        }}});
+        let mut tracker = StallTracker::default();
+        let mut conditions = Vec::new();
+        for recording in ["poll-0", "poll-1", "poll-2", "ended"] {
+            let status = poll(
+                &hop,
+                flow_in_state(&hop.id, "Playing"),
+                srt.clone(),
+                recorded_webrtc(recording),
+                &mut tracker,
+            )
+            .await;
+            conditions.push(status.egresses[0].status.condition);
+        }
+        assert_eq!(
+            conditions,
+            [
+                LinkCondition::Connected,
+                LinkCondition::Flowing,
+                LinkCondition::Flowing,
+                LinkCondition::Idle,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_webrtc_session_with_frozen_bytes_stalls() {
+        let hop = whip_to_srt_hop();
+        let mut tracker = StallTracker::default();
+        let mut last = LinkCondition::Idle;
+        for recording in ["poll-0", "poll-1", "poll-1", "poll-1", "poll-1"] {
+            last = poll(
+                &hop,
+                flow_in_state(&hop.id, "Playing"),
+                json!({}),
+                recorded_webrtc(recording),
+                &mut tracker,
+            )
+            .await
+            .ingress
+            .condition;
+        }
+        assert_eq!(last, LinkCondition::Stalled);
     }
 }

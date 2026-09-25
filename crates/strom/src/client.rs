@@ -97,8 +97,16 @@ impl StromClient {
     }
 
     pub async fn srt_stats(&self, id: &str) -> Result<Value, StromError> {
+        self.flow_stats(id, "srt-stats").await
+    }
+
+    pub async fn webrtc_stats(&self, id: &str) -> Result<Value, StromError> {
+        self.flow_stats(id, "webrtc-stats").await
+    }
+
+    async fn flow_stats(&self, id: &str, kind: &str) -> Result<Value, StromError> {
         let response = self
-            .request(Method::GET, &format!("/api/flows/{id}/srt-stats"))
+            .request(Method::GET, &format!("/api/flows/{id}/{kind}"))
             .send()
             .await?
             .error_for_status()?;
